@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Local Vs Cloud Privacy
 
 AGVM Core is local-first. A local brain stays on the user's machine unless the
@@ -13,17 +19,17 @@ user explicitly exports it or connects to a hosted AGVM platform.
 
 ## Hosted Mode
 
-Detwin Cloud is a separate platform surface. It can provide Hosted MCP, managed
-storage, billing, usage metering and advanced cloud modules.
+Hosted AGVM is a separate platform surface. It can provide hosted MCP, managed
+storage, billing, usage metering and cloud module entitlements.
 
 Hosted mode must use tenant/workspace scoping, server-side authorization and
 clear data residency rules. It is not implied by the local open-core install.
 
 ## Sync Model
 
-For this release, Pro modules run in Detwin Cloud. That does not automatically
-upload local brains. Local-to-cloud sync must be an explicit user action or a
-clearly configured hosted mode.
+Detwin Pro unlocks advanced modules in Cloud AGVM. It does not automatically
+upload local brains. Local-to-cloud sync must be an explicit user action with a
+cost preview, user confirmation, credit reservation and terminal receipt.
 
 ## Backups And Exports
 

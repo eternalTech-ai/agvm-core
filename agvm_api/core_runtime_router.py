@@ -22,6 +22,11 @@ class SetupEnvSaveRequest(BaseModel):
     agvm_retrieval_model: str | None = Field(default=None, max_length=120)
     agvm_answer_model: str | None = Field(default=None, max_length=120)
     agvm_sleep_model: str | None = Field(default=None, max_length=120)
+    agvm_clone_app_arbiter_model: str | None = Field(default=None, max_length=120)
+    agvm_clone_app_sufficiency_model: str | None = Field(default=None, max_length=120)
+    agvm_clone_app_speaker_model: str | None = Field(default=None, max_length=120)
+    agvm_clone_app_prefetch_model: str | None = Field(default=None, max_length=120)
+    agvm_clone_app_teach_model: str | None = Field(default=None, max_length=120)
 
 
 def create_core_runtime_router(
@@ -101,6 +106,11 @@ def _setup_env_updates_from_payload(payload: SetupEnvSaveRequest) -> dict[str, s
         "agvm_retrieval_model": "AGVM_RETRIEVAL_MODEL",
         "agvm_answer_model": "AGVM_ANSWER_MODEL",
         "agvm_sleep_model": "AGVM_SLEEP_MODEL",
+        "agvm_clone_app_arbiter_model": "AGVM_CLONE_APP_ARBITER_MODEL",
+        "agvm_clone_app_sufficiency_model": "AGVM_CLONE_APP_SUFFICIENCY_MODEL",
+        "agvm_clone_app_speaker_model": "AGVM_CLONE_APP_SPEAKER_MODEL",
+        "agvm_clone_app_prefetch_model": "AGVM_CLONE_APP_PREFETCH_MODEL",
+        "agvm_clone_app_teach_model": "AGVM_CLONE_APP_TEACH_MODEL",
     }
     updates: dict[str, str] = {}
     for field_name, env_name in field_map.items():

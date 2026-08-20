@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Local Install
 
 AGVM Core runs locally as a Docker Compose stack with:
@@ -51,6 +57,7 @@ AGVM_UI_PORT=3020
 AGVM_DEFAULT_BRAIN_ID=default_brain
 AGVM_MCP_BRAIN_POLICY=ai_create_if_missing
 AGVM_MCP_READ_ONLY=false
+AGVM_MCP_MODULE_VISIBILITY_POLICY=hide_unlicensed
 ```
 
 Provider keys can also be saved through the UI setup flow when the backend
@@ -71,9 +78,15 @@ before deleting volumes.
 
 After the API is healthy, configure one MCP client:
 
+- [Local MCP overview](local-mcp.md)
 - [Codex](mcp-codex.md)
 - [Claude](mcp-claude.md)
 - [Cursor](mcp-cursor.md)
 
 Ask the client to call `get_agvm_usage_guide`. If the client cannot see that
 tool, the MCP bridge did not start or cannot reach `AGVM_API_BASE_URL`.
+
+## First Brain
+
+If Context, Grow or MCP pages report that no active brain exists, create or
+import one before retrying. See [Brain Bootstrap](brain-bootstrap.md).

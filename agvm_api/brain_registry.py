@@ -30,7 +30,37 @@ class BrainRegistryError(ValueError):
 
 
 def brain_root_path() -> Path:
-    return Path(os.getenv("AGVM_BRAINS_DIR", str(BASE_DIR / "brains"))).expanduser().resolve()
+    configured = str(os.getenv("AGVM_BRAINS_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    default_root = (BASE_DIR / "brains").expanduser().resolve()
+    if _is_writable_brain_root_candidate(default_root):
+        return default_root
+    core_home = str(os.getenv("AGVM_CORE_HOME") or "").strip()
+    if core_home:
+        fallback_root = Path(core_home).expanduser().resolve() / "brains"
+        if _is_writable_brain_root_candidate(fallback_root):
+            return fallback_root
+    local_app_data = str(os.getenv("LOCALAPPDATA") or "").strip()
+    if local_app_data:
+        fallback_root = Path(local_app_data).expanduser().resolve() / "AGVM" / "brains"
+        if _is_writable_brain_root_candidate(fallback_root):
+            return fallback_root
+    home_fallback = Path.home().expanduser().resolve() / ".agvm" / "brains"
+    if _is_writable_brain_root_candidate(home_fallback):
+        return home_fallback
+    return (Path(tempfile.gettempdir()).expanduser().resolve() / "agvm-core" / "brains")
+
+
+def _is_writable_brain_root_candidate(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".agvm_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
 
 
 def brain_registry_path(brain_root: Path | None = None) -> Path:
@@ -392,7 +422,8 @@ def bootstrap_local_brain_registry(
     data_dirs = discover_legacy_data_dirs(current_data_dir=current_data_dir) if legacy_data_dirs is None else legacy_data_dirs
     current = (current_data_dir or DATA_DIR).resolve()
     env_default = str(os.getenv("AGVM_DEFAULT_BRAIN_ID", "") or "").strip()
-    preferred = preferred_default_brain_id or env_default
+    requested_preferred = str(preferred_default_brain_id or env_default or "").strip()
+    preferred = requested_preferred
     known_preferred_ids = set(previous_by_id.keys())
     known_preferred_ids.update(_known_legacy_brain_id(path.resolve()) for path in data_dirs)
     if preferred and preferred not in known_preferred_ids:
@@ -453,7 +484,7 @@ def bootstrap_local_brain_registry(
                 )
             )
     if not brain_records:
-        default_brain_id = _safe_id(preferred or os.getenv("AGVM_DEFAULT_BRAIN_ID") or "default_brain")
+        default_brain_id = _safe_id(requested_preferred or preferred or os.getenv("AGVM_DEFAULT_BRAIN_ID") or "default_brain")
         default_brain_path = root / default_brain_id
         brain_records.append(
             build_local_brain_record(

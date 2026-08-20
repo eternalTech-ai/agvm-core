@@ -9,6 +9,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from mcp_tool_registration import GROW_MODULE_ID, MAINTAIN_MODULE_ID, required_module_id_for_tool_name
+
+
 SURFACE_CATEGORIES = (
     "core",
     "paid_module",
@@ -130,6 +133,37 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         exact=("/agent-demo/chat-turn", "/mcp/agent-chat-turn"),
     ),
     RouteRule(
+        name="mcp_core_grow_sleep_evolve",
+        category="core",
+        owner="agvm_core_mcp",
+        public_core_allowed=True,
+        rationale="Raw local MCP Grow/Sleep/Evolve operations remain public core when they enforce preview and explicit apply policy.",
+        exact=(
+            "/memory/mcp/grow-source-preview",
+            "/mcp/grow-source-preview",
+            "/memory/mcp/grow-preview",
+            "/mcp/grow-preview",
+            "/memory/mcp/grow-guided",
+            "/mcp/grow-guided",
+            "/memory/mcp/grow-source-apply",
+            "/mcp/grow-source-apply",
+            "/memory/mcp/grow-apply",
+            "/mcp/grow-apply",
+            "/memory/mcp/grow-source-status",
+            "/mcp/grow-source-status",
+            "/memory/mcp/grow-status",
+            "/mcp/grow-status",
+            "/memory/mcp/sleep-preview",
+            "/mcp/sleep-preview",
+            "/memory/mcp/evolve-preview",
+            "/mcp/evolve-preview",
+            "/memory/mcp/sleep-apply",
+            "/mcp/sleep-apply",
+            "/memory/mcp/evolve-apply",
+            "/mcp/evolve-apply",
+        ),
+    ),
+    RouteRule(
         name="grow_source_product",
         category="paid_module",
         owner="agvm_grow_studio",
@@ -139,6 +173,8 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
             "/grow-studio/",
             "/source-investigation/",
             "/memory/source-investigation/",
+            "/mcp/grow-",
+            "/memory/mcp/grow-",
         ),
     ),
     RouteRule(
@@ -149,6 +185,14 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         rationale="Sleep, Evolve, Matrix and maintenance orchestration are Pro module surfaces.",
         prefixes=(
             "/maintain-studio/",
+            "/mcp/matrix-calibration-",
+            "/memory/mcp/matrix-calibration-",
+            "/mcp/sleep-",
+            "/memory/mcp/sleep-",
+            "/mcp/evolve-",
+            "/memory/mcp/evolve-",
+            "/mcp/list-",
+            "/memory/mcp/list-",
         ),
         exact=(
             "/restructure-local-area",
@@ -242,11 +286,7 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         category="core",
         owner="agvm_core_mcp",
         public_core_allowed=True,
-        rationale="Raw MCP Grow and write primitives stay core when explicit-apply policy is enforced.",
-        prefixes=(
-            "/memory/mcp/grow-",
-            "/mcp/grow-",
-        ),
+        rationale="Raw MCP preview/commit primitives may remain core when explicit-apply policy is enforced.",
         exact=(
             "/memory/mcp/write-memory-preview",
             "/mcp/write-memory-preview",
@@ -254,23 +294,6 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
             "/mcp/write-memory-commit",
             "/memory/mcp/ask-memory-clarification",
             "/mcp/ask-memory-clarification",
-        ),
-    ),
-    RouteRule(
-        name="mcp_maintenance_primitives",
-        category="core",
-        owner="agvm_core_mcp",
-        public_core_allowed=True,
-        rationale="Raw MCP Sleep, Evolve, Matrix and Memory OS list primitives stay core; rich studio UI remains outside core.",
-        prefixes=(
-            "/memory/mcp/matrix-calibration-",
-            "/mcp/matrix-calibration-",
-            "/memory/mcp/sleep-",
-            "/mcp/sleep-",
-            "/memory/mcp/evolve-",
-            "/mcp/evolve-",
-            "/memory/mcp/list-",
-            "/mcp/list-",
         ),
     ),
     RouteRule(
@@ -453,15 +476,11 @@ def classify_mcp_tool(tool_name: str) -> SurfaceClassification | None:
         return SurfaceClassification("core", "agvm_core_mcp", True, "MCP retrieval and inspection tools are core.")
     if clean in {"write_memory_preview", "write_memory_commit", "ask_memory_clarification", "brain_health"}:
         return SurfaceClassification("core", "agvm_core_mcp", True, "Raw memory write/health primitives stay core with explicit permission policy.")
-    if clean.startswith("grow_"):
-        return SurfaceClassification("core", "agvm_core_mcp", True, "Raw Grow MCP tools are public core; rich Grow Studio UI remains outside core.")
-    if clean.startswith(("matrix_calibration_", "sleep_", "evolve_")) or clean in {
-        "list_open_questions",
-        "list_hypotheses",
-        "list_contradictions",
-        "list_memory_os_processes",
-    }:
-        return SurfaceClassification("core", "agvm_core_mcp", True, "Raw maintenance MCP tools are public core; rich Maintain Studio UI remains outside core.")
+    required_module_id = required_module_id_for_tool_name(clean)
+    if required_module_id == GROW_MODULE_ID:
+        return SurfaceClassification("paid_module", "agvm_grow_studio", False, "Grow orchestration tools belong to the Pro Grow module.")
+    if required_module_id == MAINTAIN_MODULE_ID:
+        return SurfaceClassification("paid_module", "agvm_maintain_studio", False, "Maintenance and Matrix tools belong to the Pro Maintain module.")
     return None
 
 

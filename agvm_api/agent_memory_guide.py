@@ -13,6 +13,14 @@ def build_agvm_usage_guide() -> dict[str, Any]:
         "ensure_brain",
         "retrieve_context",
     ]
+    bootstrap_flow = [
+        "ensure_brain with create_if_missing=true and activation_policy=return_only",
+        "grow_source_preview with raw_input and the returned brain_id",
+        "review source_formation_contract, preview_bundle and clarification_questions",
+        "grow_source_apply with investigation_id and confirm_apply=true only after approval",
+        "repeat Grow in batches for large bootstraps",
+        "sleep_preview, evolve_preview, sleep_preview to inspect maintenance proposals",
+    ]
     query_recipes = {
         "normal_recall": {
             "tool": "retrieve_context",
@@ -74,6 +82,9 @@ def build_agvm_usage_guide() -> dict[str, Any]:
         "mutation": {
             "preview_first": "Use preview tools before apply tools.",
             "apply_requires_user_approval": True,
+            "grow_apply": "Use grow_source_preview first. Apply requires investigation_id and confirm_apply=true; if blocked, answer clarification questions or pass exact selected_preview_ids.",
+            "large_bootstrap": "For hundreds of memories, split input into batches and repeat preview/apply; verify node_count with list_brains or active_brain between batches.",
+            "sleep_evolve": "Use sleep_preview/evolve_preview for proposals. Use sleep_apply/evolve_apply only with proposal_ids and confirm_apply=true.",
             "registry_write": "Brain creation/selection is separate from memory mutation but still changes registry state.",
         },
         "documents": {
@@ -94,6 +105,7 @@ def build_agvm_usage_guide() -> dict[str, Any]:
         ],
         "inspection": ["inspect_context_package", "inspect_route", "inspect_path_corridor", "inspect_memory_object"],
         "memory_growth": ["grow_source_preview", "grow_source_status", "write_memory_preview", "ask_memory_clarification"],
+        "bootstrap_from_zero": ["ensure_brain", "grow_source_preview", "grow_source_apply", "brain_health", "sleep_preview", "evolve_preview"],
         "apply_gated": ["grow_source_apply", "write_memory_commit", "grow_apply", "sleep_apply", "evolve_apply", "matrix_calibration_apply"],
     }
     markdown_guide = """# AGVM MCP Usage Guide
@@ -120,6 +132,16 @@ Safety rules:
 - Preview memory changes before apply.
 - Do not call apply/destructive tools without explicit user approval.
 - Do not silently change shared active/default brain.
+
+Bootstrap and Grow:
+- To bootstrap a new memory scope, call `ensure_brain` or `create_brain`, then pass that `brain_id` explicitly to every scoped tool.
+- Call `grow_source_preview` first and read `source_formation_contract`, `preview_bundle`, `clarification_questions` and `status`.
+- Call `grow_source_apply` only with `investigation_id` and `confirm_apply=true` after review. If the apply returns `blocked`, answer the reported questions or provide exact `selected_preview_ids`.
+- For large imports, split the source into batches, repeat preview/apply, and verify `node_count` with `list_brains`.
+
+Maintenance:
+- `sleep_preview` and `evolve_preview` are non-mutating and return proposals.
+- `sleep_apply` and `evolve_apply` require reviewed `proposal_ids` plus `confirm_apply=true`.
 """
     return {
         "schema_version": AGVM_USAGE_GUIDE_SCHEMA_VERSION,
@@ -129,6 +151,7 @@ Safety rules:
         "recommended_flow": recommended_flow,
         "query_recipes": query_recipes,
         "tool_map": tool_map,
+        "bootstrap_flow": bootstrap_flow,
         "first_call": {
             "tool": "get_agvm_usage_guide",
             "requires_brain_id": False,

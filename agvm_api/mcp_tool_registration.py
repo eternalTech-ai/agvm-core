@@ -8,8 +8,23 @@ MCP_MODULE_TOOL_REGISTRATION_SCHEMA_VERSION = "agvm.mcp_module_tool_registration
 MCP_TOOL_REGISTRATION_STATE = "core_mcp_module_tool_registration_boundary"
 MCP_CORE_TOOL_OWNER_ID = "agvm_core_mcp"
 
+GROW_MODULE_ID = "agvm_grow_studio"
+MAINTAIN_MODULE_ID = "agvm_maintain_studio"
+
+MAINTAIN_LIST_TOOL_NAMES = {
+    "list_open_questions",
+    "list_hypotheses",
+    "list_contradictions",
+    "list_memory_os_processes",
+}
+
+
 def required_module_id_for_tool_name(tool_name: str) -> str | None:
-    _ = str(tool_name or "").strip()
+    clean = str(tool_name or "").strip()
+    if clean.startswith("grow_"):
+        return GROW_MODULE_ID
+    if clean.startswith(("matrix_calibration_", "sleep_", "evolve_")) or clean in MAINTAIN_LIST_TOOL_NAMES:
+        return MAINTAIN_MODULE_ID
     return None
 
 
@@ -93,8 +108,8 @@ def build_mcp_module_tool_registration_summary(tools: list[Mapping[str, Any]]) -
         "filter_contract": {
             "required_module_field": "tool_registration.required_module_id",
             "entitlement_required_field": "tool_registration.entitlement_required",
-            "hosted_gateway_filter": "not_applicable_to_public_core",
-            "local_gateway_filter": "permission families apply; public core MCP tools do not require module leases",
+            "hosted_gateway_filter": "active module_access entitlement required when required_module_id is set",
+            "local_gateway_filter": "permission families still apply; local module lease filtering is a later supervisor slice",
         },
     }
 

@@ -1,15 +1,21 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Security Policy
 
 ## Supported Versions
 
-AGVM Core follows the security policy for the latest public `main` branch and
-tagged releases.
+AGVM Core has not reached public release. Security support starts when the first
+public version is tagged.
 
 ## Reporting A Vulnerability
 
-Report issues privately to the repository owner. Do not open public issues for
-suspected secrets, authentication bypasses, data exposure or arbitrary code
-execution.
+Report issues privately through GitHub private vulnerability reporting when it
+is enabled for the public repository. If that is unavailable, contact
+`info@eternaltech.ai` and include only sanitized logs.
 
 ## Local Threat Model
 
@@ -36,8 +42,8 @@ supports the workflow.
 
 ## Public/Private Boundary
 
-Paid modules and cloud platform code are not part of AGVM Core. For this
-release, advanced modules are account-gated in Detwin Cloud. UI hiding is not a
-security boundary.
+Paid modules and cloud platform code are not part of AGVM Core. Their activation
+and entitlement checks must be enforced server-side by the platform and locally
+by the module host. UI hiding is not a security boundary.
 
 For the full public model, see [Security Model](docs/security-model.md).

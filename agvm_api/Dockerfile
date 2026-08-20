@@ -13,10 +13,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY sdk/python ./sdk/python
-RUN pip install --no-cache-dir ./sdk/python
-
 COPY agvm_api .
+COPY sdk/python ./sdk/python
 COPY agvm_mcp_server ./agvm_mcp_server
 RUN mkdir -p /app/data /app/brains
 

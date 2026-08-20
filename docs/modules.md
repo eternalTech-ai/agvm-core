@@ -1,37 +1,57 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Modules
 
-AGVM Core is open source under AGPL-3.0. Advanced modules are not bundled into
-the public core repository.
+AGVM Core is open source. Optional modules add richer product workflows without
+being bundled into the public core repository.
 
-The first paid module group is planned as cloud-only:
+Local Core includes Grow. Advanced Detwin modules are Cloud-only for this
+release:
 
 - Clone App;
-- Grow Studio;
+- Teach;
 - Maintain Studio;
 - advanced chat/product surfaces.
 
-For this release, those advanced workflows run in Detwin Cloud behind account
-and workspace entitlement. Local AGVM Core still exposes the raw MCP primitives:
-Grow/source preview, write preview/commit, Sleep, Evolve, Matrix calibration,
-memory OS lists and route inspection.
+The public Core UI may show these module slots, but it must route users to
+Detwin Cloud instead of installing or serving paid module source locally.
 
-## Boundary
+For the public core repository, module code is not copied. Only public contracts
+and generic placeholders are allowed.
 
-The public core repository contains:
+## SDK Contracts
 
-- local API and UI packaging;
-- local stdio MCP server;
-- raw core MCP tool contracts and endpoints;
-- TypeScript contracts required by the core UI;
-- AGPL license, notices and local setup docs.
+The public core export includes SDK contract packages under:
 
-The public core repository does not contain:
+- `sdk/python/agvm_sdk`;
+- `sdk/typescript/src`.
 
-- private cloud platform code;
-- billing implementation or Stripe secrets;
-- paid module source code;
-- private runtime images;
-- local paid module download helpers.
+New modules should use those contracts for manifests, release grants, safe
+account views, MCP tool metadata and UI slots. Existing compatibility adapters
+remain in the core API and cockpit UI, but modules should not import private
+core internals directly.
 
-Local paid module delivery can be added later only after the helper,
-verification, revocation and private distribution path is fully tested.
+## Expected Module Boundary
+
+A module is a cloud capability or separate service that exposes a manifest,
+health state and UI entry point through public contracts. Core does not import
+paid module source code, and hiding a UI route is not considered an entitlement
+boundary. Detwin Cloud must still validate account, plan, credits and runtime
+readiness server-side.
+
+## Local And Cloud Activation
+
+The target release model is:
+
+1. the user logs into the hosted AGVM platform;
+2. the platform decides whether the account has AGVM Pro;
+3. Cloud AGVM checks provider, brain, entitlement and credits;
+4. the cloud module action runs only after quota preflight;
+5. the platform records a usage event and receipt.
+
+The public core repository contains docs and public contracts needed to explain
+this boundary, not the paid implementation.

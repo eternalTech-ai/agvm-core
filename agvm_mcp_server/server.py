@@ -36,6 +36,14 @@ BRAIN_POLICY_FIXED = "fixed"
 BRAIN_POLICY_AI_RESOLVE_EXISTING = "ai_resolve_existing"
 BRAIN_POLICY_AI_CREATE_IF_MISSING = "ai_create_if_missing"
 BRAIN_POLICIES = {BRAIN_POLICY_FIXED, BRAIN_POLICY_AI_RESOLVE_EXISTING, BRAIN_POLICY_AI_CREATE_IF_MISSING}
+MODULE_VISIBILITY_METADATA_ONLY = "metadata_only"
+MODULE_VISIBILITY_HIDE_UNLICENSED = "hide_unlicensed"
+MODULE_VISIBILITY_BLOCK_UNLICENSED = "block_unlicensed"
+MODULE_VISIBILITY_POLICIES = {
+    MODULE_VISIBILITY_METADATA_ONLY,
+    MODULE_VISIBILITY_HIDE_UNLICENSED,
+    MODULE_VISIBILITY_BLOCK_UNLICENSED,
+}
 BRAIN_SCOPE_OPTIONAL_TOOLS = {
     "get_agvm_usage_guide",
     "list_brains",
@@ -115,6 +123,77 @@ class ToolPermissions:
 
 
 @dataclass(frozen=True)
+class LocalModuleAccessPolicy:
+    visibility_policy: str = MODULE_VISIBILITY_METADATA_ONLY
+    license_state_path: str | None = None
+    status_source: str = "local_license_supervisor"
+
+    def __post_init__(self) -> None:
+        normalized = str(self.visibility_policy or MODULE_VISIBILITY_METADATA_ONLY).strip().lower()
+        if normalized not in MODULE_VISIBILITY_POLICIES:
+            raise AgvmMcpError(
+                "AGVM MCP module visibility policy must be one of "
+                f"{', '.join(sorted(MODULE_VISIBILITY_POLICIES))}; got {normalized!r}"
+            )
+        object.__setattr__(self, "visibility_policy", normalized)
+        clean_path = str(self.license_state_path or "").strip() or None
+        object.__setattr__(self, "license_state_path", clean_path)
+
+    @property
+    def enabled(self) -> bool:
+        return self.visibility_policy != MODULE_VISIBILITY_METADATA_ONLY
+
+    @property
+    def hides_unlicensed_tools(self) -> bool:
+        return self.visibility_policy == MODULE_VISIBILITY_HIDE_UNLICENSED
+
+    @property
+    def blocks_unlicensed_calls(self) -> bool:
+        return self.visibility_policy in {MODULE_VISIBILITY_HIDE_UNLICENSED, MODULE_VISIBILITY_BLOCK_UNLICENSED}
+
+    def status_for_module(self, module_id: str) -> dict[str, Any]:
+        clean_module_id = str(module_id or "").strip()
+        if not clean_module_id:
+            return {
+                "schema_version": "agvm.local_module_entitlement_status.v1",
+                "module_id": None,
+                "granted": True,
+                "module_state": "not_required",
+                "license_state": "not_required",
+                "reason": "core_tool",
+                "lease_present": False,
+                "token_present": False,
+            }
+        if not self.enabled:
+            return {
+                "schema_version": "agvm.local_module_entitlement_status.v1",
+                "module_id": clean_module_id,
+                "granted": True,
+                "module_state": "not_enforced",
+                "license_state": "not_enforced",
+                "reason": "metadata_only_local_mcp_module_visibility",
+                "lease_present": False,
+                "token_present": False,
+            }
+        try:
+            module_entitlement_status = _load_module_entitlement_status_provider()
+            path = Path(self.license_state_path).expanduser() if self.license_state_path else None
+            return dict(module_entitlement_status(clean_module_id, path=path))
+        except Exception as exc:
+            return {
+                "schema_version": "agvm.local_module_entitlement_status.v1",
+                "module_id": clean_module_id,
+                "granted": False,
+                "module_state": "unavailable",
+                "license_state": "invalid",
+                "reason": "local_module_entitlement_status_unavailable",
+                "provider_error_type": type(exc).__name__,
+                "lease_present": False,
+                "token_present": False,
+            }
+
+
+@dataclass(frozen=True)
 class AgvmMcpConfig:
     api_base_url: str = "http://127.0.0.1:8010"
     active_brain_id: str | None = None
@@ -123,8 +202,13 @@ class AgvmMcpConfig:
     brain_id_hint: str | None = None
     brain_display_name: str | None = None
     brain_purpose: str | None = None
+    tenant_id: str | None = None
+    organization_id: str | None = None
+    user_id: str | None = None
+    environment_id: str | None = None
     request_timeout_seconds: float = 180.0
     tool_permissions: ToolPermissions = field(default_factory=ToolPermissions)
+    module_access: LocalModuleAccessPolicy = field(default_factory=LocalModuleAccessPolicy)
 
     def __post_init__(self) -> None:
         normalized_policy = str(self.brain_policy or BRAIN_POLICY_FIXED).strip().lower()
@@ -145,6 +229,19 @@ class AgvmMcpConfig:
     def requires_ai_brain_resolution(self) -> bool:
         return self.brain_policy in {BRAIN_POLICY_AI_RESOLVE_EXISTING, BRAIN_POLICY_AI_CREATE_IF_MISSING}
 
+    @property
+    def hosted_scope_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self.tenant_id:
+            headers["X-AGVM-Tenant-Id"] = self.tenant_id
+        if self.organization_id:
+            headers["X-AGVM-Organization-Id"] = self.organization_id
+        if self.user_id:
+            headers["X-AGVM-User-Id"] = self.user_id
+        if self.environment_id:
+            headers["X-AGVM-Environment-Id"] = self.environment_id
+        return headers
+
 
 def _as_tuple(value: Any, *, default: tuple[str, ...]) -> tuple[str, ...]:
     if value is None:
@@ -162,6 +259,22 @@ def _as_env_tuple(env_name: str) -> tuple[str, ...] | None:
         return None
     values = tuple(item.strip() for item in raw.split(",") if item.strip())
     return values
+
+
+def _module_access_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload.get("module_access") or payload.get("module_visibility") or {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _load_module_entitlement_status_provider() -> Any:
+    try:
+        from agvm_api.local_entitlements import module_entitlement_status
+
+        return module_entitlement_status
+    except ImportError:
+        from local_entitlements import module_entitlement_status  # type: ignore[no-redef]
+
+        return module_entitlement_status
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -205,6 +318,23 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgvmMcpConfig:
         ),
         allow_mutation_tools=_as_tuple(permissions_payload.get("allow_mutation_tools"), default=tuple(sorted(MUTATION_TOOLS))),
     )
+    module_access_payload = _module_access_payload(payload)
+    module_visibility_env = os.environ.get("AGVM_MCP_MODULE_VISIBILITY_POLICY")
+    local_license_path_env = os.environ.get("AGVM_MCP_LOCAL_LICENSE_PATH")
+    module_access = LocalModuleAccessPolicy(
+        visibility_policy=(
+            str(module_visibility_env).strip()
+            if module_visibility_env is not None
+            else str(module_access_payload.get("visibility_policy") or MODULE_VISIBILITY_METADATA_ONLY)
+        ),
+        license_state_path=(
+            str(local_license_path_env).strip()
+            if local_license_path_env is not None
+            else (str(module_access_payload.get("license_state_path")).strip() if module_access_payload.get("license_state_path") else None)
+        ),
+        status_source=str(module_access_payload.get("status_source") or "local_license_supervisor"),
+    )
+
     api_base_url = str(os.environ.get("AGVM_API_BASE_URL") or payload.get("api_base_url") or "http://127.0.0.1:8010").rstrip("/")
     brain_policy = str(os.environ.get("AGVM_MCP_BRAIN_POLICY") or payload.get("brain_policy") or BRAIN_POLICY_FIXED).strip().lower()
     if brain_policy not in BRAIN_POLICIES:
@@ -218,6 +348,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgvmMcpConfig:
     brain_id_hint = str(os.environ.get("AGVM_MCP_BRAIN_ID_HINT") or payload.get("brain_id_hint") or "").strip() or None
     brain_display_name = str(os.environ.get("AGVM_MCP_BRAIN_DISPLAY_NAME") or payload.get("brain_display_name") or "").strip() or None
     brain_purpose = str(os.environ.get("AGVM_MCP_BRAIN_PURPOSE") or payload.get("brain_purpose") or "").strip() or None
+    tenant_id = str(os.environ.get("AGVM_MCP_TENANT_ID") or payload.get("tenant_id") or "").strip() or None
+    organization_id = str(os.environ.get("AGVM_MCP_ORGANIZATION_ID") or payload.get("organization_id") or "").strip() or None
+    user_id = str(os.environ.get("AGVM_MCP_USER_ID") or payload.get("user_id") or "").strip() or None
+    environment_id = str(os.environ.get("AGVM_MCP_ENVIRONMENT_ID") or payload.get("environment_id") or "").strip() or None
     timeout = float(os.environ.get("AGVM_MCP_TIMEOUT_SECONDS") or payload.get("request_timeout_seconds") or 180.0)
 
     return AgvmMcpConfig(
@@ -228,8 +362,13 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgvmMcpConfig:
         brain_id_hint=brain_id_hint,
         brain_display_name=brain_display_name,
         brain_purpose=brain_purpose,
+        tenant_id=tenant_id,
+        organization_id=organization_id,
+        user_id=user_id,
+        environment_id=environment_id,
         request_timeout_seconds=timeout,
         tool_permissions=permissions,
+        module_access=module_access,
     )
 
 
@@ -237,8 +376,8 @@ class AgvmHttpClient:
     def __init__(self, config: AgvmMcpConfig) -> None:
         self.config = config
 
-    def get_json(self, path: str, *, brain_id: str | None = None) -> dict[str, Any]:
-        return self._request_json("GET", path, payload=None, brain_id=brain_id)
+    def get_json(self, path: str, *, brain_id: str | None = None, hosted_scope: dict[str, str | None] | None = None) -> dict[str, Any]:
+        return self._request_json("GET", path, payload=None, brain_id=brain_id, hosted_scope=hosted_scope)
 
     def request_json(
         self,
@@ -247,8 +386,9 @@ class AgvmHttpClient:
         payload: dict[str, Any] | None = None,
         *,
         brain_id: str | None = None,
+        hosted_scope: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
-        return self._request_json(str(method or "POST").upper(), path, payload=payload, brain_id=brain_id)
+        return self._request_json(str(method or "POST").upper(), path, payload=payload, brain_id=brain_id, hosted_scope=hosted_scope)
 
     def post_json(
         self,
@@ -256,8 +396,9 @@ class AgvmHttpClient:
         payload: dict[str, Any],
         *,
         brain_id: str | None = None,
+        hosted_scope: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
-        return self._request_json("POST", path, payload=payload, brain_id=brain_id)
+        return self._request_json("POST", path, payload=payload, brain_id=brain_id, hosted_scope=hosted_scope)
 
     def _request_json(
         self,
@@ -266,6 +407,7 @@ class AgvmHttpClient:
         *,
         payload: dict[str, Any] | None,
         brain_id: str | None,
+        hosted_scope: dict[str, str | None] | None,
     ) -> dict[str, Any]:
         if method.upper() == "GET" and payload:
             path = _path_with_query(path, payload)
@@ -280,6 +422,16 @@ class AgvmHttpClient:
             headers["Content-Type"] = "application/json"
         if brain_id:
             headers["X-AGVM-Brain-Id"] = brain_id
+        headers.update(self.config.hosted_scope_headers)
+        for key, header_name in {
+            "tenant_id": "X-AGVM-Tenant-Id",
+            "organization_id": "X-AGVM-Organization-Id",
+            "user_id": "X-AGVM-User-Id",
+            "environment_id": "X-AGVM-Environment-Id",
+        }.items():
+            value = str((hosted_scope or {}).get(key) or "").strip()
+            if value:
+                headers[header_name] = value
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds) as response:
@@ -371,6 +523,8 @@ class AgvmMcpServer:
     def _tools_list(self) -> dict[str, Any]:
         registry = self.client.get_json("/mcp/contracts", brain_id=self.config.selected_brain_id)
         tools = []
+        module_access = self._module_access_summary(registry)
+        hidden_module_tool_names: list[str] = []
         for contract in registry.get("tools") or []:
             if not isinstance(contract, dict):
                 continue
@@ -379,7 +533,12 @@ class AgvmMcpServer:
                 continue
             if not self._contract_is_callable(contract):
                 continue
+            module_decision = self._module_access_decision(contract, module_access=module_access)
+            if not module_decision["granted"] and self.config.module_access.hides_unlicensed_tools:
+                hidden_module_tool_names.append(name)
+                continue
             tools.append(self._contract_to_mcp_tool(contract))
+        module_access["hidden_tool_names"] = sorted(hidden_module_tool_names)
         return {
             "tools": tools,
             "agvm": {
@@ -390,10 +549,14 @@ class AgvmMcpServer:
                 "brain_display_name": self.config.brain_display_name,
                 "brain_purpose": self.config.brain_purpose,
                 "brain_resolution": self._brain_resolution_data(),
+                "tenant_id": self.config.tenant_id,
+                "user_id": self.config.user_id,
+                "environment_id": self.config.environment_id,
                 "read_only": self.config.tool_permissions.read_only,
                 "contract_registry_schema_version": registry.get("schema_version"),
                 "module_tool_registration_state": dict(registry.get("module_tool_registration") or {}).get("state"),
                 "module_required_tool_names": list(dict(registry.get("module_tool_registration") or {}).get("module_tool_names") or []),
+                "module_access": module_access,
             },
         }
 
@@ -408,9 +571,12 @@ class AgvmMcpServer:
         argument_brain_id = str(arguments.get("brain_id") or "").strip() or None
         configured_brain_id = argument_brain_id or (str(self.config.selected_brain_id or "").strip() or None)
         registry_lookup_brain_id = str(self.config.selected_brain_id or "").strip() or None
+        hosted_scope = self._hosted_scope_from_arguments(arguments)
+        hosted_scope_arg = hosted_scope if self._has_hosted_scope(hosted_scope) else None
         if (
             tool_name not in BRAIN_SCOPE_OPTIONAL_TOOLS
             and not configured_brain_id
+            and not (hosted_scope.get("tenant_id") and hosted_scope.get("user_id"))
         ):
             return self._tool_error(
                 "brain_id_required_for_ambiguous_local_mcp_scope",
@@ -420,12 +586,25 @@ class AgvmMcpServer:
                     "policy": self._brain_missing_policy_text(),
                 },
             )
-        contract = self._contract_for_tool(tool_name, brain_id=registry_lookup_brain_id)
+        contract = self._contract_for_tool(tool_name, brain_id=registry_lookup_brain_id, hosted_scope=hosted_scope_arg)
         if not contract:
             return self._tool_error("tool_not_in_agvm_contract_registry", {"tool_name": tool_name})
 
+        module_decision = self._module_access_decision(contract)
+        if not module_decision["granted"] and self.config.module_access.blocks_unlicensed_calls:
+            return self._tool_error(
+                "module_tool_not_enabled_by_local_mcp_lease",
+                {
+                    "tool_name": tool_name,
+                    "required_module_id": module_decision["required_module_id"],
+                    "visibility_policy": self.config.module_access.visibility_policy,
+                    "module_status": module_decision["module_status"],
+                    "recovery": "Activate or renew the local Pro module lease, then restart or reconnect the MCP client.",
+                },
+            )
+
         requires_brain_id = bool(contract.get("requires_brain_id", True))
-        if requires_brain_id and not configured_brain_id:
+        if requires_brain_id and not configured_brain_id and not (hosted_scope.get("tenant_id") and hosted_scope.get("user_id")):
             return self._tool_error(
                 "brain_id_required_for_ambiguous_local_mcp_scope",
                 {
@@ -452,11 +631,26 @@ class AgvmMcpServer:
         if requires_brain_id and brain_id:
             payload["brain_id"] = brain_id
         endpoint_path = str(contract.get("endpoint_path") or f"/mcp/{tool_name.replace('_', '-')}")
+        if brain_id:
+            endpoint_path = endpoint_path.replace("{brain_id}", urllib.parse.quote(brain_id, safe=""))
         http_method = str(contract.get("http_method") or "POST").upper()
-        result = self.client.request_json(http_method, endpoint_path, payload, brain_id=brain_id)
+        result = self.client.request_json(http_method, endpoint_path, payload, brain_id=brain_id, hosted_scope=hosted_scope_arg)
         return self._tool_result(result)
 
-    def _contract_registry(self, *, brain_id: str | None) -> dict[str, Any]:
+    def _has_hosted_scope(self, hosted_scope: dict[str, str | None] | None) -> bool:
+        return any(str(value or "").strip() for value in dict(hosted_scope or {}).values())
+
+    def _hosted_scope_from_arguments(self, arguments: dict[str, Any]) -> dict[str, str | None]:
+        return {
+            "tenant_id": str(arguments.get("tenant_id") or self.config.tenant_id or "").strip() or None,
+            "organization_id": str(arguments.get("organization_id") or self.config.organization_id or "").strip() or None,
+            "user_id": str(arguments.get("user_id") or self.config.user_id or "").strip() or None,
+            "environment_id": str(arguments.get("environment_id") or self.config.environment_id or "").strip() or None,
+        }
+
+    def _contract_registry(self, *, brain_id: str | None, hosted_scope: dict[str, str | None] | None = None) -> dict[str, Any]:
+        if self._has_hosted_scope(hosted_scope):
+            return self.client.get_json("/mcp/contracts", brain_id=brain_id, hosted_scope=hosted_scope)
         return self.client.get_json("/mcp/contracts", brain_id=brain_id)
 
     def _contract_for_tool(
@@ -464,8 +658,9 @@ class AgvmMcpServer:
         tool_name: str,
         *,
         brain_id: str | None,
+        hosted_scope: dict[str, str | None] | None = None,
     ) -> dict[str, Any] | None:
-        registry = self._contract_registry(brain_id=brain_id)
+        registry = self._contract_registry(brain_id=brain_id, hosted_scope=hosted_scope)
         for tool in registry.get("tools") or []:
             if not isinstance(tool, dict):
                 continue
@@ -476,8 +671,8 @@ class AgvmMcpServer:
             return dict(tool)
         return None
 
-    def _contract_tool_names(self, *, brain_id: str | None) -> set[str]:
-        registry = self._contract_registry(brain_id=brain_id)
+    def _contract_tool_names(self, *, brain_id: str | None, hosted_scope: dict[str, str | None] | None = None) -> set[str]:
+        registry = self._contract_registry(brain_id=brain_id, hosted_scope=hosted_scope)
         return {
             str(tool.get("name") or "")
             for tool in registry.get("tools") or []
@@ -486,10 +681,73 @@ class AgvmMcpServer:
 
     def _contract_is_callable(self, contract: dict[str, Any]) -> bool:
         backend_binding = dict(contract.get("backend_binding") or {})
+        if (
+            str(contract.get("implementation_status") or "") == "implemented"
+            and backend_binding.get("executable") is True
+            and str(contract.get("endpoint_path") or "")
+        ):
+            return True
         return (
             str(contract.get("implementation_status") or "") == "implemented"
             and str(backend_binding.get("binding_state") or "") == "implemented"
         )
+
+    def _module_access_summary(self, registry: dict[str, Any]) -> dict[str, Any]:
+        required_module_ids = sorted(
+            {
+                module_id
+                for tool in registry.get("tools") or []
+                if isinstance(tool, dict)
+                for module_id in [self._required_module_id(tool)]
+                if module_id
+            }
+        )
+        statuses = {
+            module_id: self.config.module_access.status_for_module(module_id)
+            for module_id in required_module_ids
+        }
+        if self.config.module_access.enabled:
+            granted = sorted(module_id for module_id, status in statuses.items() if bool(status.get("granted")))
+            blocked = sorted(module_id for module_id in required_module_ids if module_id not in granted)
+            not_enforced: list[str] = []
+        else:
+            granted = []
+            blocked = []
+            not_enforced = list(required_module_ids)
+        return {
+            "schema_version": "agvm.local_mcp_module_access.v1",
+            "visibility_policy": self.config.module_access.visibility_policy,
+            "status_source": self.config.module_access.status_source,
+            "enforced": self.config.module_access.enabled,
+            "license_state_path_configured": bool(self.config.module_access.license_state_path),
+            "required_module_ids": required_module_ids,
+            "granted_module_ids": granted,
+            "blocked_module_ids": blocked,
+            "not_enforced_module_ids": not_enforced,
+            "hidden_tool_names": [],
+            "module_statuses": statuses,
+        }
+
+    def _module_access_decision(self, contract: dict[str, Any], *, module_access: dict[str, Any] | None = None) -> dict[str, Any]:
+        required_module_id = self._required_module_id(contract)
+        if not required_module_id:
+            return {
+                "required_module_id": None,
+                "granted": True,
+                "module_status": self.config.module_access.status_for_module(""),
+            }
+        statuses = dict(dict(module_access or {}).get("module_statuses") or {})
+        status = dict(statuses.get(required_module_id) or self.config.module_access.status_for_module(required_module_id))
+        return {
+            "required_module_id": required_module_id,
+            "granted": bool(status.get("granted")),
+            "module_status": status,
+        }
+
+    def _required_module_id(self, contract: dict[str, Any]) -> str | None:
+        tool_registration = dict(contract.get("tool_registration") or {})
+        required_module_id = str(tool_registration.get("required_module_id") or "").strip()
+        return required_module_id or None
 
     def _arguments_with_brain_policy_defaults(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name != "ensure_brain" or not self.config.requires_ai_brain_resolution:
@@ -551,7 +809,7 @@ class AgvmMcpServer:
             )
         return (
             "Set active_brain_id/default_brain_id or AGVM_MCP_BRAIN_ID in the local MCP config, "
-            "or pass brain_id explicitly."
+            "pass brain_id explicitly, or configure tenant_id/user_id for hosted default-brain resolution."
         )
 
     def _brain_id_schema_description(self) -> str:
@@ -602,12 +860,15 @@ class AgvmMcpServer:
         )
         safety_contract = dict(contract.get("safety_contract") or {})
         client_usage = dict(contract.get("client_usage") or {})
+        tool_registration = dict(contract.get("tool_registration") or {})
         mutation_policy = str(safety_contract.get("mutation_policy") or client_usage.get("mutation_policy") or "read_only")
+        required_module = str(tool_registration.get("required_module_id") or "").strip()
         description_parts = [
             str(contract.get("description") or "").strip(),
             f"Default output package: {contract.get('default_output_package')}.",
             f"Mutation policy: {mutation_policy}.",
             f"Endpoint: {contract.get('http_method', 'POST')} {contract.get('endpoint_path')}.",
+            f"Module entitlement required: {required_module}." if required_module else "",
             self._brain_policy_tool_text(name, requires_brain_id=bool(contract.get("requires_brain_id", True))),
             str(client_usage.get("when_to_use") or "").strip(),
             self._client_usage_text(client_usage),
@@ -632,6 +893,34 @@ class AgvmMcpServer:
                     "description": self._brain_id_schema_description(),
                 },
             )
+        properties.setdefault(
+            "tenant_id",
+            {
+                "type": ["string", "null"],
+                "description": "Optional hosted tenant id. Prefer MCP config/env so every call stays under one tenant scope.",
+            },
+        )
+        properties.setdefault(
+            "organization_id",
+            {
+                "type": ["string", "null"],
+                "description": "Optional hosted organization id. Prefer MCP config/env so every call stays under one organization scope.",
+            },
+        )
+        properties.setdefault(
+            "user_id",
+            {
+                "type": ["string", "null"],
+                "description": "Optional hosted user id. Prefer MCP config/env so every call stays under one user scope.",
+            },
+        )
+        properties.setdefault(
+            "environment_id",
+            {
+                "type": ["string", "null"],
+                "description": "Optional hosted environment id such as local_self_hosted_dev, staging or production.",
+            },
+        )
         schema_copy["properties"] = properties
         return schema_copy
 

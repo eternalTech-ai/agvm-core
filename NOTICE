@@ -1,0 +1,20 @@
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+
+AGVM Core
+Copyright (C) 2026 Eternal Tech SRL <info@eternaltech.ai>
+
+Primary author and contributor: Lorenzo Massaro.
+
+AGVM Core is distributed under the GNU Affero General Public License v3.0 only
+(AGPL-3.0-only). See LICENSE for the full license text.
+
+This public repository contains the local AGVM Core runtime, local MCP bridge,
+public core UI, public documentation and public integration contracts selected
+by the repository export policy. It does not include Detwin Cloud platform
+source, billing source, private infrastructure, customer data, local brain
+exports, private module source or proprietary internal operating documents.
+
+Third-party dependency notices are maintained in THIRD_PARTY_NOTICES.md. That
+notice inventory must be reviewed before a public release is tagged.

@@ -5,8 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import APP_NAME, APP_VERSION
 from core_brain_router import create_core_brain_router
+from core_graph_router import create_core_graph_router
+from core_license_router import create_core_license_router
 from core_mcp_contract_router import create_core_mcp_contract_router
-from core_mcp_operations_router import create_core_mcp_operations_router
+from core_mcp_ops_router import create_core_mcp_ops_router
 from core_retrieve_router import create_core_retrieve_router
 from core_runtime_router import create_core_runtime_router
 from edition_gate import EditionSettings, install_edition_route_gate
@@ -29,9 +31,11 @@ def create_core_app() -> FastAPI:
         )
     )
     app.include_router(create_core_brain_router())
+    app.include_router(create_core_graph_router())
     app.include_router(create_core_mcp_contract_router())
+    app.include_router(create_core_mcp_ops_router())
     app.include_router(create_core_retrieve_router())
-    app.include_router(create_core_mcp_operations_router())
+    app.include_router(create_core_license_router())
     install_edition_route_gate(
         app,
         EditionSettings(

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Connect Claude
 
 AGVM Core can be launched by Claude Desktop as a stdio MCP server.
@@ -46,7 +52,5 @@ path and `AGVM_API_BASE_URL`.
 Keep provider API keys in `.env` or backend-managed environment storage unless
 you intentionally want Claude's MCP child process to receive the secret.
 
-AGVM Core exposes the public raw MCP tool set. Permission families still decide
-which tools can be called from this local client. `hide_unlicensed` is safe for
-the public core: it hides future local module-only tools without hiding core raw
-MCP tools.
+`AGVM_MCP_MODULE_VISIBILITY_POLICY=hide_unlicensed` keeps Core memory tools
+visible and keeps advanced Detwin Cloud module tools out of the local tool list.

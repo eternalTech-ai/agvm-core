@@ -1,4 +1,8 @@
-name: AGVM Core CI
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: public-core
 
 on:
   pull_request:
@@ -35,14 +39,11 @@ jobs:
             agvm_api/core_runtime_router.py \
             agvm_api/core_brain_router.py \
             agvm_api/core_mcp_contract_router.py \
-            agvm_api/core_mcp_operations_router.py \
-            agvm_api/core_retrieve_router.py \
-            agvm_api/maintenance.py \
-            agvm_api/maintenance_contract.py \
-            agvm_api/memory_learning_maintenance.py \
-            agvm_api/memory_policy_revisioning.py \
-            agvm_api/mcp_contracts.py \
-            agvm_mcp_server/server.py
+            agvm_api/core_license_router.py \
+            agvm_api/module_manifest_contracts.py \
+            agvm_api/module_hardening.py \
+            agvm_mcp_server/server.py \
+            scripts/agvm_module_supervisor.py
 
       - name: Install UI dependencies
         working-directory: agvm_cockpit_prototype

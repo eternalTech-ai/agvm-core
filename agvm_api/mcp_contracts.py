@@ -84,10 +84,6 @@ AGENT_MEMORY_MCP_TOOL_NAMES = [
     "ensure_brain",
 ]
 
-PUBLIC_CORE_MCP_TOOL_NAMES = [
-    *REQUIRED_MCP_TOOL_NAMES,
-]
-
 PR12J_B_IMPLEMENTED_TOOL_NAMES = {
     "retrieve_context",
     "retrieve_document",
@@ -316,6 +312,57 @@ def _source_input_schema() -> dict[str, Any]:
     )
 
 
+def _source_apply_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "investigation_id": _string(
+                "Source investigation id returned by grow_source_preview or grow_preview.",
+                nullable=True,
+            ),
+            "source_investigation": _object("Optional full source investigation package returned by preview."),
+            "source_formation_contract": _object("Optional formation contract returned by preview."),
+            "preview_bundle": _object("Optional preview bundle returned by preview."),
+            "selected_preview_ids": _array(
+                "Exact preview node ids approved for persistence. Omit only when the preview contract allows applying the default reviewed set.",
+                item_type="string",
+            ),
+            "approved_preview_ids": _array(
+                "Alias/receipt list of approved preview ids when a UI review surface records approval separately.",
+                item_type="string",
+            ),
+            "clarification_answers": _object(
+                "Answers to clarification questions returned by preview. Required when the source_formation_contract reports pending questions."
+            ),
+            "learning_mode": _string(
+                "Learning policy for the persisted nodes.",
+                enum=["strict_review", "guided_learning", "autonomous_cautious", "autonomous_research", "sleep_review"],
+            ),
+            "question_limit": _integer("Maximum clarification questions to preserve during apply.", minimum=1, maximum=8, default=3),
+            "confirm_apply": _boolean(
+                "Required explicit confirmation for mutation. Set true only after the preview/formation contract has been reviewed.",
+                default=False,
+            ),
+        },
+        required=["investigation_id"],
+        description=(
+            "Grow source explicit-apply contract. Normal flow: call grow_source_preview, review "
+            "source_formation_contract/preview_bundle/clarification_questions, then call grow_source_apply "
+            "with investigation_id and confirm_apply=true. If status is blocked, answer the reported questions "
+            "or pass exact selected_preview_ids from the preview."
+        ),
+    )
+
+
+def _source_status_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "investigation_id": _string("Source investigation id returned by preview.", nullable=True),
+        },
+        required=["investigation_id"],
+        description="Read source investigation status without mutating the brain.",
+    )
+
+
 def _source_output_schema(*, applied: bool = False) -> dict[str, Any]:
     properties = {
         "schema_version": _string("Tool output schema version."),
@@ -388,14 +435,19 @@ def _write_output_schema(*, commit: bool = False) -> dict[str, Any]:
 def _maintenance_input_schema(*, apply: bool = False) -> dict[str, Any]:
     properties = {
         "focus_node_id": _string("Optional focus node id for local maintenance.", nullable=True),
-        "mode": _string("Maintenance mode.", enum=["sleep", "evolve"]),
-        "dry_run": _boolean("Preview only; true by default.", default=True),
+        "mode": _string("Optional maintenance mode override. Named tools already imply this: sleep_preview/sleep_apply use sleep, evolve_preview/evolve_apply use evolve.", enum=["sleep", "evolve"]),
+        "dry_run": _boolean("Preview only; true by default for preview tools.", default=True),
         "max_nodes_considered": _integer("Maintenance node budget. Default MCP preview is 20 for fast local-client inspection; request 80+ for a deeper maintenance preview.", minimum=10, maximum=500, default=20),
     }
     if apply:
         properties["proposal_ids"] = _array("Review-approved maintenance proposal ids.", item_type="string")
         properties["confirm_apply"] = _boolean("Explicit apply confirmation.", default=False)
-    return _schema_object(properties=properties, required=["mode"], description="Maintenance MCP input contract.")
+    required = ["confirm_apply"] if apply else []
+    return _schema_object(
+        properties=properties,
+        required=required,
+        description="Maintenance MCP input contract. For preview tools, pass brain_id and optionally max_nodes_considered; the tool name selects sleep or evolve.",
+    )
 
 
 def _maintenance_output_schema(*, apply: bool = False) -> dict[str, Any]:
@@ -1010,15 +1062,23 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
             _tool_contract(
                 name=name,
                 title=title,
-                description="MCP contract for source investigation preview, status or explicit apply.",
+                description=(
+                    "Preview, inspect or explicitly apply source-based Grow. Preview is non-mutating. "
+                    "Apply mutates only with confirm_apply=true after reviewing the returned formation contract."
+                    if apply_tool
+                    else "Preview or inspect source-based Grow. Preview returns an investigation_id plus review gates for any later apply."
+                    if not status_tool
+                    else "Inspect a stored source investigation by investigation_id without mutation."
+                ),
                 category="grow",
                 planned_slice="PR-12J-C",
                 default_output_package="source_investigation",
-                input_schema=_schema_object(
-                    properties={"investigation_id": _string("Source investigation id.", nullable=True)}
-                    if status_tool or apply_tool
-                    else _source_input_schema()["properties"],
-                    required=["investigation_id"] if status_tool or apply_tool else ["raw_input"],
+                input_schema=(
+                    _source_apply_input_schema()
+                    if apply_tool
+                    else _source_status_input_schema()
+                    if status_tool
+                    else _source_input_schema()
                 ),
                 output_schema=_source_output_schema(applied=apply_tool),
                 candidate_backend_routes=["POST /memory/source-investigation/preview", "POST /memory/source-investigation/upload", "POST /memory/save-selection"],
@@ -1122,7 +1182,12 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
             _tool_contract(
                 name=name,
                 title=title,
-                description=f"Run {mode} maintenance preview or explicit apply through reviewable proposals.",
+                description=(
+                    f"Run a non-mutating {mode} maintenance preview that returns reviewable proposals. "
+                    "Do not infer mutation from preview_ready; apply requires the matching apply tool."
+                    if not apply_tool
+                    else f"Apply reviewed {mode} maintenance proposals. Requires proposal_ids from {mode}_preview and confirm_apply=true."
+                ),
                 category="maintenance",
                 planned_slice="PR-12J-D",
                 default_output_package="maintenance_report",
@@ -1327,11 +1392,7 @@ def _build_agent_memory_tool_contracts() -> list[dict[str, Any]]:
 def validate_mcp_contract_registry(registry: dict[str, Any]) -> dict[str, Any]:
     tools = [dict(tool) for tool in list(registry.get("tools") or []) if isinstance(tool, dict)]
     names = [str(tool.get("name") or "") for tool in tools]
-    required_tool_names = [
-        str(name)
-        for name in list(registry.get("required_tool_names") or REQUIRED_MCP_TOOL_NAMES)
-    ]
-    missing_tools = [name for name in required_tool_names if name not in names]
+    missing_tools = [name for name in REQUIRED_MCP_TOOL_NAMES if name not in names]
     duplicate_tools = sorted({name for name in names if names.count(name) > 1 and name})
     schema_errors: list[dict[str, Any]] = []
     answer_demo_default_tools: list[str] = []
@@ -1370,12 +1431,12 @@ def validate_mcp_contract_registry(registry: dict[str, Any]) -> dict[str, Any]:
         if required_module_id != registration_required_module_id:
             schema_errors.append({"tool": name, "schema": "module_requirement", "reason": "module_requirement_registration_mismatch"})
     module_registration = dict(registry.get("module_tool_registration") or {})
-    if module_registration and module_registration.get("state") != MCP_TOOL_REGISTRATION_STATE:
+    if module_registration.get("state") != MCP_TOOL_REGISTRATION_STATE:
         schema_errors.append({"tool": "__registry__", "schema": "module_tool_registration", "reason": "module_tool_registration_state_not_supported"})
     passed = not missing_tools and not duplicate_tools and not schema_errors and not answer_demo_default_tools
     return {
         "passed": passed,
-        "required_tool_count": len(required_tool_names),
+        "required_tool_count": len(REQUIRED_MCP_TOOL_NAMES),
         "registered_tool_count": len(tools),
         "missing_tools": missing_tools,
         "duplicate_tools": duplicate_tools,
@@ -1385,25 +1446,15 @@ def validate_mcp_contract_registry(registry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_mcp_contract_registry(*, public_core_only: bool = False) -> dict[str, Any]:
+def build_mcp_contract_registry() -> dict[str, Any]:
     tools = _build_tool_contracts()
-    if public_core_only:
-        allowed_names = {
-            *GUIDE_MCP_TOOL_NAMES,
-            *AGENT_MEMORY_MCP_TOOL_NAMES,
-            *PUBLIC_CORE_MCP_TOOL_NAMES,
-        }
-        tools = [tool for tool in tools if str(tool.get("name") or "") in allowed_names]
-        required_tool_names = list(PUBLIC_CORE_MCP_TOOL_NAMES)
-    else:
-        required_tool_names = list(REQUIRED_MCP_TOOL_NAMES)
     registry = {
         "schema_version": MCP_CONTRACT_REGISTRY_SCHEMA_VERSION,
         "source_slice": MCP_CONTRACT_REGISTRY_SLICE,
-        "registry_status": "public_core_registry_ready" if public_core_only else "schema_registry_ready",
+        "registry_status": "schema_registry_ready",
         "tool_schema_version": MCP_TOOL_CONTRACT_SCHEMA_VERSION,
         "guide_tool_names": list(GUIDE_MCP_TOOL_NAMES),
-        "required_tool_names": required_tool_names,
+        "required_tool_names": list(REQUIRED_MCP_TOOL_NAMES),
         "agent_memory_tool_names": list(AGENT_MEMORY_MCP_TOOL_NAMES),
         "staged_tool_names": [],
         "tools": tools,

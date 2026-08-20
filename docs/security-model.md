@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Security Model
 
 AGVM Core uses a layered security model. The public repository must be safe to
@@ -7,13 +13,15 @@ cloud infrastructure.
 ## Trust Boundaries
 
 - Browser UI: not trusted for entitlement enforcement or secret storage.
-- Local API: owns local runtime state and backend-managed environment values.
+- Local API: owns local runtime state, backend-managed environment values and
+  public Core permission checks.
 - MCP bridge: adapts an AI client to AGVM tools and enforces visible tool
   filtering based on permission families.
-- Hosted platform: owns account login, billing, tenant scoping and Pro cloud
-  entitlements.
-- Paid modules: run in cloud for this release and are not shipped in public
-  core.
+- Hosted platform: owns account login, billing, tenant scoping, cloud module
+  entitlements and usage metering.
+- Paid modules: run in Detwin Cloud for this release and must refuse paid
+  capabilities unless server-side account, plan, brain, provider and credit
+  checks pass.
 
 ## Secrets
 
@@ -41,10 +49,10 @@ blocked unless the operator intentionally enters an admin workflow.
 
 ## Module Security
 
-Paid module code is not shipped in the public core repository. For this release,
-advanced modules are account-gated in Detwin Cloud. Local paid module delivery
-must remain hidden until its helper, verification and revocation path is fully
-tested. UI hiding is not a security boundary.
+Paid module code is not shipped in the public core repository. Advanced modules
+are Detwin Cloud capabilities for this release. Detwin Cloud must enforce plan,
+workspace, provider, brain and credit checks server-side. UI hiding is not a
+security boundary.
 
 ## Data Safety
 

@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from brain_health import build_brain_health_report, build_mcp_brain_health_output
 from brain_registry import BrainRegistryError, resolve_brain_scope
-from mcp_retrieval import build_mcp_memory_object_output, build_mcp_retrieval_tool_output, build_mcp_route_trace_output
+from mcp_retrieval import build_mcp_retrieval_tool_output
 from retrieval import (
     build_landing_metadata,
     build_search_map_2d_truth,
@@ -27,7 +27,6 @@ from schemas import (
     McpBrainHealthRequest,
     McpBrainHealthToolExecutionResponse,
     McpInspectionRequest,
-    McpMemoryObjectInspectionRequest,
     McpRetrievalToolRequest,
     McpToolExecutionResponse,
     RetrieveRequest,
@@ -46,7 +45,6 @@ from sqlite_store import (
     fetch_active_search_session_by_thread,
     fetch_atlas,
     fetch_graph_snapshot,
-    fetch_cluster_runtime,
     fetch_heuristic_calibration_snapshot,
     fetch_identity_nucleus,
     fetch_recent_maintenance_runs,
@@ -309,36 +307,10 @@ def create_core_retrieve_router() -> APIRouter:
     def mcp_inspect_context_package_endpoint(payload: McpInspectionRequest) -> McpToolExecutionResponse:
         return _inspect_mcp_result("inspect_context_package", payload)
 
-    @router.post("/memory/mcp/inspect-route", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
-    @router.post("/mcp/inspect-route", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
-    def mcp_inspect_route_endpoint(payload: McpInspectionRequest) -> McpToolExecutionResponse:
-        with _brain_request_scope(_payload_brain_id(payload)):
-            trace = fetch_search_trace(payload.search_id)
-            if not trace:
-                raise HTTPException(status_code=404, detail="search_not_found")
-            output = build_mcp_route_trace_output(
-                search_id=payload.search_id,
-                trace=trace,
-                include_debug=payload.include_debug,
-            )
-            return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
-
     @router.post("/memory/mcp/inspect-path-corridor", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/inspect-path-corridor", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     def mcp_inspect_path_corridor_endpoint(payload: McpInspectionRequest) -> McpToolExecutionResponse:
         return _inspect_mcp_result("inspect_path_corridor", payload)
-
-    @router.post("/memory/mcp/inspect-memory-object", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
-    @router.post("/mcp/inspect-memory-object", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
-    def mcp_inspect_memory_object_endpoint(payload: McpMemoryObjectInspectionRequest) -> McpToolExecutionResponse:
-        with _brain_request_scope(_payload_brain_id(payload)):
-            cluster = fetch_cluster_runtime(payload.node_id)
-            output = build_mcp_memory_object_output(
-                node_id=payload.node_id,
-                cluster=cluster,
-                include_debug=payload.include_debug,
-            )
-            return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
 
     @router.get("/memory/brain-health")
     def memory_brain_health_endpoint(

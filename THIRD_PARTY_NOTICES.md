@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Third-Party Notices
 
 Status: generated candidate notice inventory. Review with counsel before public release.

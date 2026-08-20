@@ -510,7 +510,7 @@ class McpToolContract(BaseModel):
 class McpContractRegistryResponse(BaseModel):
     schema_version: str
     source_slice: str
-    registry_status: Literal["schema_registry_ready", "public_core_registry_ready", "failed"]
+    registry_status: Literal["schema_registry_ready", "failed"]
     tool_schema_version: str
     guide_tool_names: list[str] = Field(default_factory=list)
     required_tool_names: list[str] = Field(default_factory=list)

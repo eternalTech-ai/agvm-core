@@ -1,26 +1,50 @@
-name: Bug Report
-description: Report a reproducible AGVM Core problem.
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Bug report
+description: Report a reproducible AGVM Core issue.
 title: "[Bug]: "
-labels: ["bug"]
+labels: ["bug", "public-core"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include provider keys, local brain exports, customer data or private platform details.
   - type: textarea
     id: summary
     attributes:
       label: Summary
-      description: What failed?
+      description: What happened?
     validations:
       required: true
   - type: textarea
-    id: steps
+    id: reproduce
     attributes:
-      label: Steps To Reproduce
-      description: Include commands, MCP tool calls or API routes.
+      label: Steps to reproduce
+      description: Use a fresh checkout when possible.
+      placeholder: |
+        1. Run docker compose up --build
+        2. Open ...
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AGVM Core version
+      placeholder: commit SHA or release tag
     validations:
       required: true
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: OS, Docker/Python/Node versions, AGVM Core commit.
+      description: OS, Docker version, Python version, MCP client if relevant.
     validations:
       required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      render: text

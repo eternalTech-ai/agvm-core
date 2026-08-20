@@ -12,7 +12,7 @@ def create_core_mcp_contract_router() -> APIRouter:
 
     @router.get("/memory/mcp/contracts", response_model=McpContractRegistryResponse)
     def memory_mcp_contracts_endpoint() -> McpContractRegistryResponse:
-        return McpContractRegistryResponse(**build_mcp_contract_registry(public_core_only=True))
+        return McpContractRegistryResponse(**build_mcp_contract_registry())
 
     @router.get("/mcp/contracts", response_model=McpContractRegistryResponse)
     def mcp_contracts_endpoint() -> McpContractRegistryResponse:

@@ -1,10 +1,16 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # AGVM Core
 
 AGVM Core is a local-first memory operating system for MCP clients. It gives an
 AI client a persistent memory brain, a self-hosted API, a local stdio MCP bridge
 and a core UI for setup, inspection, health checks, benchmarks and raw MCP calls.
 
-This repository is the AGPL-3.0 open-source core. It is deliberately smaller than the
+This repository is the open-source core. It is deliberately smaller than the
 private AGVM lab repository: paid modules, cloud control-plane code, private AWS
 infrastructure, internal planning documents, local brains and generated
 benchmark artifacts are not included.
@@ -16,13 +22,13 @@ benchmark artifacts are not included.
 - public MCP contracts for local AI clients;
 - a Docker-based API and UI package;
 - setup surfaces for provider keys and MCP client configuration;
-- Retrieve, Health, Bench and MCP Raw Console surfaces;
-- public raw MCP primitives for Grow, Sleep, Evolve, Matrix, memory write and
-  route inspection.
+- explicit local brain bootstrap, create/import and switching workflows;
+- Retrieve, Health, Bench and MCP Raw Console surfaces when the public core API
+  exports their backing endpoints.
 
 ## What AGVM Core Is Not
 
-- not the paid Clone App, Grow Studio, Maintain Studio or advanced chat product;
+- not the Cloud Clone, Teach, Maintain or advanced chat product;
 - not the hosted AGVM cloud platform;
 - not a billing, entitlement or private module registry;
 - not a place to commit provider keys, local brains, customer data or old
@@ -46,12 +52,13 @@ operations are needed. The browser UI must not store raw provider keys in
 localStorage; keys belong in backend-managed environment storage or an OS secret
 manager.
 
-See [Local Install](docs/local-install.md) for the full setup flow.
+See [Local Install](docs/local-install.md) and [Brain Bootstrap](docs/brain-bootstrap.md)
+for the full setup flow.
 
 ## Connect An MCP Client
 
 Start the AGVM API first, then configure your AI app to launch the local stdio
-bridge from this checkout:
+bridge from this checkout. The generic flow is documented in [Local MCP](docs/local-mcp.md).
 
 - [Codex](docs/mcp-codex.md)
 - [Claude](docs/mcp-claude.md)
@@ -73,15 +80,15 @@ health and points to the MCP/setup docs. The full core cockpit should expose:
   MCP clients;
 - MCP Raw Console: call exposed MCP tools directly for debugging.
 
-If a screen shows a disabled or missing rich workflow, treat that as a product
-boundary signal. The raw MCP primitives remain part of core.
+If a screen shows a disabled or missing capability, treat that as a product
+boundary signal. Paid modules are not hidden in the public repository.
 
 ## Modules And Pro
 
-Advanced modules are not distributed with AGVM Core. The first paid path is
-cloud-only: users who want Clone App, Grow Studio, Maintain Studio or advanced
-product surfaces use Detwin Cloud with an account-gated cloud brain. Local paid
-module downloads are arriving later and are not part of this repository.
+Advanced modules are not distributed in the public Core repository. Grow remains
+part of Local Core. Clone, Teach and Maintain are Detwin Cloud capabilities that
+require platform account state, server-side entitlement checks and cloud usage
+metering.
 
 See [Modules](docs/modules.md) and [Cloud And Pro](docs/cloud-and-pro.md).
 
@@ -92,6 +99,9 @@ See [Modules](docs/modules.md) and [Cloud And Pro](docs/cloud-and-pro.md).
 - [Security Policy](SECURITY.md)
 - [License And Notices](docs/license-and-notices.md)
 - [Third-Party Notices](THIRD_PARTY_NOTICES.md)
+- [Notice](NOTICE)
+- [Support](SUPPORT.md)
+- [Code Of Conduct](CODE_OF_CONDUCT.md)
 
 Local mode keeps brains and provider configuration on the user's machine unless
 the user explicitly exports data or connects to hosted AGVM.

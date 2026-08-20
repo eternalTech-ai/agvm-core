@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Connect Codex
 
 Use this flow for a single Codex chat or project.
@@ -73,9 +79,9 @@ not, check:
 For normal local memory usage, include `explicit_apply` and keep `destructive`
 blocked.
 
-## Tool Visibility
+## Module Tool Visibility
 
-AGVM Core exposes the public raw MCP tool set. Local config still controls
-permission families, so mutation tools require `explicit_apply` and destructive
-tools stay blocked by default. `hide_unlicensed` is safe for the public core:
-it hides future local module-only tools without hiding core raw MCP tools.
+`AGVM_MCP_MODULE_VISIBILITY_POLICY=hide_unlicensed` is the recommended local
+default. Core memory tools remain visible. Advanced Clone, Teach and Maintain
+tools are Detwin Cloud capabilities for this release and should not appear as
+local installable tools in the public Core checkout.
