@@ -1,0 +1,13 @@
+{
+  "name": "@agvm/sdk-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stable AGVM TypeScript contracts for public core and modules.",
+  "license": "AGPL-3.0-only",
+  "exports": {
+    ".": "./src/index.ts",
+    "./module-manifest": "./src/moduleManifestContracts.ts",
+    "./module-slots": "./src/moduleSlots.ts"
+  }
+}

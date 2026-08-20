@@ -1,0 +1,930 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import sqlite3
+import tempfile
+import zipfile
+from pathlib import Path
+from typing import Any
+
+from config import API_DIR, ATLAS_VERSION, BASE_DIR, DATA_DIR, GRAPH_VERSION, INDEX_VERSION
+from storage import utc_timestamp
+
+
+LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION = "agvm.local_brain_registry.v1"
+LOCAL_BRAIN_RECORD_SCHEMA_VERSION = "agvm.local_brain_record.v1"
+LOCAL_BRAIN_STORAGE_FORMAT_VERSION = "agvm.local_brain_storage.v1"
+
+GRAPH_FILENAME = "beta_vector_memory.graph.json"
+GRAPH_VIEW_FILENAME = "beta_vector_memory.graph.view.json"
+INDEX_FILENAME = "beta_vector_memory.index.json"
+ATLAS_FILENAME = "beta_vector_memory.atlas.json"
+SQLITE_FILENAME = "beta_vector_memory.sqlite3"
+
+
+class BrainRegistryError(ValueError):
+    pass
+
+
+def brain_root_path() -> Path:
+    return Path(os.getenv("AGVM_BRAINS_DIR", str(BASE_DIR / "brains"))).expanduser().resolve()
+
+
+def brain_registry_path(brain_root: Path | None = None) -> Path:
+    root = (brain_root or brain_root_path()).resolve()
+    return root / "brain_registry.json"
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        os.close(fd)
+        Path(tmp_name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(tmp_name).replace(path)
+    finally:
+        tmp_path = Path(tmp_name)
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _safe_id(value: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(value or "").strip().lower()).strip("_")
+    return value or "brain"
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_rmtree(path: Path, *, required_parent: Path) -> None:
+    target = path.resolve()
+    parent = required_parent.resolve()
+    if target == parent or not _path_is_within(target, parent):
+        raise BrainRegistryError(f"unsafe_delete_path:{target}")
+    if target.exists():
+        shutil.rmtree(target)
+
+
+def _unique_brain_id(base: str, existing_ids: set[str]) -> str:
+    normalized = _safe_id(base)
+    if normalized not in existing_ids:
+        return normalized
+    suffix = 2
+    while f"{normalized}_{suffix}" in existing_ids:
+        suffix += 1
+    return f"{normalized}_{suffix}"
+
+
+def _legacy_storage_slug(path: Path) -> str:
+    name = path.name.strip()
+    lower = name.lower()
+    if lower == "data":
+        configured = str(os.getenv("AGVM_LEGACY_DATA_BRAIN_ID", "") or "").strip()
+        return configured or name
+    if lower.startswith("data_") and len(name) > 5:
+        return name[5:]
+    return name
+
+
+def _known_legacy_brain_id(path: Path) -> str:
+    return _safe_id(_legacy_storage_slug(path))
+
+
+def _known_display_name(path: Path, brain_id: str) -> str:
+    configured = str(os.getenv("AGVM_LEGACY_DATA_DISPLAY_NAME", "") or "").strip()
+    if path.name.lower() == "data" and configured:
+        return configured
+    source = _legacy_storage_slug(path) or brain_id
+    return _safe_id(source).replace("_", " ").title()
+
+
+def _json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _sqlite_node_count(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(path), timeout=1.0)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM nodes_nav").fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _storage_file_status(storage_path: Path) -> dict[str, Any]:
+    statuses: dict[str, Any] = {}
+    for filename in (SQLITE_FILENAME, GRAPH_FILENAME, GRAPH_VIEW_FILENAME, INDEX_FILENAME, ATLAS_FILENAME):
+        path = storage_path / filename
+        statuses[filename] = {
+            "exists": path.exists(),
+            "path": str(path.resolve()),
+            "size_bytes": path.stat().st_size if path.exists() else 0,
+        }
+    return statuses
+
+
+def _node_count(storage_path: Path) -> int:
+    atlas = _json_file(storage_path / ATLAS_FILENAME)
+    if atlas.get("node_count") is not None:
+        return int(atlas.get("node_count") or 0)
+    graph = _json_file(storage_path / GRAPH_FILENAME)
+    if graph.get("nodes") is not None:
+        return len(list(graph.get("nodes") or []))
+    sqlite_count = _sqlite_node_count(storage_path / SQLITE_FILENAME)
+    return int(sqlite_count or 0)
+
+
+def _storage_quality(storage_path: Path) -> dict[str, Any]:
+    storage = storage_path.resolve()
+    file_status = _storage_file_status(storage)
+    has_sqlite = bool(file_status[SQLITE_FILENAME]["exists"])
+    has_index = bool(file_status[INDEX_FILENAME]["exists"])
+    has_atlas = bool(file_status[ATLAS_FILENAME]["exists"])
+    node_count = _node_count(storage) if has_sqlite or has_index or has_atlas else 0
+    sqlite_size = int(file_status[SQLITE_FILENAME]["size_bytes"])
+    return {
+        "path": str(storage),
+        "has_sqlite": has_sqlite,
+        "has_index": has_index,
+        "has_atlas": has_atlas,
+        "node_count": int(node_count or 0),
+        "sqlite_size_bytes": sqlite_size,
+        "safe_for_mcp": bool(has_sqlite and has_index and has_atlas),
+    }
+
+
+def _prefer_previous_storage(previous: dict[str, Any] | None, discovered_storage: Path) -> Path | None:
+    if not previous:
+        return None
+    previous_raw = str(previous.get("storage_path") or "").strip()
+    if not previous_raw:
+        return None
+    previous_storage = Path(previous_raw).expanduser().resolve()
+    discovered = discovered_storage.resolve()
+    if previous_storage == discovered or not previous_storage.exists():
+        return None
+    previous_quality = _storage_quality(previous_storage)
+    discovered_quality = _storage_quality(discovered)
+    previous_is_real = bool(previous_quality["safe_for_mcp"]) and int(previous_quality["node_count"]) > 0
+    discovered_is_weaker = (
+        not bool(discovered_quality["safe_for_mcp"])
+        or int(discovered_quality["node_count"]) < int(previous_quality["node_count"])
+        or int(discovered_quality["sqlite_size_bytes"]) <= 4096
+    )
+    if previous_is_real and discovered_is_weaker:
+        return previous_storage
+    return None
+
+
+def discover_legacy_data_dirs(
+    *,
+    api_dir: Path | None = None,
+    current_data_dir: Path | None = None,
+) -> list[Path]:
+    api = (api_dir or API_DIR).resolve()
+    candidates = [api / "data"]
+    try:
+        candidates.extend(sorted(path for path in api.glob("data_*") if path.is_dir()))
+    except OSError:
+        pass
+    current = (current_data_dir or DATA_DIR).resolve()
+    candidates.append(current)
+    discovered: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = candidate.resolve()
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        if any((path / filename).exists() for filename in (SQLITE_FILENAME, GRAPH_FILENAME, INDEX_FILENAME, ATLAS_FILENAME)):
+            discovered.append(path)
+    return discovered
+
+
+def _ensure_brain_dirs(registry_brain_path: Path) -> dict[str, str]:
+    registry_brain_path.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "registry_brain_path": registry_brain_path,
+        "document_asset_path": registry_brain_path / "documents",
+        "source_package_path": registry_brain_path / "source_packages",
+        "maintenance_path": registry_brain_path / "maintenance",
+        "mcp_log_path": registry_brain_path / "mcp_logs",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return {key: str(path.resolve()) for key, path in paths.items()}
+
+
+def build_local_brain_record(
+    *,
+    brain_id: str,
+    display_name: str,
+    storage_path: Path,
+    registry_brain_path: Path,
+    is_default: bool = False,
+    is_active: bool = False,
+    migration_source: str = "legacy_data_dir",
+    storage_layout: str = "legacy_in_place",
+    migration_status: str = "legacy_imported_in_place_runtime_scoped_pr12m_b",
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    previous_payload = dict(previous or {})
+    storage = storage_path.resolve()
+    storage.mkdir(parents=True, exist_ok=True)
+    registry_paths = _ensure_brain_dirs(registry_brain_path.resolve())
+    file_status = _storage_file_status(storage)
+    has_sqlite = bool(file_status[SQLITE_FILENAME]["exists"])
+    has_index = bool(file_status[INDEX_FILENAME]["exists"])
+    has_atlas = bool(file_status[ATLAS_FILENAME]["exists"])
+    warnings: list[str] = []
+    if not has_sqlite:
+        warnings.append("sqlite_store_missing")
+    if not has_index:
+        warnings.append("index_file_missing")
+    if not has_atlas:
+        warnings.append("atlas_file_missing")
+    return {
+        "schema_version": LOCAL_BRAIN_RECORD_SCHEMA_VERSION,
+        "brain_id": brain_id,
+        "display_name": display_name,
+        "description": previous_payload.get("description") or f"Imported local AGVM brain: {display_name}.",
+        "storage_path": str(storage),
+        "storage_layout": storage_layout,
+        "registry_brain_path": registry_paths["registry_brain_path"],
+        "document_asset_path": registry_paths["document_asset_path"],
+        "source_package_path": registry_paths["source_package_path"],
+        "maintenance_path": registry_paths["maintenance_path"],
+        "mcp_log_path": registry_paths["mcp_log_path"],
+        "storage_format_version": LOCAL_BRAIN_STORAGE_FORMAT_VERSION,
+        "graph_version": GRAPH_VERSION,
+        "index_version": INDEX_VERSION,
+        "atlas_version": ATLAS_VERSION,
+        "migration_status": migration_status,
+        "migration_source": migration_source,
+        "migration_target_path": registry_paths["registry_brain_path"],
+        "created_at": previous_payload.get("created_at") or utc_timestamp(),
+        "updated_at": utc_timestamp(),
+        "is_default": bool(is_default),
+        "is_active": bool(is_active),
+        "safe_for_mcp": has_sqlite and has_index and has_atlas,
+        "runtime_scope_status": "brain_scoped_runtime_ready_pr12m_b",
+        "node_count": _node_count(storage),
+        "sqlite_size_bytes": int(file_status[SQLITE_FILENAME]["size_bytes"]),
+        "storage_files": file_status,
+        "capabilities": {
+            "retrieve": has_sqlite,
+            "grow": has_sqlite,
+            "documents": True,
+            "source_packages": True,
+            "maintenance": has_sqlite,
+            "mcp_logs": True,
+        },
+        "warnings": warnings,
+    }
+
+
+def validate_local_brain_registry(registry: dict[str, Any]) -> dict[str, Any]:
+    brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+    ids = [str(item.get("brain_id") or "").strip() for item in brains]
+    unique_ids = sorted(set(ids))
+    duplicate_ids = sorted({brain_id for brain_id in ids if ids.count(brain_id) > 1})
+    default_ids = [str(item.get("brain_id") or "") for item in brains if bool(item.get("is_default"))]
+    active_ids = [str(item.get("brain_id") or "") for item in brains if bool(item.get("is_active"))]
+    missing_paths: list[str] = []
+    shared_storage_paths: list[str] = []
+    storage_paths = [str(item.get("storage_path") or "") for item in brains]
+    for item in brains:
+        for field in ("storage_path", "registry_brain_path", "document_asset_path", "source_package_path", "maintenance_path", "mcp_log_path"):
+            raw = str(item.get(field) or "")
+            if not raw or not Path(raw).exists():
+                missing_paths.append(f"{item.get('brain_id')}:{field}")
+    for path in sorted(set(storage_paths)):
+        if path and storage_paths.count(path) > 1:
+            shared_storage_paths.append(path)
+    errors: list[str] = []
+    if registry.get("schema_version") != LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION:
+        errors.append("registry_schema_version_mismatch")
+    if not brains:
+        errors.append("no_brains_registered")
+    if duplicate_ids:
+        errors.append("duplicate_brain_ids")
+    if len(default_ids) != 1:
+        errors.append("default_brain_count_not_one")
+    if len(active_ids) != 1:
+        errors.append("active_brain_count_not_one")
+    if missing_paths:
+        errors.append("registered_paths_missing")
+    if shared_storage_paths:
+        errors.append("shared_storage_path_between_brains")
+    safe_default_configured = len(default_ids) == 1 and default_ids[0] in unique_ids
+    if len(brains) > 1 and not safe_default_configured:
+        errors.append("multi_brain_without_safe_default")
+    return {
+        "schema_version": "agvm.local_brain_registry.validation.v1",
+        "passed": not errors,
+        "brain_count": len(brains),
+        "brain_ids": unique_ids,
+        "default_brain_ids": default_ids,
+        "active_brain_ids": active_ids,
+        "duplicate_brain_ids": duplicate_ids,
+        "missing_paths": missing_paths,
+        "shared_storage_paths": shared_storage_paths,
+        "safe_default_configured": safe_default_configured,
+        "errors": errors,
+        "next_slice": "PR-12N-B Cloud Persistence And Operations",
+    }
+
+
+def _normalize_active_default(brains: list[dict[str, Any]], preferred_id: str | None = None) -> list[dict[str, Any]]:
+    if not brains:
+        return []
+    ids = [str(item.get("brain_id") or "") for item in brains]
+    preferred = str(preferred_id or "").strip()
+    current_default = next((str(item.get("brain_id") or "") for item in brains if bool(item.get("is_default"))), "")
+    current_active = next((str(item.get("brain_id") or "") for item in brains if bool(item.get("is_active"))), "")
+    target = preferred if preferred in ids else current_active if current_active in ids else current_default if current_default in ids else ids[0]
+    normalized: list[dict[str, Any]] = []
+    for item in brains:
+        row = dict(item)
+        row["is_default"] = str(row.get("brain_id") or "") == target
+        row["is_active"] = str(row.get("brain_id") or "") == target
+        normalized.append(row)
+    return normalized
+
+
+def bootstrap_local_brain_registry(
+    *,
+    brain_root: Path | None = None,
+    legacy_data_dirs: list[Path] | None = None,
+    current_data_dir: Path | None = None,
+    preferred_default_brain_id: str | None = None,
+) -> dict[str, Any]:
+    root = (brain_root or brain_root_path()).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    registry_file = brain_registry_path(root)
+    existing = _json_file(registry_file)
+    previous_by_id = {
+        str(item.get("brain_id") or ""): dict(item)
+        for item in list(existing.get("brains") or [])
+        if isinstance(item, dict) and str(item.get("brain_id") or "").strip()
+    }
+    data_dirs = discover_legacy_data_dirs(current_data_dir=current_data_dir) if legacy_data_dirs is None else legacy_data_dirs
+    current = (current_data_dir or DATA_DIR).resolve()
+    env_default = str(os.getenv("AGVM_DEFAULT_BRAIN_ID", "") or "").strip()
+    preferred = preferred_default_brain_id or env_default
+    known_preferred_ids = set(previous_by_id.keys())
+    known_preferred_ids.update(_known_legacy_brain_id(path.resolve()) for path in data_dirs)
+    if preferred and preferred not in known_preferred_ids:
+        preferred = ""
+    if not preferred:
+        existing_active = str(existing.get("active_brain_id") or "").strip()
+        existing_default = str(existing.get("default_brain_id") or "").strip()
+        if existing_active and existing_active in previous_by_id:
+            preferred = existing_active
+        elif existing_default and existing_default in previous_by_id:
+            preferred = existing_default
+    if not preferred:
+        for candidate in data_dirs:
+            if candidate.resolve() == current:
+                preferred = _known_legacy_brain_id(candidate)
+                break
+    brain_records: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for data_dir in data_dirs:
+        discovered_storage_path = data_dir.resolve()
+        brain_id = _known_legacy_brain_id(discovered_storage_path)
+        if brain_id in seen_ids:
+            suffix = 2
+            base = brain_id
+            while f"{base}_{suffix}" in seen_ids:
+                suffix += 1
+            brain_id = f"{base}_{suffix}"
+        seen_ids.add(brain_id)
+        previous = previous_by_id.get(brain_id)
+        storage_path = _prefer_previous_storage(previous, discovered_storage_path) or discovered_storage_path
+        brain_records.append(
+            build_local_brain_record(
+                brain_id=brain_id,
+                display_name=str((previous or {}).get("display_name") or _known_display_name(discovered_storage_path, brain_id)),
+                storage_path=storage_path,
+                registry_brain_path=root / brain_id,
+                is_default=bool((previous or {}).get("is_default")),
+                is_active=bool((previous or {}).get("is_active")),
+                migration_source=str((previous or {}).get("migration_source") or "legacy_data_dir"),
+                storage_layout=str((previous or {}).get("storage_layout") or "legacy_in_place"),
+                migration_status=str((previous or {}).get("migration_status") or "legacy_imported_in_place_runtime_scoped_pr12m_b"),
+                previous=previous,
+            )
+        )
+    for brain_id, previous in previous_by_id.items():
+        if brain_id not in seen_ids and str(previous.get("storage_path") or "").strip():
+            storage_path = Path(str(previous["storage_path"])).expanduser().resolve()
+            brain_records.append(
+                build_local_brain_record(
+                    brain_id=brain_id,
+                    display_name=str(previous.get("display_name") or brain_id),
+                    storage_path=storage_path,
+                    registry_brain_path=Path(str(previous.get("registry_brain_path") or root / brain_id)).expanduser(),
+                    is_default=False,
+                    is_active=False,
+                    migration_source=str(previous.get("migration_source") or "existing_registry"),
+                    previous=previous,
+                )
+            )
+    if not brain_records:
+        default_brain_id = _safe_id(preferred or os.getenv("AGVM_DEFAULT_BRAIN_ID") or "default_brain")
+        default_brain_path = root / default_brain_id
+        brain_records.append(
+            build_local_brain_record(
+                brain_id=default_brain_id,
+                display_name=_known_display_name(default_brain_path, default_brain_id),
+                storage_path=default_brain_path / "storage",
+                registry_brain_path=default_brain_path,
+                is_default=False,
+                is_active=False,
+                migration_source="empty_self_hosted_default",
+                storage_layout="registry_managed",
+                migration_status="empty_local_brain_ready_for_runtime_bootstrap_pr12m_d",
+            )
+        )
+    brain_records = _normalize_active_default(brain_records, preferred_id=preferred)
+    registry = {
+        "schema_version": LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION,
+        "registry_id": "local",
+        "brain_root": str(root),
+        "registry_path": str(registry_file),
+        "storage_format_version": LOCAL_BRAIN_STORAGE_FORMAT_VERSION,
+        "created_at": existing.get("created_at") or utc_timestamp(),
+        "updated_at": utc_timestamp(),
+        "active_brain_id": next((str(item.get("brain_id") or "") for item in brain_records if bool(item.get("is_active"))), ""),
+        "default_brain_id": next((str(item.get("brain_id") or "") for item in brain_records if bool(item.get("is_default"))), ""),
+        "brain_count": len(brain_records),
+        "legacy_data_dir_policy": {
+            "agvm_lab_data_dir": str(DATA_DIR.resolve()),
+            "role": "backward_compatible_import_default_only",
+            "product_switching": "brain_registry",
+        },
+        "runtime_scope_status": "brain_scoped_runtime_ready_pr12m_b",
+        "brains": brain_records,
+        "product_boundary": {
+            "implemented_slice": "PR-12N-A Hosted Brain Registry And Tenant Isolation",
+            "registry_slice": "PR-12M-A Local Brain Registry",
+            "runtime_scoping_slice": "PR-12M-B Brain-Scoped Runtime",
+            "mcp_server_slice": "PR-12M-C Local MCP Server Package",
+            "self_hosted_distribution_slice": "PR-12M-D Docker Self-Hosted Distribution",
+            "local_admin_export_slice": "PR-12M-E Local Admin And Export",
+            "self_hosted_readiness_slice": "PR-12M-F Self-Hosted Readiness Benchmark",
+            "hosted_registry_slice": "PR-12N-A Hosted Brain Registry And Tenant Isolation",
+            "self_hosted_release_status": "self_hosted_ready_pr12m_closed",
+            "cloud_commercialization_status": "hosted_registry_ready_cloud_persistence_pending",
+            "data_copy_policy": "existing_large_brains_imported_in_place_no_db_copy",
+            "agvm_lab_data_dir_role": "backward_compatible_import_default_only",
+        },
+        "next_slice": "PR-12N-B Cloud Persistence And Operations",
+    }
+    registry["validation"] = validate_local_brain_registry(registry)
+    _atomic_write_json(registry_file, registry)
+    return registry
+
+
+def _finalize_registry(registry: dict[str, Any], *, brain_root: Path | None = None) -> dict[str, Any]:
+    brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+    registry["brains"] = brains
+    registry["brain_count"] = len(brains)
+    registry["active_brain_id"] = next((str(item.get("brain_id") or "") for item in brains if bool(item.get("is_active"))), "")
+    registry["default_brain_id"] = next((str(item.get("brain_id") or "") for item in brains if bool(item.get("is_default"))), "")
+    registry["updated_at"] = utc_timestamp()
+    product_boundary = dict(registry.get("product_boundary") or {})
+    product_boundary.update(
+        {
+            "implemented_slice": "PR-12N-A Hosted Brain Registry And Tenant Isolation",
+            "local_admin_export_slice": "PR-12M-E Local Admin And Export",
+            "self_hosted_readiness_slice": "PR-12M-F Self-Hosted Readiness Benchmark",
+            "hosted_registry_slice": "PR-12N-A Hosted Brain Registry And Tenant Isolation",
+            "self_hosted_release_status": "self_hosted_ready_pr12m_closed",
+            "cloud_commercialization_status": "hosted_registry_ready_cloud_persistence_pending",
+        }
+    )
+    registry["product_boundary"] = product_boundary
+    registry["next_slice"] = "PR-12N-B Cloud Persistence And Operations"
+    registry["validation"] = validate_local_brain_registry(registry)
+    _atomic_write_json(brain_registry_path(brain_root), registry)
+    return registry
+
+
+def refresh_local_brain_registry(*, brain_root: Path | None = None) -> dict[str, Any]:
+    root = (brain_root or brain_root_path()).resolve()
+    registry = load_local_brain_registry(brain_root=root)
+    refreshed: list[dict[str, Any]] = []
+    for previous in list(registry.get("brains") or []):
+        if not isinstance(previous, dict):
+            continue
+        brain_id = str(previous.get("brain_id") or "").strip()
+        if not brain_id:
+            continue
+        refreshed.append(
+            build_local_brain_record(
+                brain_id=brain_id,
+                display_name=str(previous.get("display_name") or brain_id),
+                storage_path=Path(str(previous.get("storage_path") or root / brain_id / "storage")).expanduser(),
+                registry_brain_path=Path(str(previous.get("registry_brain_path") or root / brain_id)).expanduser(),
+                is_default=bool(previous.get("is_default")),
+                is_active=bool(previous.get("is_active")),
+                migration_source=str(previous.get("migration_source") or "existing_registry"),
+                storage_layout=str(previous.get("storage_layout") or "registry_managed"),
+                migration_status=str(previous.get("migration_status") or "registry_refreshed_pr12m_e"),
+                previous=previous,
+            )
+        )
+    registry["brains"] = refreshed
+    return _finalize_registry(registry, brain_root=root)
+
+
+def create_local_brain(
+    *,
+    display_name: str,
+    brain_id: str | None = None,
+    description: str | None = None,
+    make_default: bool = False,
+    make_active: bool = True,
+    brain_root: Path | None = None,
+) -> dict[str, Any]:
+    root = (brain_root or brain_root_path()).resolve()
+    registry = load_local_brain_registry(brain_root=root)
+    brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+    existing_ids = {str(item.get("brain_id") or "") for item in brains}
+    target_id = _unique_brain_id(brain_id or display_name or "brain", existing_ids)
+    registry_brain_path = root / target_id
+    record = build_local_brain_record(
+        brain_id=target_id,
+        display_name=str(display_name or target_id.replace("_", " ").title()).strip(),
+        storage_path=registry_brain_path / "storage",
+        registry_brain_path=registry_brain_path,
+        is_default=False,
+        is_active=False,
+        migration_source="local_admin_create",
+        storage_layout="registry_managed",
+        migration_status="created_by_local_admin_pending_runtime_bootstrap_pr12m_e",
+    )
+    if description is not None:
+        record["description"] = str(description).strip()
+    if make_active or make_default or not brains:
+        for item in brains:
+            item["is_active"] = False if make_active or not brains else bool(item.get("is_active"))
+            if make_default or not brains:
+                item["is_default"] = False
+        record["is_active"] = bool(make_active or not brains)
+        record["is_default"] = bool(make_default or not brains)
+    brains.append(record)
+    registry["brains"] = brains
+    return _finalize_registry(registry, brain_root=root)
+
+
+def rename_local_brain(
+    brain_id: str,
+    *,
+    display_name: str,
+    description: str | None = None,
+    brain_root: Path | None = None,
+) -> dict[str, Any]:
+    target = str(brain_id or "").strip()
+    registry = load_local_brain_registry(brain_root=brain_root)
+    found = False
+    brains: list[dict[str, Any]] = []
+    for item in list(registry.get("brains") or []):
+        row = dict(item)
+        if str(row.get("brain_id") or "") == target:
+            found = True
+            row["display_name"] = str(display_name or target).strip()
+            if description is not None:
+                row["description"] = str(description).strip()
+            row["updated_at"] = utc_timestamp()
+        brains.append(row)
+    if not found:
+        raise BrainRegistryError(f"unknown_brain_id:{target}")
+    registry["brains"] = brains
+    return _finalize_registry(registry, brain_root=brain_root)
+
+
+def _brain_export_manifest(record: dict[str, Any], *, export_kind: str) -> dict[str, Any]:
+    return {
+        "schema_version": "agvm.local_brain_export.v1",
+        "export_kind": export_kind,
+        "exported_at": utc_timestamp(),
+        "brain_id": record.get("brain_id"),
+        "display_name": record.get("display_name"),
+        "description": record.get("description"),
+        "storage_layout": record.get("storage_layout"),
+        "storage_format_version": record.get("storage_format_version"),
+        "source_registry_path": record.get("registry_brain_path"),
+        "source_storage_path": record.get("storage_path"),
+        "included_paths": {
+            "storage": "storage/",
+            "documents": "documents/",
+            "source_packages": "source_packages/",
+            "maintenance": "maintenance/",
+            "mcp_logs": "mcp_logs/",
+        },
+        "restore_policy": "imports_as_registry_managed_brain_by_default",
+    }
+
+
+def _zip_dir(zip_file: zipfile.ZipFile, source: Path, arc_prefix: str) -> int:
+    if not source.exists():
+        return 0
+    count = 0
+    if source.is_file():
+        zip_file.write(source, arc_prefix.rstrip("/"))
+        return 1
+    for path in sorted(source.rglob("*")):
+        if path.is_file():
+            zip_file.write(path, f"{arc_prefix.rstrip('/')}/{path.relative_to(source).as_posix()}")
+            count += 1
+    return count
+
+
+def export_local_brain(
+    brain_id: str,
+    *,
+    export_dir: Path | None = None,
+    export_kind: str = "export",
+    brain_root: Path | None = None,
+) -> dict[str, Any]:
+    registry = refresh_local_brain_registry(brain_root=brain_root)
+    target = str(brain_id or "").strip()
+    record = next((dict(item) for item in list(registry.get("brains") or []) if str(item.get("brain_id") or "") == target), None)
+    if not record:
+        raise BrainRegistryError(f"unknown_brain_id:{target}")
+    root = Path(str(registry.get("brain_root") or brain_root_path())).expanduser().resolve()
+    out_dir = (export_dir or root / "exports").expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = out_dir / f"{target}-{utc_timestamp().replace(':', '').replace('+', 'Z')}.agvm-brain.zip"
+    manifest = _brain_export_manifest(record, export_kind=export_kind)
+    file_count = 0
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr("agvm_brain_export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        zip_file.writestr("brain_record.json", json.dumps(record, ensure_ascii=False, indent=2))
+        file_count += _zip_dir(zip_file, Path(str(record.get("storage_path") or "")).expanduser(), "storage")
+        file_count += _zip_dir(zip_file, Path(str(record.get("document_asset_path") or "")).expanduser(), "documents")
+        file_count += _zip_dir(zip_file, Path(str(record.get("source_package_path") or "")).expanduser(), "source_packages")
+        file_count += _zip_dir(zip_file, Path(str(record.get("maintenance_path") or "")).expanduser(), "maintenance")
+        file_count += _zip_dir(zip_file, Path(str(record.get("mcp_log_path") or "")).expanduser(), "mcp_logs")
+    return {
+        "schema_version": "agvm.local_brain_export_result.v1",
+        "action": export_kind,
+        "status": "exported",
+        "brain_id": target,
+        "archive_path": str(archive_path),
+        "archive_size_bytes": archive_path.stat().st_size,
+        "file_count": file_count,
+        "export_manifest": manifest,
+        "registry": registry,
+        "warnings": [],
+        "next_slice": "PR-12N-B Cloud Persistence And Operations",
+    }
+
+
+def _safe_extract_zip(archive_path: Path, target_dir: Path) -> None:
+    archive = archive_path.expanduser().resolve()
+    target = target_dir.expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "r") as zip_file:
+        for member in zip_file.infolist():
+            destination = target / member.filename
+            if not _path_is_within(destination, target):
+                raise BrainRegistryError(f"unsafe_archive_member:{member.filename}")
+        zip_file.extractall(target)
+
+
+def import_local_brain_archive(
+    archive_path: Path,
+    *,
+    brain_id: str | None = None,
+    display_name: str | None = None,
+    make_active: bool = False,
+    make_default: bool = False,
+    overwrite_existing: bool = False,
+    brain_root: Path | None = None,
+) -> dict[str, Any]:
+    root = (brain_root or brain_root_path()).resolve()
+    registry = load_local_brain_registry(brain_root=root)
+    brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+    existing_ids = {str(item.get("brain_id") or "") for item in brains}
+    with tempfile.TemporaryDirectory(prefix="agvm-brain-import-") as tmp_name:
+        temp_dir = Path(tmp_name)
+        _safe_extract_zip(archive_path, temp_dir)
+        manifest_path = temp_dir / "agvm_brain_export_manifest.json"
+        record_path = temp_dir / "brain_record.json"
+        manifest = _json_file(manifest_path)
+        source_record = _json_file(record_path)
+        requested_id = brain_id or str(manifest.get("brain_id") or source_record.get("brain_id") or "imported_brain")
+        target_id = _safe_id(requested_id)
+        if target_id in existing_ids and not overwrite_existing:
+            raise BrainRegistryError(f"brain_id_already_exists:{target_id}")
+        target_path = root / target_id
+        if target_id in existing_ids and overwrite_existing:
+            existing = next((item for item in brains if str(item.get("brain_id") or "") == target_id), {})
+            if str(existing.get("storage_layout") or "") != "registry_managed":
+                raise BrainRegistryError(f"overwrite_requires_registry_managed_brain:{target_id}")
+            _safe_rmtree(target_path, required_parent=root)
+            brains = [item for item in brains if str(item.get("brain_id") or "") != target_id]
+        target_path.mkdir(parents=True, exist_ok=True)
+        for dirname in ("storage", "documents", "source_packages", "maintenance", "mcp_logs"):
+            source = temp_dir / dirname
+            destination = target_path / ("storage" if dirname == "storage" else dirname)
+            if source.exists():
+                if destination.exists():
+                    shutil.rmtree(destination)
+                shutil.copytree(source, destination)
+            else:
+                destination.mkdir(parents=True, exist_ok=True)
+        record = build_local_brain_record(
+            brain_id=target_id,
+            display_name=str(display_name or manifest.get("display_name") or source_record.get("display_name") or target_id.replace("_", " ").title()),
+            storage_path=target_path / "storage",
+            registry_brain_path=target_path,
+            is_default=False,
+            is_active=False,
+            migration_source="local_admin_import",
+            storage_layout="registry_managed",
+            migration_status="imported_from_export_pr12m_e",
+            previous={
+                "description": source_record.get("description") or manifest.get("description"),
+                "created_at": source_record.get("created_at"),
+            },
+        )
+        for item in brains:
+            if make_active:
+                item["is_active"] = False
+            if make_default:
+                item["is_default"] = False
+        record["is_active"] = bool(make_active or not brains)
+        record["is_default"] = bool(make_default or not brains)
+        brains.append(record)
+        registry["brains"] = brains
+        registry = _finalize_registry(registry, brain_root=root)
+    return {
+        "schema_version": "agvm.local_brain_import_result.v1",
+        "action": "import",
+        "status": "imported",
+        "brain_id": target_id,
+        "brain": record,
+        "import_manifest": manifest,
+        "registry": registry,
+        "warnings": [],
+        "next_slice": "PR-12N-B Cloud Persistence And Operations",
+    }
+
+
+def delete_local_brain(
+    brain_id: str,
+    *,
+    confirm_brain_id: str,
+    delete_storage: bool = False,
+    brain_root: Path | None = None,
+) -> dict[str, Any]:
+    target = str(brain_id or "").strip()
+    confirmation = str(confirm_brain_id or "").strip()
+    if target != confirmation:
+        raise BrainRegistryError("delete_confirmation_mismatch")
+    root = (brain_root or brain_root_path()).resolve()
+    registry = load_local_brain_registry(brain_root=root)
+    brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+    record = next((dict(item) for item in brains if str(item.get("brain_id") or "") == target), None)
+    if not record:
+        raise BrainRegistryError(f"unknown_brain_id:{target}")
+    if len(brains) <= 1:
+        raise BrainRegistryError("cannot_delete_last_brain")
+    if bool(record.get("is_active")) or bool(record.get("is_default")):
+        raise BrainRegistryError("cannot_delete_active_or_default_brain")
+    warnings: list[str] = []
+    if delete_storage:
+        if str(record.get("storage_layout") or "") == "registry_managed":
+            registry_path = Path(str(record.get("registry_brain_path") or root / target)).expanduser().resolve()
+            _safe_rmtree(registry_path, required_parent=root)
+        else:
+            warnings.append("legacy_in_place_storage_not_deleted")
+            registry_path = Path(str(record.get("registry_brain_path") or root / target)).expanduser().resolve()
+            if _path_is_within(registry_path, root) and registry_path.exists():
+                _safe_rmtree(registry_path, required_parent=root)
+    registry["brains"] = [item for item in brains if str(item.get("brain_id") or "") != target]
+    registry = _finalize_registry(registry, brain_root=root)
+    return {
+        "schema_version": "agvm.local_brain_delete_result.v1",
+        "action": "delete",
+        "status": "deleted",
+        "brain_id": target,
+        "deleted_storage": bool(delete_storage and str(record.get("storage_layout") or "") == "registry_managed"),
+        "registry": registry,
+        "warnings": warnings,
+        "next_slice": "PR-12N-B Cloud Persistence And Operations",
+    }
+
+
+def load_local_brain_registry(*, brain_root: Path | None = None, bootstrap_if_missing: bool = True) -> dict[str, Any]:
+    registry_file = brain_registry_path(brain_root)
+    if not registry_file.exists():
+        if not bootstrap_if_missing:
+            return {
+                "schema_version": LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION,
+                "registry_id": "local",
+                "brain_root": str((brain_root or brain_root_path()).resolve()),
+                "brains": [],
+                "validation": validate_local_brain_registry({"schema_version": LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION, "brains": []}),
+            }
+        return bootstrap_local_brain_registry(brain_root=brain_root)
+    registry = _json_file(registry_file)
+    registry["brain_count"] = len(list(registry.get("brains") or []))
+    registry["validation"] = validate_local_brain_registry(registry)
+    return registry
+
+
+def set_active_brain(
+    brain_id: str,
+    *,
+    make_default: bool = False,
+    brain_root: Path | None = None,
+) -> dict[str, Any]:
+    target = str(brain_id or "").strip()
+    registry = load_local_brain_registry(brain_root=brain_root)
+    brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+    if target not in {str(item.get("brain_id") or "") for item in brains}:
+        raise BrainRegistryError(f"unknown_brain_id:{target}")
+    for item in brains:
+        is_target = str(item.get("brain_id") or "") == target
+        item["is_active"] = is_target
+        if make_default:
+            item["is_default"] = is_target
+        item["updated_at"] = utc_timestamp() if is_target else item.get("updated_at")
+    registry["brains"] = brains
+    registry["brain_count"] = len(brains)
+    registry["active_brain_id"] = target
+    if make_default:
+        registry["default_brain_id"] = target
+    registry["updated_at"] = utc_timestamp()
+    registry["validation"] = validate_local_brain_registry(registry)
+    _atomic_write_json(brain_registry_path(brain_root), registry)
+    return registry
+
+
+def resolve_brain_scope(
+    brain_id: str | None = None,
+    *,
+    brain_root: Path | None = None,
+    require_explicit: bool = False,
+) -> dict[str, Any]:
+    registry = load_local_brain_registry(brain_root=brain_root)
+    brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+    by_id = {str(item.get("brain_id") or ""): item for item in brains}
+    requested = str(brain_id or "").strip()
+    if requested:
+        if requested not in by_id:
+            raise BrainRegistryError(f"unknown_brain_id:{requested}")
+        return by_id[requested]
+    if require_explicit:
+        raise BrainRegistryError("brain_id_required")
+    validation = dict(registry.get("validation") or {})
+    default_id = str(registry.get("default_brain_id") or "")
+    active_id = str(registry.get("active_brain_id") or "")
+    resolved = active_id or default_id
+    if not bool(validation.get("safe_default_configured")) or resolved not in by_id:
+        raise BrainRegistryError("ambiguous_brain_scope_without_safe_default")
+    return by_id[resolved]
+
+
+def active_brain_summary(*, brain_root: Path | None = None) -> dict[str, Any]:
+    registry = load_local_brain_registry(brain_root=brain_root)
+    active_id = str(registry.get("active_brain_id") or "")
+    active = next((dict(item) for item in list(registry.get("brains") or []) if str((item or {}).get("brain_id") or "") == active_id), {})
+    return {
+        "schema_version": "agvm.local_active_brain_summary.v1",
+        "brain_id": active.get("brain_id"),
+        "display_name": active.get("display_name"),
+        "storage_path": active.get("storage_path"),
+        "storage_layout": active.get("storage_layout"),
+        "safe_for_mcp": bool(active.get("safe_for_mcp")),
+        "runtime_scope_status": registry.get("runtime_scope_status"),
+        "registry_path": registry.get("registry_path"),
+        "brain_count": len(list(registry.get("brains") or [])),
+    }

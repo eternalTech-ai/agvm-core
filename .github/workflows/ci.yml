@@ -1,0 +1,59 @@
+name: AGVM Core CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  public-core:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: agvm_cockpit_prototype/package-lock.json
+
+      - name: Install API dependencies
+        run: python -m pip install -r agvm_api/requirements.txt
+
+      - name: Compile public Python entrypoints
+        run: |
+          python -m py_compile \
+            agvm_api/core_api_app.py \
+            agvm_api/core_runtime_router.py \
+            agvm_api/core_brain_router.py \
+            agvm_api/core_mcp_contract_router.py \
+            agvm_api/core_mcp_operations_router.py \
+            agvm_api/core_retrieve_router.py \
+            agvm_api/maintenance.py \
+            agvm_api/maintenance_contract.py \
+            agvm_api/memory_learning_maintenance.py \
+            agvm_api/memory_policy_revisioning.py \
+            agvm_api/mcp_contracts.py \
+            agvm_mcp_server/server.py
+
+      - name: Install UI dependencies
+        working-directory: agvm_cockpit_prototype
+        run: npm ci
+
+      - name: Build public core UI
+        working-directory: agvm_cockpit_prototype
+        run: npm run build
+        env:
+          VITE_AGVM_UI_SHELL_PROFILE: public_core
+          VITE_API_URL: http://localhost:8010
+
+      - name: Validate Docker Compose
+        run: docker compose config

@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    AGVM_API_BASE_URL=http://agvm_api:8010
+
+WORKDIR /app
+COPY agvm_mcp_server ./agvm_mcp_server
+
+CMD ["python", "-m", "agvm_mcp_server"]

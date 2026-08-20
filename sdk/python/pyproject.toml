@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agvm-sdk"
+version = "0.1.0"
+description = "Stable AGVM public contracts for modules, entitlements and MCP integrations."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Eternal Tech SRL", email = "info@eternaltech.ai" }]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agvm_sdk*"]

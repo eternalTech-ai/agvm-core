@@ -1,0 +1,70 @@
+services:
+  agvm_core_api:
+    build:
+      context: .
+      dockerfile: agvm_api/Dockerfile.core
+    container_name: agvm_core_api
+    environment:
+      AGVM_EDITION: core
+      AGVM_LAB_DATA_DIR: /app/data
+      AGVM_BRAINS_DIR: /app/brains
+      AGVM_DEFAULT_BRAIN_ID: ${AGVM_DEFAULT_BRAIN_ID:-default_brain}
+      AGVM_ALLOW_SETUP_WITHOUT_PROVIDER: ${AGVM_ALLOW_SETUP_WITHOUT_PROVIDER:-true}
+      AGVM_LLM_ENABLED: ${AGVM_LLM_ENABLED:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AGVM_LLM_MODEL: ${AGVM_LLM_MODEL:-gpt-4o-mini}
+      AGVM_COMPILER_MODEL: ${AGVM_COMPILER_MODEL:-gpt-4o-mini}
+      AGVM_RETRIEVAL_MODEL: ${AGVM_RETRIEVAL_MODEL:-gpt-4o-mini}
+      AGVM_ANSWER_MODEL: ${AGVM_ANSWER_MODEL:-gpt-4o-mini}
+      AGVM_SLEEP_MODEL: ${AGVM_SLEEP_MODEL:-gpt-4o-mini}
+    ports:
+      - "${AGVM_API_PORT:-8010}:8010"
+    volumes:
+      - agvm_core_data:/app/data
+      - agvm_core_brains:/app/brains
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  agvm_core_ui:
+    build:
+      context: .
+      dockerfile: agvm_cockpit_prototype/Dockerfile.core
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8010}
+        VITE_AGVM_UI_SHELL_PROFILE: public_core
+    container_name: agvm_core_ui
+    depends_on:
+      agvm_core_api:
+        condition: service_healthy
+    ports:
+      - "${AGVM_UI_PORT:-3020}:3020"
+
+  agvm_mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: agvm_core_mcp
+    profiles:
+      - mcp
+    environment:
+      AGVM_API_BASE_URL: http://agvm_core_api:8010
+      AGVM_MCP_BRAIN_POLICY: ${AGVM_MCP_BRAIN_POLICY:-fixed}
+      AGVM_MCP_BRAIN_ID: ${AGVM_MCP_BRAIN_ID:-default_brain}
+      AGVM_MCP_BRAIN_ID_HINT: ${AGVM_MCP_BRAIN_ID_HINT:-}
+      AGVM_MCP_BRAIN_DISPLAY_NAME: ${AGVM_MCP_BRAIN_DISPLAY_NAME:-Codex Project Memory}
+      AGVM_MCP_BRAIN_PURPOSE: ${AGVM_MCP_BRAIN_PURPOSE:-Persistent MCP memory for this AI client.}
+      AGVM_MCP_READ_ONLY: ${AGVM_MCP_READ_ONLY:-false}
+      AGVM_MCP_TIMEOUT_SECONDS: ${AGVM_MCP_TIMEOUT_SECONDS:-180}
+    depends_on:
+      agvm_core_api:
+        condition: service_healthy
+    stdin_open: true
+    tty: false
+
+volumes:
+  agvm_core_data:
+  agvm_core_brains:

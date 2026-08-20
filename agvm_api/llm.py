@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from typing import Any
+
+from config import (
+    DEFAULT_ANSWER_MODEL,
+    DEFAULT_COMPILER_MODEL,
+    DEFAULT_OPENAI_MODEL,
+    DEFAULT_RETRIEVAL_MODEL,
+    DEFAULT_SLEEP_MODEL,
+)
+
+_ROLE_NAMES = (
+    "compiler",
+    "retrieval",
+    "answer",
+    "sleep",
+    "clone_arbiter",
+    "clone_sufficiency",
+    "clone_speaker",
+    "clone_prefetch",
+    "context_correction",
+)
+_LLM_RUNTIME: dict[str, Any] = {
+    "requests": {role: 0 for role in _ROLE_NAMES},
+    "success": {role: 0 for role in _ROLE_NAMES},
+    "fallback": {role: 0 for role in _ROLE_NAMES},
+    "last_path": {role: "fallback" for role in _ROLE_NAMES},
+    "last_error": {role: None for role in _ROLE_NAMES},
+    "last_queue_wait_ms": {role: 0.0 for role in _ROLE_NAMES},
+    "last_model": {role: "" for role in _ROLE_NAMES},
+    "last_timeout_seconds": {role: 0.0 for role in _ROLE_NAMES},
+    "queued": {role: 0 for role in _ROLE_NAMES},
+}
+_LLM_PROVIDER_LOCK = threading.Lock()
+_LLM_PROVIDER_SEMAPHORE: threading.BoundedSemaphore | None = None
+_LLM_PROVIDER_SEMAPHORE_LIMIT: int | None = None
+
+
+def _bounded_int_from_env(name: str, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(os.getenv(name, "") or "").strip() or default)
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _llm_max_concurrent_requests() -> int:
+    return _bounded_int_from_env(
+        "AGVM_LLM_MAX_CONCURRENT_REQUESTS",
+        default=3,
+        minimum=1,
+        maximum=8,
+    )
+
+
+def _llm_queue_timeout_seconds(request_timeout: float) -> float:
+    local_budget = max(0.25, float(request_timeout or 3.0))
+    configured = os.getenv("AGVM_LLM_QUEUE_TIMEOUT_SECONDS")
+    if configured is not None and str(configured).strip():
+        try:
+            # The env value is a ceiling for abnormal local stalls, not
+            # permission for first-payload calls to wait behind unrelated LLM
+            # work longer than their own product budget.
+            return max(0.05, min(float(configured), local_budget))
+        except ValueError:
+            pass
+    return local_budget
+
+
+def _llm_provider_semaphore() -> threading.BoundedSemaphore:
+    global _LLM_PROVIDER_SEMAPHORE, _LLM_PROVIDER_SEMAPHORE_LIMIT
+    limit = _llm_max_concurrent_requests()
+    with _LLM_PROVIDER_LOCK:
+        if _LLM_PROVIDER_SEMAPHORE is None or _LLM_PROVIDER_SEMAPHORE_LIMIT != limit:
+            _LLM_PROVIDER_SEMAPHORE = threading.BoundedSemaphore(limit)
+            _LLM_PROVIDER_SEMAPHORE_LIMIT = limit
+        return _LLM_PROVIDER_SEMAPHORE
+
+
+def _ensure_openai_strict_schema(schema: Any) -> Any:
+    if isinstance(schema, dict):
+        normalized = {key: _ensure_openai_strict_schema(value) for key, value in schema.items()}
+        schema_type = normalized.get("type")
+        if schema_type == "object":
+            properties = dict(normalized.get("properties") or {})
+            normalized["properties"] = properties
+            normalized["additionalProperties"] = False
+            normalized["required"] = list(properties.keys())
+        if schema_type == "array" and "items" in normalized:
+            normalized["items"] = _ensure_openai_strict_schema(normalized["items"])
+        return normalized
+    if isinstance(schema, list):
+        return [_ensure_openai_strict_schema(item) for item in schema]
+    return schema
+
+
+def llm_enabled() -> bool:
+    flag = os.getenv("AGVM_LLM_ENABLED", "").strip().lower()
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return bool(key)
+
+
+def llm_model() -> str:
+    return os.getenv("AGVM_LLM_MODEL", DEFAULT_OPENAI_MODEL)
+
+
+def compiler_model() -> str:
+    return os.getenv("AGVM_COMPILER_MODEL", DEFAULT_COMPILER_MODEL)
+
+
+def retrieval_model() -> str:
+    return os.getenv("AGVM_RETRIEVAL_MODEL", DEFAULT_RETRIEVAL_MODEL)
+
+
+def answer_model() -> str:
+    return os.getenv("AGVM_ANSWER_MODEL", DEFAULT_ANSWER_MODEL)
+
+
+def sleep_model() -> str:
+    return os.getenv("AGVM_SLEEP_MODEL", DEFAULT_SLEEP_MODEL)
+
+
+def _model_env_or(env_name: str, fallback: str) -> str:
+    return str(os.getenv(env_name) or "").strip() or fallback
+
+
+def clone_app_arbiter_model() -> str:
+    return _model_env_or("AGVM_CLONE_APP_ARBITER_MODEL", retrieval_model())
+
+
+def clone_app_sufficiency_model() -> str:
+    return _model_env_or("AGVM_CLONE_APP_SUFFICIENCY_MODEL", answer_model())
+
+
+def clone_app_speaker_model() -> str:
+    return _model_env_or("AGVM_CLONE_APP_SPEAKER_MODEL", answer_model())
+
+
+def clone_app_prefetch_model() -> str:
+    return _model_env_or("AGVM_CLONE_APP_PREFETCH_MODEL", retrieval_model())
+
+
+def clone_app_teach_model() -> str:
+    return _model_env_or("AGVM_CLONE_APP_TEACH_MODEL", compiler_model())
+
+
+def record_llm_result(
+    role: str,
+    *,
+    path: str,
+    error: str | None = None,
+    model: str | None = None,
+    timeout_seconds: float | None = None,
+) -> None:
+    if role not in _ROLE_NAMES:
+        return
+    _LLM_RUNTIME["requests"][role] += 1
+    if path == "llm":
+        _LLM_RUNTIME["success"][role] += 1
+    else:
+        _LLM_RUNTIME["fallback"][role] += 1
+    _LLM_RUNTIME["last_path"][role] = path
+    _LLM_RUNTIME["last_error"][role] = error
+    if model:
+        _LLM_RUNTIME["last_model"][role] = str(model)
+    if timeout_seconds is not None:
+        _LLM_RUNTIME["last_timeout_seconds"][role] = float(timeout_seconds)
+
+
+def llm_runtime_status() -> dict[str, Any]:
+    per_role: dict[str, Any] = {}
+    for role in _ROLE_NAMES:
+        requests = int(_LLM_RUNTIME["requests"][role])
+        fallbacks = int(_LLM_RUNTIME["fallback"][role])
+        per_role[role] = {
+            "requests": requests,
+            "success": int(_LLM_RUNTIME["success"][role]),
+            "fallback": fallbacks,
+            "last_path": _LLM_RUNTIME["last_path"][role],
+            "last_error": _LLM_RUNTIME["last_error"][role],
+            "last_queue_wait_ms": float(_LLM_RUNTIME["last_queue_wait_ms"][role] or 0.0),
+            "last_model": _LLM_RUNTIME["last_model"][role],
+            "last_timeout_seconds": float(_LLM_RUNTIME["last_timeout_seconds"][role] or 0.0),
+            "queued": int(_LLM_RUNTIME["queued"][role]),
+            "fallback_ratio": round(fallbacks / requests, 4) if requests else 0.0,
+        }
+    return per_role
+
+
+def provider_auth_ok() -> bool | None:
+    if not llm_enabled():
+        return None
+    known_errors = [str(_LLM_RUNTIME["last_error"][role] or "") for role in _ROLE_NAMES]
+    if any("401" in error or "invalid_api_key" in error for error in known_errors):
+        return False
+    if any(int(_LLM_RUNTIME["success"][role]) > 0 for role in _ROLE_NAMES):
+        return True
+    return None
+
+
+def _extract_text(payload: dict[str, Any]) -> str | None:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    collected: list[str] = []
+    for item in payload.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []):
+            if not isinstance(content, dict):
+                continue
+            content_type = content.get("type")
+            if content_type in {"output_text", "text"} and isinstance(content.get("text"), str):
+                collected.append(content["text"])
+    text = "".join(collected).strip()
+    return text or None
+
+
+def structured_json(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    schema_name: str,
+    schema: dict[str, Any],
+    model: str | None = None,
+    timeout: float = 45.0,
+    role: str = "compiler",
+    max_output_tokens: int | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    resolved_model = model or llm_model()
+    if not llm_enabled():
+        record_llm_result(role, path="fallback", error="llm_disabled", model=resolved_model, timeout_seconds=timeout)
+        return None, "llm_disabled"
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        record_llm_result(role, path="fallback", error="missing_api_key", model=resolved_model, timeout_seconds=timeout)
+        return None, "missing_api_key"
+
+    request_body = {
+        "model": resolved_model,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_prompt}],
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "strict": True,
+                "schema": _ensure_openai_strict_schema(schema),
+            }
+        },
+    }
+    if max_output_tokens is not None:
+        request_body["max_output_tokens"] = max(16, int(max_output_tokens))
+
+    req = urllib.request.Request(
+        url="https://api.openai.com/v1/responses",
+        method="POST",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    semaphore = _llm_provider_semaphore()
+    queue_started_at = time.perf_counter()
+    acquired = semaphore.acquire(timeout=_llm_queue_timeout_seconds(timeout))
+    queue_wait_ms = round((time.perf_counter() - queue_started_at) * 1000.0, 2)
+    if role in _ROLE_NAMES:
+        _LLM_RUNTIME["last_queue_wait_ms"][role] = queue_wait_ms
+        if queue_wait_ms > 1.0:
+            _LLM_RUNTIME["queued"][role] += 1
+    if not acquired:
+        error = f"llm_queue_timeout:waited_ms={queue_wait_ms}"
+        record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
+        return None, error
+
+    try:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            semaphore.release()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        error = f"http_error:{exc.code}:{detail[:240]}"
+        record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
+        return None, error
+    except Exception as exc:  # noqa: BLE001
+        error = f"transport_error:{exc}"
+        record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
+        return None, error
+
+    text = _extract_text(payload)
+    if not text:
+        record_llm_result(role, path="fallback", error="missing_output_text", model=resolved_model, timeout_seconds=timeout)
+        return None, "missing_output_text"
+
+    try:
+        parsed = json.loads(text)
+        record_llm_result(role, path="llm", error=None, model=resolved_model, timeout_seconds=timeout)
+        return parsed, None
+    except json.JSONDecodeError:
+        record_llm_result(role, path="fallback", error="invalid_json", model=resolved_model, timeout_seconds=timeout)
+        return None, "invalid_json"

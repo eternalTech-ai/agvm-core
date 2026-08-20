@@ -1,0 +1,26 @@
+name: Bug Report
+description: Report a reproducible AGVM Core problem.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps To Reproduce
+      description: Include commands, MCP tool calls or API routes.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Docker/Python/Node versions, AGVM Core commit.
+    validations:
+      required: true
