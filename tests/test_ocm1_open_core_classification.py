@@ -35,14 +35,23 @@ ROUTE_SOURCES = [
 ]
 
 
+def _is_public_core_export() -> bool:
+    return (ROOT / ".agvm-public-export-marker").exists()
+
+
 def test_ocm1_every_discovered_backend_route_is_classified() -> None:
     routes = discover_fastapi_routes([path for path in ROUTE_SOURCES if path.exists()])
 
-    assert len(routes) >= 100
+    assert len(routes) >= (20 if _is_public_core_export() else 100)
     classified = classify_routes(routes)
 
     assert len(classified) == len(routes)
-    assert {item.classification.category for item in classified} >= {"core", "paid_module", "platform_only", "dev_only", "compat"}
+    categories = {item.classification.category for item in classified}
+    if _is_public_core_export():
+        assert "core" in categories
+        assert "platform_only" not in categories
+    else:
+        assert categories >= {"core", "paid_module", "platform_only", "dev_only", "compat"}
     assert all(classify_route(route) is not None for route in routes)
 
 
@@ -58,12 +67,24 @@ def test_ocm1_paid_product_routes_are_not_public_core_allowed() -> None:
         or "apps/agvm_clone_app" in item.route.source
     ]
 
+    if _is_public_core_export():
+        assert all("apps/agvm_clone_app" not in item.route.source for item in classified)
+        return
     assert paid
     assert {item.classification.category for item in paid} == {"paid_module"}
     assert all(not item.classification.public_core_allowed for item in paid)
 
 
 def test_ocm1_ui_modes_are_classified_in_python_and_typescript() -> None:
+    if _is_public_core_export():
+        public_app = ROOT / "agvm_cockpit_prototype" / "src" / "App.tsx"
+        assert public_app.exists()
+        text = public_app.read_text(encoding="utf-8")
+        assert "Local AGVM" in text
+        assert "Use Detwin Cloud" in text
+        assert "Install module" not in text
+        return
+
     mode_rail = ROOT / "agvm_cockpit_prototype" / "src" / "new-ui" / "shell" / "ModeRail.tsx"
     ts_classification = ROOT / "agvm_cockpit_prototype" / "src" / "new-ui" / "modules" / "coreModeClassification.ts"
 
@@ -98,6 +119,10 @@ def test_ocm1_docker_services_are_classified() -> None:
     assert services
     assert set(services) <= set(DOCKER_SERVICE_CLASSIFICATIONS)
     assert all(classify_docker_service(service) is not None for service in services)
+    if _is_public_core_export():
+        assert "agvm_clone_app_api" not in services
+        assert {"agvm_core_api", "agvm_core_ui", "agvm_mcp"} <= set(services)
+        return
     assert DOCKER_SERVICE_CLASSIFICATIONS["agvm_api"].category == "compat"
     assert DOCKER_SERVICE_CLASSIFICATIONS["agvm_ui"].category == "compat"
     assert DOCKER_SERVICE_CLASSIFICATIONS["agvm_mcp"].category == "core"

@@ -5,12 +5,14 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
 API_DIR = ROOT / "agvm_api"
 CLONE_APP_BACKEND_DIR = ROOT / "apps" / "agvm_clone_app" / "backend"
+PUBLIC_EXPORT = (ROOT / ".agvm-public-export-marker").exists()
 for path in (API_DIR, CLONE_APP_BACKEND_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
@@ -71,6 +73,9 @@ def test_ocm7_core_license_router_exposes_activation_without_docker_socket(monke
 
 
 def test_ocm7_clone_app_manifest_requires_valid_signed_module_token(monkeypatch) -> None:
+    if PUBLIC_EXPORT and not CLONE_APP_BACKEND_DIR.exists():
+        pytest.skip("Private Clone App runtime source is not part of the public Core export.")
+
     monkeypatch.setenv("AGVM_LOCAL_LICENSE_SIGNING_SECRET", SECRET)
     monkeypatch.delenv("AGVM_ALLOW_UNSIGNED_MODULE_LICENSE_FIXTURE", raising=False)
 
@@ -96,6 +101,16 @@ def test_ocm7_clone_app_manifest_requires_valid_signed_module_token(monkeypatch)
 
 
 def test_ocm7_compose_files_do_not_auto_install_paid_modules() -> None:
+    if PUBLIC_EXPORT:
+        core_compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+        assert "AGVM_MODULE_LICENSE_STATE" not in core_compose
+        assert "agvm_clone_app" not in core_compose
+        assert "AGVM_CLONE_APP_" not in core_compose
+        assert "AGVM_LOCAL_LICENSE_SIGNING_SECRET" in core_compose
+        assert "AGVM_ALLOW_DEV_LICENSE_FIXTURE" in core_compose
+        return
+
     pro_overlay = (ROOT / "docker-compose.pro.local.yml").read_text(encoding="utf-8")
     module_fragment = (ROOT / "apps" / "agvm_clone_app" / "docker-compose.module.yml").read_text(encoding="utf-8")
     core_compose = (ROOT / "docker-compose.core.yml").read_text(encoding="utf-8")

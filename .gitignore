@@ -17,6 +17,7 @@ dist/
 .env
 .env.*
 !.env.example
+agvm_mcp_server/config.local.json
 data/
 brains/
 local_brains/

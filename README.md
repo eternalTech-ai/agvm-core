@@ -60,6 +60,10 @@ for the full setup flow.
 Start the AGVM API first, then configure your AI app to launch the local stdio
 bridge from this checkout. The generic flow is documented in [Local MCP](docs/local-mcp.md).
 
+```bash
+python -m agvm_mcp_server
+```
+
 - [Codex](docs/mcp-codex.md)
 - [Claude](docs/mcp-claude.md)
 - [Cursor](docs/mcp-cursor.md)

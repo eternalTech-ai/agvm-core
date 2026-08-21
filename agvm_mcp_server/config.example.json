@@ -1,0 +1,64 @@
+{
+  "api_base_url": "http://127.0.0.1:8010",
+  "brain_policy": "fixed",
+  "active_brain_id": "example_local_brain",
+  "default_brain_id": "example_local_brain",
+  "brain_id_hint": null,
+  "brain_display_name": null,
+  "brain_purpose": null,
+  "tenant_id": "local_tenant",
+  "organization_id": "local_org",
+  "user_id": "local_user",
+  "environment_id": "local_self_hosted_dev",
+  "request_timeout_seconds": 180,
+  "tool_permissions": {
+    "read_only": false,
+    "enabled_tools": ["*"],
+    "disabled_tools": [],
+    "allowed_permission_families": [
+      "read_only",
+      "read_only_export",
+      "registry_write",
+      "preview_only",
+      "explicit_apply"
+    ],
+    "blocked_permission_families": [
+      "destructive"
+    ],
+    "allow_mutation_tools": [
+      "grow_source_apply",
+      "grow_apply",
+      "write_memory_commit",
+      "sleep_apply",
+      "evolve_apply",
+      "matrix_calibration_apply"
+    ]
+  },
+  "module_access": {
+    "visibility_policy": "block_unlicensed",
+    "status_source": "local_license_supervisor",
+    "license_state_path": null
+  },
+  "permission_profiles": {
+    "read_only_recall": {
+      "read_only": true,
+      "allowed_permission_families": ["read_only", "read_only_export"],
+      "blocked_permission_families": ["registry_write", "explicit_apply", "destructive"]
+    },
+    "agent_onboarding": {
+      "read_only": false,
+      "allowed_permission_families": ["read_only", "read_only_export", "registry_write"],
+      "blocked_permission_families": ["preview_only", "explicit_apply", "destructive"]
+    },
+    "preview_only_learning": {
+      "read_only": false,
+      "allowed_permission_families": ["read_only", "read_only_export", "registry_write", "preview_only"],
+      "blocked_permission_families": ["explicit_apply", "destructive"]
+    },
+    "full_local_operator": {
+      "read_only": false,
+      "allowed_permission_families": ["read_only", "read_only_export", "registry_write", "preview_only", "explicit_apply"],
+      "blocked_permission_families": ["destructive"]
+    }
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "schema_version": "agvm.local_mcp_server_manifest.v1",
+  "slice": "PR-12M-C",
+  "server_name": "agvm-local-memory-os",
+  "transport": "stdio",
+  "command": "python",
+  "args": ["-m", "agvm_mcp_server"],
+  "working_directory": ".",
+  "api_base_url_default": "http://127.0.0.1:8010",
+  "contract_registry_endpoint": "/mcp/contracts",
+  "tool_call_endpoint_policy": "contract_metadata_endpoint_path_and_http_method",
+  "brain_scope": {
+    "config_keys": ["brain_policy", "active_brain_id", "default_brain_id", "brain_id_hint", "brain_display_name", "brain_purpose"],
+    "env_override": "AGVM_MCP_BRAIN_ID",
+    "env_overrides": ["AGVM_MCP_BRAIN_POLICY", "AGVM_MCP_BRAIN_ID", "AGVM_MCP_BRAIN_ID_HINT", "AGVM_MCP_BRAIN_DISPLAY_NAME", "AGVM_MCP_BRAIN_PURPOSE"],
+    "http_header": "X-AGVM-Brain-Id",
+    "tool_argument": "brain_id",
+    "policies": {
+      "fixed": "tool argument wins; otherwise AGVM_MCP_BRAIN_ID or active/default local MCP config brain is injected",
+      "ai_resolve_existing": "no UI active brain is injected; AI must call list_brains or ensure_brain with create_if_missing=false, then pass the chosen brain_id",
+      "ai_create_if_missing": "no UI active brain is injected; AI must call ensure_brain with create_if_missing=true and activation_policy=return_only, then pass the returned brain_id"
+    }
+  },
+  "hosted_scope": {
+    "config_keys": ["tenant_id", "organization_id", "user_id", "environment_id"],
+    "env_overrides": ["AGVM_MCP_TENANT_ID", "AGVM_MCP_ORGANIZATION_ID", "AGVM_MCP_USER_ID", "AGVM_MCP_ENVIRONMENT_ID"],
+    "http_headers": ["X-AGVM-Tenant-Id", "X-AGVM-Organization-Id", "X-AGVM-User-Id", "X-AGVM-Environment-Id"],
+    "policy": "tenant_id and user_id let the API resolve the hosted default brain when no local brain_id is provided"
+  },
+  "environment": {
+    "AGVM_MCP_CONFIG": "Optional path to agvm_mcp_server/config.local.json",
+    "AGVM_API_BASE_URL": "Optional override for http://127.0.0.1:8010",
+    "AGVM_MCP_BRAIN_POLICY": "Optional brain policy: fixed, ai_resolve_existing, or ai_create_if_missing",
+    "AGVM_MCP_BRAIN_ID": "Optional override for active/default brain id",
+    "AGVM_MCP_BRAIN_ID_HINT": "Optional stable brain id hint used by ensure_brain in AI-managed policies",
+    "AGVM_MCP_BRAIN_DISPLAY_NAME": "Optional display name injected into ensure_brain in AI-managed policies",
+    "AGVM_MCP_BRAIN_PURPOSE": "Optional purpose injected into ensure_brain in AI-managed policies",
+    "AGVM_MCP_TENANT_ID": "Optional hosted tenant id for managed or hosted-dev scope",
+    "AGVM_MCP_ORGANIZATION_ID": "Optional hosted organization id",
+    "AGVM_MCP_USER_ID": "Optional hosted user id for default-brain resolution",
+    "AGVM_MCP_ENVIRONMENT_ID": "Optional hosted environment id",
+    "AGVM_MCP_READ_ONLY": "Optional true/false override for mutation tool execution; tools remain visible and blocked calls return structured reasons",
+    "AGVM_MCP_ALLOWED_PERMISSION_FAMILIES": "Optional comma-separated override such as read_only,read_only_export,registry_write,preview_only",
+    "AGVM_MCP_BLOCKED_PERMISSION_FAMILIES": "Optional comma-separated override such as explicit_apply,destructive",
+    "AGVM_MCP_MODULE_VISIBILITY_POLICY": "Optional module tool visibility policy: metadata_only, hide_unlicensed, or block_unlicensed",
+    "AGVM_MCP_LOCAL_LICENSE_PATH": "Optional explicit path to agvm_local_license.json; defaults to AGVM_LAB_DATA_DIR/agvm_local_license.json inside the API container",
+    "AGVM_MCP_TIMEOUT_SECONDS": "Optional HTTP timeout override"
+  },
+  "module_access": {
+    "visibility_policy_default_for_generated_local_configs": "block_unlicensed",
+    "status_source": "local_license_supervisor",
+    "required_module_field": "tool_registration.required_module_id",
+    "license_state_file": "AGVM_LAB_DATA_DIR/agvm_local_license.json",
+    "policies": {
+      "metadata_only": "Do not enforce local module leases; expose registry metadata only.",
+      "hide_unlicensed": "Hide module-required tools from tools/list and block direct calls when the local lease is missing, invalid, expired or lacks that module.",
+      "block_unlicensed": "Keep module-required tools visible for discoverability but block direct calls when the local lease is missing, invalid, expired or lacks that module."
+    }
+  },
+  "permission_families": {
+    "read_only": "Safe read tools and guide calls",
+    "read_only_export": "Read tools that may return larger exported packages",
+    "registry_write": "Brain registry create/select/ensure operations",
+    "preview_only": "Preview memory formation or maintenance without applying",
+    "explicit_apply": "Apply memory writes, grow, sleep, evolve or calibration after approval",
+    "destructive": "Delete/restore/destructive admin operations; blocked by default"
+  },
+  "client_examples": {
+    "claude_desktop": {
+      "mcpServers": {
+        "agvm": {
+          "command": "python",
+          "args": ["-m", "agvm_mcp_server"],
+          "cwd": ".",
+          "env": {
+            "AGVM_MCP_CONFIG": "agvm_mcp_server/config.local.json"
+          }
+        }
+      }
+    },
+    "codex_or_generic_stdio": {
+      "name": "agvm",
+      "command": "python",
+      "args": ["-m", "agvm_mcp_server"],
+      "cwd": ".",
+      "env": {
+        "AGVM_MCP_CONFIG": "agvm_mcp_server/config.local.json"
+      }
+    }
+  }
+}

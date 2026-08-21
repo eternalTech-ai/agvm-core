@@ -626,17 +626,13 @@ def test_pr12m_c_stdio_protocol_initialize_and_notification_handling() -> None:
 def test_pr12m_c_config_manifest_and_docs_close_slice() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     config_example = json.loads(CONFIG_EXAMPLE.read_text(encoding="utf-8"))
-    report = REPORT.read_text(encoding="utf-8")
-    spec = SPEC.read_text(encoding="utf-8")
-    index = INDEX.read_text(encoding="utf-8")
-    master = MASTER.read_text(encoding="utf-8")
-    roadmap = ROADMAP.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
     gitignore = GITIGNORE.read_text(encoding="utf-8")
+    internal_docs_available = all(path.exists() for path in (REPORT, SPEC, INDEX, MASTER, ROADMAP))
 
     loaded = load_config(CONFIG_EXAMPLE)
     assert loaded.api_base_url == "http://127.0.0.1:8010"
-    assert loaded.selected_brain_id == "simone_massaro"
+    assert loaded.selected_brain_id == "example_local_brain"
     assert "registry_write" in loaded.tool_permissions.allowed_permission_families
     assert "preview_only" in loaded.tool_permissions.allowed_permission_families
     assert "destructive" in loaded.tool_permissions.blocked_permission_families
@@ -654,10 +650,16 @@ def test_pr12m_c_config_manifest_and_docs_close_slice() -> None:
     assert "preview_only_learning" in config_example["permission_profiles"]
     assert "explicit_apply" in config_example["permission_profiles"]["preview_only_learning"]["blocked_permission_families"]
     assert "agvm_mcp_server/config.local.json" in gitignore
-    assert "local stdio MCP smoke" in report
-    assert "python -m agvm_mcp_server" in report
-    assert "Local MCP Proof" in spec
-    assert "brain_health" in index
-    assert "MCP" in master
-    assert "Phase 8 - Local MCP Proof" in roadmap
     assert "python -m agvm_mcp_server" in readme
+    if internal_docs_available:
+        report = REPORT.read_text(encoding="utf-8")
+        spec = SPEC.read_text(encoding="utf-8")
+        index = INDEX.read_text(encoding="utf-8")
+        master = MASTER.read_text(encoding="utf-8")
+        roadmap = ROADMAP.read_text(encoding="utf-8")
+        assert "local stdio MCP smoke" in report
+        assert "python -m agvm_mcp_server" in report
+        assert "Local MCP Proof" in spec
+        assert "brain_health" in index
+        assert "MCP" in master
+        assert "Phase 8 - Local MCP Proof" in roadmap
