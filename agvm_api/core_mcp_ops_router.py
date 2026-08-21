@@ -13,15 +13,19 @@ from fastapi import APIRouter, HTTPException
 
 from brain_registry import BrainRegistryError, resolve_brain_scope
 from derivation import persist_selection, preview_bundle
+from local_module_manifest_router import MAINTAIN_MODULE_ID, ensure_local_module_entitled
 from retrieval import build_index
 from runtime_scope import use_runtime_brain
 from schemas import (
+    McpClarificationRequest,
     McpGrowApplyRequest,
     McpGrowSourceRequest,
     McpGrowToolExecutionResponse,
     McpMaintenanceApplyRequest,
     McpMaintenanceRequest,
     McpMaintenanceToolExecutionResponse,
+    McpWriteMemoryCommitRequest,
+    McpWriteMemoryPreviewRequest,
 )
 from sqlite_store import bootstrap_runtime_store, fetch_atlas, fetch_graph_snapshot, replace_runtime_graph
 
@@ -70,27 +74,50 @@ def create_core_mcp_ops_router() -> APIRouter:
     def grow_status(payload: McpGrowApplyRequest) -> McpGrowToolExecutionResponse:
         return _grow_source_status("grow_status", payload)
 
+    @router.post("/memory/mcp/write-memory-preview", response_model=McpGrowToolExecutionResponse, response_model_exclude_none=True)
+    @router.post("/mcp/write-memory-preview", response_model=McpGrowToolExecutionResponse, response_model_exclude_none=True)
+    def write_memory_preview(payload: McpWriteMemoryPreviewRequest) -> McpGrowToolExecutionResponse:
+        return _write_memory_preview("write_memory_preview", payload)
+
+    @router.post("/memory/mcp/write-memory-commit", response_model=McpGrowToolExecutionResponse, response_model_exclude_none=True)
+    @router.post("/mcp/write-memory-commit", response_model=McpGrowToolExecutionResponse, response_model_exclude_none=True)
+    def write_memory_commit(payload: McpWriteMemoryCommitRequest) -> McpGrowToolExecutionResponse:
+        return _write_memory_commit("write_memory_commit", payload)
+
+    @router.post("/memory/mcp/ask-memory-clarification", response_model=McpGrowToolExecutionResponse, response_model_exclude_none=True)
+    @router.post("/mcp/ask-memory-clarification", response_model=McpGrowToolExecutionResponse, response_model_exclude_none=True)
+    def ask_memory_clarification(payload: McpClarificationRequest) -> McpGrowToolExecutionResponse:
+        return _ask_memory_clarification("ask_memory_clarification", payload)
+
     @router.post("/memory/mcp/sleep-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/sleep-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def sleep_preview(payload: McpMaintenanceRequest) -> McpMaintenanceToolExecutionResponse:
+        _ensure_maintain_studio_entitled()
         return _maintenance_preview("sleep_preview", "sleep", payload)
 
     @router.post("/memory/mcp/evolve-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/evolve-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def evolve_preview(payload: McpMaintenanceRequest) -> McpMaintenanceToolExecutionResponse:
+        _ensure_maintain_studio_entitled()
         return _maintenance_preview("evolve_preview", "evolve", payload)
 
     @router.post("/memory/mcp/sleep-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/sleep-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def sleep_apply(payload: McpMaintenanceApplyRequest) -> McpMaintenanceToolExecutionResponse:
+        _ensure_maintain_studio_entitled()
         return _maintenance_apply("sleep_apply", "sleep", payload)
 
     @router.post("/memory/mcp/evolve-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/evolve-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def evolve_apply(payload: McpMaintenanceApplyRequest) -> McpMaintenanceToolExecutionResponse:
+        _ensure_maintain_studio_entitled()
         return _maintenance_apply("evolve_apply", "evolve", payload)
 
     return router
+
+
+def _ensure_maintain_studio_entitled() -> None:
+    ensure_local_module_entitled(MAINTAIN_MODULE_ID)
 
 
 def _utc_now() -> str:
@@ -102,6 +129,10 @@ def _resolve_brain_record(brain_id: str | None = None) -> dict[str, Any]:
         return resolve_brain_scope(brain_id=str(brain_id or "").strip() or None)
     except BrainRegistryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _brain_record_id(record: dict[str, Any]) -> str:
+    return str(record.get("brain_id") or record.get("id") or "").strip()
 
 
 def _input_mode(payload: McpGrowSourceRequest) -> str:
@@ -130,7 +161,7 @@ def _selected_preview_ids(bundle: dict[str, Any], payload_ids: list[str]) -> lis
 def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGrowToolExecutionResponse:
     started = time.perf_counter()
     brain_record = _resolve_brain_record(payload.brain_id)
-    brain_id = str(brain_record.get("id") or "")
+    brain_id = _brain_record_id(brain_record)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
@@ -209,7 +240,7 @@ def _grow_source_apply(tool_name: str, payload: McpGrowApplyRequest) -> McpGrowT
     if not payload.confirm_apply:
         return _grow_blocked(tool_name, brain_id, "confirm_apply_required", started, preview_bundle=bundle)
     brain_record = _resolve_brain_record(brain_id)
-    resolved_brain_id = str(brain_record.get("id") or "")
+    resolved_brain_id = _brain_record_id(brain_record)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
@@ -284,6 +315,161 @@ def _grow_source_status(tool_name: str, payload: McpGrowApplyRequest) -> McpGrow
     )
 
 
+def _write_memory_preview(tool_name: str, payload: McpWriteMemoryPreviewRequest) -> McpGrowToolExecutionResponse:
+    started = time.perf_counter()
+    brain_record = _resolve_brain_record(payload.brain_id)
+    brain_id = _brain_record_id(brain_record)
+    with use_runtime_brain(brain_record):
+        bootstrap_runtime_store()
+        graph = fetch_graph_snapshot()
+        bundle = preview_bundle(
+            payload.text,
+            payload.input_mode,
+            graph,
+            build_index(list(graph.get("nodes") or [])),
+            fetch_atlas(),
+            source_label=payload.source_label,
+            source_type=payload.source_type or "self_memory",
+            source_trust=str(payload.source_trust or "user_asserted"),
+            learning_mode=payload.learning_mode,
+            question_limit=payload.question_limit,
+        )
+    return McpGrowToolExecutionResponse(
+        schema_version="agvm.mcp_grow_tool_output.v1",
+        brain_id=brain_id,
+        tool_name=tool_name,
+        status="preview_ready",
+        preview_bundle=bundle,
+        cognitive_write_plan=dict(bundle.get("cognitive_write_plan") or {}),
+        learning_policy=dict(bundle.get("learning_policy") or {}),
+        write_trace=dict(bundle.get("write_trace") or {}),
+        memory_operation_lifecycle_contract={
+            "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
+            "operation": "write_memory",
+            "phase": "preview",
+            "mutates_memory": False,
+            "next_action": "call write_memory_commit with preview_bundle as bundle and confirm_apply=true",
+        },
+        completeness={
+            "preview_generated": True,
+            "selected_preview_count": len(_selected_preview_ids(bundle, [])),
+        },
+        mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
+        budget={"credits_required": 0, "runtime": "local_core"},
+    )
+
+
+def _write_memory_commit(tool_name: str, payload: McpWriteMemoryCommitRequest) -> McpGrowToolExecutionResponse:
+    started = time.perf_counter()
+    bundle = payload.bundle
+    brain_id = str(payload.brain_id or "").strip() or None
+    if bundle is None and payload.text:
+        preview = _write_memory_preview(
+            "write_memory_preview",
+            McpWriteMemoryPreviewRequest(
+                brain_id=brain_id,
+                text=payload.text,
+                input_mode=payload.input_mode,
+                source_label=payload.source_label,
+                source_type=payload.source_type,
+                source_trust=payload.source_trust,
+                learning_mode=payload.learning_mode,
+                question_limit=payload.question_limit,
+            ),
+        )
+        bundle = dict(preview.preview_bundle or {})
+        brain_id = preview.brain_id
+    if not bundle:
+        return _grow_blocked(tool_name, brain_id, "preview_bundle_or_text_required", started)
+    if not payload.confirm_apply:
+        return _grow_blocked(tool_name, brain_id, "confirm_apply_required", started, preview_bundle=bundle)
+    brain_record = _resolve_brain_record(brain_id)
+    resolved_brain_id = _brain_record_id(brain_record)
+    with use_runtime_brain(brain_record):
+        bootstrap_runtime_store()
+        graph = fetch_graph_snapshot()
+        selected_ids = _selected_preview_ids(bundle, payload.selected_preview_ids)
+        updated_graph, persisted_ids, persisted_edge_count, merged_ids, learning_policy = persist_selection(
+            bundle,
+            selected_ids,
+            graph,
+            build_index(list(graph.get("nodes") or [])),
+            learning_mode=payload.learning_mode,
+            clarification_answers=payload.clarification_answers,
+            approved_preview_ids=payload.approved_preview_ids,
+            question_limit=payload.question_limit,
+        )
+        replace_runtime_graph(updated_graph)
+    return McpGrowToolExecutionResponse(
+        schema_version="agvm.mcp_grow_tool_output.v1",
+        brain_id=resolved_brain_id,
+        tool_name=tool_name,
+        status="applied",
+        preview_bundle=bundle,
+        persist_result={
+            "schema_version": "agvm.core_write_persist_result.v1",
+            "persisted_node_ids": persisted_ids,
+            "persisted_edge_count": persisted_edge_count,
+            "merged_into_existing_ids": merged_ids,
+            "selected_preview_ids": selected_ids,
+        },
+        learning_policy=learning_policy,
+        memory_operation_lifecycle_contract={
+            "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
+            "operation": "write_memory",
+            "phase": "applied",
+            "confirm_apply": True,
+            "partial_merge_allowed": False,
+        },
+        completeness={"applied": True, "persisted_node_count": len(persisted_ids)},
+        mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
+        budget={"credits_required": 0, "runtime": "local_core"},
+    )
+
+
+def _ask_memory_clarification(tool_name: str, payload: McpClarificationRequest) -> McpGrowToolExecutionResponse:
+    started = time.perf_counter()
+    text = payload.text or payload.raw_input or payload.user_instruction or ""
+    questions = [
+        {
+            "question_id": "clarify-source-and-scope",
+            "question": "What should this memory be used for, and should it be treated as a fact, preference, project note, or source-backed evidence?",
+            "required": True,
+        }
+    ]
+    if payload.source_uri:
+        questions.append(
+            {
+                "question_id": "clarify-source-trust",
+                "question": "Should this source be treated as verified public evidence or as user-provided context?",
+                "required": False,
+            }
+        )
+    return McpGrowToolExecutionResponse(
+        schema_version="agvm.mcp_grow_tool_output.v1",
+        brain_id=payload.brain_id,
+        tool_name=tool_name,
+        status="asking_clarification",
+        clarification_questions=questions[: max(1, min(payload.question_limit, len(questions)))],
+        source_investigation={
+            "schema_version": "agvm.mcp_clarification_request.v1",
+            "input_preview": text[:240],
+            "source_label": payload.source_label,
+            "source_uri": payload.source_uri,
+        },
+        memory_operation_lifecycle_contract={
+            "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
+            "operation": "write_memory",
+            "phase": "clarification",
+            "mutates_memory": False,
+            "next_action": "answer clarification questions, then call write_memory_preview or grow_source_preview",
+        },
+        completeness={"question_count": len(questions[: max(1, min(payload.question_limit, len(questions)))])},
+        mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
+        budget={"credits_required": 0, "runtime": "local_core"},
+    )
+
+
 def _grow_blocked(
     tool_name: str,
     brain_id: str | None,
@@ -312,7 +498,7 @@ def _grow_blocked(
 def _maintenance_preview(tool_name: str, mode: str, payload: McpMaintenanceRequest) -> McpMaintenanceToolExecutionResponse:
     started = time.perf_counter()
     brain_record = _resolve_brain_record(payload.brain_id)
-    brain_id = str(brain_record.get("id") or "")
+    brain_id = _brain_record_id(brain_record)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
@@ -346,7 +532,7 @@ def _maintenance_apply(tool_name: str, mode: str, payload: McpMaintenanceApplyRe
             started,
         )
     brain_record = _resolve_brain_record(payload.brain_id)
-    brain_id = str(brain_record.get("id") or "")
+    brain_id = _brain_record_id(brain_record)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()

@@ -53,8 +53,6 @@ def test_ocm1_paid_product_routes_are_not_public_core_allowed() -> None:
         item
         for item in classified
         if item.route.path.startswith("/clone-app/")
-        or item.route.path.startswith("/mcp/grow-")
-        or item.route.path.startswith("/memory/mcp/grow-")
         or item.route.path.startswith("/mcp/sleep-")
         or item.route.path.startswith("/mcp/evolve-")
         or "apps/agvm_clone_app" in item.route.source
@@ -76,7 +74,9 @@ def test_ocm1_ui_modes_are_classified_in_python_and_typescript() -> None:
     assert set(modes) == set(UI_MODE_CLASSIFICATIONS)
     assert set(modes) == set(ts_modes)
     assert UI_MODE_CLASSIFICATIONS["clone_app"].category == "paid_module"
-    assert UI_MODE_CLASSIFICATIONS["grow"].category == "paid_module"
+    assert UI_MODE_CLASSIFICATIONS["platform"].category == "platform_only"
+    assert UI_MODE_CLASSIFICATIONS["grow"].category == "core"
+    assert UI_MODE_CLASSIFICATIONS["grow"].public_core_allowed is True
     assert UI_MODE_CLASSIFICATIONS["evolve"].category == "paid_module"
     assert UI_MODE_CLASSIFICATIONS["retrieve"].public_core_allowed is True
 
@@ -88,7 +88,7 @@ def test_ocm1_mcp_tools_are_classified() -> None:
     assert not missing
     assert classify_mcp_tool("retrieve_context").category == "core"  # type: ignore[union-attr]
     assert classify_mcp_tool("write_memory_commit").category == "core"  # type: ignore[union-attr]
-    assert classify_mcp_tool("grow_apply").category == "paid_module"  # type: ignore[union-attr]
+    assert classify_mcp_tool("grow_apply").category == "core"  # type: ignore[union-attr]
     assert classify_mcp_tool("sleep_apply").category == "paid_module"  # type: ignore[union-attr]
 
 

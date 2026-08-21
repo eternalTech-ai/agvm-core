@@ -133,11 +133,11 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         exact=("/agent-demo/chat-turn", "/mcp/agent-chat-turn"),
     ),
     RouteRule(
-        name="mcp_core_grow_sleep_evolve",
+        name="mcp_core_grow",
         category="core",
         owner="agvm_core_mcp",
         public_core_allowed=True,
-        rationale="Raw local MCP Grow/Sleep/Evolve operations remain public core when they enforce preview and explicit apply policy.",
+        rationale="Raw local MCP Grow operations remain public core when they enforce preview and explicit apply policy.",
         exact=(
             "/memory/mcp/grow-source-preview",
             "/mcp/grow-source-preview",
@@ -153,29 +153,28 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
             "/mcp/grow-source-status",
             "/memory/mcp/grow-status",
             "/mcp/grow-status",
-            "/memory/mcp/sleep-preview",
-            "/mcp/sleep-preview",
-            "/memory/mcp/evolve-preview",
-            "/mcp/evolve-preview",
-            "/memory/mcp/sleep-apply",
-            "/mcp/sleep-apply",
-            "/memory/mcp/evolve-apply",
-            "/mcp/evolve-apply",
         ),
     ),
     RouteRule(
         name="grow_source_product",
-        category="paid_module",
-        owner="agvm_grow_studio",
-        public_core_allowed=False,
-        rationale="Source investigation and Grow Studio orchestration are Pro module surfaces.",
+        category="core",
+        owner="agvm_core_grow",
+        public_core_allowed=True,
+        rationale="Core Grow MCP/source orchestration is included in Local AGVM.",
         prefixes=(
-            "/grow-studio/",
             "/source-investigation/",
             "/memory/source-investigation/",
             "/mcp/grow-",
             "/memory/mcp/grow-",
         ),
+    ),
+    RouteRule(
+        name="grow_studio_sidecar",
+        category="paid_module",
+        owner="agvm_grow_studio",
+        public_core_allowed=False,
+        rationale="The legacy Grow Studio sidecar service is not part of the public core image.",
+        prefixes=("/grow-studio/",),
     ),
     RouteRule(
         name="maintain_product",
@@ -202,6 +201,7 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
             "/memory/evolve",
             "/memory/rebuild-region-summaries",
             "/memory/correct-after-query",
+            "/memory/correct-after-query/plan",
         ),
     ),
     RouteRule(
@@ -355,9 +355,10 @@ UI_MODE_CLASSIFICATIONS: dict[str, SurfaceClassification] = {
     "mcp_setup": SurfaceClassification("core", "agvm_core_mcp", True, "MCP setup is required for local open-core adoption."),
     "mcp_raw_console": SurfaceClassification("core", "agvm_core_mcp_raw_console", True, "Raw MCP contract console lets public-core users call core MCP tools without paid module UI."),
     "settings": SurfaceClassification("core", "agvm_core_settings", True, "Minimal local settings stay in core."),
+    "platform": SurfaceClassification("platform_only", "agvm_platform", False, "Platform/account controls are private hosted surfaces."),
     "clone_app": SurfaceClassification("paid_module", "agvm_clone_app", False, "Clone App is a paid module."),
     "chat": SurfaceClassification("paid_module", "agvm_agent_chat", False, "Non-core assistant chat should become an optional module."),
-    "grow": SurfaceClassification("paid_module", "agvm_grow_studio", False, "Grow Studio rich source workflow is Pro."),
+    "grow": SurfaceClassification("core", "agvm_core_grow", True, "Grow is included in Local AGVM Core."),
     "evolve": SurfaceClassification("paid_module", "agvm_maintain_studio", False, "Maintain/Sleep/Evolve rich workflow is Pro."),
 }
 
@@ -374,6 +375,24 @@ DOCKER_SERVICE_CLASSIFICATIONS: dict[str, SurfaceClassification] = {
         "agvm_core_ui_host",
         False,
         "Current UI image is a transitional cockpit that still imports paid module UI directly.",
+    ),
+    "agvm_platform": SurfaceClassification(
+        "platform_only",
+        "agvm_platform",
+        False,
+        "Platform account, billing, CRM and cloud-control services are not part of public core.",
+    ),
+    "agvm_cloud_ui": SurfaceClassification(
+        "platform_only",
+        "agvm_cloud_agvm_ui",
+        False,
+        "Cloud AGVM UI is served as a hosted platform surface.",
+    ),
+    "agvm_platform_postgres": SurfaceClassification(
+        "platform_only",
+        "agvm_platform",
+        False,
+        "Platform Postgres is hosted account/control-plane infrastructure.",
     ),
     "agvm_mcp": SurfaceClassification(
         "core",
@@ -477,8 +496,8 @@ def classify_mcp_tool(tool_name: str) -> SurfaceClassification | None:
     if clean in {"write_memory_preview", "write_memory_commit", "ask_memory_clarification", "brain_health"}:
         return SurfaceClassification("core", "agvm_core_mcp", True, "Raw memory write/health primitives stay core with explicit permission policy.")
     required_module_id = required_module_id_for_tool_name(clean)
-    if required_module_id == GROW_MODULE_ID:
-        return SurfaceClassification("paid_module", "agvm_grow_studio", False, "Grow orchestration tools belong to the Pro Grow module.")
+    if clean.startswith("grow_"):
+        return SurfaceClassification("core", "agvm_core_grow", True, "Grow orchestration tools are included in Local AGVM Core.")
     if required_module_id == MAINTAIN_MODULE_ID:
         return SurfaceClassification("paid_module", "agvm_maintain_studio", False, "Maintenance and Matrix tools belong to the Pro Maintain module.")
     return None

@@ -4277,20 +4277,22 @@ def apply_matrix_calibration_position_updates_with_revisions(
 
 
 def write_legacy_exports(graph: dict[str, Any], atlas_payload: dict[str, Any]) -> None:
+    nodes = list(graph.get("nodes") or [])
+    edges = list(graph.get("edges") or [])
     atomic_write_json(
         current_graph_path(),
         {
             "version": graph.get("version", GRAPH_VERSION),
             "graph_name": graph.get("graph_name", APP_NAME),
-            "nodes": [],
-            "edges": [],
+            "nodes": nodes,
+            "edges": edges,
             "meta": {
                 **dict(graph.get("meta") or {}),
                 "runtime_source": "sqlite",
                 "canonical_storage": "sqlite",
-                "export_note": "Legacy JSON export intentionally keeps hot-path data empty. Use runtime DB-backed endpoints instead.",
-                "node_count": len(graph.get("nodes") or []),
-                "edge_count": len(graph.get("edges") or []),
+                "export_note": "Legacy JSON export is synchronized from the SQLite runtime store for local compatibility.",
+                "node_count": len(nodes),
+                "edge_count": len(edges),
             },
         },
     )
@@ -4305,7 +4307,7 @@ def write_legacy_exports(graph: dict[str, Any], atlas_payload: dict[str, Any]) -
         },
     )
     atomic_write_json(current_atlas_path(), atlas_payload)
-    atomic_write_json(current_graph_view_path(), build_graph_view(graph, max_nodes=min(1600, max(100, len(graph.get("nodes") or [])))))
+    atomic_write_json(current_graph_view_path(), build_graph_view(graph, max_nodes=min(1600, max(100, len(nodes)))))
 
 
 def _sample_node_ids_by_bucket(rows: list[sqlite3.Row], max_nodes: int) -> list[str]:

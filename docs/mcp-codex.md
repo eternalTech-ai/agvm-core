@@ -42,7 +42,7 @@ AGVM_MCP_BRAIN_PURPOSE = "Persistent MCP memory for this Codex project."
 AGVM_MCP_READ_ONLY = "false"
 AGVM_MCP_ALLOWED_PERMISSION_FAMILIES = "read_only,read_only_export,registry_write,preview_only,explicit_apply"
 AGVM_MCP_BLOCKED_PERMISSION_FAMILIES = "destructive"
-AGVM_MCP_MODULE_VISIBILITY_POLICY = "hide_unlicensed"
+AGVM_MCP_MODULE_VISIBILITY_POLICY = "block_unlicensed"
 ```
 
 Do not put provider API keys in the MCP bridge config unless you intentionally
@@ -81,7 +81,8 @@ blocked.
 
 ## Module Tool Visibility
 
-`AGVM_MCP_MODULE_VISIBILITY_POLICY=hide_unlicensed` is the recommended local
-default. Core memory tools remain visible. Advanced Clone, Teach and Maintain
-tools are Detwin Cloud capabilities for this release and should not appear as
-local installable tools in the public Core checkout.
+`AGVM_MCP_MODULE_VISIBILITY_POLICY=block_unlicensed` is the recommended local
+default. Core memory tools remain executable. Advanced Clone, Teach and
+Maintain tools remain visible in the MCP catalog for discoverability, but direct
+local calls return a structured Detwin Cloud/account/credits action contract
+until the required entitlement is active.

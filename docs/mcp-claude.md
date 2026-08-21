@@ -36,7 +36,7 @@ Use the AGVM Core checkout as `cwd`. That is how Claude can import and launch
         "AGVM_MCP_READ_ONLY": "false",
         "AGVM_MCP_ALLOWED_PERMISSION_FAMILIES": "read_only,read_only_export,registry_write,preview_only,explicit_apply",
         "AGVM_MCP_BLOCKED_PERMISSION_FAMILIES": "destructive",
-        "AGVM_MCP_MODULE_VISIBILITY_POLICY": "hide_unlicensed"
+        "AGVM_MCP_MODULE_VISIBILITY_POLICY": "block_unlicensed"
       }
     }
   }
@@ -52,5 +52,7 @@ path and `AGVM_API_BASE_URL`.
 Keep provider API keys in `.env` or backend-managed environment storage unless
 you intentionally want Claude's MCP child process to receive the secret.
 
-`AGVM_MCP_MODULE_VISIBILITY_POLICY=hide_unlicensed` keeps Core memory tools
-visible and keeps advanced Detwin Cloud module tools out of the local tool list.
+`AGVM_MCP_MODULE_VISIBILITY_POLICY=block_unlicensed` keeps Core memory tools
+executable and keeps advanced Detwin Cloud module tools visible in the local
+tool list. Calls to paid tools return a structured Detwin Cloud/account/credits
+action contract until the required entitlement is active.

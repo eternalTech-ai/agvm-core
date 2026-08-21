@@ -414,7 +414,7 @@ def test_pr12m_c_tools_call_uses_contract_endpoint_method_and_registry_scope() -
     }
 
 
-def test_pr12m_c_read_only_config_hides_and_blocks_mutation_tools() -> None:
+def test_pr12m_c_read_only_config_lists_and_blocks_mutation_tools() -> None:
     http_server, handler, base_url = _stub_api()
     try:
         server = AgvmMcpServer(
@@ -437,18 +437,59 @@ def test_pr12m_c_read_only_config_hides_and_blocks_mutation_tools() -> None:
         _shutdown(http_server)
 
     listed_names = [tool["name"] for tool in listed["result"]["tools"]]  # type: ignore[index]
-    assert "write_memory_commit" not in listed_names
-    assert "grow_source_apply" not in listed_names
-    assert "matrix_calibration_apply" not in listed_names
+    assert "write_memory_commit" in listed_names
+    assert "grow_source_apply" in listed_names
+    assert "matrix_calibration_apply" in listed_names
     assert "list_brains" in listed_names
     assert "active_brain" in listed_names
     assert "get_agvm_usage_guide" in listed_names
-    assert "create_brain" not in listed_names
-    assert "select_brain" not in listed_names
-    assert "ensure_brain" not in listed_names
+    assert "create_brain" in listed_names
+    assert "select_brain" in listed_names
+    assert "ensure_brain" in listed_names
     assert called is not None
     assert called["result"]["isError"] is True
     assert called["result"]["structuredContent"]["reason"] == "mutation_tool_blocked_by_read_only_local_mcp_config"
+    assert handler.post_requests == []
+
+
+def test_pr12m_c_default_module_policy_lists_paid_tools_but_blocks_unlicensed_calls() -> None:
+    http_server, handler, base_url = _stub_api()
+    try:
+        server = AgvmMcpServer(
+            AgvmMcpConfig(
+                api_base_url=base_url,
+                active_brain_id="alpha_brain",
+            )
+        )
+        listed = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        called = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "sleep_preview", "arguments": {"max_nodes_considered": 20}},
+            }
+        )
+    finally:
+        _shutdown(http_server)
+
+    listed_names = [tool["name"] for tool in listed["result"]["tools"]]  # type: ignore[index]
+    assert "sleep_preview" in listed_names
+    assert "evolve_preview" in listed_names
+    assert "matrix_calibration_preview" in listed_names
+    assert called is not None
+    assert called["result"]["isError"] is True
+    payload = called["result"]["structuredContent"]
+    assert payload["reason"] == "module_tool_not_enabled_by_local_mcp_lease"
+    assert payload["data"]["visibility_policy"] == "block_unlicensed"
+    assert payload["data"]["required_module_id"] == "agvm_maintain_studio"
+    action_contract = payload["data"]["action_contract"]
+    assert action_contract["schema_version"] == "agvm.local_mcp_paid_tool_action.v1"
+    assert action_contract["action"] == "use_detwin_cloud_for_advanced_tool"
+    assert action_contract["requires_account"] is True
+    assert action_contract["requires_credits"] is True
+    assert action_contract["cloud_workspace_url"].startswith("https://cloud.detwin.ai/")
+    assert "Detwin Cloud" in payload["data"]["recovery"]
     assert handler.post_requests == []
 
 
@@ -498,8 +539,8 @@ def test_pr12m_c_permission_families_allow_registry_and_preview_without_apply() 
     assert "ensure_brain" in listed_names
     assert "create_brain" in listed_names
     assert "grow_source_preview" in listed_names
-    assert "write_memory_commit" not in listed_names
-    assert "grow_apply" not in listed_names
+    assert "write_memory_commit" in listed_names
+    assert "grow_apply" in listed_names
     assert ensure_response is not None
     assert ensure_response["result"]["isError"] is False
     assert preview_response is not None
@@ -514,7 +555,7 @@ def test_pr12m_c_permission_families_allow_registry_and_preview_without_apply() 
 def test_pr12m_c_destructive_permission_family_is_blocked_by_default() -> None:
     permissions = ToolPermissions()
 
-    assert permissions.is_visible("delete_brain", permission_family="destructive") is False
+    assert permissions.is_visible("delete_brain", permission_family="destructive") is True
     can_call, reason = permissions.can_call("delete_brain", permission_family="destructive")
     assert can_call is False
     assert reason == "permission_family_blocked_by_local_mcp_config"
@@ -600,16 +641,16 @@ def test_pr12m_c_config_manifest_and_docs_close_slice() -> None:
     assert "preview_only" in loaded.tool_permissions.allowed_permission_families
     assert "destructive" in loaded.tool_permissions.blocked_permission_families
     assert "write_memory_commit" in loaded.tool_permissions.allow_mutation_tools
-    assert loaded.module_access.visibility_policy == "hide_unlicensed"
+    assert loaded.module_access.visibility_policy == "block_unlicensed"
     assert manifest["schema_version"] == "agvm.local_mcp_server_manifest.v1"
     assert manifest["transport"] == "stdio"
     assert manifest["contract_registry_endpoint"] == "/mcp/contracts"
     assert manifest["tool_call_endpoint_policy"] == "contract_metadata_endpoint_path_and_http_method"
     assert manifest["module_access"]["required_module_field"] == "tool_registration.required_module_id"
-    assert manifest["module_access"]["visibility_policy_default_for_generated_local_configs"] == "hide_unlicensed"
+    assert manifest["module_access"]["visibility_policy_default_for_generated_local_configs"] == "block_unlicensed"
     assert "registry_write" in manifest["permission_families"]
     assert config_example["tool_permissions"]["enabled_tools"] == ["*"]
-    assert config_example["module_access"]["visibility_policy"] == "hide_unlicensed"
+    assert config_example["module_access"]["visibility_policy"] == "block_unlicensed"
     assert "preview_only_learning" in config_example["permission_profiles"]
     assert "explicit_apply" in config_example["permission_profiles"]["preview_only_learning"]["blocked_permission_families"]
     assert "agvm_mcp_server/config.local.json" in gitignore

@@ -16,6 +16,13 @@ FRAMEWORK_ROUTE_PATHS = {
     "/redoc",
 }
 
+INTERNAL_SERVICE_ROUTE_PATHS = {
+    "/internal/hosted-memory/capabilities",
+}
+INTERNAL_SERVICE_ROUTE_PREFIXES = (
+    "/memory/brains/",
+)
+
 MODULE_OWNER_ENV = {
     "agvm_agent_chat": "AGVM_ENABLE_MODULE_AGENT_CHAT",
     "agvm_clone_app": "AGVM_ENABLE_MODULE_CLONE_APP",
@@ -94,6 +101,26 @@ def route_decision(path: str, settings: EditionSettings) -> RuntimeRouteDecision
     normalized = str(path or "").strip() or "/"
     if normalized in FRAMEWORK_ROUTE_PATHS:
         return RuntimeRouteDecision(True, "framework", "fastapi", normalized, "framework route")
+    if normalized in INTERNAL_SERVICE_ROUTE_PATHS:
+        return RuntimeRouteDecision(
+            settings.edition in {"cloud", "pro", "dev"},
+            "internal_service",
+            "hosted_mcp",
+            normalized,
+            "signed internal service route"
+            if settings.edition in {"cloud", "pro", "dev"}
+            else "internal service route excluded from public core",
+        )
+    if any(normalized.startswith(prefix) for prefix in INTERNAL_SERVICE_ROUTE_PREFIXES):
+        return RuntimeRouteDecision(
+            settings.edition in {"cloud", "pro", "dev"},
+            "internal_service",
+            "hosted_mcp",
+            normalized,
+            "signed internal service route"
+            if settings.edition in {"cloud", "pro", "dev"}
+            else "internal service route excluded from public core",
+        )
 
     classification = classify_runtime_route_path(normalized)
     if classification is None:

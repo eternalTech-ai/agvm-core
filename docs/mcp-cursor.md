@@ -27,7 +27,7 @@ Use these values in Cursor's MCP configuration UI or JSON config:
 - API URL: `http://127.0.0.1:8010`
 - brain policy: `ai_create_if_missing` for a dedicated Cursor memory brain, or
   `fixed` when you want to lock Cursor to a known brain id.
-- module visibility policy: `hide_unlicensed`.
+- module visibility policy: `block_unlicensed`.
 
 The working directory is required because Cursor launches a new process and
 Python must be able to import `agvm_mcp_server`.
@@ -41,5 +41,7 @@ For normal local memory usage, allow `read_only`, `read_only_export`,
 `registry_write`, `preview_only` and `explicit_apply`, while keeping
 `destructive` blocked.
 
-`hide_unlicensed` keeps Core memory tools visible and keeps advanced Detwin
-Cloud module tools out of the local tool list.
+`block_unlicensed` keeps Core memory tools executable and keeps advanced Detwin
+Cloud module tools visible in the local tool list. Calls to paid tools return a
+structured Detwin Cloud/account/credits action contract until the required
+entitlement is active.

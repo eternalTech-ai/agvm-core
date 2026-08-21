@@ -36,7 +36,7 @@ Minimum environment:
 AGVM_API_BASE_URL=http://127.0.0.1:8010
 AGVM_MCP_BRAIN_POLICY=ai_create_if_missing
 AGVM_MCP_READ_ONLY=false
-AGVM_MCP_MODULE_VISIBILITY_POLICY=hide_unlicensed
+AGVM_MCP_MODULE_VISIBILITY_POLICY=block_unlicensed
 ```
 
 Use the client-specific guides for exact configuration:

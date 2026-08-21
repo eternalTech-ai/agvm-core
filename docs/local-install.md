@@ -57,7 +57,7 @@ AGVM_UI_PORT=3020
 AGVM_DEFAULT_BRAIN_ID=default_brain
 AGVM_MCP_BRAIN_POLICY=ai_create_if_missing
 AGVM_MCP_READ_ONLY=false
-AGVM_MCP_MODULE_VISIBILITY_POLICY=hide_unlicensed
+AGVM_MCP_MODULE_VISIBILITY_POLICY=block_unlicensed
 ```
 
 Provider keys can also be saved through the UI setup flow when the backend

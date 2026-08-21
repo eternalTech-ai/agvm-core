@@ -21,8 +21,6 @@ MAINTAIN_LIST_TOOL_NAMES = {
 
 def required_module_id_for_tool_name(tool_name: str) -> str | None:
     clean = str(tool_name or "").strip()
-    if clean.startswith("grow_"):
-        return GROW_MODULE_ID
     if clean.startswith(("matrix_calibration_", "sleep_", "evolve_")) or clean in MAINTAIN_LIST_TOOL_NAMES:
         return MAINTAIN_MODULE_ID
     return None

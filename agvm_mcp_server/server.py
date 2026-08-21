@@ -39,6 +39,8 @@ BRAIN_POLICIES = {BRAIN_POLICY_FIXED, BRAIN_POLICY_AI_RESOLVE_EXISTING, BRAIN_PO
 MODULE_VISIBILITY_METADATA_ONLY = "metadata_only"
 MODULE_VISIBILITY_HIDE_UNLICENSED = "hide_unlicensed"
 MODULE_VISIBILITY_BLOCK_UNLICENSED = "block_unlicensed"
+DEFAULT_DETWIN_PLATFORM_URL = "https://app.detwin.ai"
+DEFAULT_DETWIN_CLOUD_URL = "https://cloud.detwin.ai"
 MODULE_VISIBILITY_POLICIES = {
     MODULE_VISIBILITY_METADATA_ONLY,
     MODULE_VISIBILITY_HIDE_UNLICENSED,
@@ -80,16 +82,7 @@ class ToolPermissions:
         return "*" in self.enabled_tools or tool_name in self.enabled_tools
 
     def is_visible(self, tool_name: str, *, permission_family: str | None = None) -> bool:
-        if not self.is_enabled(tool_name):
-            return False
-        family = self._normalized_permission_family(permission_family)
-        if self.read_only and self._is_write_family_or_legacy_mutation(tool_name, family):
-            return False
-        if not self._permission_family_allowed(family):
-            return False
-        if self._legacy_allowlist_applies(tool_name, family) and "*" not in self.allow_mutation_tools and tool_name not in self.allow_mutation_tools:
-            return False
-        return True
+        return self.is_enabled(tool_name)
 
     def can_call(self, tool_name: str, *, permission_family: str | None = None) -> tuple[bool, str | None]:
         if not self.is_enabled(tool_name):
@@ -124,12 +117,12 @@ class ToolPermissions:
 
 @dataclass(frozen=True)
 class LocalModuleAccessPolicy:
-    visibility_policy: str = MODULE_VISIBILITY_METADATA_ONLY
+    visibility_policy: str = MODULE_VISIBILITY_BLOCK_UNLICENSED
     license_state_path: str | None = None
     status_source: str = "local_license_supervisor"
 
     def __post_init__(self) -> None:
-        normalized = str(self.visibility_policy or MODULE_VISIBILITY_METADATA_ONLY).strip().lower()
+        normalized = str(self.visibility_policy or MODULE_VISIBILITY_BLOCK_UNLICENSED).strip().lower()
         if normalized not in MODULE_VISIBILITY_POLICIES:
             raise AgvmMcpError(
                 "AGVM MCP module visibility policy must be one of "
@@ -325,7 +318,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgvmMcpConfig:
         visibility_policy=(
             str(module_visibility_env).strip()
             if module_visibility_env is not None
-            else str(module_access_payload.get("visibility_policy") or MODULE_VISIBILITY_METADATA_ONLY)
+            else str(module_access_payload.get("visibility_policy") or MODULE_VISIBILITY_BLOCK_UNLICENSED)
         ),
         license_state_path=(
             str(local_license_path_env).strip()
@@ -592,6 +585,7 @@ class AgvmMcpServer:
 
         module_decision = self._module_access_decision(contract)
         if not module_decision["granted"] and self.config.module_access.blocks_unlicensed_calls:
+            action_contract = self._module_access_action_contract(tool_name, module_decision)
             return self._tool_error(
                 "module_tool_not_enabled_by_local_mcp_lease",
                 {
@@ -599,7 +593,12 @@ class AgvmMcpServer:
                     "required_module_id": module_decision["required_module_id"],
                     "visibility_policy": self.config.module_access.visibility_policy,
                     "module_status": module_decision["module_status"],
-                    "recovery": "Activate or renew the local Pro module lease, then restart or reconnect the MCP client.",
+                    "recovery": (
+                        "This advanced tool is intentionally visible in the local MCP catalog, "
+                        "but execution requires Detwin Cloud, account credits, or an active local Pro module lease. "
+                        "Open Detwin Cloud or connect/renew the account, then reconnect the MCP client."
+                    ),
+                    "action_contract": action_contract,
                 },
             )
 
@@ -742,6 +741,27 @@ class AgvmMcpServer:
             "required_module_id": required_module_id,
             "granted": bool(status.get("granted")),
             "module_status": status,
+        }
+
+    def _module_access_action_contract(self, tool_name: str, module_decision: dict[str, Any]) -> dict[str, Any]:
+        platform_url = str(os.environ.get("AGVM_DETWIN_PLATFORM_URL") or os.environ.get("AGVM_PLATFORM_PUBLIC_BASE_URL") or DEFAULT_DETWIN_PLATFORM_URL).rstrip("/")
+        cloud_url = str(os.environ.get("AGVM_DETWIN_CLOUD_URL") or os.environ.get("AGVM_CLOUD_APP_PUBLIC_BASE_URL") or DEFAULT_DETWIN_CLOUD_URL).rstrip("/")
+        required_module_id = str(module_decision.get("required_module_id") or "").strip()
+        return {
+            "schema_version": "agvm.local_mcp_paid_tool_action.v1",
+            "action": "use_detwin_cloud_for_advanced_tool",
+            "tool_name": tool_name,
+            "required_module_id": required_module_id or None,
+            "requires_account": True,
+            "requires_credits": True,
+            "requires_cloud_handoff": True,
+            "platform_account_url": f"{platform_url}/account/modules",
+            "platform_billing_url": f"{platform_url}/account/billing",
+            "cloud_workspace_url": f"{cloud_url}/?runtime=cloud&route=modules",
+            "client_message": (
+                "Keep the tool visible for planning. Before executing it, open Detwin Cloud "
+                "or connect a paid Detwin account/local Pro lease with enough credits."
+            ),
         }
 
     def _required_module_id(self, contract: dict[str, Any]) -> str | None:

@@ -742,13 +742,26 @@ class McpWriteMemoryPreviewRequest(PreviewRequest):
 
 class McpWriteMemoryCommitRequest(BaseModel):
     brain_id: str | None = None
-    bundle: dict[str, Any]
+    bundle: dict[str, Any] | None = None
+    text: str | None = None
+    input_mode: Literal["auto", "document"] = "auto"
+    source_label: str | None = None
+    source_type: str | None = None
+    source_trust: SourceTrust | None = None
     selected_preview_ids: list[str] = Field(default_factory=list)
     learning_mode: LearningMode = "strict_review"
     clarification_answers: dict[str, str] = Field(default_factory=dict)
     approved_preview_ids: list[str] = Field(default_factory=list)
     question_limit: int = Field(default=3, ge=1, le=8)
     confirm_apply: bool = False
+
+    @field_validator("text", "source_label", "source_type")
+    @classmethod
+    def trim_optional_write_commit_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
 
 class McpClarificationRequest(BaseModel):
@@ -791,6 +804,8 @@ class McpGrowToolExecutionResponse(BaseModel):
     completeness: dict[str, Any] = Field(default_factory=dict)
     mcp_latency_profile: dict[str, Any] = Field(default_factory=dict)
     budget: dict[str, Any] = Field(default_factory=dict)
+    error_contract: dict[str, Any] = Field(default_factory=dict)
+    next_action: str | None = None
 
 
 class McpMaintenanceRequest(BaseModel):

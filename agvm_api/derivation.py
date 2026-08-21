@@ -5144,6 +5144,14 @@ def _append_source_section_preview_items(
             current_key = _source_grounding_fold(str(existing.get("raw_text") or existing.get("summary") or ""))
             if current_key != existing_key:
                 continue
+            existing_role = str(existing.get("document_role") or "").strip().lower()
+            item_role = str(item.get("document_role") or "").strip().lower()
+            if (
+                existing_role != item_role
+                and existing_role in {"chunk", "fact", "summary"}
+                and item_role in {"chunk", "fact", "summary"}
+            ):
+                return False
             if _source_preview_item_is_qa_affordance(item):
                 return False
             if existing_key in new_key and len(new_key) > len(existing_key) + 24:
@@ -5625,7 +5633,7 @@ def preview_bundle(
     source_micro_chunk_items: list[dict[str, Any]] = []
     source_micro_chunks_added = 0
     source_has_claim_level_preview = bool(source_semantic_added or source_claims_added or source_qa_added)
-    if not source_has_claim_level_preview:
+    if source_investigation_scope and source_sections:
         source_micro_chunk_items = _source_section_micro_chunk_preview_items(
             source_text=text,
             input_mode=input_mode,

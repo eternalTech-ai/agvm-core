@@ -405,7 +405,7 @@ def _clarification_output_schema() -> dict[str, Any]:
 
 def _write_input_schema(*, commit: bool = False) -> dict[str, Any]:
     properties = {
-        "text": _string("Text to preview or commit into memory."),
+        "text": _string("Text to preview into memory. For commit, use this only for a one-shot text commit when no preview bundle is available.", nullable=commit),
         "input_mode": _string("Compiler input mode.", enum=["auto", "document"]),
         "source_label": _string("Optional source label.", nullable=True),
         "source_type": _string("Optional source type.", nullable=True),
@@ -413,8 +413,24 @@ def _write_input_schema(*, commit: bool = False) -> dict[str, Any]:
         "learning_mode": _string("Learning policy mode.", enum=["strict_review", "guided_learning", "autonomous_cautious", "autonomous_research", "sleep_review"]),
     }
     if commit:
+        properties["bundle"] = _object("Preview bundle returned by write_memory_preview. Preferred commit flow: preview first, review, then pass this bundle.")
         properties["selected_preview_ids"] = _array("Preview ids approved by the user.", item_type="string")
-    return _schema_object(properties=properties, required=["text"], description="Write memory MCP input contract.")
+        properties["approved_preview_ids"] = _array("Alias/receipt list of approved preview ids when a UI review surface records approval separately.", item_type="string")
+        properties["clarification_answers"] = _object("Answers to clarification questions returned by preview.")
+        properties["question_limit"] = _integer("Maximum clarification questions to preserve during apply.", minimum=1, maximum=8, default=3)
+        properties["confirm_apply"] = _boolean("Required explicit confirmation for mutation. Set true only after reviewing the preview bundle.", default=False)
+        schema = _schema_object(
+            properties=properties,
+            required=[],
+            description=(
+                "Write memory commit contract. Preferred flow: call write_memory_preview with text, "
+                "review preview_bundle, then call write_memory_commit with bundle and confirm_apply=true. "
+                "One-shot text commit is accepted only when confirm_apply=true and still runs a preview internally."
+            ),
+        )
+        schema["anyOf"] = [{"required": ["bundle"]}, {"required": ["text"]}]
+        return schema
+    return _schema_object(properties=properties, required=["text"], description="Write memory preview input contract.")
 
 
 def _write_output_schema(*, commit: bool = False) -> dict[str, Any]:
@@ -896,6 +912,13 @@ def _tool_contract(
     }
 
 
+def _advanced_module_visibility_note() -> str:
+    return (
+        " Local MCP keeps this advanced tool discoverable for planning; execution may be blocked until "
+        "the user opens Detwin Cloud or connects a paid Detwin account/local Pro lease with enough credits."
+    )
+
+
 def _build_tool_contracts() -> list[dict[str, Any]]:
     contracts = [
         _tool_contract(
@@ -1146,7 +1169,10 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
         _tool_contract(
             name="matrix_calibration_preview",
             title="Matrix Calibration Preview",
-            description="Return a non-mutating geometry/matrix calibration preview when brain health reports radial or semantic distribution drift.",
+            description=(
+                "Return a non-mutating geometry/matrix calibration preview when brain health reports radial or semantic distribution drift."
+                + _advanced_module_visibility_note()
+            ),
             category="maintenance",
             planned_slice="PR-12J-D",
             default_output_package="brain_geometry_calibration",
@@ -1161,7 +1187,10 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
         _tool_contract(
             name="matrix_calibration_apply",
             title="Matrix Calibration Apply",
-            description="Apply a reviewed matrix calibration position plan with explicit confirmation, rollback metadata and before/after proof.",
+            description=(
+                "Apply a reviewed matrix calibration position plan with explicit confirmation, rollback metadata and before/after proof."
+                + _advanced_module_visibility_note()
+            ),
             category="maintenance",
             planned_slice="PR-12J-D",
             default_output_package="before_after_audit",
@@ -1185,8 +1214,12 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
                 description=(
                     f"Run a non-mutating {mode} maintenance preview that returns reviewable proposals. "
                     "Do not infer mutation from preview_ready; apply requires the matching apply tool."
+                    + _advanced_module_visibility_note()
                     if not apply_tool
-                    else f"Apply reviewed {mode} maintenance proposals. Requires proposal_ids from {mode}_preview and confirm_apply=true."
+                    else (
+                        f"Apply reviewed {mode} maintenance proposals. Requires proposal_ids from {mode}_preview and confirm_apply=true."
+                        + _advanced_module_visibility_note()
+                    )
                 ),
                 category="maintenance",
                 planned_slice="PR-12J-D",
@@ -1215,7 +1248,7 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
             _tool_contract(
                 name=name,
                 title=name.replace("_", " ").title(),
-                description=description,
+                description=description + _advanced_module_visibility_note(),
                 category="maintenance",
                 planned_slice="PR-12J-D",
                 default_output_package=field_name,
