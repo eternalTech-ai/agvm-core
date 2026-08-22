@@ -9,14 +9,18 @@ import {
   CheckCircle2,
   CircleAlert,
   Cloud,
+  ClipboardCheck,
   Database,
   Download,
   FileUp,
   GitBranch,
+  Globe2,
   Layers3,
+  Link2,
   Lock,
   LucideIcon,
   MessageSquareText,
+  Moon,
   Network,
   Play,
   PlusCircle,
@@ -25,7 +29,9 @@ import {
   Server,
   ShieldCheck,
   Sparkles,
+  Sun,
   TerminalSquare,
+  UploadCloud,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 
@@ -99,6 +105,8 @@ type McpRegistry = {
 
 type RouteId = "brain" | "context" | "grow" | "mcp" | "modules" | "health" | "settings";
 type Tone = "ready" | "active" | "pending" | "blocked" | "neutral";
+type ThemeMode = "light" | "dark";
+type GrowSourceKind = "manual_text" | "url" | "website" | "pdf" | "docx" | "transcript" | "mixed_bundle";
 type BrainActivity = {
   active: boolean;
   detail: string;
@@ -117,6 +125,16 @@ const routes: Array<{ id: RouteId; label: string; eyebrow: string; icon: LucideI
   { id: "modules", label: "Modules", eyebrow: "Core vs Cloud", icon: Layers3 },
   { id: "health", label: "Health", eyebrow: "Runtime proof", icon: Activity },
   { id: "settings", label: "Settings", eyebrow: "Local only", icon: ShieldCheck },
+];
+
+const growSourceModes: Array<{ kind: GrowSourceKind; label: string; meta: string; icon: LucideIcon }> = [
+  { kind: "manual_text", label: "Text", meta: "Paste notes", icon: ClipboardCheck },
+  { kind: "url", label: "URL", meta: "Single source", icon: Link2 },
+  { kind: "website", label: "Website", meta: "Crawl handoff", icon: Globe2 },
+  { kind: "pdf", label: "PDF", meta: "Upload or extract", icon: FileUp },
+  { kind: "docx", label: "DOCX", meta: "Document", icon: FileUp },
+  { kind: "transcript", label: "Transcript", meta: "Interview / OCR", icon: MessageSquareText },
+  { kind: "mixed_bundle", label: "Bundle", meta: "Mixed evidence", icon: Layers3 },
 ];
 
 const demoNodes: GraphNode[] = Array.from({ length: 48 }, (_, index) => {
@@ -146,6 +164,11 @@ export function CockpitApp() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const [query, setQuery] = useState("What changed in this brain recently?");
+  const [theme, setTheme] = useState<ThemeMode>(() => readTheme());
+  const [sourceKind, setSourceKind] = useState<GrowSourceKind>("manual_text");
+  const [sourceLabel, setSourceLabel] = useState("Local Core source");
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceFileName, setSourceFileName] = useState("");
   const [sourceText, setSourceText] = useState(
     "Capture the product-readiness decision: AGVM Core stays local and free, while advanced modules run in Detwin Cloud.",
   );
@@ -179,6 +202,11 @@ export function CockpitApp() {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, [refresh]);
+
+  useEffect(() => {
+    document.documentElement.dataset.coreTheme = theme;
+    window.localStorage?.setItem("agvm.core.theme", theme);
+  }, [theme]);
 
   const brains = useMemo(() => registry?.brains || [], [registry]);
   const activeBrainId = String(
@@ -261,6 +289,25 @@ export function CockpitApp() {
 
   function createDemoBrain() {
     createLocalBrain("Core Product Demo Brain", "core_product_demo_brain");
+  }
+
+  async function loadGrowSourceFile(file: File | null) {
+    if (!file) return;
+    setSourceFileName(`${file.name} / ${formatBytes(file.size)}`);
+    setSourceLabel(file.name);
+    setSourceKind(inputKindForFile(file));
+    if (/^text\/|json|markdown|csv|xml|yaml/i.test(file.type) || /\.(txt|md|markdown|json|csv|xml|yaml|yml)$/i.test(file.name)) {
+      setSourceText(await file.text());
+      return;
+    }
+    setSourceText(
+      [
+        `Uploaded source file: ${file.name}`,
+        `File type: ${file.type || "unknown"}`,
+        `Size: ${formatBytes(file.size)}`,
+        "For binary PDF/DOCX/image sources, run the same Grow source preview contract through Cloud AGVM or provide extracted text here for Local Core preview.",
+      ].join("\n"),
+    );
   }
 
   return (
@@ -391,16 +438,25 @@ export function CockpitApp() {
               activity={activity}
               busy={busyAction === "grow"}
               nodes={nodes}
+              sourceFileName={sourceFileName}
+              sourceKind={sourceKind}
+              sourceLabel={sourceLabel}
               result={result}
+              setSourceKind={setSourceKind}
+              setSourceLabel={setSourceLabel}
               sourceText={sourceText}
+              sourceUrl={sourceUrl}
+              setSourceUrl={setSourceUrl}
               setSourceText={setSourceText}
+              onFileChange={(file) => void loadGrowSourceFile(file)}
               onRun={() =>
                 runAction("grow", () =>
                   writeApi<Record<string, unknown>>("/mcp/grow-source-preview", {
                     brain_id: activeBrainId || undefined,
-                    raw_input: sourceText,
-                    input_kind: "manual_text",
-                    source_label: "Local Core UI note",
+                    raw_input: growRawInput(sourceKind, sourceText, sourceUrl, sourceFileName),
+                    input_kind: sourceKind,
+                    source_label: sourceLabel,
+                    source_uri: sourceKind === "url" || sourceKind === "website" ? sourceUrl : undefined,
                     run_preview: true,
                   }),
                 )
@@ -451,7 +507,7 @@ export function CockpitApp() {
               }
             />
           ) : null}
-          {route === "settings" ? <SettingsRoute activeBrainId={activeBrainId} health={health} mcpRegistry={mcpRegistry} /> : null}
+          {route === "settings" ? <SettingsRoute activeBrainId={activeBrainId} health={health} mcpRegistry={mcpRegistry} setTheme={setTheme} theme={theme} /> : null}
         </section>
       </section>
     </main>
@@ -538,34 +594,115 @@ function GrowRoute({
   activity,
   busy,
   nodes,
+  onFileChange,
   onRun,
   result,
+  setSourceKind,
+  setSourceLabel,
+  setSourceUrl,
   setSourceText,
+  sourceFileName,
+  sourceKind,
+  sourceLabel,
   sourceText,
+  sourceUrl,
 }: {
   activeBrainId: string;
   activity: BrainActivity;
   busy: boolean;
   nodes: GraphNode[];
+  onFileChange: (file: File | null) => void;
   onRun: () => void;
   result: Record<string, unknown> | null;
+  setSourceKind: (value: GrowSourceKind) => void;
+  setSourceLabel: (value: string) => void;
+  setSourceUrl: (value: string) => void;
   setSourceText: (value: string) => void;
+  sourceFileName: string;
+  sourceKind: GrowSourceKind;
+  sourceLabel: string;
   sourceText: string;
+  sourceUrl: string;
 }) {
+  const requiresUrl = sourceKind === "url" || sourceKind === "website";
+  const sourceReady = requiresUrl ? sourceUrl.trim().length > 0 : sourceText.trim().length > 0;
+  const preview = growPreviewSummary(result);
   return (
     <div className="operation-grid">
-      <section className="command-surface">
-        <PanelEyebrow icon={Sparkles} label="Grow Source Preview" />
-        <textarea onChange={(event) => setSourceText(event.target.value)} value={sourceText} />
-        <button className="primary wide" disabled={busy || !sourceText.trim()} onClick={onRun} type="button">
+      <section className="command-surface grow-workspace">
+        <PanelEyebrow icon={Sparkles} label="Guided Grow Workspace" />
+        <div className="grow-source-mode-grid" role="radiogroup" aria-label="Source type">
+          {growSourceModes.map((mode) => (
+            <button
+              aria-checked={sourceKind === mode.kind}
+              className={sourceKind === mode.kind ? "active" : ""}
+              key={mode.kind}
+              onClick={() => setSourceKind(mode.kind)}
+              role="radio"
+              type="button"
+            >
+              <mode.icon size={16} />
+              <strong>{mode.label}</strong>
+              <span>{mode.meta}</span>
+            </button>
+          ))}
+        </div>
+        <div className="grow-input-grid">
+          <label>
+            Source label
+            <input onChange={(event) => setSourceLabel(event.target.value)} placeholder="Interview notes, project page, PDF title" value={sourceLabel} />
+          </label>
+          {requiresUrl ? (
+            <label>
+              {sourceKind === "website" ? "Website URL" : "Source URL"}
+              <input
+                onChange={(event) => setSourceUrl(event.target.value)}
+                placeholder={sourceKind === "website" ? "https://example.com/about" : "https://example.com/source.pdf"}
+                type="url"
+                value={sourceUrl}
+              />
+            </label>
+          ) : (
+            <label className="file-picker">
+              Upload source
+              <span>
+                <UploadCloud size={15} />
+                {sourceFileName || "PDF, DOCX, text, transcript or notes"}
+              </span>
+              <input
+                accept=".txt,.md,.markdown,.json,.csv,.pdf,.docx,.png,.jpg,.jpeg,.webp,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*"
+                onChange={(event) => onFileChange(event.currentTarget.files?.[0] || null)}
+                type="file"
+              />
+            </label>
+          )}
+        </div>
+        <textarea
+          aria-label="Source material"
+          onChange={(event) => setSourceText(event.target.value)}
+          placeholder={
+            requiresUrl
+              ? "Optional notes or instructions for this URL source."
+              : "Paste source material. For PDFs/OCR sources, paste extracted text when running fully local Core."
+          }
+          value={sourceText}
+        />
+        <div className="grow-review-strip">
+          <Receipt title="Source units" detail={preview.sourceUnits} tone={preview.sourceUnits === "0" ? "pending" : "ready" } />
+          <Receipt title="Candidate nodes" detail={preview.candidates} tone={preview.candidates === "0" ? "pending" : "active" } />
+          <Receipt title="Apply" detail={preview.applyState} tone={preview.applyState === "review needed" ? "pending" : "ready"} />
+        </div>
+        <button className="primary wide" disabled={busy || !sourceReady} onClick={onRun} type="button">
           {busy ? <RefreshCw size={17} /> : <GitBranch size={17} />}
           Preview memory growth
         </button>
-        <p className="fine-print">Preview is local and explicit. Apply/write actions stay behind MCP confirmation contracts.</p>
+        <p className="fine-print">
+          Grow produces reviewable source units, ghost nodes, candidate nodes and an apply contract. Local Core preview uses no Detwin credits.
+        </p>
       </section>
       <div className="live-result-stack">
         <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
-        <ResultPanel emptyTitle={activeBrainId ? "Grow preview has not run" : "Create a brain before growing memory"} result={result} />
+        <GrowResultPanel emptyTitle={activeBrainId ? "Grow preview has not run" : "Create a brain before growing memory"} result={result} />
       </div>
     </div>
   );
@@ -622,7 +759,7 @@ function McpRoute({
           Invoke local MCP tool
         </button>
         <p className="fine-print">
-          Catalog status: {mcpRegistry?.registry_status || "not loaded"}.
+          Tool catalog: {mcpRegistry?.registry_status === "ready" ? "loaded" : mcpRegistry?.registry_status || "not loaded"}.
           {activeBrainId ? " Active brain is injected when required." : " Select a brain for brain-scoped tools."}
         </p>
       </section>
@@ -700,17 +837,44 @@ function HealthRoute({
   );
 }
 
-function SettingsRoute({ activeBrainId, health, mcpRegistry }: { activeBrainId: string; health: HealthState | null; mcpRegistry: McpRegistry | null }) {
+function SettingsRoute({
+  activeBrainId,
+  health,
+  mcpRegistry,
+  setTheme,
+  theme,
+}: {
+  activeBrainId: string;
+  health: HealthState | null;
+  mcpRegistry: McpRegistry | null;
+  setTheme: (theme: ThemeMode) => void;
+  theme: ThemeMode;
+}) {
   return (
     <div className="settings-grid">
       <Notice tone="ready" title="Local-first boundary" detail="This UI talks only to the local AGVM API configured with VITE_API_URL. It does not sign in, sync, bill, or unlock cloud modules." />
+      <section className="settings-panel">
+        <PanelEyebrow icon={Sun} label="Interface palette" />
+        <h2>Match Detwin by default.</h2>
+        <p>Core opens in the same light direction as the Platform. Switch to the dark brain cockpit when you want the high-contrast operator view.</p>
+        <div className="theme-toggle" role="group" aria-label="Theme">
+          <button className={theme === "light" ? "active" : ""} onClick={() => setTheme("light")} type="button">
+            <Sun size={16} />
+            Light
+          </button>
+          <button className={theme === "dark" ? "active" : ""} onClick={() => setTheme("dark")} type="button">
+            <Moon size={16} />
+            Dark
+          </button>
+        </div>
+      </section>
       <MetricGrid
         metrics={[
           { label: "API base", value: apiBaseUrl },
           { label: "Cloud link", value: cloudUrl },
           { label: "Active brain", value: activeBrainId || "not selected" },
           { label: "MCP tools", value: String(mcpRegistry?.tools?.length || 0) },
-          { label: "Registry", value: health?.brain_registry_ready ? "ready" : "not ready" },
+          { label: "Brain list", value: health?.brain_registry_ready ? "ready" : "not ready" },
           { label: "Credits", value: "not used locally" },
         ]}
       />
@@ -848,7 +1012,7 @@ function BrainSelector({
             </label>
           </fieldset>
           <div className="brain-menu-actions">
-            <button disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={15} />Bootstrap registry</button>
+            <button disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={15} />Scan local brains</button>
             <button disabled={busy || !activeBrainId} onClick={onExportBrain} type="button"><Download size={15} />Export active</button>
             <button disabled={busy} onClick={onRefresh} type="button"><RefreshCw size={15} />Refresh</button>
             <a href="#brain"><Brain size={15} />Open Brain Center</a>
@@ -866,10 +1030,10 @@ function BrainBootstrapNotice({ busyAction, onBootstrap, onCreateDemo }: { busyA
       <Brain size={22} />
       <div>
         <strong>Create or import a local brain to start.</strong>
-        <p>Context, Grow and MCP are brain-scoped. Bootstrap scans the local registry; Create demo brain makes a synthetic Core brain you can use immediately.</p>
+        <p>Context, Grow and MCP are brain-scoped. Bootstrap scans available local brains; Create demo brain makes a synthetic Core brain you can use immediately.</p>
       </div>
       <button className="primary" disabled={busy} onClick={onCreateDemo} type="button"><PlusCircle size={16} />Create demo brain</button>
-      <button className="secondary" disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={16} />Bootstrap registry</button>
+      <button className="secondary" disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={16} />Scan local brains</button>
     </article>
   );
 }
@@ -950,6 +1114,54 @@ function ResultPanel({ emptyTitle, result }: { emptyTitle: string; result: Recor
   );
 }
 
+function GrowResultPanel({ emptyTitle, result }: { emptyTitle: string; result: Record<string, unknown> | null }) {
+  const summary = growPreviewSummary(result);
+  const candidates = growCandidateSummaries(result);
+  return (
+    <section className="result-panel grow-result-panel">
+      <PanelEyebrow icon={GitBranch} label="Grow preview" />
+      {result ? (
+        <>
+          <div className="grow-result-kpis">
+            <Receipt title="Source units" detail={summary.sourceUnits} tone={summary.sourceUnits === "0" ? "pending" : "ready"} />
+            <Receipt title="Candidate nodes" detail={summary.candidates} tone={summary.candidates === "0" ? "pending" : "active"} />
+            <Receipt title="Write state" detail={summary.applyState} tone={summary.applyState === "review needed" ? "pending" : "ready"} />
+          </div>
+          {candidates.length ? (
+            <div className="grow-candidate-list">
+              {candidates.map((candidate, index) => (
+                <article key={`${candidate.title}-${index}`}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <div>
+                    <strong>{candidate.title}</strong>
+                    <p>{candidate.detail}</p>
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-result compact">
+              <Network size={22} />
+              <strong>No candidate list returned yet</strong>
+              <span>Run a source preview with enough source material to inspect proposed memory nodes before apply.</span>
+            </div>
+          )}
+          <details className="raw-receipt">
+            <summary>Open exact receipt</summary>
+            <pre>{JSON.stringify(result, null, 2)}</pre>
+          </details>
+        </>
+      ) : (
+        <div className="empty-result">
+          <GitBranch size={26} />
+          <strong>{emptyTitle}</strong>
+          <span>The preview will show source units, candidate memory nodes and the exact apply contract.</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
 async function readApi<T>(path: string): Promise<T> {
   return requestApi<T>(path, { method: "GET" });
 }
@@ -987,6 +1199,15 @@ async function requestApi<T>(path: string, init: RequestInit, jsonBody = true): 
 function routeFromLocation(): RouteId {
   const raw = window.location.hash.replace(/^#/, "") || new URLSearchParams(window.location.search).get("route") || "brain";
   return routes.some((item) => item.id === raw) ? (raw as RouteId) : "brain";
+}
+
+function readTheme(): ThemeMode {
+  try {
+    const stored = window.localStorage?.getItem("agvm.core.theme");
+    return stored === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
 }
 
 function activityFor(busyAction: string | null, route: RouteId): BrainActivity {
@@ -1069,6 +1290,105 @@ function withQuery(path: string, payload: Record<string, unknown>) {
   }
   const query = params.toString();
   return query ? `${path}?${query}` : path;
+}
+
+function formatBytes(size: number) {
+  if (!Number.isFinite(size) || size <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = size;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function inputKindForFile(file: File): GrowSourceKind {
+  const name = file.name.toLowerCase();
+  const type = file.type.toLowerCase();
+  if (name.endsWith(".pdf") || type === "application/pdf") return "pdf";
+  if (name.endsWith(".docx") || type.includes("wordprocessingml")) return "docx";
+  if (/\.(png|jpg|jpeg|webp|tiff|bmp)$/i.test(name) || type.startsWith("image/")) return "mixed_bundle";
+  if (/\.(vtt|srt|transcript|txt)$/i.test(name)) return "transcript";
+  return "manual_text";
+}
+
+function growRawInput(kind: GrowSourceKind, text: string, url: string, fileName: string) {
+  if (kind === "url" || kind === "website") {
+    return [url.trim(), text.trim()].filter(Boolean).join("\n\nNotes:\n");
+  }
+  if (fileName && text.trim()) return `${fileName}\n\n${text.trim()}`;
+  return text.trim();
+}
+
+function growPreviewSummary(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const sourceInvestigation = objectAt(data, "source_investigation") || objectAt(data, "sourceInvestigation");
+  const previewBundle = objectAt(data, "preview_bundle") || objectAt(data, "previewBundle");
+  const completeness = objectAt(data, "completeness") || objectAt(previewBundle, "completeness");
+  const sourceUnits =
+    arrayLength(sourceInvestigation?.source_units) ||
+    numberString(sourceInvestigation?.source_unit_count) ||
+    numberString(completeness?.source_unit_count) ||
+    "0";
+  const candidates =
+    arrayLength(previewBundle?.derived_nodes) ||
+    arrayLength(previewBundle?.candidate_nodes) ||
+    numberString(completeness?.preview_node_count) ||
+    (previewBundle?.primary_node_preview ? "1" : "0");
+  const applyContract = objectAt(data, "source_formation_contract") || objectAt(data, "apply_contract") || objectAt(previewBundle, "apply_contract");
+  const applyState = result?.status === "applied" ? "applied" : applyContract ? "review needed" : "preview first";
+  return { applyState, candidates, sourceUnits };
+}
+
+function growCandidateSummaries(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const previewBundle = objectAt(data, "preview_bundle") || objectAt(data, "previewBundle");
+  const rawCandidates = arrayAt(previewBundle, "derived_nodes") || arrayAt(previewBundle, "candidate_nodes") || [];
+  const candidates = rawCandidates
+    .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 8)
+    .map((item) => ({
+      title: String(item.summary || item.title || item.label || item.node_id || "Candidate memory node"),
+      detail: String(item.memory_type || item.source_label || item.confidence || item.rationale || "Review this candidate before any apply step."),
+    }));
+  if (!candidates.length && previewBundle?.primary_node_preview && typeof previewBundle.primary_node_preview === "object") {
+    const primary = previewBundle.primary_node_preview as Record<string, unknown>;
+    candidates.push({
+      title: String(primary.summary || primary.title || "Primary candidate memory node"),
+      detail: String(primary.memory_type || primary.rationale || "Primary preview returned by the local Grow contract."),
+    });
+  }
+  return candidates;
+}
+
+function resultData(result: Record<string, unknown> | null) {
+  if (!result) return null;
+  const structured = objectAt(result, "structuredContent");
+  const data = objectAt(structured, "data");
+  return data || result;
+}
+
+function objectAt(source: unknown, key: string): Record<string, unknown> | null {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const value = (source as Record<string, unknown>)[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function arrayAt(source: unknown, key: string): unknown[] | null {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const value = (source as Record<string, unknown>)[key];
+  return Array.isArray(value) ? value : null;
+}
+
+function arrayLength(value: unknown) {
+  return Array.isArray(value) ? String(value.length) : "";
+}
+
+function numberString(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
 }
 
 function compact(value: Record<string, unknown>) {

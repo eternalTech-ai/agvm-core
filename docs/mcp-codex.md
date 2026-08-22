@@ -18,6 +18,16 @@ docker compose up --build
 
 Confirm `http://127.0.0.1:8010/health` returns `ok: true`.
 
+For a clean project-specific brain store, set both storage roots before the API
+starts:
+
+```bash
+AGVM_LAB_DATA_DIR=/absolute/path/to/agvm-data
+AGVM_BRAINS_DIR=/absolute/path/to/agvm-brains
+```
+
+`AGVM_LAB_DATA_DIR` alone is not enough to isolate the brain registry.
+
 ## 2. Add The MCP Server To Codex
 
 Codex must launch the stdio bridge from the AGVM checkout. `cwd` is the AGVM

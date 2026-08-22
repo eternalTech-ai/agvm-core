@@ -73,16 +73,18 @@ tools it can see. That is the first connection check.
 
 ## Core UI
 
-The public Docker UI currently boots a local launch shell that checks API
-health and points to the MCP/setup docs. The full core cockpit should expose:
+The public Docker UI boots the Local AGVM cockpit. It uses the same visual
+system as Detwin Cloud, scoped to the AGPL Core boundary:
 
-- Retrieve: run or inspect memory retrieval calls when the API exposes the
-  retrieve endpoints;
-- Health: inspect brain readiness and maintenance signals;
-- Bench: review scoped benchmark evidence and claim boundaries;
+- Brain Center: create, import, switch and inspect local brains;
+- Context: retrieve from the selected local brain;
+- Grow: add text, URL, website or uploaded source material through preview and
+  explicit apply;
+- Health and Bench: inspect local brain readiness and claim boundaries;
 - MCP Setup: generate client configuration for Codex, Claude, Cursor or generic
   MCP clients;
-- MCP Raw Console: call exposed MCP tools directly for debugging.
+- MCP Raw Console: inspect the visible catalog and call exposed MCP tools for
+  debugging.
 
 If a screen shows a disabled or missing capability, treat that as a product
 boundary signal. Paid modules are not hidden in the public repository.

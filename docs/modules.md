@@ -20,6 +20,12 @@ release:
 The public Core UI may show these module slots, but it must route users to
 Detwin Cloud instead of installing or serving paid module source locally.
 
+The local MCP bridge intentionally keeps all 37 registry tools discoverable by
+default. This is for AI-client planning, not for entitlement. Paid-module calls
+that require a module lease must return a structured block response before the
+local API runs. Core users cannot bypass Detwin Cloud or a local module lease by
+calling those tools directly.
+
 For the public core repository, module code is not copied. Only public contracts
 and generic placeholders are allowed.
 

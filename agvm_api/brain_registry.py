@@ -658,6 +658,57 @@ def rename_local_brain(
     return _finalize_registry(registry, brain_root=brain_root)
 
 
+def _brain_export_graph_summary(record: dict[str, Any]) -> dict[str, Any]:
+    storage = Path(str(record.get("storage_path") or "")).expanduser()
+    graph_path = storage / GRAPH_FILENAME
+    index_path = storage / INDEX_FILENAME
+    atlas_path = storage / ATLAS_FILENAME
+    sqlite_path = storage / SQLITE_FILENAME
+    graph = _json_file(graph_path)
+    atlas = _json_file(atlas_path)
+    graph_nodes = list(graph.get("nodes") or []) if isinstance(graph.get("nodes"), list) else []
+    graph_edges = list(graph.get("edges") or []) if isinstance(graph.get("edges"), list) else []
+    atlas_node_count = atlas.get("node_count")
+    sqlite_node_count = _sqlite_node_count(sqlite_path) if sqlite_path.exists() else None
+    runtime_node_count = (
+        int(sqlite_node_count)
+        if sqlite_node_count is not None
+        else int(atlas_node_count or len(graph_nodes) or record.get("node_count") or 0)
+    )
+    return {
+        "schema_version": "agvm.local_brain_graph_export_summary.v1",
+        "runtime_node_count": runtime_node_count,
+        "graph_payload_node_count": len(graph_nodes),
+        "graph_payload_edge_count": len(graph_edges),
+        "atlas_node_count": int(atlas_node_count or 0),
+        "graph_version": graph.get("version") or record.get("graph_version"),
+        "index_version": record.get("index_version"),
+        "atlas_version": atlas.get("version") or record.get("atlas_version"),
+        "included_files": {
+            GRAPH_FILENAME: {
+                "path": f"storage/{GRAPH_FILENAME}",
+                "present": graph_path.exists(),
+                "size_bytes": graph_path.stat().st_size if graph_path.exists() else 0,
+            },
+            INDEX_FILENAME: {
+                "path": f"storage/{INDEX_FILENAME}",
+                "present": index_path.exists(),
+                "size_bytes": index_path.stat().st_size if index_path.exists() else 0,
+            },
+            ATLAS_FILENAME: {
+                "path": f"storage/{ATLAS_FILENAME}",
+                "present": atlas_path.exists(),
+                "size_bytes": atlas_path.stat().st_size if atlas_path.exists() else 0,
+            },
+            SQLITE_FILENAME: {
+                "path": f"storage/{SQLITE_FILENAME}",
+                "present": sqlite_path.exists(),
+                "size_bytes": sqlite_path.stat().st_size if sqlite_path.exists() else 0,
+            },
+        },
+    }
+
+
 def _brain_export_manifest(record: dict[str, Any], *, export_kind: str) -> dict[str, Any]:
     return {
         "schema_version": "agvm.local_brain_export.v1",
@@ -677,6 +728,7 @@ def _brain_export_manifest(record: dict[str, Any], *, export_kind: str) -> dict[
             "maintenance": "maintenance/",
             "mcp_logs": "mcp_logs/",
         },
+        "graph_export": _brain_export_graph_summary(record),
         "restore_policy": "imports_as_registry_managed_brain_by_default",
     }
 

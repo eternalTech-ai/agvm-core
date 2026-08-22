@@ -37,7 +37,8 @@
   "module_access": {
     "visibility_policy": "block_unlicensed",
     "status_source": "local_license_supervisor",
-    "license_state_path": null
+    "license_state_path": null,
+    "public_core_behavior": "All 37 registry tools remain visible. Module-required paid tools return a structured block response before API execution unless a valid local module lease is present."
   },
   "permission_profiles": {
     "read_only_recall": {
