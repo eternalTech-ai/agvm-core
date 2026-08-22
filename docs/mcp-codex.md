@@ -53,6 +53,9 @@ AGVM_MCP_READ_ONLY = "false"
 AGVM_MCP_ALLOWED_PERMISSION_FAMILIES = "read_only,read_only_export,registry_write,preview_only,explicit_apply"
 AGVM_MCP_BLOCKED_PERMISSION_FAMILIES = "destructive"
 AGVM_MCP_MODULE_VISIBILITY_POLICY = "block_unlicensed"
+# Optional: enables paid tools through Detwin Hosted MCP.
+AGVM_HOSTED_MCP_API_KEY = "<hosted-key-from-detwin-account>"
+AGVM_HOSTED_MCP_URL = "https://mcp.detwin.ai"
 ```
 
 Do not put provider API keys in the MCP bridge config unless you intentionally
@@ -95,4 +98,8 @@ blocked.
 default. Core memory tools remain executable. Advanced Clone, Teach and
 Maintain tools remain visible in the MCP catalog for discoverability, but direct
 local calls return a structured Detwin Cloud/account/credits action contract
-until the required entitlement is active.
+until `AGVM_HOSTED_MCP_API_KEY` is configured. With that key, the certified
+`sleep_preview` and `evolve_preview` calls run through Hosted MCP and settle
+workspace credits dynamically. Other paid tools remain visible but unavailable
+until their Hosted adapter is certified. Grow remains local and free. Sync or
+create the target cloud brain before invoking a paid tool.

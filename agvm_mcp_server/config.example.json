@@ -11,6 +11,7 @@
   "user_id": "local_user",
   "environment_id": "local_self_hosted_dev",
   "request_timeout_seconds": 180,
+  "hosted_mcp_base_url": "https://mcp.detwin.ai",
   "tool_permissions": {
     "read_only": false,
     "enabled_tools": ["*"],
@@ -38,7 +39,7 @@
     "visibility_policy": "block_unlicensed",
     "status_source": "local_license_supervisor",
     "license_state_path": null,
-    "public_core_behavior": "All 37 registry tools remain visible. Module-required paid tools return a structured block response before API execution unless a valid local module lease is present."
+    "public_core_behavior": "All 37 registry tools remain visible. Core tools execute locally. Module-required paid tools execute only through Detwin Hosted MCP when AGVM_HOSTED_MCP_API_KEY is set; otherwise they return a structured account and billing recovery contract."
   },
   "permission_profiles": {
     "read_only_recall": {

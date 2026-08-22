@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 import urllib.error
@@ -41,6 +42,7 @@ MODULE_VISIBILITY_HIDE_UNLICENSED = "hide_unlicensed"
 MODULE_VISIBILITY_BLOCK_UNLICENSED = "block_unlicensed"
 DEFAULT_DETWIN_PLATFORM_URL = "https://app.detwin.ai"
 DEFAULT_DETWIN_CLOUD_URL = "https://cloud.detwin.ai"
+DEFAULT_DETWIN_HOSTED_MCP_URL = "https://mcp.detwin.ai"
 MODULE_VISIBILITY_POLICIES = {
     MODULE_VISIBILITY_METADATA_ONLY,
     MODULE_VISIBILITY_HIDE_UNLICENSED,
@@ -200,6 +202,8 @@ class AgvmMcpConfig:
     user_id: str | None = None
     environment_id: str | None = None
     request_timeout_seconds: float = 180.0
+    hosted_mcp_base_url: str = DEFAULT_DETWIN_HOSTED_MCP_URL
+    hosted_mcp_api_key: str | None = field(default=None, repr=False)
     tool_permissions: ToolPermissions = field(default_factory=ToolPermissions)
     module_access: LocalModuleAccessPolicy = field(default_factory=LocalModuleAccessPolicy)
 
@@ -221,6 +225,10 @@ class AgvmMcpConfig:
     @property
     def requires_ai_brain_resolution(self) -> bool:
         return self.brain_policy in {BRAIN_POLICY_AI_RESOLVE_EXISTING, BRAIN_POLICY_AI_CREATE_IF_MISSING}
+
+    @property
+    def hosted_mcp_configured(self) -> bool:
+        return bool(str(self.hosted_mcp_api_key or "").strip())
 
     @property
     def hosted_scope_headers(self) -> dict[str, str]:
@@ -346,6 +354,14 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgvmMcpConfig:
     user_id = str(os.environ.get("AGVM_MCP_USER_ID") or payload.get("user_id") or "").strip() or None
     environment_id = str(os.environ.get("AGVM_MCP_ENVIRONMENT_ID") or payload.get("environment_id") or "").strip() or None
     timeout = float(os.environ.get("AGVM_MCP_TIMEOUT_SECONDS") or payload.get("request_timeout_seconds") or 180.0)
+    hosted_mcp_base_url = str(
+        os.environ.get("AGVM_HOSTED_MCP_URL")
+        or payload.get("hosted_mcp_base_url")
+        or DEFAULT_DETWIN_HOSTED_MCP_URL
+    ).rstrip("/")
+    # Hosted MCP credentials are intentionally environment-only. They must not be
+    # persisted in the shareable local MCP JSON configuration.
+    hosted_mcp_api_key = str(os.environ.get("AGVM_HOSTED_MCP_API_KEY") or "").strip() or None
 
     return AgvmMcpConfig(
         api_base_url=api_base_url,
@@ -360,6 +376,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgvmMcpConfig:
         user_id=user_id,
         environment_id=environment_id,
         request_timeout_seconds=timeout,
+        hosted_mcp_base_url=hosted_mcp_base_url,
+        hosted_mcp_api_key=hosted_mcp_api_key,
         tool_permissions=permissions,
         module_access=module_access,
     )
@@ -446,6 +464,105 @@ class AgvmHttpClient:
             raise AgvmMcpHttpError(status=None, message=f"AGVM API returned invalid JSON for {path}", payload=str(exc)) from exc
 
 
+class HostedMcpClient:
+    def __init__(self, config: AgvmMcpConfig) -> None:
+        self.config = config
+
+    def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        request_id: Any = None,
+    ) -> dict[str, Any]:
+        api_key = str(self.config.hosted_mcp_api_key or "").strip()
+        if not api_key:
+            raise AgvmMcpError("hosted_mcp_api_key_required")
+        url = f"{self.config.hosted_mcp_base_url}/mcp/tools/call"
+        explicit_idempotency_key = str(arguments.get("idempotency_key") or "").strip()
+        idempotency_key = explicit_idempotency_key or _hosted_mcp_idempotency_key(
+            tool_name=tool_name,
+            arguments=arguments,
+            request_id=request_id,
+        )
+        body = json.dumps(
+            {
+                "name": tool_name,
+                "arguments": arguments,
+                "idempotency_key": idempotency_key,
+                # Hosted MCP treats every supplied identity field as the same
+                # operation key. Preserve the JSON-RPC id inside the derived
+                # hash, then send that canonical identity in both fields.
+                "request_id": idempotency_key,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+                decoded = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload: Any = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                payload = {"error": "hosted_mcp_non_json_error"}
+            raise AgvmMcpHttpError(
+                status=exc.code,
+                message=f"Detwin Hosted MCP HTTP {exc.code}",
+                payload=payload,
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise AgvmMcpHttpError(
+                status=None,
+                message="Detwin Hosted MCP is unreachable",
+                payload={"reason": str(exc.reason)},
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise AgvmMcpHttpError(
+                status=None,
+                message="Detwin Hosted MCP returned invalid JSON",
+                payload={"reason": str(exc)},
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise AgvmMcpHttpError(
+                status=None,
+                message="Detwin Hosted MCP returned non-object JSON",
+                payload=None,
+            )
+        return decoded
+
+
+def _hosted_mcp_idempotency_key(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    request_id: Any,
+) -> str:
+    canonical = json.dumps(
+        {
+            "tool_name": str(tool_name),
+            "arguments": arguments,
+            "request_id": request_id,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"local-mcp::{hashlib.sha256(canonical).hexdigest()}"
+
+
 def _path_with_query(path: str, payload: dict[str, Any]) -> str:
     query_items: dict[str, str] = {}
     for key, value in payload.items():
@@ -471,9 +588,15 @@ def _reconfigure_utf8(stream: TextIO) -> None:
 
 
 class AgvmMcpServer:
-    def __init__(self, config: AgvmMcpConfig | None = None, client: AgvmHttpClient | None = None) -> None:
+    def __init__(
+        self,
+        config: AgvmMcpConfig | None = None,
+        client: AgvmHttpClient | None = None,
+        hosted_client: HostedMcpClient | None = None,
+    ) -> None:
         self.config = config or load_config()
         self.client = client or AgvmHttpClient(self.config)
+        self.hosted_client = hosted_client or HostedMcpClient(self.config)
 
     def handle_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
         request_id = message.get("id")
@@ -499,7 +622,10 @@ class AgvmMcpServer:
             if method == "tools/call":
                 if not isinstance(params, dict):
                     return self._jsonrpc_error(request_id, -32602, "tools/call params must be an object")
-                return self._success(request_id, self._tools_call(params))
+                return self._success(
+                    request_id,
+                    self._tools_call(params, request_id=request_id),
+                )
             return self._jsonrpc_error(request_id, -32601, f"Unknown MCP method: {method}")
         except AgvmMcpHttpError as exc:
             return self._jsonrpc_error(
@@ -546,6 +672,11 @@ class AgvmMcpServer:
                 "user_id": self.config.user_id,
                 "environment_id": self.config.environment_id,
                 "read_only": self.config.tool_permissions.read_only,
+                "hosted_mcp": {
+                    "configured": self.config.hosted_mcp_configured,
+                    "base_url": self.config.hosted_mcp_base_url,
+                    "credential_source": "environment" if self.config.hosted_mcp_configured else "not_configured",
+                },
                 "contract_registry_schema_version": registry.get("schema_version"),
                 "module_tool_registration_state": dict(registry.get("module_tool_registration") or {}).get("state"),
                 "module_required_tool_names": list(dict(registry.get("module_tool_registration") or {}).get("module_tool_names") or []),
@@ -553,7 +684,12 @@ class AgvmMcpServer:
             },
         }
 
-    def _tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _tools_call(
+        self,
+        params: dict[str, Any],
+        *,
+        request_id: Any = None,
+    ) -> dict[str, Any]:
         tool_name = str(params.get("name") or "").strip()
         arguments = params.get("arguments") or {}
         if not tool_name:
@@ -584,23 +720,6 @@ class AgvmMcpServer:
             return self._tool_error("tool_not_in_agvm_contract_registry", {"tool_name": tool_name})
 
         module_decision = self._module_access_decision(contract)
-        if not module_decision["granted"] and self.config.module_access.blocks_unlicensed_calls:
-            action_contract = self._module_access_action_contract(tool_name, module_decision)
-            return self._tool_error(
-                "module_tool_not_enabled_by_local_mcp_lease",
-                {
-                    "tool_name": tool_name,
-                    "required_module_id": module_decision["required_module_id"],
-                    "visibility_policy": self.config.module_access.visibility_policy,
-                    "module_status": module_decision["module_status"],
-                    "recovery": (
-                        "This advanced tool is intentionally visible in the local MCP catalog, "
-                        "but execution requires Detwin Cloud, account credits, or an active local Pro module lease. "
-                        "Open Detwin Cloud or connect/renew the account, then reconnect the MCP client."
-                    ),
-                    "action_contract": action_contract,
-                },
-            )
 
         requires_brain_id = bool(contract.get("requires_brain_id", True))
         if requires_brain_id and not configured_brain_id and not (hosted_scope.get("tenant_id") and hosted_scope.get("user_id")):
@@ -625,6 +744,17 @@ class AgvmMcpServer:
         if validation_error:
             return self._tool_error(validation_error["reason"], {"tool_name": tool_name, **validation_error})
 
+        if module_decision["required_module_id"]:
+            hosted_arguments = dict(arguments)
+            if bool(contract.get("requires_brain_id", True)) and configured_brain_id:
+                hosted_arguments["brain_id"] = configured_brain_id
+            return self._call_paid_tool_through_hosted_mcp(
+                tool_name=tool_name,
+                arguments=hosted_arguments,
+                module_decision=module_decision,
+                request_id=request_id,
+            )
+
         payload = dict(arguments)
         brain_id = configured_brain_id if requires_brain_id else None
         if requires_brain_id and brain_id:
@@ -635,6 +765,66 @@ class AgvmMcpServer:
         http_method = str(contract.get("http_method") or "POST").upper()
         result = self.client.request_json(http_method, endpoint_path, payload, brain_id=brain_id, hosted_scope=hosted_scope_arg)
         return self._tool_result(result)
+
+    def _call_paid_tool_through_hosted_mcp(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        module_decision: dict[str, Any],
+        request_id: Any = None,
+    ) -> dict[str, Any]:
+        action_contract = self._module_access_action_contract(tool_name, module_decision)
+        if not self.config.hosted_mcp_configured:
+            return self._tool_error(
+                "detwin_cloud_auth_required",
+                {
+                    "tool_name": tool_name,
+                    "required_module_id": module_decision["required_module_id"],
+                    "recovery": (
+                        "Create a Hosted MCP key in Detwin Account, set AGVM_HOSTED_MCP_API_KEY "
+                        "for this MCP process, then reconnect the client. The paid tool will run in "
+                        "Detwin Cloud and consume workspace credits."
+                    ),
+                    "action_contract": action_contract,
+                },
+            )
+        try:
+            return self.hosted_client.call_tool(
+                tool_name,
+                arguments,
+                request_id=request_id,
+            )
+        except AgvmMcpHttpError as exc:
+            reason_by_status = {
+                401: "detwin_cloud_auth_invalid",
+                402: "detwin_cloud_credits_required",
+                403: "detwin_cloud_entitlement_required",
+                409: "detwin_cloud_request_conflict",
+            }
+            reason = reason_by_status.get(exc.status, "detwin_cloud_unavailable")
+            return self._tool_error(
+                reason,
+                {
+                    "tool_name": tool_name,
+                    "required_module_id": module_decision["required_module_id"],
+                    "http_status": exc.status,
+                    "hosted_error": exc.payload,
+                    "recovery": self._hosted_mcp_recovery(reason),
+                    "action_contract": action_contract,
+                },
+            )
+
+    def _hosted_mcp_recovery(self, reason: str) -> str:
+        if reason == "detwin_cloud_auth_invalid":
+            return "Issue a new Hosted MCP key from Detwin Account and reconnect this MCP client."
+        if reason == "detwin_cloud_credits_required":
+            return "Buy usage credits or upgrade the Detwin plan before retrying the paid tool."
+        if reason == "detwin_cloud_entitlement_required":
+            return "Activate the required Detwin Pro entitlement, then retry the paid tool."
+        if reason == "detwin_cloud_request_conflict":
+            return "Retry with the original idempotency key and unchanged arguments, or start a new operation."
+        return "Detwin Hosted MCP is temporarily unavailable. Retry without changing the idempotency key."
 
     def _has_hosted_scope(self, hosted_scope: dict[str, str | None] | None) -> bool:
         return any(str(value or "").strip() for value in dict(hosted_scope or {}).values())
@@ -755,12 +945,17 @@ class AgvmMcpServer:
             "requires_account": True,
             "requires_credits": True,
             "requires_cloud_handoff": True,
+            "execution_surface": "hosted_mcp",
+            "hosted_mcp_url": self.config.hosted_mcp_base_url,
+            "hosted_mcp_key_setup_url": f"{platform_url}/account/mcp",
+            "credential_environment_variable": "AGVM_HOSTED_MCP_API_KEY",
+            "dynamic_usage_settlement": True,
             "platform_account_url": f"{platform_url}/account/modules",
             "platform_billing_url": f"{platform_url}/account/billing",
             "cloud_workspace_url": f"{cloud_url}/?runtime=cloud&route=modules",
             "client_message": (
                 "Keep the tool visible for planning. Before executing it, open Detwin Cloud "
-                "or connect a paid Detwin account/local Pro lease with enough credits."
+                "and connect a Hosted MCP key for a paid Detwin account with enough credits."
             ),
         }
 

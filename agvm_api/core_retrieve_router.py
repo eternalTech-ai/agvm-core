@@ -13,7 +13,11 @@ from fastapi.responses import StreamingResponse
 
 from brain_health import build_brain_health_report, build_mcp_brain_health_output
 from brain_registry import BrainRegistryError, resolve_brain_scope
-from mcp_retrieval import build_mcp_retrieval_tool_output
+from mcp_retrieval import (
+    build_mcp_memory_object_output,
+    build_mcp_retrieval_tool_output,
+    build_mcp_route_trace_output,
+)
 from retrieval import (
     build_landing_metadata,
     build_search_map_2d_truth,
@@ -27,6 +31,7 @@ from schemas import (
     McpBrainHealthRequest,
     McpBrainHealthToolExecutionResponse,
     McpInspectionRequest,
+    McpMemoryObjectInspectionRequest,
     McpRetrievalToolRequest,
     McpToolExecutionResponse,
     RetrieveRequest,
@@ -44,6 +49,7 @@ from sqlite_store import (
     fail_search_session,
     fetch_active_search_session_by_thread,
     fetch_atlas,
+    fetch_cluster_runtime,
     fetch_graph_snapshot,
     fetch_heuristic_calibration_snapshot,
     fetch_identity_nucleus,
@@ -307,10 +313,58 @@ def create_core_retrieve_router() -> APIRouter:
     def mcp_inspect_context_package_endpoint(payload: McpInspectionRequest) -> McpToolExecutionResponse:
         return _inspect_mcp_result("inspect_context_package", payload)
 
+    @router.post("/memory/mcp/inspect-route", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
+    @router.post("/mcp/inspect-route", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
+    def mcp_inspect_route_endpoint(payload: McpInspectionRequest) -> McpToolExecutionResponse:
+        with _brain_request_scope(_payload_brain_id(payload)):
+            trace = fetch_search_trace(payload.search_id)
+            if not trace:
+                raise HTTPException(status_code=404, detail="search_not_found")
+
+            originating_tool = ""
+            for event in list(dict(trace).get("events") or []):
+                event_payload = dict(dict(event or {}).get("payload") or {})
+                candidate_tool = str(event_payload.get("tool_name") or "").strip()
+                if candidate_tool:
+                    originating_tool = candidate_tool
+                    break
+            if originating_tool == "retrieve_source_trace":
+                try:
+                    result = _completed_search_result(payload.search_id)
+                except HTTPException:
+                    result = {}
+                if result:
+                    output = build_mcp_retrieval_tool_output(
+                        "retrieve_source_trace",
+                        result,
+                        include_answer_demo=payload.include_answer_demo,
+                        include_raw_text=payload.include_raw_text,
+                    )
+                    return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+
+            output = build_mcp_route_trace_output(
+                search_id=payload.search_id,
+                trace=trace,
+                include_debug=payload.include_debug,
+            )
+            return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+
     @router.post("/memory/mcp/inspect-path-corridor", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/inspect-path-corridor", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     def mcp_inspect_path_corridor_endpoint(payload: McpInspectionRequest) -> McpToolExecutionResponse:
         return _inspect_mcp_result("inspect_path_corridor", payload)
+
+    @router.post("/memory/mcp/inspect-memory-object", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
+    @router.post("/mcp/inspect-memory-object", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
+    def mcp_inspect_memory_object_endpoint(payload: McpMemoryObjectInspectionRequest) -> McpToolExecutionResponse:
+        with _brain_request_scope(_payload_brain_id(payload)):
+            cluster = fetch_cluster_runtime(payload.node_id)
+            output = build_mcp_memory_object_output(
+                node_id=payload.node_id,
+                cluster=cluster,
+                include_debug=payload.include_debug,
+            )
+            return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
 
     @router.get("/memory/brain-health")
     def memory_brain_health_endpoint(

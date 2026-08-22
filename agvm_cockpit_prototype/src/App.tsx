@@ -33,7 +33,10 @@ import {
   TerminalSquare,
   UploadCloud,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { OrbitControls } from "@react-three/drei";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Quaternion, Vector3, type Group } from "three";
 
 type HealthState = {
   ok?: boolean;
@@ -114,6 +117,15 @@ type BrainActivity = {
   phase: "idle" | "retrieving" | "growing" | "mcp" | "health";
 };
 
+type BrainPoint3d = {
+  id: string;
+  label: string;
+  memoryType: string;
+  position: [number, number, number];
+  color: string;
+  size: number;
+};
+
 const apiBaseUrl = String(import.meta.env.VITE_API_URL || "http://localhost:8010").replace(/\/$/, "");
 const cloudUrl = String(import.meta.env.VITE_DETWIN_CLOUD_URL || "https://app.detwin.ai").replace(/\/$/, "");
 
@@ -136,23 +148,6 @@ const growSourceModes: Array<{ kind: GrowSourceKind; label: string; meta: string
   { kind: "transcript", label: "Transcript", meta: "Interview / OCR", icon: MessageSquareText },
   { kind: "mixed_bundle", label: "Bundle", meta: "Mixed evidence", icon: Layers3 },
 ];
-
-const demoNodes: GraphNode[] = Array.from({ length: 48 }, (_, index) => {
-  const angle = (index / 48) * Math.PI * 2;
-  const ring = index % 4;
-  return {
-    id: `demo-${index + 1}`,
-    summary: ["Context", "Evidence", "Receipt", "Growth"][ring],
-    memory_type: ["context", "evidence", "receipt", "growth"][ring],
-    final_position: {
-      x: Math.cos(angle) * (0.34 + ring * 0.14),
-      y: Math.sin(angle) * (0.24 + ring * 0.1),
-      z: Math.sin(angle * 1.7) * 0.2,
-    },
-    semantic_color: { hex: ["#01eab2", "#486efe", "#d0ccf0", "#ffffff"][ring] },
-    links: index > 0 ? [{ target_node_id: `demo-${Math.max(1, index - ring)}`, strength: 0.72 }] : [],
-  };
-});
 
 export function CockpitApp() {
   const [route, setRoute] = useState<RouteId>(() => routeFromLocation());
@@ -214,7 +209,7 @@ export function CockpitApp() {
     registry?.active_brain_id || health?.active_brain_id || brains.find((brain) => brain.is_active)?.brain_id || brains[0]?.brain_id || "",
   );
   const activeBrain = brains.find((brain) => brainId(brain) === activeBrainId) || brains[0] || null;
-  const nodes = graph?.graph?.nodes?.length ? graph.graph.nodes : demoNodes;
+  const nodes = graph?.graph?.nodes || [];
   const toolOptions = useMemo(() => (mcpRegistry?.tools || []).filter((tool) => tool.endpoint_path).slice(0, 80), [mcpRegistry]);
   const selectedTool = toolOptions.find((tool) => tool.name === toolName) || toolOptions[0] || null;
   const routeModel = routes.find((item) => item.id === route) || routes[0];
@@ -325,70 +320,74 @@ export function CockpitApp() {
 
   return (
     <main className="core-shell" data-route={route}>
-      <aside className="core-rail" aria-label="Local AGVM navigation">
-        <div className="core-brand">
-          <span className="core-mark">de</span>
+      <header className="core-topbar" aria-label="Local AGVM status">
+        <div className="core-brand topbar-product">
+          <span className="core-mark"><Brain size={19} /></span>
           <div>
             <strong>AGVM</strong>
             <small>Local Core</small>
           </div>
         </div>
-        <nav>
-          {routes.map((item) => (
-            <a className={route === item.id ? "active" : ""} href={`#${item.id}`} key={item.id} onClick={() => setRoute(item.id)}>
-              <item.icon size={17} />
-              <span>{item.label}</span>
-              <small>{item.eyebrow}</small>
-            </a>
-          ))}
-        </nav>
-        <div className="rail-card">
-          <Server size={16} />
-          <strong>{health?.ok ? "Runtime connected" : loading ? "Checking runtime" : "Runtime offline"}</strong>
-          <span>{apiBaseUrl}</span>
-        </div>
-      </aside>
+        <StatusTile label="Workspace" value="Local Workspace" tone="neutral" />
+        <BrainSelector
+          activeBrainId={activeBrainId}
+          brains={brains}
+          busyAction={busyAction}
+          importBrainDisplayName={importBrainDisplayName}
+          importBrainId={importBrainId}
+          newBrainDisplayName={newBrainDisplayName}
+          newBrainId={newBrainId}
+          onBootstrap={bootstrapRegistry}
+          onCreateBrain={() => createLocalBrain()}
+          onExportBrain={exportActiveBrain}
+          onImportFile={importLocalBrain}
+          onRefresh={refresh}
+          onSelect={(brain) =>
+            runAction("select-brain", async () => {
+              const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/select-brain", "/memory/brains/select", { brain_id: brain, make_default: false });
+              await refresh();
+              return response;
+            })
+          }
+          setImportBrainDisplayName={setImportBrainDisplayName}
+          setImportBrainId={setImportBrainId}
+          setNewBrainDisplayName={setNewBrainDisplayName}
+          setNewBrainId={setNewBrainId}
+        />
+        <StatusTile label="Plan" value="AGVM Core" tone="neutral" />
+        <StatusTile label="Graph" value={graph?.graph?.nodes?.length ? `${graph.graph.nodes.length} nodes` : "Empty brain"} tone={graph?.graph?.nodes?.length ? "active" : "pending"} />
+        <StatusTile label="Runtime" value={health?.ok ? "Local ready" : loading ? "Checking" : "Offline"} tone={health?.ok ? "ready" : loading ? "pending" : "blocked"} />
+        <button className="icon-button" onClick={refresh} title="Refresh local runtime" type="button">
+          <RefreshCw size={17} />
+        </button>
+      </header>
 
-      <section className="core-main">
-        <header className="core-topbar">
-          <div className="topbar-title">
-            <routeModel.icon size={18} />
+      <div className="core-layout">
+        <aside className="core-rail" aria-label="Local AGVM navigation">
+          <div className="rail-context">
+            <routeModel.icon size={17} />
             <div>
               <span>{routeModel.eyebrow}</span>
               <strong>{routeModel.label}</strong>
             </div>
           </div>
-          <BrainSelector
-            activeBrainId={activeBrainId}
-            brains={brains}
-            busyAction={busyAction}
-            importBrainDisplayName={importBrainDisplayName}
-            importBrainId={importBrainId}
-            newBrainDisplayName={newBrainDisplayName}
-            newBrainId={newBrainId}
-            onBootstrap={bootstrapRegistry}
-            onCreateBrain={() => createLocalBrain()}
-            onExportBrain={exportActiveBrain}
-            onImportFile={importLocalBrain}
-            onRefresh={refresh}
-            onSelect={(brain) =>
-              runAction("select-brain", async () => {
-                const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/select-brain", "/memory/brains/select", { brain_id: brain, make_default: false });
-                await refresh();
-                return response;
-              })
-            }
-            setImportBrainDisplayName={setImportBrainDisplayName}
-            setImportBrainId={setImportBrainId}
-            setNewBrainDisplayName={setNewBrainDisplayName}
-            setNewBrainId={setNewBrainId}
-          />
-          <StatusTile label="API" value={health?.ok ? "Running" : loading ? "Checking" : "Offline"} tone={health?.ok ? "ready" : loading ? "pending" : "blocked"} />
-          <StatusTile label="Graph" value={graph?.graph?.nodes?.length ? `${graph.graph.nodes.length} nodes` : "Demo shape"} tone={graph?.graph?.nodes?.length ? "active" : "pending"} />
-          <button className="icon-button" onClick={refresh} title="Refresh local runtime" type="button">
-            <RefreshCw size={17} />
-          </button>
-        </header>
+          <nav>
+            {routes.map((item) => (
+              <a className={route === item.id ? "active" : ""} href={`#${item.id}`} key={item.id} onClick={() => setRoute(item.id)}>
+                <item.icon size={17} />
+                <span>{item.label}</span>
+                <small>{item.eyebrow}</small>
+              </a>
+            ))}
+          </nav>
+          <div className="rail-card">
+            <Server size={16} />
+            <strong>{health?.ok ? "Local Core connected" : loading ? "Checking runtime" : "Runtime offline"}</strong>
+            <span>{apiBaseUrl}</span>
+          </div>
+        </aside>
+
+        <section className="core-main">
 
         <section className="workspace">
           <div className="workspace-head">
@@ -406,7 +405,7 @@ export function CockpitApp() {
                   type="button"
                 >
                   {busyAction === "create-brain" ? <RefreshCw size={16} /> : <Brain size={16} />}
-                  Create demo brain
+                  Create starter brain
                 </button>
               ) : null}
               <a className="secondary" href={`${cloudUrl}/modules`}>
@@ -522,7 +521,8 @@ export function CockpitApp() {
           ) : null}
           {route === "settings" ? <SettingsRoute activeBrainId={activeBrainId} health={health} mcpRegistry={mcpRegistry} setTheme={setTheme} theme={theme} /> : null}
         </section>
-      </section>
+        </section>
+      </div>
     </main>
   );
 }
@@ -549,13 +549,13 @@ function BrainRoute({
         <MetricGrid
           metrics={[
             { label: "Brain id", value: activeBrainId || "not selected" },
-            { label: "Nodes", value: String(graph?.graph?.meta?.total_node_count || activeBrain?.node_count || nodes.length) },
-            { label: "MCP", value: activeBrain?.safe_for_mcp === false ? "gated" : "ready" },
+            { label: "Nodes", value: String(graph?.graph?.meta?.total_node_count || activeBrain?.node_count || 0) },
+            { label: "MCP", value: !activeBrain ? "select brain" : activeBrain.safe_for_mcp === false ? "gated" : "ready" },
             { label: "Scope", value: "local only" },
           ]}
         />
         <div className="receipt-list">
-          <Receipt title="Brain shape" detail="The canvas keeps a stable brain-like projection even before a large local graph is loaded." tone="active" />
+          <Receipt title="Brain shape" detail="The 3D projection is derived only from the nodes currently stored in this brain." tone="active" />
           <Receipt title="Runtime boundary" detail="No Detwin account, billing state or cloud workspace is required for this local Core UI." tone="ready" />
           <Receipt title="Advanced modules" detail="Clone, Teach and Maintain are cloud surfaces. Local Core links to Detwin Cloud instead of downloading paid modules." tone="pending" />
         </div>
@@ -640,10 +640,49 @@ function GrowRoute({
   const requiresUrl = sourceKind === "url" || sourceKind === "website";
   const sourceReady = requiresUrl ? sourceUrl.trim().length > 0 : sourceText.trim().length > 0;
   const preview = growPreviewSummary(result);
+  const previewReady = preview.sourceUnits !== "0" || preview.candidates !== "0";
   return (
-    <div className="operation-grid">
-      <section className="command-surface grow-workspace">
-        <PanelEyebrow icon={Sparkles} label="Guided Grow Workspace" />
+    <div className="grow-product">
+      <section className="grow-overview" aria-label="Grow operation status">
+        <div>
+          <PanelEyebrow icon={Sparkles} label="Guided growth" />
+          <h2>Grow Workspace</h2>
+          <p>Turn local source material into inspectable memory candidates, then approve the exact set before any write.</p>
+        </div>
+        <div className="grow-overview-metrics">
+          <Receipt title="Source units" detail={preview.sourceUnits} tone={preview.sourceUnits === "0" ? "pending" : "ready"} />
+          <Receipt title="Ghost nodes" detail={preview.candidates} tone={preview.candidates === "0" ? "pending" : "active"} />
+          <Receipt title="Will add" detail={previewReady ? preview.candidates : "0"} tone={previewReady ? "active" : "pending"} />
+          <Receipt title="Current state" detail={previewReady ? "Review candidates" : "Preview required"} tone={previewReady ? "ready" : "pending"} />
+        </div>
+      </section>
+
+      <div className="grow-workbench">
+        <aside className="grow-runway" aria-label="Grow steps">
+          <PanelEyebrow icon={GitBranch} label="Operator runway" />
+          {[
+            { label: "Prepare source", detail: sourceReady ? "source ready" : "text, URL, website or upload", state: sourceReady ? "done" : "active" },
+            { label: "Preview formation", detail: previewReady ? "preview ready" : "not run", state: previewReady ? "done" : sourceReady ? "active" : "pending" },
+            { label: "Inspect candidates", detail: previewReady ? `${preview.candidates} proposed` : "waiting for preview", state: previewReady ? "active" : "pending" },
+            { label: "Apply growth", detail: previewReady ? "explicit review required" : "locked until review", state: "pending" },
+          ].map((step, index) => (
+            <article className={step.state} key={step.label}>
+              <span>{step.state === "done" ? <CheckCircle2 size={15} /> : index + 1}</span>
+              <div>
+                <strong>{step.label}</strong>
+                <small>{step.detail}</small>
+              </div>
+            </article>
+          ))}
+        </aside>
+
+        <div className="operation-grid grow-operation-grid">
+          <section className="command-surface grow-workspace">
+            <div className="grow-step-heading">
+              <span>Step 1</span>
+              <strong>Add source material</strong>
+              <small>Nothing is written during preview.</small>
+            </div>
         <div className="grow-source-mode-grid" role="radiogroup" aria-label="Source type">
           {growSourceModes.map((mode) => (
             <button
@@ -712,10 +751,12 @@ function GrowRoute({
         <p className="fine-print">
           Grow produces reviewable source units, ghost nodes, candidate nodes and an apply contract. Local Core preview uses no Detwin credits.
         </p>
-      </section>
-      <div className="live-result-stack">
-        <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
-        <GrowResultPanel emptyTitle={activeBrainId ? "Grow preview has not run" : "Create a brain before growing memory"} result={result} />
+          </section>
+          <div className="live-result-stack">
+            <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
+            <GrowResultPanel emptyTitle={activeBrainId ? "Grow preview has not run" : "Create a brain before growing memory"} result={result} />
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -907,52 +948,137 @@ function BrainCanvas({
   variant?: "stage" | "compact";
 }) {
   const visibleNodes = nodes.slice(0, 90);
-  const points = visibleNodes.map((node, index) => nodePoint(node, index));
-  const pathIndexes = points
-    .map((point, index) => ({ index, point }))
-    .filter((_, index) => index % 5 === 0 || index % 7 === 0)
-    .slice(0, 11);
-  const activePathIndexSet = new Set(pathIndexes.map((item) => item.index));
-  const pathPoints = pathIndexes.map((item) => `${item.point.x.toFixed(2)},${item.point.y.toFixed(2)}`).join(" ");
+  const liveGraph = Boolean(activeBrainId && nodes.length);
+  const theme = readTheme();
+  const points = useMemo(() => visibleNodes.map((node, index) => nodePoint3d(node, index, visibleNodes.length)), [visibleNodes]);
   return (
     <section className={`brain-canvas ${variant} ${activity.active ? "is-active" : "is-idle"}`} aria-label="Local AGVM brain projection">
-      <div className="brain-orbit" />
-      <svg aria-hidden="true" className="brain-paths" preserveAspectRatio="none" viewBox="0 0 100 100">
-        <polyline className="brain-path ghost" points={pathPoints} />
-        <polyline className="brain-path live" points={pathPoints} />
-        {pathIndexes.map((item, index) => (
-          <circle className="brain-path-stop" cx={item.point.x} cy={item.point.y} key={`${item.index}-${index}`} r={activity.active ? 1.2 : 0.7} />
-        ))}
-      </svg>
-      <div className="brain-core">
-        {visibleNodes.map((node, index) => {
-          const point = points[index];
-          const style = {
-            "--x": `${point.x}%`,
-            "--y": `${point.y}%`,
-            "--size": `${5 + (index % 5)}px`,
-            "--delay": `${(index % 13) * 0.21}s`,
-            "--node-color": node.semantic_color?.hex || (index % 3 === 0 ? "#01eab2" : index % 3 === 1 ? "#486efe" : "#d0ccf0"),
-          } as CSSProperties;
-          return (
-            <span
-              className={`brain-node ${activePathIndexSet.has(index) ? "on-path" : ""}`}
-              key={`${node.id || "node"}-${index}`}
-              style={style}
-              title={node.summary || node.id || "memory node"}
-            />
-          );
-        })}
-      </div>
+      <Canvas className="brain-three-canvas" camera={{ fov: variant === "stage" ? 42 : 48, position: [0, 0.16, variant === "stage" ? 5.2 : 5.8] }} dpr={[1, 1.75]}>
+        <color args={[theme === "dark" ? "#071311" : "#f7faf9"]} attach="background" />
+        <ambientLight intensity={0.68} />
+        <directionalLight color="#f7fffb" intensity={1.2} position={[3.2, 4.5, 5]} />
+        <pointLight color="#00e9b1" intensity={2.4} position={[-2.6, 1.8, 2.4]} />
+        <pointLight color="#8b55e7" intensity={1.25} position={[2.8, -1.2, 2.2]} />
+        <BrainThreeScene activity={activity} points={points} variant={variant} />
+        <OrbitControls
+          autoRotate
+          autoRotateSpeed={activity.active ? 1.2 : 0.38}
+          enableDamping
+          enablePan={false}
+          enableZoom={false}
+          maxPolarAngle={Math.PI * 0.72}
+          minPolarAngle={Math.PI * 0.28}
+        />
+      </Canvas>
       <div className="brain-hud top-left">
-        <span>Active brain</span>
-        <strong>{activeBrainId || "demo projection"}</strong>
+        <span>{liveGraph ? "Active brain" : activeBrainId ? "Empty brain" : "Brain required"}</span>
+        <strong>{liveGraph ? activeBrainId : activeBrainId ? "Grow the first memory" : "Create or import a brain"}</strong>
       </div>
       <div className="brain-hud bottom-right">
         <span>{activity.label}</span>
         <strong>{activity.detail}</strong>
       </div>
+      <div className="brain-hud bottom-left">
+        <span>Graph nodes</span>
+        <strong>{liveGraph ? `${visibleNodes.length} rendered` : "0 - no synthetic data"}</strong>
+      </div>
     </section>
+  );
+}
+
+function BrainThreeScene({
+  activity,
+  points,
+  variant,
+}: {
+  activity: BrainActivity;
+  points: BrainPoint3d[];
+  variant: "stage" | "compact";
+}) {
+  const groupRef = useRef<Group>(null);
+  const active = activity.active;
+  const scale = variant === "stage" ? 1.14 : 1;
+  const pathPoints = useMemo(() => points.filter((_, index) => index % 5 === 0 || index % 7 === 0).slice(0, 18), [points]);
+
+  useFrame(({ clock }) => {
+    if (!groupRef.current) return;
+    const elapsed = clock.getElapsedTime();
+    groupRef.current.rotation.y = Math.sin(elapsed * 0.18) * 0.16 + elapsed * (active ? 0.09 : 0.035);
+    groupRef.current.rotation.x = -0.08 + Math.sin(elapsed * 0.22) * 0.035;
+  });
+
+  return (
+    <group ref={groupRef} scale={scale}>
+      {points.length >= 8 ? <group>
+        <mesh position={[-0.72, 0.08, 0]} rotation={[0.04, 0.02, -0.08]} scale={[1.18, 0.78, 0.54]}>
+          <sphereGeometry args={[1, 48, 24]} />
+          <meshStandardMaterial color="#0e2b28" emissive="#00e9b1" emissiveIntensity={0.08} metalness={0.08} opacity={Math.min(0.16, 0.035 + points.length / 900)} roughness={0.72} transparent wireframe />
+        </mesh>
+        <mesh position={[0.72, 0.08, 0]} rotation={[0.04, -0.02, 0.08]} scale={[1.18, 0.78, 0.54]}>
+          <sphereGeometry args={[1, 48, 24]} />
+          <meshStandardMaterial color="#17122a" emissive="#8b55e7" emissiveIntensity={0.08} metalness={0.08} opacity={Math.min(0.16, 0.035 + points.length / 900)} roughness={0.72} transparent wireframe />
+        </mesh>
+        <mesh position={[0, -0.45, -0.08]} rotation={[0.05, 0, 0]} scale={[0.8, 0.32, 0.38]}>
+          <sphereGeometry args={[1, 36, 18]} />
+          <meshStandardMaterial color="#ded5ed" opacity={Math.min(0.1, 0.02 + points.length / 1200)} roughness={0.8} transparent wireframe />
+        </mesh>
+      </group> : null}
+
+      {pathPoints.length > 1 ? (
+        <group>
+          {pathPoints.slice(1).map((point, index) => {
+            const previous = pathPoints[index];
+            return <ConnectionTube active={active} from={previous.position} key={`${previous.id}-${point.id}`} to={point.position} />;
+          })}
+        </group>
+      ) : null}
+
+      {points.map((point, index) => (
+        <MemoryNodeMesh active={active} key={`${point.id}-${index}`} point={point} pulseOffset={index * 0.137} />
+      ))}
+    </group>
+  );
+}
+
+function MemoryNodeMesh({ active, point, pulseOffset }: { active: boolean; point: BrainPoint3d; pulseOffset: number }) {
+  const meshRef = useRef<Group>(null);
+  useFrame(({ clock }) => {
+    if (!meshRef.current) return;
+    const pulse = 1 + Math.sin(clock.getElapsedTime() * (active ? 3.2 : 1.4) + pulseOffset) * (active ? 0.22 : 0.08);
+    meshRef.current.scale.setScalar(pulse);
+  });
+  return (
+    <group ref={meshRef} position={point.position}>
+      <mesh>
+        <sphereGeometry args={[point.size, 16, 10]} />
+        <meshStandardMaterial color={point.color} emissive={point.color} emissiveIntensity={active ? 0.55 : 0.24} roughness={0.48} />
+      </mesh>
+      <mesh scale={2.15}>
+        <sphereGeometry args={[point.size, 12, 8]} />
+        <meshBasicMaterial color={point.color} opacity={0.11} transparent />
+      </mesh>
+    </group>
+  );
+}
+
+function ConnectionTube({ active, from, to }: { active: boolean; from: [number, number, number]; to: [number, number, number] }) {
+  const midpoint: [number, number, number] = [(from[0] + to[0]) / 2, (from[1] + to[1]) / 2, (from[2] + to[2]) / 2];
+  const dx = to[0] - from[0];
+  const dy = to[1] - from[1];
+  const dz = to[2] - from[2];
+  const length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const quaternion = useMemo(() => {
+    if (length < 0.001) return new Quaternion();
+    const direction = new Vector3(dx, dy, dz).normalize();
+    const axis = new Vector3(0, 1, 0);
+    return new Quaternion().setFromUnitVectors(axis, direction);
+  }, [dx, dy, dz, length]);
+  if (length < 0.001) return null;
+  return (
+    <mesh position={midpoint} quaternion={quaternion}>
+      <cylinderGeometry args={[active ? 0.008 : 0.005, active ? 0.008 : 0.005, length, 8, 1]} />
+      <meshBasicMaterial color={active ? "#00e9b1" : "#ded5ed"} opacity={active ? 0.42 : 0.2} transparent />
+    </mesh>
   );
 }
 
@@ -1043,9 +1169,9 @@ function BrainBootstrapNotice({ busyAction, onBootstrap, onCreateDemo }: { busyA
       <Brain size={22} />
       <div>
         <strong>Create or import a local brain to start.</strong>
-        <p>Context, Grow and MCP are brain-scoped. Bootstrap scans available local brains; Create demo brain makes a synthetic Core brain you can use immediately.</p>
+        <p>Context, Grow and MCP are brain-scoped. Scan discovers existing local brains; Create starter brain creates an empty brain ready for your first Grow.</p>
       </div>
-      <button className="primary" disabled={busy} onClick={onCreateDemo} type="button"><PlusCircle size={16} />Create demo brain</button>
+      <button className="primary" disabled={busy} onClick={onCreateDemo} type="button"><PlusCircle size={16} />Create starter brain</button>
       <button className="secondary" disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={16} />Scan local brains</button>
     </article>
   );
@@ -1289,12 +1415,53 @@ function normalizeBrainId(value: string) {
   return normalized || "local_brain";
 }
 
-function nodePoint(node: GraphNode, index: number) {
+function nodePoint3d(node: GraphNode, index: number, total: number): BrainPoint3d {
   const position = node.final_position || {};
-  const syntheticAngle = (index / 90) * Math.PI * 2;
-  const x = clamp(50 + Number(position.x || Math.cos(syntheticAngle) * 0.62) * 34, 8, 92);
-  const y = clamp(50 + Number(position.y || Math.sin(syntheticAngle * 1.18) * 0.46) * 42, 8, 92);
-  return { x, y };
+  const hasRuntimePosition =
+    typeof position.x === "number" || typeof position.y === "number" || typeof position.z === "number";
+  const color = node.semantic_color?.hex || detwinNodeColor(index, node.memory_type);
+  if (hasRuntimePosition) {
+    return {
+      id: String(node.id || `node-${index + 1}`),
+      label: String(node.summary || node.id || "memory node"),
+      memoryType: String(node.memory_type || "memory"),
+      position: [
+        clamp(Number(position.x || 0) * 1.78, -2.25, 2.25),
+        clamp(Number(position.y || 0) * 1.2, -1.18, 1.18),
+        clamp(Number(position.z || 0) * 1.12, -1.08, 1.08),
+      ],
+      color,
+      size: 0.028 + (index % 5) * 0.006,
+    };
+  }
+
+  const count = Math.max(total, 1);
+  const theta = (index / count) * Math.PI * 2;
+  const layer = index % 6;
+  const hemisphere = index % 2 === 0 ? -1 : 1;
+  const lobe = Math.floor(index / 2) % 5;
+  const radial = 0.44 + (layer / 5) * 0.74;
+  const fold = Math.sin(theta * 3 + lobe * 0.72) * 0.18;
+  return {
+    id: String(node.id || `demo-node-${index + 1}`),
+    label: String(node.summary || node.id || "demo memory node"),
+    memoryType: String(node.memory_type || "demo"),
+    position: [
+      hemisphere * (0.22 + Math.abs(Math.cos(theta)) * radial) + fold * 0.34,
+      Math.sin(theta * 0.92) * (0.42 + lobe * 0.05) + Math.cos(theta * 2.4) * 0.08,
+      Math.sin(theta * 1.47 + layer) * 0.46 + hemisphere * 0.08,
+    ],
+    color,
+    size: 0.032 + (index % 5) * 0.006,
+  };
+}
+
+function detwinNodeColor(index: number, memoryType?: string | null) {
+  const type = String(memoryType || "").toLowerCase();
+  if (type.includes("receipt") || type.includes("proof")) return "#8b55e7";
+  if (type.includes("source") || type.includes("evidence")) return "#ded5ed";
+  if (type.includes("growth") || type.includes("candidate")) return "#00e9b1";
+  return ["#00e9b1", "#8b55e7", "#ded5ed", "#f7fffb"][index % 4];
 }
 
 function parseJsonObject(value: string): Record<string, unknown> {

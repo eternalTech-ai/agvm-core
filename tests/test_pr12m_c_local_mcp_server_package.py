@@ -33,6 +33,39 @@ CONFIG_EXAMPLE = ROOT / "agvm_mcp_server" / "config.example.json"
 GITIGNORE = ROOT / ".gitignore"
 
 
+class _FakeHostedMcpClient:
+    def __init__(self, result: dict[str, Any] | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.result = result or {
+            "content": [{"type": "text", "text": "Hosted operation settled."}],
+            "isError": False,
+            "structuredContent": {
+                "status": "preview_ready",
+                "metering": {
+                    "mode": "estimate_then_settle",
+                    "estimated_credit_units": 180,
+                    "settled_credit_units": 193,
+                },
+            },
+        }
+
+    def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        request_id: Any = None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "tool_name": tool_name,
+                "arguments": dict(arguments),
+                "request_id": request_id,
+            }
+        )
+        return self.result
+
+
 def _stub_api() -> tuple[ThreadingHTTPServer, type[BaseHTTPRequestHandler], str]:
     registry = build_mcp_contract_registry()
 
@@ -143,6 +176,7 @@ def test_pr12m_c_tools_list_is_mcp_protocol_registry_projection_with_brain_scope
     assert response is not None
     result = response["result"]
     tools = result["tools"]
+    assert len(tools) == 37
     assert [tool["name"] for tool in tools] == [*GUIDE_MCP_TOOL_NAMES, *REQUIRED_MCP_TOOL_NAMES, *AGENT_MEMORY_MCP_TOOL_NAMES]
     for name in GUIDE_MCP_TOOL_NAMES:
         assert name in {tool["name"] for tool in tools}
@@ -480,17 +514,91 @@ def test_pr12m_c_default_module_policy_lists_paid_tools_but_blocks_unlicensed_ca
     assert called is not None
     assert called["result"]["isError"] is True
     payload = called["result"]["structuredContent"]
-    assert payload["reason"] == "module_tool_not_enabled_by_local_mcp_lease"
-    assert payload["data"]["visibility_policy"] == "block_unlicensed"
+    assert payload["reason"] == "detwin_cloud_auth_required"
     assert payload["data"]["required_module_id"] == "agvm_maintain_studio"
     action_contract = payload["data"]["action_contract"]
     assert action_contract["schema_version"] == "agvm.local_mcp_paid_tool_action.v1"
     assert action_contract["action"] == "use_detwin_cloud_for_advanced_tool"
     assert action_contract["requires_account"] is True
     assert action_contract["requires_credits"] is True
+    assert action_contract["execution_surface"] == "hosted_mcp"
+    assert action_contract["dynamic_usage_settlement"] is True
+    assert action_contract["credential_environment_variable"] == "AGVM_HOSTED_MCP_API_KEY"
     assert action_contract["cloud_workspace_url"].startswith("https://cloud.detwin.ai/")
     assert "Detwin Cloud" in payload["data"]["recovery"]
     assert handler.post_requests == []
+
+
+def test_pr12m_c_paid_tool_uses_hosted_mcp_while_core_grow_stays_local() -> None:
+    http_server, handler, base_url = _stub_api()
+    hosted = _FakeHostedMcpClient()
+    try:
+        server = AgvmMcpServer(
+            AgvmMcpConfig(
+                api_base_url=base_url,
+                active_brain_id="alpha_brain",
+                hosted_mcp_api_key="agvm_mcp_test_secret_not_logged",
+            ),
+            hosted_client=hosted,  # type: ignore[arg-type]
+        )
+        grow = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": "grow-local",
+                "method": "tools/call",
+                "params": {
+                    "name": "grow_source_preview",
+                    "arguments": {"raw_input": "Grow remains a local Core operation."},
+                },
+            }
+        )
+        sleep = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": "sleep-hosted",
+                "method": "tools/call",
+                "params": {
+                    "name": "sleep_preview",
+                    "arguments": {"max_nodes_considered": 20},
+                },
+            }
+        )
+    finally:
+        _shutdown(http_server)
+
+    assert grow is not None and grow["result"]["isError"] is False
+    assert sleep is not None and sleep["result"]["isError"] is False
+    assert handler.post_requests == [
+        {
+            "path": "/mcp/grow-source-preview",
+            "brain_header": "alpha_brain",
+            "payload": {
+                "raw_input": "Grow remains a local Core operation.",
+                "brain_id": "alpha_brain",
+            },
+        }
+    ]
+    assert hosted.calls == [
+        {
+            "tool_name": "sleep_preview",
+            "arguments": {"max_nodes_considered": 20, "brain_id": "alpha_brain"},
+            "request_id": "sleep-hosted",
+        }
+    ]
+    metering = sleep["result"]["structuredContent"]["metering"]
+    assert metering["estimated_credit_units"] == 180
+    assert metering["settled_credit_units"] == 193
+
+
+def test_pr12m_c_hosted_mcp_secret_is_environment_only_and_redacted_from_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGVM_HOSTED_MCP_API_KEY", "agvm_mcp_never_render_this_secret")
+
+    config = load_config()
+
+    assert config.hosted_mcp_configured is True
+    assert "agvm_mcp_never_render_this_secret" not in repr(config)
 
 
 def test_pr12m_c_permission_families_allow_registry_and_preview_without_apply() -> None:

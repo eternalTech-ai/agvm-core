@@ -17,14 +17,21 @@ release:
 - Maintain Studio;
 - advanced chat/product surfaces.
 
-The public Core UI may show these module slots, but it must route users to
-Detwin Cloud instead of installing or serving paid module source locally.
+The public Core UI may show Cloud module entry points, but it must route users
+to Detwin Cloud instead of installing or serving paid module source locally.
 
 The local MCP bridge intentionally keeps all 37 registry tools discoverable by
 default. This is for AI-client planning, not for entitlement. Paid-module calls
-that require a module lease must return a structured block response before the
-local API runs. Core users cannot bypass Detwin Cloud or a local module lease by
-calling those tools directly.
+that require a paid module never run against the local API. Without a Hosted MCP
+key or active module lease they return
+`module_tool_not_enabled_by_local_mcp_lease` with a structured Detwin Cloud
+action contract. If Cloud authentication is missing, the hosted handoff returns
+`detwin_cloud_auth_required`. With a valid key, the certified
+`sleep_preview` and `evolve_preview` calls are forwarded to Detwin Hosted MCP,
+where account, plan, brain, provider and quota checks happen before execution.
+Platform settles the dynamic usage reported by the Core terminal receipt. Other
+paid tools remain visible and return a structured unavailable result until their
+Hosted adapter is certified. Grow remains local and free.
 
 For the public core repository, module code is not copied. Only public contracts
 and generic placeholders are allowed.
@@ -53,7 +60,7 @@ readiness server-side.
 
 The target release model is:
 
-1. the user logs into the hosted AGVM platform;
+1. the user logs into Detwin;
 2. the platform decides whether the account has AGVM Pro;
 3. Cloud AGVM checks provider, brain, entitlement and credits;
 4. the cloud module action runs only after quota preflight;

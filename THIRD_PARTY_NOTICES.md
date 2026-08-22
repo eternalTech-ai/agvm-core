@@ -1,60 +1,49 @@
-<!--
-SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
-SPDX-FileContributor: Lorenzo Massaro
-SPDX-License-Identifier: AGPL-3.0-only
--->
-
 # Third-Party Notices
 
-Status: generated candidate notice inventory. Review with counsel before public release.
+Status: generated candidate notice inventory. Locked dependency artifacts were verified.
 
 This file lists third-party runtime and UI dependencies included in the AGVM Core public export.
 It is generated from `agvm_api/requirements.txt` and `agvm_cockpit_prototype/package-lock.json`.
-It is not a substitute for legal review or for the final AGVM Core license decision.
+It records dependency license metadata and redistribution notes; it is not legal advice.
+Do not treat this notice inventory as approved independently of the technical release gates.
 
 ## Summary
 
 - Total dependencies: `196`
 - Python dependencies: `10`
 - NPM dependencies: `186`
-- Dependencies requiring manual legal review: `4`
+- Dependencies requiring manual legal review: `0`
 - Main AGVM Core license placeholder still present: `false`
 
 ## License Counts
 
 | License | Count |
 | --- | ---: |
-| MIT | 165 |
+| MIT | 166 |
 | Apache-2.0 | 10 |
 | ISC | 10 |
 | BSD-3-Clause | 7 |
 | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | 1 |
 | CC-BY-4.0 | 1 |
 | MIT-CMU | 1 |
-| pending_scan | 1 |
 
-## Manual Review Queue
+## Unresolved License Metadata
 
-| Ecosystem | Package | Version / Specifier | License | Review |
-| --- | --- | --- | --- | --- |
-| python | `Pillow` | `Pillow>=10.0.0,<13.0.0` | MIT-CMU | required |
-| python | `pypdfium2` | `pypdfium2>=4.30.0,<5.0.0` | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | required |
-| npm | `caniuse-lite` | `1.0.30001793` | CC-BY-4.0 | required |
-| npm | `webgl-constants` | `1.1.1` | pending_scan | required |
+No dependency is currently marked for manual review by the generator.
 
 ## Python Dependencies
 
 | Ecosystem | Package | Version / Specifier | License | Review |
 | --- | --- | --- | --- | --- |
-| python | `fastapi` | `fastapi==0.117.1` | MIT | standard |
-| python | `Pillow` | `Pillow>=10.0.0,<13.0.0` | MIT-CMU | required |
+| python | `fastapi` | `fastapi==0.133.0` | MIT | standard |
+| python | `Pillow` | `Pillow>=10.0.0,<13.0.0` | MIT-CMU | standard |
 | python | `playwright` | `playwright>=1.45.0,<2.0.0` | Apache-2.0 | standard |
 | python | `pydantic` | `pydantic==2.11.9` | MIT | standard |
 | python | `pypdf` | `pypdf>=5.0.0,<7.0.0` | BSD-3-Clause | standard |
-| python | `pypdfium2` | `pypdfium2>=4.30.0,<5.0.0` | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | required |
+| python | `pypdfium2` | `pypdfium2>=4.30.0,<5.0.0` | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | standard |
 | python | `pytesseract` | `pytesseract>=0.3.13,<0.4.0` | Apache-2.0 | standard |
 | python | `python-dotenv` | `python-dotenv==1.2.2` | BSD-3-Clause | standard |
-| python | `python-multipart` | `python-multipart==0.0.20` | Apache-2.0 | standard |
+| python | `python-multipart` | `python-multipart==0.0.32` | Apache-2.0 | standard |
 | python | `uvicorn` | `uvicorn[standard]==0.37.0` | BSD-3-Clause | standard |
 
 ## NPM Dependencies
@@ -167,7 +156,7 @@ It is not a substitute for legal review or for the final AGVM Core license decis
 | npm | `browserslist` | `4.28.2` | MIT | standard |
 | npm | `buffer` | `6.0.3` | MIT | standard |
 | npm | `camera-controls` | `3.1.0` | MIT | standard |
-| npm | `caniuse-lite` | `1.0.30001793` | CC-BY-4.0 | required |
+| npm | `caniuse-lite` | `1.0.30001793` | CC-BY-4.0 | standard |
 | npm | `convert-source-map` | `2.0.0` | MIT | standard |
 | npm | `cross-env` | `7.0.3` | MIT | standard |
 | npm | `cross-spawn` | `7.0.6` | MIT | standard |
@@ -241,7 +230,7 @@ It is not a substitute for legal review or for the final AGVM Core license decis
 | npm | `use-sync-external-store` | `1.6.0` | MIT | standard |
 | npm | `utility-types` | `3.11.0` | MIT | standard |
 | npm | `vite` | `5.4.21` | MIT | standard |
-| npm | `webgl-constants` | `1.1.1` | pending_scan | required |
+| npm | `webgl-constants` | `1.1.1` | MIT | standard |
 | npm | `webgl-sdf-generator` | `1.1.1` | MIT | standard |
 | npm | `which` | `2.0.2` | ISC | standard |
 | npm | `yallist` | `3.1.1` | ISC | standard |
@@ -250,4 +239,4 @@ It is not a substitute for legal review or for the final AGVM Core license decis
 
 ## Release Note
 
-Do not treat this notice inventory as approved until the final public license and third-party notice pack have been reviewed and approved.
+No release approval is inferred from this inventory; the automated release gates and owner decision remain authoritative.
