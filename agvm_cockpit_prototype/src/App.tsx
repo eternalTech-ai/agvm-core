@@ -240,13 +240,14 @@ export function CockpitApp() {
     const cleanDisplayName = displayName.trim() || "Personal Memory";
     const brain_id = normalizeBrainId(requestedBrainId || cleanDisplayName);
     runAction("create-brain", async () => {
-      const response = await writeApi<Record<string, unknown>>("/memory/brains/create", {
+      const payload = {
         brain_id,
         display_name: cleanDisplayName,
         description: "Created from the AGVM Core UI.",
         make_active: true,
         make_default: true,
-      });
+      };
+      const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/brains/create", "/memory/brains/create", payload);
       await refresh();
       return response;
     });
@@ -254,11 +255,22 @@ export function CockpitApp() {
 
   function bootstrapRegistry() {
     runAction("bootstrap-brain-registry", async () => {
-      const response = await writeApi<Record<string, unknown>>("/memory/brains/bootstrap", {
-        legacy_data_dirs: [],
-        default_brain_id: normalizeBrainId(newBrainId || newBrainDisplayName),
-        force_rescan: true,
-      });
+      const brain_id = normalizeBrainId(newBrainId || newBrainDisplayName);
+      const response = await writeApiWithFallback<Record<string, unknown>>(
+        "/mcp/brains/ensure",
+        "/memory/brains/bootstrap",
+        {
+          brain_id,
+          default_brain_id: brain_id,
+          display_name: newBrainDisplayName.trim() || "Personal Memory",
+          description: "Bootstrapped from the AGVM Core UI.",
+          purpose: "local_core",
+          activation_policy: "make_default",
+          create_if_missing: true,
+          force_rescan: true,
+          legacy_data_dirs: [],
+        },
+      );
       await refresh();
       return response;
     });
@@ -283,7 +295,7 @@ export function CockpitApp() {
   function exportActiveBrain() {
     runAction("export-brain", async () => {
       if (!activeBrainId) throw new Error("Select or create a local brain before export.");
-      return writeApi<Record<string, unknown>>("/memory/brains/export", { brain_id: activeBrainId });
+      return writeApiWithFallback<Record<string, unknown>>("/mcp/brains/export", "/memory/brains/export", { brain_id: activeBrainId });
     });
   }
 
@@ -360,7 +372,7 @@ export function CockpitApp() {
             onRefresh={refresh}
             onSelect={(brain) =>
               runAction("select-brain", async () => {
-                const response = await writeApi<Record<string, unknown>>("/memory/brains/select", { brain_id: brain, make_default: false });
+                const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/select-brain", "/memory/brains/select", { brain_id: brain, make_default: false });
                 await refresh();
                 return response;
               })
@@ -1168,6 +1180,14 @@ async function readApi<T>(path: string): Promise<T> {
 
 async function writeApi<T>(path: string, body: Record<string, unknown>): Promise<T> {
   return requestApi<T>(path, { method: "POST", body: JSON.stringify(compact(body)) });
+}
+
+async function writeApiWithFallback<T>(primaryPath: string, fallbackPath: string, body: Record<string, unknown>): Promise<T> {
+  try {
+    return await writeApi<T>(primaryPath, body);
+  } catch {
+    return writeApi<T>(fallbackPath, body);
+  }
 }
 
 async function uploadApi<T>(path: string, body: FormData): Promise<T> {

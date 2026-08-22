@@ -36,7 +36,7 @@ services:
       context: .
       dockerfile: agvm_cockpit_prototype/Dockerfile.core
       args:
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8010}
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:${AGVM_API_PORT:-8010}}
         VITE_AGVM_UI_SHELL_PROFILE: public_core
     container_name: agvm_core_ui
     depends_on:

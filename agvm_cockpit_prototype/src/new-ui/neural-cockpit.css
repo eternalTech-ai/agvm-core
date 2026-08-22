@@ -75,6 +75,13 @@ body {
   background: var(--core-page-bg);
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  max-width: 100%;
+}
+
 button,
 input,
 select,
@@ -86,7 +93,8 @@ textarea {
 .core-shell {
   display: grid;
   grid-template-columns: 242px minmax(0, 1fr);
-  width: 100vw;
+  width: 100%;
+  max-width: 100%;
   min-height: 100vh;
   overflow: hidden;
 }
@@ -94,6 +102,8 @@ textarea {
 .core-rail {
   display: grid;
   grid-template-rows: auto 1fr auto;
+  min-width: 0;
+  max-width: 100%;
   min-height: 100vh;
   padding: 18px 14px;
   border-right: 1px solid var(--core-line);
@@ -170,6 +180,7 @@ textarea {
 .core-rail nav a {
   display: grid;
   grid-template-columns: 22px 1fr;
+  min-width: 0;
   gap: 2px 10px;
   align-items: center;
   padding: 11px 10px;
@@ -224,6 +235,8 @@ textarea {
 .core-topbar {
   display: grid;
   grid-template-columns: minmax(160px, 0.8fr) minmax(250px, 1fr) repeat(2, minmax(120px, 0.38fr)) 46px;
+  min-width: 0;
+  max-width: 100%;
   gap: 10px;
   align-items: center;
   padding: 12px 18px;
@@ -448,12 +461,15 @@ textarea {
 
 .workspace {
   min-width: 0;
+  max-width: 100%;
   overflow: auto;
   padding: 24px;
 }
 
 .workspace-head {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   gap: 18px;
   align-items: flex-start;
   justify-content: space-between;
@@ -602,6 +618,8 @@ textarea {
   border-radius: 8px;
   background: var(--core-surface-bg);
   box-shadow: var(--core-shadow);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .brain-canvas {

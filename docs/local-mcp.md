@@ -86,8 +86,9 @@ through to the local API.
 
 ## Brain And Graph Export
 
-Local brain export is explicit. Use `/memory/brains/export` or
-`/mcp/brains/export` only after selecting the intended brain. The archive
+Local brain export is explicit. Use `/mcp/brains/export` after selecting the
+intended brain. `/memory/brains/export` remains a browser compatibility alias, not
+the primary MCP contract. The archive
 contains the brain record, storage files and an export manifest with graph
 summary metadata: runtime node count, graph payload node/edge counts and the
 included graph/index/atlas/sqlite files. Treat every brain archive as sensitive

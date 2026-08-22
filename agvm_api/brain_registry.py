@@ -185,6 +185,14 @@ def _node_count(storage_path: Path) -> int:
     return int(sqlite_count or 0)
 
 
+def _env_truthy(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _repo_legacy_discovery_allowed() -> bool:
+    return _env_truthy("AGVM_DISCOVER_REPO_LEGACY_DATA") or _env_truthy("AGVM_ENABLE_LEGACY_DATA_DISCOVERY")
+
+
 def _storage_quality(storage_path: Path) -> dict[str, Any]:
     storage = storage_path.resolve()
     file_status = _storage_file_status(storage)
@@ -233,13 +241,18 @@ def discover_legacy_data_dirs(
     current_data_dir: Path | None = None,
 ) -> list[Path]:
     api = (api_dir or API_DIR).resolve()
-    candidates = [api / "data"]
-    try:
-        candidates.extend(sorted(path for path in api.glob("data_*") if path.is_dir()))
-    except OSError:
-        pass
     current = (current_data_dir or DATA_DIR).resolve()
-    candidates.append(current)
+    explicit_brain_root = bool(str(os.getenv("AGVM_BRAINS_DIR") or "").strip())
+    explicit_current_data = current_data_dir is not None or bool(str(os.getenv("AGVM_LAB_DATA_DIR") or "").strip())
+    candidates: list[Path] = []
+    if not explicit_brain_root or _repo_legacy_discovery_allowed():
+        candidates.append(api / "data")
+        try:
+            candidates.extend(sorted(path for path in api.glob("data_*") if path.is_dir()))
+        except OSError:
+            pass
+    if explicit_current_data or not explicit_brain_root:
+        candidates.append(current)
     discovered: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
