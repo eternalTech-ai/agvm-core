@@ -1,0 +1,20 @@
+{
+  "_spdx": {
+    "copyright": "2026 Eternal Tech SRL <info@eternaltech.ai>",
+    "license": "AGPL-3.0-only"
+  },
+  "name": "@detwin/design-tokens",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./tokens": "./src/generated/tokens.ts",
+    "./tokens.css": "./src/generated/tokens.css",
+    "./manifest": "./src/generated/token-manifest.json"
+  },
+  "scripts": {
+    "generate": "node ./scripts/generate.mjs",
+    "generate:check": "node ./scripts/generate.mjs --check",
+    "test": "npm run generate:check"
+  }
+}

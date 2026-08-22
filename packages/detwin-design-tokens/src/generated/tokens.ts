@@ -1,0 +1,155 @@
+// SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+// SPDX-FileContributor: Lorenzo Massaro
+// SPDX-License-Identifier: AGPL-3.0-only
+// Generated from src/tokens.json. Do not edit.
+
+export const designPackageAggregateSha256 = "e668b8c8ffeb54a913381e3ec007d42bac24895a96e2ec23a5d14537770bb8f3" as const;
+export const visualColorProjectionMetadata = {
+  "schema_version": "detwin.visual_color_projection.v1",
+  "semantic_boundary": "display_only_never_e_or_g",
+  "roles": {
+    "flat_reference": "Accepted v3 source-palette parity and renderer calibration",
+    "local_runtime_gradient": "Local 3D depth and node-density projection only",
+    "cloud_runtime_gradient": "Cloud 3D depth and node-density projection only",
+    "mint": "Selected source-backed object projection",
+    "lavender": "Candidate or comparison projection",
+    "violet": "Revision and diff projection accent"
+  }
+} as const;
+export const tokens = {
+  "color": {
+    "ink": "#1d1d1d",
+    "white": "#ffffff",
+    "paper": "#ececec",
+    "graphite": "#404040",
+    "teal": "#00e9b1",
+    "tealDeep": "#0e6e5a",
+    "mint": "#c9f1e8",
+    "lavender": "#ded5ed",
+    "violet": "#8b55e7",
+    "line": "rgba(29,29,29,.12)",
+    "lineStrong": "rgba(29,29,29,.22)",
+    "darkLine": "rgba(255,255,255,.16)",
+    "muted": "rgba(29,29,29,.64)",
+    "mutedDark": "rgba(255,255,255,.68)"
+  },
+  "font": {
+    "sans": "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif"
+  },
+  "type": {
+    "pageTitleSize": "32px",
+    "pageTitleLine": "36px",
+    "mobilePageTitleSize": "26px",
+    "mobilePageTitleLine": "32px",
+    "sectionTitleSize": "20px",
+    "sectionTitleLine": "26px",
+    "panelTitleSize": "16px",
+    "panelTitleLine": "22px",
+    "bodySize": "14px",
+    "bodyLine": "21px",
+    "metadataSize": "12px",
+    "metadataLine": "18px"
+  },
+  "weight": {
+    "regular": "400",
+    "medium": "520",
+    "semibold": "680",
+    "bold": "800"
+  },
+  "radius": {
+    "none": "0",
+    "small": "4px",
+    "medium": "6px",
+    "large": "8px",
+    "publicCta": "999px"
+  },
+  "size": {
+    "controlMin": "44px",
+    "fieldMin": "48px",
+    "iconButton": "44px",
+    "shellHeader": "64px",
+    "shellHeaderMin": "56px",
+    "shellHeaderMax": "64px",
+    "navigationRail": "208px",
+    "navigationRailCompact": "64px",
+    "inspector": "400px",
+    "inspectorMin": "320px",
+    "mobileTaskNavigation": "72px",
+    "tooltipMax": "240px",
+    "workspacePrimary": "896px"
+  },
+  "space": {
+    "1": "4px",
+    "2": "8px",
+    "3": "12px",
+    "4": "16px",
+    "5": "20px",
+    "6": "24px",
+    "8": "32px",
+    "10": "40px",
+    "12": "48px",
+    "16": "64px"
+  },
+  "layout": {
+    "contentMax": "1440px",
+    "desktopGutter": "32px",
+    "tabletGutter": "24px",
+    "mobileGutter": "16px",
+    "workspaceGap": "24px"
+  },
+  "role": {
+    "appBackground": "var(--dt-color-paper)",
+    "backdrop": "var(--dt-color-ink)",
+    "candidateSurface": "var(--dt-color-lavender)",
+    "focus": "var(--dt-color-violet)",
+    "primaryAction": "var(--dt-color-teal)",
+    "primaryActionText": "var(--dt-color-ink)",
+    "selectedBorder": "var(--dt-color-teal-deep)",
+    "selectedSurface": "var(--dt-color-mint)",
+    "surface": "var(--dt-color-white)",
+    "text": "var(--dt-color-ink)",
+    "textMuted": "var(--dt-color-muted)"
+  },
+  "opacity": {
+    "backdrop": ".56",
+    "disabled": ".48"
+  },
+  "z": {
+    "sticky": "20",
+    "drawer": "60",
+    "navigation": "70",
+    "dialog": "80",
+    "skipLink": "100"
+  },
+  "motion": {
+    "fast": "120ms",
+    "standard": "180ms",
+    "deliberate": "260ms",
+    "ease": "cubic-bezier(.2,.8,.2,1)"
+  },
+  "visualProjection": {
+    "flatReference": {
+      "ink": "#1E1E1E",
+      "white": "#FFFFFF",
+      "paper": "#EDEDED",
+      "graphite": "#404040",
+      "teal": "#00E9B1"
+    },
+    "localRuntime": {
+      "near": "#192E28",
+      "active": "#20D5A2",
+      "far": "#D5EBE5",
+      "gradient": "linear-gradient(135deg, #192E28 0%, #20D5A2 52%, #D5EBE5 100%)"
+    },
+    "cloudRuntime": {
+      "near": "#2C2437",
+      "active": "#A568FC",
+      "far": "#E4DDEE",
+      "gradient": "linear-gradient(135deg, #2C2437 0%, #A568FC 52%, #E4DDEE 100%)"
+    },
+    "selected": "var(--dt-color-mint)",
+    "candidate": "var(--dt-color-lavender)",
+    "revisionDiff": "var(--dt-color-violet)"
+  }
+} as const;
+export type DetwinTokens = typeof tokens;

@@ -158,6 +158,52 @@ def _selected_preview_ids(bundle: dict[str, Any], payload_ids: list[str]) -> lis
     return [item for item in [primary_id, *derived_ids] if item]
 
 
+def _local_core_source_unit(payload: McpGrowSourceRequest, investigation_id: str) -> dict[str, Any]:
+    raw_text = str(payload.raw_input or "").strip()
+    source_unit_id = f"src_{investigation_id.removeprefix('mcp-grow-')}"
+    return {
+        "unit_id": source_unit_id,
+        "kind": "manual_block" if payload.input_kind == "manual_text" else "external_reference",
+        "title": str(payload.source_label or "Local Grow source"),
+        "source_uri": payload.source_uri,
+        "source_type": str(payload.input_kind or "auto"),
+        "raw_text": raw_text,
+        "char_count": len(raw_text),
+        "token_estimate": max(1, (len(raw_text) + 3) // 4),
+        "confidence": 0.96 if payload.input_kind == "manual_text" else 0.74,
+        "fact_eligible": True,
+        "status": "available",
+    }
+
+
+def _bind_preview_bundle_to_source_unit(bundle: dict[str, Any], source_unit: dict[str, Any]) -> dict[str, Any]:
+    source_unit_id = str(source_unit.get("unit_id") or "")
+    if not source_unit_id:
+        return bundle
+    bound = dict(bundle)
+    primary = dict(bound.get("primary_node_preview") or {})
+    if primary:
+        if not primary.get("source_unit_id"):
+            primary["source_unit_id"] = source_unit_id
+        if not primary.get("source_unit_title"):
+            primary["source_unit_title"] = source_unit.get("title")
+        if not primary.get("source_unit_kind"):
+            primary["source_unit_kind"] = source_unit.get("kind")
+        bound["primary_node_preview"] = primary
+    derived_nodes: list[dict[str, Any]] = []
+    for raw_node in list(bound.get("derived_nodes") or []):
+        node = dict(raw_node or {})
+        if not node.get("source_unit_id"):
+            node["source_unit_id"] = source_unit_id
+        if not node.get("source_unit_title"):
+            node["source_unit_title"] = source_unit.get("title")
+        if not node.get("source_unit_kind"):
+            node["source_unit_kind"] = source_unit.get("kind")
+        derived_nodes.append(node)
+    bound["derived_nodes"] = derived_nodes
+    return bound
+
+
 def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGrowToolExecutionResponse:
     started = time.perf_counter()
     brain_record = _resolve_brain_record(payload.brain_id)
@@ -185,6 +231,9 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
             operator_instruction=payload.user_instruction,
             compiler_timeout_seconds=options.compiler_preview_timeout_seconds,
         )
+    source_unit = _local_core_source_unit(payload, investigation_id)
+    bundle = _bind_preview_bundle_to_source_unit(bundle, source_unit)
+    selected_preview_ids = _selected_preview_ids(bundle, [])
     source_investigation = {
         "schema_version": "agvm.mcp_source_investigation.v1",
         "investigation_id": investigation_id,
@@ -194,10 +243,29 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
         "input_kind": payload.input_kind,
         "created_at": _utc_now(),
         "status": "preview_ready",
+        "source_units": [source_unit],
+    }
+    source_formation_contract = {
+        "schema_version": "agvm.core_source_formation_contract.v1",
+        "mode": "local_core_preview",
+        "mutates_memory": False,
+        "apply_requires_confirm_apply": True,
+        "state": "preview_ready",
+        "source_kind": str(payload.input_kind or "auto"),
+        "investigation_id": investigation_id,
+        "apply_contract": {
+            "preview_required": True,
+            "explicit_confirm_apply_required": True,
+            "apply_without_preview_allowed": False,
+            "can_apply_now": bool(selected_preview_ids),
+            "blocked_reasons": [] if selected_preview_ids else ["preview_bundle_missing"],
+            "selected_preview_ids": selected_preview_ids,
+        },
     }
     _GROW_PREVIEW_RUNS[investigation_id] = {
         "brain_id": brain_id,
         "source_investigation": source_investigation,
+        "source_formation_contract": source_formation_contract,
         "preview_bundle": bundle,
     }
     return McpGrowToolExecutionResponse(
@@ -206,12 +274,7 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
         tool_name=tool_name,
         status="preview_ready",
         source_investigation=source_investigation,
-        source_formation_contract={
-            "schema_version": "agvm.core_source_formation_contract.v1",
-            "mode": "local_core_preview",
-            "mutates_memory": False,
-            "apply_requires_confirm_apply": True,
-        },
+        source_formation_contract=source_formation_contract,
         memory_operation_lifecycle_contract={
             "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
             "operation": "grow",
@@ -222,7 +285,13 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
         cognitive_write_plan=dict(bundle.get("cognitive_write_plan") or {}),
         learning_policy=dict(bundle.get("learning_policy") or {}),
         write_trace=dict(bundle.get("write_trace") or {}),
-        completeness={"preview_generated": True, "selected_preview_count": len(_selected_preview_ids(bundle, []))},
+        completeness={
+            "preview_generated": True,
+            "preview_node_count": len(selected_preview_ids),
+            "selected_preview_count": len(selected_preview_ids),
+            "source_status": "source_units_ready",
+            "source_unit_count": 1,
+        },
         mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
         budget={"credits_required": 0, "runtime": "local_core"},
     )
@@ -267,6 +336,11 @@ def _grow_source_apply(tool_name: str, payload: McpGrowApplyRequest) -> McpGrowT
             "status": "applied",
             "applied_at": _utc_now(),
         },
+        source_formation_contract={
+            **dict(stored.get("source_formation_contract") or {}),
+            "state": "applied",
+            "mutates_memory": True,
+        },
         memory_operation_lifecycle_contract={
             "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
             "operation": "grow",
@@ -283,7 +357,12 @@ def _grow_source_apply(tool_name: str, payload: McpGrowApplyRequest) -> McpGrowT
             "selected_preview_ids": selected_ids,
         },
         learning_policy=learning_policy,
-        completeness={"applied": True, "persisted_node_count": len(persisted_ids)},
+        completeness={
+            "applied": True,
+            "persisted_node_count": len(persisted_ids),
+            "persisted_edge_count": persisted_edge_count,
+            "source_unit_count": len(list((stored.get("source_investigation") or investigation).get("source_units") or [])),
+        },
         mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
         budget={"credits_required": 0, "runtime": "local_core"},
     )

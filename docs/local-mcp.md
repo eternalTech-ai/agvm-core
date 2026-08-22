@@ -69,9 +69,26 @@ tools are Core tools. Maintain-family module tools such as `sleep_preview`,
 `sleep_apply`, `evolve_preview`, `evolve_apply`,
 `matrix_calibration_preview`, `matrix_calibration_apply` and
 `list_memory_os_processes` stay visible so AI clients can plan correctly, but a
-direct call is blocked before API execution unless a valid local module lease is
-present. The block response includes an action contract that points the user to
-Detwin Cloud or account renewal.
+direct call requires a Detwin Hosted MCP key. Without one, the bridge returns
+`detwin_cloud_auth_required` with an action contract. With one, the bridge can
+send a certified paid operation to Hosted MCP; Platform checks the account,
+plan, cloud brain, provider and credits before dispatch and settles dynamic
+usage from the Core terminal receipt. In this release the certified stdio to
+Hosted adapters are `sleep_preview` and `evolve_preview`. Other paid tools stay
+discoverable but return a structured unavailable response until their Hosted
+adapter passes the same execution and metering gate.
+
+Create the key in Detwin Account, then expose it only to the MCP process:
+
+```bash
+AGVM_HOSTED_MCP_API_KEY=<hosted-key>
+AGVM_HOSTED_MCP_URL=https://mcp.detwin.ai
+```
+
+Do not write the key into the shareable JSON configuration. The target brain
+must already exist in the Detwin workspace, normally after an explicit Brain
+Sync. A retry with the same MCP request ID and arguments reuses the same
+idempotency key and cannot settle usage twice.
 
 ## Tool Boundary
 
@@ -80,9 +97,10 @@ advanced cloud modules are metered by the Detwin platform, not by the local
 Core bridge.
 
 Do not treat a visible paid-module MCP tool as authorization. The boundary is
-the server-side call gate: missing, expired or insufficient module access must
-return `module_tool_not_enabled_by_local_mcp_lease` and must not pass the call
-through to the local API.
+the server-side Hosted MCP gate. Missing credentials, entitlement or credits
+return structured recovery responses; paid operations never fall back to local
+execution. Grow remains a local Core operation and does not consume Detwin
+credits.
 
 ## Brain And Graph Export
 
