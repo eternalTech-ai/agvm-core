@@ -205,6 +205,7 @@ export function CockpitApp() {
 
   useEffect(() => {
     document.documentElement.dataset.coreTheme = theme;
+    document.documentElement.dataset.agvmTheme = theme;
     window.localStorage?.setItem("agvm.core.theme", theme);
   }, [theme]);
 
