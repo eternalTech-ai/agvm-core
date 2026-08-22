@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:9c900dea9e8fb7e16277c179b555cc72d29a352dbc33cff48ad5a0412fd5bfc7
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -6,5 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY agvm_mcp_server ./agvm_mcp_server
+RUN groupadd --system agvm \
+    && useradd --system --gid agvm --home-dir /app --shell /usr/sbin/nologin agvm \
+    && chown -R agvm:agvm /app
+
+USER agvm
 
 CMD ["python", "-m", "agvm_mcp_server"]

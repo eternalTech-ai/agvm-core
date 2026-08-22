@@ -6,8 +6,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Cloud And Pro
 
-AGVM Core is local-first and does not require an AGVM cloud account. The planned
-hosted AGVM platform is a separate product surface for users who want managed
+AGVM Core is local-first and does not require a Detwin cloud account. Detwin
+Cloud is a separate product surface for users who want managed
 memory, hosted MCP, usage metering and Pro cloud module activation.
 
 ## Local Free Core
@@ -22,7 +22,7 @@ Local free core runs on the user's machine:
 
 ## Hosted AGVM
 
-Hosted AGVM is intended to provide:
+Detwin Cloud provides the account and authorization boundary for:
 
 - hosted MCP access without running the local product;
 - managed tenant/workspace storage;
@@ -36,7 +36,7 @@ grant access to another user's brain, module entitlement or usage records.
 
 ## Detwin Pro
 
-The planned first paid package is a Detwin Pro bundle. It unlocks advanced
+Detwin Pro unlocks advanced
 modules in Detwin Cloud while keeping the local Core repository free of paid
 module source:
 
@@ -45,8 +45,16 @@ module source:
 - Hosted MCP for account-scoped cloud brains;
 - metered Cloud AGVM actions and receipts.
 
-Local AGVM does not download Clone, Teach or Maintain modules in this release.
-It keeps Grow local and routes advanced module calls to Detwin Cloud.
+Local AGVM does not download Clone, Teach or Maintain runtime source. Grow is a
+free Core capability. The local MCP bridge nevertheless exposes all 37 public
+tool contracts so an AI client can discover the complete workflow. A paid-tool
+call without valid module access is blocked before local API execution and
+returns a structured action contract directing the user to Detwin Cloud. Tool
+visibility is never treated as authorization.
+
+Local Core operations do not consume Detwin credits. Hosted MCP and advanced
+Cloud actions perform server-side entitlement and quota preflight, then record
+usage only in the hosted platform.
 
 ## What Is Public Here
 
@@ -67,7 +75,7 @@ This repository must not include:
 
 ## Current Status
 
-Cloud and Pro are separate from a local AGVM Core install. If a public core
-screen references hosted or Pro capabilities, it should make clear whether the
-feature requires platform login, a Pro plan, provider readiness, a cloud brain
-or available credits.
+Cloud and Pro remain separate from a local AGVM Core install. Public screens and
+MCP block responses identify when a capability requires platform login, a Pro
+plan, provider readiness, a cloud brain or available credits. The public repo
+contains the contracts and recovery guidance, not the paid implementation.

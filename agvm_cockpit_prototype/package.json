@@ -10,20 +10,21 @@
     "test:context-insight": "node scripts/test-context-run-insight.mjs"
   },
   "dependencies": {
+    "@detwin/design-tokens": "file:../packages/detwin-design-tokens",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.6.0",
-    "@vitejs/plugin-react": "^4.3.4",
     "lucide-react": "^0.468.0",
     "pixi.js": "^8.18.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "three": "^0.184.0",
-    "typescript": "^5.9.3",
-    "vite": "^5.4.19",
     "zustand": "^5.0.13"
   },
   "devDependencies": {
     "@types/react": "^19.2.2",
-    "@types/react-dom": "^19.2.2"
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.19"
   }
 }

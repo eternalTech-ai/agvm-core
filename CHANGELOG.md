@@ -13,8 +13,12 @@ All notable AGVM Core public releases will be tracked here.
 - Prepare AGVM Core public repository metadata, policies and documentation.
 - Document local MCP setup, local brain bootstrap and explicit Brain Sync
   boundaries.
-- Keep advanced Clone, Teach and Maintain capabilities cloud-only; local Core
-  exposes Grow and public MCP tools only.
+- Keep Grow free in Local Core and expose the complete 37-tool MCP catalog so
+  AI clients can plan against stable contracts.
+- Block paid-module MCP calls before local API execution when no valid module
+  access is present, returning a structured Detwin Cloud action contract.
+- Make the exported test suite, source-boundary scanner, SPDX policy, secret
+  scan and Docker smoke reproducible from the public repository alone.
 
 ## 0.1.0
 

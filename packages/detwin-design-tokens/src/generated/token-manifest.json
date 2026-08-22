@@ -1,0 +1,34 @@
+{
+  "_spdx": {
+    "copyright": "2026 Eternal Tech SRL <info@eternaltech.ai>",
+    "license": "AGPL-3.0-only"
+  },
+  "schema_version": "detwin.design_token_manifest.v1",
+  "design_package_aggregate_sha256": "e668b8c8ffeb54a913381e3ec007d42bac24895a96e2ec23a5d14537770bb8f3",
+  "visual_color_projection": {
+    "schema_version": "detwin.visual_color_projection.v1",
+    "semantic_boundary": "display_only_never_e_or_g",
+    "roles": {
+      "flat_reference": "Accepted v3 source-palette parity and renderer calibration",
+      "local_runtime_gradient": "Local 3D depth and node-density projection only",
+      "cloud_runtime_gradient": "Cloud 3D depth and node-density projection only",
+      "mint": "Selected source-backed object projection",
+      "lavender": "Candidate or comparison projection",
+      "violet": "Revision and diff projection accent"
+    }
+  },
+  "source": {
+    "path": "src/tokens.json",
+    "sha256": "70ec94071a3c6895d54731b7c685e2ed13d36a995b01871ecfdd21afc6a2d454"
+  },
+  "outputs": [
+    {
+      "path": "src/generated/tokens.css",
+      "sha256": "5c36e6c2cb15be09f2055ad956e313c515164f9f7f0f80f935b035120ea79f2c"
+    },
+    {
+      "path": "src/generated/tokens.ts",
+      "sha256": "58110d799abd115a2fab5d27ca18c6eef611248446b3bb572a7d6ca961c9173b"
+    }
+  ]
+}
