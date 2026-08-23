@@ -111,8 +111,10 @@ jobs:
 
       - name: Scan committed content with TruffleHog
         run: |
+          mkdir -p "$RUNNER_TEMP/trufflehog-tree"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/trufflehog-tree"
           if ! docker run --rm \
-            -v "$PWD:/src:ro" \
+            -v "$RUNNER_TEMP/trufflehog-tree:/src:ro" \
             trufflesecurity/trufflehog:3.95.6 \
             filesystem /src --json --no-update --fail \
             >"$RUNNER_TEMP/trufflehog.jsonl"; then
