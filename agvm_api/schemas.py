@@ -1,8 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 DocumentLookupKind = Literal[
     "none",
@@ -195,7 +199,7 @@ class VectorNode(BaseModel):
     matrix_calibration_plan_signature: str | None = None
     matrix_calibrated_at: str | None = None
     active_matrix_projection: dict[str, Any] = Field(default_factory=dict)
-    active_spatial_revision_context: dict[str, Any] = Field(default_factory=dict)
+    geometry_profile_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class Graph(BaseModel):
@@ -870,11 +874,35 @@ class McpMatrixCalibrationApplyRequest(McpMatrixCalibrationRequest):
 
     @field_validator("preview_signature")
     @classmethod
-    def trim_optional_mcp_matrix_preview_signature(cls, value: str | None) -> str | None:
+    def trim_mcp_geometry_calibration_preview_signature(cls, value: str | None) -> str | None:
         if value is None:
             return None
         value = value.strip()
-        return value or None
+        if not value:
+            raise ValueError("geometry_calibration_preview_signature_required")
+        return value
+
+    @model_validator(mode="after")
+    def require_signature_for_explicit_brain(self) -> "McpMatrixCalibrationApplyRequest":
+        # Missing scope is an MCP policy result. Once a brain is explicit, the
+        # apply request must be bound to a nonblank preview at model validation.
+        if self.brain_id and not self.preview_signature:
+            raise ValueError("geometry_calibration_preview_signature_required")
+        return self
+
+
+class McpGeometryCalibrationRollbackRequest(BaseModel):
+    brain_id: str = Field(min_length=1)
+    plan_signature: str = Field(min_length=1)
+    confirm_rollback: bool = False
+
+    @field_validator("brain_id", "plan_signature")
+    @classmethod
+    def trim_geometry_calibration_rollback_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("geometry_calibration_rollback_value_required")
+        return value
 
 
 class McpBrainHealthToolExecutionResponse(BaseModel):
@@ -925,6 +953,24 @@ class McpMatrixCalibrationToolExecutionResponse(BaseModel):
     actions: list[dict[str, Any]] = Field(default_factory=list)
     budget: dict[str, Any] = Field(default_factory=dict)
     completeness: dict[str, Any] = Field(default_factory=dict)
+
+
+class McpGeometryCalibrationRollbackResponse(BaseModel):
+    schema_version: str = "agvm.geometry_calibration_rollback_response.v1"
+    brain_id: str
+    tool_name: str = "geometry_calibration_rollback"
+    status: Literal["rolled_back", "already_rolled_back"]
+    plan_signature: str
+    rollback_result: dict[str, Any] = Field(default_factory=dict)
+    mutation_surface: dict[str, Any] = Field(default_factory=dict)
+    safety_contract: dict[str, Any] = Field(default_factory=dict)
+
+
+# Matrix remains a compatibility alias; new contracts use Geometry Calibration copy.
+McpGeometryCalibrationRequest = McpMatrixCalibrationRequest
+McpGeometryCalibrationApplyRequest = McpMatrixCalibrationApplyRequest
+McpMatrixCalibrationRollbackRequest = McpGeometryCalibrationRollbackRequest
+McpMatrixCalibrationRollbackResponse = McpGeometryCalibrationRollbackResponse
 
 
 class McpMaintenanceToolExecutionResponse(BaseModel):
@@ -2046,7 +2092,9 @@ class AuditResponse(BaseModel):
     version: str
     llm_enabled: bool
     provider_auth_ok: bool | None = None
-    llm_models: dict[str, str]
+    # Most runtime roles map directly to one model name. Product modules such
+    # as Clone expose a bounded role-to-model map under their module key.
+    llm_models: dict[str, Any]
     llm_runtime: dict[str, Any] = Field(default_factory=dict)
     runtime_signature: dict[str, Any] = Field(default_factory=dict)
     brain_registry: dict[str, Any] = Field(default_factory=dict)
@@ -2179,9 +2227,7 @@ class AuditResponse(BaseModel):
     latest_route_richness_benchmark: dict[str, Any] = Field(default_factory=dict)
     latest_master_closure_benchmark: dict[str, Any] = Field(default_factory=dict)
     latest_evaluation_benchmark: dict[str, Any] = Field(default_factory=dict)
-    latest_evaluation_v2_benchmark: dict[str, Any] = Field(default_factory=dict)
     final_evaluation_matrix: dict[str, Any] = Field(default_factory=dict)
-    final_evaluation_matrix_v2: dict[str, Any] = Field(default_factory=dict)
     maintenance_quality_scores: list[float] = Field(default_factory=list)
     metamemory: dict[str, Any] = Field(default_factory=dict)
     endpoints: list[str] = Field(default_factory=list)
@@ -2493,7 +2539,7 @@ class HostedBrainScopeResolutionResponse(BaseModel):
     registry_validation: dict[str, Any] = Field(default_factory=dict)
 
 
-BenchmarkPhase = Literal["product_harness", "source_intake", "retrieval_mcp", "ui_truth", "brain_os_v2_truth", "backend_integrity", "local_mcp_client", "live_product_matrix", "product_ready_local_gate", "final_gate_expansion", "final_self_hosted_readiness", "local_beta_fast_health", "local_mcp_product_matrix", "simone_source_manifest_reset_guard", "simone_source_intake_grow_preview", "node_atomicity_identity_link_coherence", "real_validation_brain_clean_density", "large_brain_scale_radial_matrix_distribution", "retrieve_context_quality_matrix", "sleep_evolve_metamemory_heuristic_evolution", "final_grow_retrieve_sleep_evolve_verdict", "phase8c_comparative_backend_benchmark", "external_certification", "product_scorecard", "self_hosted_readiness", "hosted_tenant_isolation", "smoke", "modes", "stream", "trace", "documents", "maintenance", "calibration", "planner_seed", "planner_merge", "geometry_audit", "route_richness", "master_closure", "recursive_contract", "evaluation", "evaluation_v2", "evaluation_v2_bounded", "all", "slice1_revalidation"]
+BenchmarkPhase = Literal["product_harness", "source_intake", "retrieval_mcp", "ui_truth", "backend_integrity", "local_mcp_client", "live_product_matrix", "product_ready_local_gate", "final_gate_expansion", "final_self_hosted_readiness", "local_beta_fast_health", "local_mcp_product_matrix", "simone_source_manifest_reset_guard", "simone_source_intake_grow_preview", "node_atomicity_identity_link_coherence", "real_validation_brain_clean_density", "large_brain_scale_radial_matrix_distribution", "retrieve_context_quality_matrix", "sleep_evolve_metamemory_heuristic_evolution", "final_grow_retrieve_sleep_evolve_verdict", "phase8c_comparative_backend_benchmark", "external_certification", "product_scorecard", "self_hosted_readiness", "hosted_tenant_isolation", "smoke", "modes", "stream", "trace", "documents", "maintenance", "calibration", "planner_seed", "planner_merge", "geometry_audit", "route_richness", "master_closure", "recursive_contract", "evaluation", "all", "slice1_revalidation"]
 
 
 class BenchmarkRunRequest(BaseModel):

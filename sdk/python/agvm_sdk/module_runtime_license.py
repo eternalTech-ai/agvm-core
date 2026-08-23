@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: Apache-2.0
+
 """Runtime license evaluation for AGVM private module sidecars.
 
 This helper is intentionally dependency-light so private module images can

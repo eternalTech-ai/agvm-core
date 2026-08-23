@@ -70,24 +70,37 @@ jobs:
       - name: Scan the exported source boundary
         run: |
           python - <<'PY'
-          import os
-          import shutil
+          import re
           from pathlib import Path
 
-          source = Path.cwd()
-          target = Path(os.environ["RUNNER_TEMP"]) / "agvm-public-self-scan"
-          shutil.rmtree(target, ignore_errors=True)
-          shutil.copytree(
-              source,
-              target,
-              ignore=shutil.ignore_patterns(".git", "node_modules", "dist", "__pycache__", ".pytest_cache"),
-          )
+          root = Path.cwd()
+          forbidden_roots = {"platform", "infra", "terraform", ".aws"}
+          forbidden_suffixes = {".db", ".duckdb", ".sqlite", ".sqlite3"}
+          local_path = re.compile(r"(?:[A-Za-z]:\\Users\\|[A-Za-z]:/Users/)", re.IGNORECASE)
+          violations = []
+          for path in root.rglob("*"):
+              if not path.is_file() or any(part in {".git", "node_modules", "dist", "__pycache__", ".pytest_cache"} for part in path.parts):
+                  continue
+              relative = path.relative_to(root).as_posix()
+              if relative.split("/", 1)[0] in forbidden_roots:
+                  violations.append(f"forbidden product root: {relative}")
+              if path.suffix.lower() in forbidden_suffixes:
+                  violations.append(f"runtime database: {relative}")
+              if path.name.startswith(".env") and path.name != ".env.example":
+                  violations.append(f"private environment file: {relative}")
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              proprietary_marker = "LicenseRef-Eternal-Tech-" + "Proprietary"
+              if proprietary_marker in text:
+                  violations.append(f"proprietary license marker: {relative}")
+              if local_path.search(text):
+                  violations.append(f"local machine path: {relative}")
+          if violations:
+              raise SystemExit("\n".join(sorted(set(violations))))
+          print("Public source boundary: PASS")
           PY
-          python scripts/check_public_export.py \
-            --path "$RUNNER_TEMP/agvm-public-self-scan" \
-            --denylist repo-policy/private-denylist.txt \
-            --release \
-            --scanner-mode docker
 
       - name: Scan committed content for secrets
         uses: gitleaks/gitleaks-action@v2

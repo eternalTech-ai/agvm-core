@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 from fastapi import FastAPI
@@ -12,6 +16,8 @@ from core_mcp_matrix_router import create_core_mcp_matrix_router
 from core_mcp_ops_router import create_core_mcp_ops_router
 from core_retrieve_router import create_core_retrieve_router
 from core_runtime_router import create_core_runtime_router
+from brain_bootstrap_v1 import create_brain_bootstrap_v1_router
+from brain_profile_v1_api import create_brain_profile_v1_router
 from edition_gate import install_edition_route_gate, read_edition_settings
 try:
     from hosted_mcp_core_service_router import create_hosted_mcp_core_service_router
@@ -40,6 +46,8 @@ def create_core_app() -> FastAPI:
     app.include_router(create_core_mcp_contract_router())
     app.include_router(create_core_mcp_ops_router())
     app.include_router(create_core_mcp_matrix_router())
+    app.include_router(create_brain_bootstrap_v1_router())
+    app.include_router(create_brain_profile_v1_router())
     app.include_router(create_core_retrieve_router())
     app.include_router(create_core_license_router())
     if create_hosted_mcp_core_service_router is not None:

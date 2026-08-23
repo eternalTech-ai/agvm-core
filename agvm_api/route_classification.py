@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import argparse
@@ -9,7 +13,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from mcp_tool_registration import GROW_MODULE_ID, MAINTAIN_MODULE_ID, required_module_id_for_tool_name
+from mcp_tool_registration import MAINTAIN_MODULE_ID, required_module_id_for_tool_name
 
 
 SURFACE_CATEGORIES = (
@@ -154,6 +158,14 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
             "/memory/mcp/grow-status",
             "/mcp/grow-status",
         ),
+    ),
+    RouteRule(
+        name="brain_profile_v1",
+        category="core",
+        owner="agvm_core_mcp",
+        public_core_allowed=True,
+        rationale="Brain Profile V1 exposes shadow preview and signed CAS activation while paid fitting, backfill and activation remain Cloud-gated.",
+        prefixes=("/mcp/brain-profile-", "/memory/mcp/brain-profile-"),
     ),
     RouteRule(
         name="grow_source_product",
@@ -491,6 +503,20 @@ def classify_mcp_tool(tool_name: str) -> SurfaceClassification | None:
     clean = str(tool_name or "").strip()
     if clean in {"get_agvm_usage_guide", "list_brains", "active_brain", "create_brain", "select_brain", "ensure_brain"}:
         return SurfaceClassification("core", "agvm_core_mcp", True, "MCP guide and brain registry tools are core.")
+    if clean.startswith("brain_bootstrap_"):
+        return SurfaceClassification(
+            "core",
+            "agvm_core_mcp",
+            True,
+            "Bounded Bootstrap V1 keeps manual interview, sources and reviewed Grow local; AI capabilities return Cloud action contracts.",
+        )
+    if clean.startswith("brain_profile_"):
+        return SurfaceClassification(
+            "core",
+            "agvm_core_mcp",
+            True,
+            "Brain Profile V1 provides local shadow review and signed CAS activation; paid fitting, backfill and activation return Cloud action contracts without a lease.",
+        )
     if clean.startswith("retrieve_") or clean.startswith("inspect_"):
         return SurfaceClassification("core", "agvm_core_mcp", True, "MCP retrieval and inspection tools are core.")
     if clean in {"write_memory_preview", "write_memory_commit", "ask_memory_clarification", "brain_health"}:

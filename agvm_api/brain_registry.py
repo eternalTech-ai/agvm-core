@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import json
@@ -6,6 +10,8 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -23,6 +29,8 @@ GRAPH_VIEW_FILENAME = "beta_vector_memory.graph.view.json"
 INDEX_FILENAME = "beta_vector_memory.index.json"
 ATLAS_FILENAME = "beta_vector_memory.atlas.json"
 SQLITE_FILENAME = "beta_vector_memory.sqlite3"
+
+_REGISTRY_WRITE_LOCK = threading.RLock()
 
 
 class BrainRegistryError(ValueError):
@@ -69,19 +77,29 @@ def brain_registry_path(brain_root: Path | None = None) -> Path:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
-    try:
-        os.close(fd)
-        Path(tmp_name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        Path(tmp_name).replace(path)
-    finally:
-        tmp_path = Path(tmp_name)
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    with _REGISTRY_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+        try:
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            tmp_path.write_text(serialized, encoding="utf-8")
+            for attempt in range(5):
+                try:
+                    tmp_path.replace(path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
+        finally:
+            tmp_path = Path(tmp_name)
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
 
 
 def _safe_id(value: str) -> str:
@@ -146,6 +164,96 @@ def _json_file(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _json_object_with_error(path: Path) -> tuple[dict[str, Any], str | None]:
+    if not path.is_file():
+        return {}, None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, "lifecycle_artifact_unreadable"
+    if not isinstance(payload, dict):
+        return {}, "lifecycle_artifact_not_object"
+    return payload, None
+
+
+def _benchmark_lifecycle(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return "not_reported"
+    required = {"weighted_improvement", "max_critical_regression", "p95_latency_ratio"}
+    if value.get("complete") is not True or not required.issubset(value):
+        return "pending"
+    try:
+        passed = (
+            float(value["weighted_improvement"]) >= 0.05
+            and float(value["max_critical_regression"]) <= 0.02
+            and float(value["p95_latency_ratio"]) <= 1.20
+        )
+    except (TypeError, ValueError):
+        return "failed"
+    return "passed" if passed else "failed"
+
+
+def _latest_bootstrap_revision(registry_brain_path: Path) -> tuple[dict[str, Any], str | None]:
+    sessions_root = registry_brain_path / "brain_bootstrap_v1" / "sessions"
+    if not sessions_root.is_dir():
+        return {}, None
+    revision_paths: list[Path] = []
+    try:
+        for session_dir in sessions_root.iterdir():
+            revisions_dir = session_dir / "revisions"
+            if revisions_dir.is_dir():
+                revision_paths.extend(path for path in revisions_dir.glob("*.json") if path.is_file())
+    except OSError:
+        return {}, "bootstrap_state_unreadable"
+    if not revision_paths:
+        return {}, None
+    try:
+        latest = max(revision_paths, key=lambda path: (path.stat().st_mtime_ns, path.name))
+    except OSError:
+        return {}, "bootstrap_state_unreadable"
+    return _json_object_with_error(latest)
+
+
+def _brain_lifecycle(storage_path: Path, registry_brain_path: Path) -> dict[str, Any]:
+    lifecycle: dict[str, Any] = {
+        "bootstrap_state": "not_started",
+        "profile_state": "not_reported",
+        "benchmark_state": "not_reported",
+    }
+    errors: list[str] = []
+
+    bootstrap, bootstrap_error = _latest_bootstrap_revision(registry_brain_path)
+    if bootstrap_error:
+        errors.append(bootstrap_error)
+        lifecycle["bootstrap_state"] = "error"
+    elif bootstrap:
+        lifecycle["bootstrap_state"] = str(bootstrap.get("lifecycle_state") or "error")
+        lifecycle["bootstrap_session_id"] = str(bootstrap.get("session_id") or "") or None
+
+    profile_state, state_error = _json_object_with_error(storage_path / "brain_profile_v1_api" / "state.json")
+    runtime_profile, runtime_error = _json_object_with_error(storage_path / "brain_profile_v1.json")
+    if state_error or runtime_error:
+        errors.extend(item for item in (state_error, runtime_error) if item)
+        lifecycle["profile_state"] = "error"
+    else:
+        current_revision = int(profile_state.get("current_profile_revision") or 0)
+        previous_revision = profile_state.get("previous_revision")
+        lifecycle["profile_revision"] = current_revision
+        lifecycle["previous_profile_revision"] = int(previous_revision) if previous_revision is not None else None
+        runtime_state = str(runtime_profile.get("state") or "").strip().lower()
+        if runtime_state == "shadow":
+            lifecycle["profile_state"] = "shadow"
+        elif runtime_state == "active" and current_revision > 0:
+            lifecycle["profile_state"] = "rollback_available" if previous_revision is not None else "active"
+        elif runtime_profile:
+            lifecycle["profile_state"] = "error"
+        lifecycle["benchmark_state"] = _benchmark_lifecycle(runtime_profile.get("benchmark"))
+
+    if errors:
+        lifecycle["error_code"] = sorted(set(errors))[0]
+    return lifecycle
 
 
 def _sqlite_node_count(path: Path) -> int | None:
@@ -296,6 +404,7 @@ def build_local_brain_record(
     storage = storage_path.resolve()
     storage.mkdir(parents=True, exist_ok=True)
     registry_paths = _ensure_brain_dirs(registry_brain_path.resolve())
+    registry_brain = Path(registry_paths["registry_brain_path"])
     file_status = _storage_file_status(storage)
     has_sqlite = bool(file_status[SQLITE_FILENAME]["exists"])
     has_index = bool(file_status[INDEX_FILENAME]["exists"])
@@ -333,6 +442,7 @@ def build_local_brain_record(
         "safe_for_mcp": has_sqlite and has_index and has_atlas,
         "runtime_scope_status": "brain_scoped_runtime_ready_pr12m_b",
         "node_count": _node_count(storage),
+        "lifecycle": _brain_lifecycle(storage, registry_brain),
         "sqlite_size_bytes": int(file_status[SQLITE_FILENAME]["size_bytes"]),
         "storage_files": file_status,
         "capabilities": {
@@ -939,21 +1049,22 @@ def delete_local_brain(
 
 
 def load_local_brain_registry(*, brain_root: Path | None = None, bootstrap_if_missing: bool = True) -> dict[str, Any]:
-    registry_file = brain_registry_path(brain_root)
-    if not registry_file.exists():
-        if not bootstrap_if_missing:
-            return {
-                "schema_version": LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION,
-                "registry_id": "local",
-                "brain_root": str((brain_root or brain_root_path()).resolve()),
-                "brains": [],
-                "validation": validate_local_brain_registry({"schema_version": LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION, "brains": []}),
-            }
-        return bootstrap_local_brain_registry(brain_root=brain_root)
-    registry = _json_file(registry_file)
-    registry["brain_count"] = len(list(registry.get("brains") or []))
-    registry["validation"] = validate_local_brain_registry(registry)
-    return registry
+    with _REGISTRY_WRITE_LOCK:
+        registry_file = brain_registry_path(brain_root)
+        if not registry_file.exists():
+            if not bootstrap_if_missing:
+                return {
+                    "schema_version": LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION,
+                    "registry_id": "local",
+                    "brain_root": str((brain_root or brain_root_path()).resolve()),
+                    "brains": [],
+                    "validation": validate_local_brain_registry({"schema_version": LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION, "brains": []}),
+                }
+            return bootstrap_local_brain_registry(brain_root=brain_root)
+        registry = _json_file(registry_file)
+        registry["brain_count"] = len(list(registry.get("brains") or []))
+        registry["validation"] = validate_local_brain_registry(registry)
+        return registry
 
 
 def set_active_brain(

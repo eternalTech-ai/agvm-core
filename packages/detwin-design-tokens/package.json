@@ -1,11 +1,13 @@
 {
   "_spdx": {
     "copyright": "2026 Eternal Tech SRL <info@eternaltech.ai>",
+    "contributor": "Lorenzo Massaro",
     "license": "AGPL-3.0-only"
   },
   "name": "@detwin/design-tokens",
   "version": "0.1.0",
   "private": true,
+  "license": "AGPL-3.0-only",
   "type": "module",
   "exports": {
     "./tokens": "./src/generated/tokens.ts",

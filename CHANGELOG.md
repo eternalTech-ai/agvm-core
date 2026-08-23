@@ -13,8 +13,12 @@ All notable AGVM Core public releases will be tracked here.
 - Prepare AGVM Core public repository metadata, policies and documentation.
 - Document local MCP setup, local brain bootstrap and explicit Brain Sync
   boundaries.
-- Keep Grow free in Local Core and expose the complete 37-tool MCP catalog so
-  AI clients can plan against stable contracts.
+- Keep Grow free in Local Core and expose the complete versioned MCP contract
+  catalog so AI clients can plan against stable contracts.
+- Add bounded Brain Bootstrap V1 and fixed-12D Brain Profile V1 public
+  contracts, including shadow preview, benchmark gates and rollback metadata.
+- Document the real-node-only Brain Core visualization and its strict source
+  boundary from the proprietary Cloud cockpit.
 - Block paid-module MCP calls before local API execution when no valid module
   access is present, returning a structured Detwin Cloud action contract.
 - Make the exported test suite, source-boundary scanner, SPDX policy, secret

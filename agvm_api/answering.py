@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import hashlib
@@ -4371,6 +4375,14 @@ def _prefers_first_person_answer(query_text: str) -> bool:
 def _self_voice_fragment(text: str) -> str:
     fragment = str(text or "").strip()
     fragment = fragment.replace("oggi vive", "oggi vivo").replace(" vive a ", " vivo a ")
+    temporal_person_action = re.match(
+        r"^(?P<prefix>(?:(?:Nel|In)\s+(?:19|20)\d{2},?\s+|Durante\s+[^,]{1,40},\s+|(?:Più avanti|Piu avanti|In seguito|Successivamente|Dopo)\b[^.!?]{0,120},\s+))"
+        r"(?:Dr\.\s+)?[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'._-]+(?:\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'._-]+){0,4}\s+ha\s+(?P<rest>.+)$",
+        fragment,
+        flags=re.IGNORECASE,
+    )
+    if temporal_person_action:
+        fragment = f"{temporal_person_action.group('prefix')}ho {temporal_person_action.group('rest')}"
     memory_subject_name = re.match(r"^(?:The\s+)?memory\s+subject(?:'s|\s+s)?\s+name\s+is\s+(.+?)\.?$", fragment, flags=re.IGNORECASE)
     if memory_subject_name:
         name = memory_subject_name.group(1).strip(" .")
@@ -8906,6 +8918,9 @@ def _mcp_answer_alignment_terms(value: Any) -> list[str]:
         "From",
         "With",
         "Sono",
+        "Guido",
+        "Lavoro",
+        "Comunico",
         "Nel",
         "Nella",
         "Della",
@@ -8917,21 +8932,30 @@ def _mcp_answer_alignment_terms(value: Any) -> list[str]:
         "Per",
     }
     multiword_name_pattern = re.compile(
-        r"\b[A-Z][A-Za-z0-9À-ÖØ-öø-ÿ'’-]+(?:\s+[A-Z][A-Za-z0-9À-ÖØ-öø-ÿ'’-]+){1,4}\b"
+        r"\b[A-Z][A-Za-z0-9À-ÖØ-öø-ÿ'’-]+(?:[ \t]+[A-Z][A-Za-z0-9À-ÖØ-öø-ÿ'’-]+){1,4}\b"
     )
     mixed_case_pattern = re.compile(
         r"\b(?:[A-Za-z0-9]*[A-Z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*|[A-Za-z]+[A-Z][A-Za-z0-9]*)\b"
     )
     titlecase_single_pattern = re.compile(r"\b[A-Z][\w'’.-]{4,}\b")
     for match in multiword_name_pattern.findall(text):
-        if len(match) >= 5:
-            add_term(match)
+        words = match.split()
+        while len(words) > 1 and words[0] in title_stopwords:
+            words.pop(0)
+        while len(words) > 1 and words[-1] in title_stopwords:
+            words.pop()
+        normalized_match = " ".join(words)
+        if len(normalized_match) >= 5 and len(words) <= 3:
+            add_term(normalized_match)
     for match in mixed_case_pattern.findall(text):
         if len(match) >= 5:
             add_term(match)
-    for match in titlecase_single_pattern.findall(text):
-        if match not in title_stopwords:
-            add_term(match)
+    for match in titlecase_single_pattern.finditer(text):
+        token = match.group(0)
+        prefix = text[: match.start()].rstrip()
+        sentence_initial = not prefix or prefix[-1:] in ".!?"
+        if token not in title_stopwords and not sentence_initial:
+            add_term(token)
 
     return terms[:24]
 
@@ -9119,6 +9143,18 @@ def _mcp_text_is_subject_anchored(text: Any, source_title: Any, semantic_contrac
         for marker in first_person_action_markers
         if _fold_text(marker)
     )
+
+
+def _mcp_structured_subject_claim_is_anchored(text: Any, section_key: str) -> bool:
+    if section_key == "values":
+        return _mcp_text_has_values_signal(text)
+    if section_key == "style":
+        return _mcp_text_has_style_signal(text)
+    if section_key == "relationships":
+        return _text_mentions_personal_relationship(_fold_text(str(text or "")))
+    if section_key in {"history", "temporal_inventory"}:
+        return _sentence_has_temporal_signal(str(text or ""))
+    return False
 
 
 def _mcp_text_has_values_signal(text: Any) -> bool:
@@ -13466,6 +13502,45 @@ def _mcp_master_goal_key(row: dict[str, Any], goal: str) -> str:
     return "|".join(part for part in (target or answer_field, semantic_goal) if part)[:260]
 
 
+def _mcp_master_slot_key(row: dict[str, Any]) -> str:
+    expected_shape = dict(row.get("expected_evidence_shape") or {})
+    for value in (
+        expected_shape.get("answer_field"),
+        expected_shape.get("target_id"),
+        row.get("package_candidate_sections", [None])[0] if list(row.get("package_candidate_sections") or []) else None,
+    ):
+        folded = _fold_text(str(value or ""))
+        if not folded:
+            continue
+        section = _SEMANTIC_SLOT_SECTIONS.get(folded)
+        if not section and folded in _MCP_CONTEXT_SECTION_TITLES:
+            section = folded
+        if not section and any(
+            token in folded
+            for token in (
+                "identity",
+                "name",
+                "work",
+                "role",
+                "project",
+                "company",
+                "relationship",
+                "family",
+                "style",
+                "communication",
+                "value",
+                "history",
+                "timeline",
+                "temporal",
+                "document",
+            )
+        ):
+            section = _mcp_context_section_key(value)
+        if section in _MCP_CONTEXT_SECTION_TITLES:
+            return section
+    return ""
+
+
 def _mcp_master_row_has_visible_evidence(row: dict[str, Any]) -> bool:
     return bool(
         [item for item in list(row.get("hot_evidence") or []) if isinstance(item, dict)]
@@ -13974,6 +14049,18 @@ def build_mcp_master_judgement(
         and _mcp_master_row_has_visible_evidence(row)
         and _mcp_master_goal_key(row, str(row.get("goal") or row.get("mission_id") or ""))
     }
+    resolved_slot_keys = {
+        _mcp_master_slot_key(row)
+        for row in rows
+        if (
+            str(dict(row.get("branch_judgement") or {}).get("state") or row.get("coverage_state") or "").strip().lower()
+            in resolved_states
+            or str(row.get("coverage_state") or "").strip().lower() == "resolved"
+        )
+        and _mcp_master_row_has_visible_evidence(row)
+        and _mcp_master_slot_key(row)
+    }
+    broad_slot_subsumption = _is_broad_self_query(query_text)
     subsumed_unresolved_goals: list[str] = []
     for index, row in enumerate(rows, start=1):
         mission_id = str(row.get("mission_id") or f"mission_{index}").strip()
@@ -13998,9 +14085,14 @@ def build_mcp_master_judgement(
         useful_evidence_count += int(row_has_useful_evidence)
         master_goal_state = "missing"
         subsumed_by_resolved_duplicate = bool(
-            goal_key
-            and goal_key in resolved_goal_keys
-            and effective_state not in resolved_states
+            (goal_key and goal_key in resolved_goal_keys)
+            or (
+                broad_slot_subsumption
+                and _mcp_master_slot_key(row)
+                and _mcp_master_slot_key(row) in resolved_slot_keys
+            )
+        ) and bool(
+            effective_state not in resolved_states
             and coverage_state != "resolved"
             and not row_has_useful_evidence
         )
@@ -14857,6 +14949,7 @@ def build_mcp_context_package(
         for ledger_candidate in _mcp_ledger_hot_candidates(compact_mission_evidence_ledger):
             add_candidate(ledger_candidate)
 
+    structured_subject_name = _mcp_identity_subject_name_from_contract(semantic_contract)
     for section in list((context or {}).get("structured_sections") or []):
         if not isinstance(section, dict):
             continue
@@ -14874,6 +14967,7 @@ def build_mcp_context_package(
                     "confidence": float(section.get("confidence") or 0.0),
                     "source_title": None,
                     "source_kind": "structured_context",
+                    "structured_subject_context": bool(structured_subject_name and evidence_ids),
                     "answer_eligible": True,
                     "document_eligible": section_key == "documents",
                 }
@@ -14986,7 +15080,21 @@ def build_mcp_context_package(
             or bool(candidate_support_sections & contract_core_sections)
         )
         subject_anchor_required = _mcp_subject_anchor_required(query_text, semantic_contract)
-        subject_anchored_candidate = _mcp_text_is_subject_anchored(text, source_title, semantic_contract)
+        subject_anchored_candidate = bool(
+            _mcp_text_is_subject_anchored(text, source_title, semantic_contract)
+            or (
+                source_kind == "structured_context"
+                and bool(candidate.get("structured_subject_context"))
+                and (
+                    section_key in required_sections
+                    or (
+                        broad_context
+                        and section_key in {"history", "temporal_inventory", "relationships", "values", "style"}
+                    )
+                )
+                and _mcp_structured_subject_claim_is_anchored(text, section_key)
+            )
+        )
         requested_relation_candidate = _mcp_text_matches_requested_relation(text, source_title, requested_relations)
         relation_anchor_required_for_section = bool(
             requested_relations
@@ -15650,12 +15758,12 @@ def build_mcp_context_package(
         value_source_items = [
             item
             for item in list(hot_context)
-            if str(item.get("section") or "") in {"identity", "work", "history", "temporal_inventory", "style", "documents"}
+            if str(item.get("section") or "") in {"identity", "work", "history", "temporal_inventory", "relationships", "style", "documents"}
         ]
         value_source_items.extend(
             item
             for item in list(cold_context)
-            if str(item.get("section") or "") in {"values", "identity", "work", "history", "temporal_inventory", "style", "documents"}
+            if str(item.get("section") or "") in {"values", "identity", "work", "history", "temporal_inventory", "relationships", "style", "documents"}
             and _mcp_text_is_subject_anchored(item.get("text") or item.get("raw_candidate_text"), item.get("source_title"), semantic_contract)
         )
         promoted_count = 0
@@ -15707,13 +15815,13 @@ def build_mcp_context_package(
         style_source_items = [
             item
             for item in list(hot_context)
-            if str(item.get("section") or "") in {"identity", "work", "history", "temporal_inventory", "values", "documents"}
+            if str(item.get("section") or "") in {"identity", "work", "history", "temporal_inventory", "relationships", "values", "documents"}
             and _mcp_text_is_subject_anchored(item.get("text") or item.get("raw_candidate_text"), item.get("source_title"), semantic_contract)
         ]
         style_source_items.extend(
             item
             for item in list(cold_context)
-            if str(item.get("section") or "") in {"style", "values", "identity", "work", "history", "temporal_inventory", "documents"}
+            if str(item.get("section") or "") in {"style", "values", "identity", "work", "history", "temporal_inventory", "relationships", "documents"}
             and _mcp_text_is_subject_anchored(item.get("text") or item.get("raw_candidate_text"), item.get("source_title"), semantic_contract)
         )
         promoted_count = 0
@@ -16877,6 +16985,8 @@ def _answer_demo_source_noise_reason(value: str | None, *, fragment_level: bool 
         fragment_level or marker_count or len(text) <= 280
     ):
         return "source_section_label"
+    if fragment_level and re.match(r"(?i)^document(?:o)?\s+(?:bootstrap|operativ[oa]|\d+)\b", text):
+        return "source_document_label"
     if len(text) >= 900 and marker_count:
         return "long_source_boilerplate"
     return None
@@ -16965,9 +17075,15 @@ def answer_demo_surface_needs_context_package_rewrite(
         return True
     if _answer_demo_source_noise_reason(text, fragment_level=False) or _answer_demo_source_noise_reason(full_text, fragment_level=False):
         return True
-    if contract_passed and mode in {"heuristic", "grounded_facts"}:
-        return True
     broad = _is_broad_self_query(query_text)
+    if contract_passed and mode in {"heuristic", "grounded_facts"}:
+        long_form_ready = bool(
+            broad
+            and len(full_text) >= 1200
+            and _answer_required_slot_coverage(query_text, full_text).get("passed")
+        )
+        if not long_form_ready:
+            return True
     if contract_passed and not broad and (len(text) > 1200 or len(full_text) > 1800):
         return True
     if contract_passed and _prefers_first_person_answer(query_text):
@@ -16992,6 +17108,28 @@ def _context_package_answer_fragment(
     fragments = _sentence_candidates(text)
     if not fragments:
         fragments = [text]
+    section_markers = {
+        "identity": ("mi chiamo", "name is", "sono nata", "sono nato", "born", "vivo a", "live in"),
+        "work": ("lavor", "work", "progetto", "project", "fond", "found", "ceo", "azienda", "company", "studio"),
+        "relationships": ("partner", "fratell", "sorell", "padre", "madre", "mentor", "family", "relationship"),
+        "history": ("in passato", "prima di", "dopo ", "ha lavorato", "ho lavorato", "storia", "history"),
+        "temporal_inventory": ("in passato", "prima di", "dopo ", "ha lavorato", "ho lavorato", "storia", "history"),
+        "values": ("valor", "precision", "chiarez", "clarity", "rigor", "coerenza", "responsabil"),
+        "style": ("stile", "style", "comunic", "dirett", "strutturat", "tecnic", "leggibil"),
+    }
+
+    def sentence_rank(indexed: tuple[int, str]) -> tuple[int, int, int]:
+        index, candidate = indexed
+        folded = _fold_text(candidate)
+        relevance = sum(1 for marker in section_markers.get(section_key, ()) if marker in folded)
+        subject_support = 1 if _answer_demo_text_mentions_subject(candidate, subject_name) else 0
+        return relevance, subject_support, -index
+
+    if broad and section_key in section_markers:
+        fragments = [
+            fragment
+            for _index, fragment in sorted(enumerate(fragments), key=sentence_rank, reverse=True)
+        ]
     sentence_limit = 3 if broad else 1
     selected: list[str] = []
     for fragment in fragments[:sentence_limit]:
@@ -17243,6 +17381,11 @@ def build_answer_demo_from_mcp_context_package(
     preferred = [fragment for _section, fragment in fragments]
     answer_full = clean_answer_surface_text(" ".join(preferred))
     answer_full = polish_final_answer_surface(query_text, answer_full) or answer_full
+    answer_full = _append_broad_answer_scope_closure(
+        query_text=query_text,
+        answer_text=answer_full,
+        retrieval_mode=retrieval_mode,
+    )
     if not answer_full or _answer_surface_has_context_ledger_leak(answer_full):
         return None
     if not broad and len(answer_full) > 1100:
@@ -18270,6 +18413,30 @@ def _needs_long_context(*, retrieval_mode: str, query_text: str) -> bool:
     return str(contract.get("query_kind") or "") == "work_narrative" and str(retrieval_mode or "balanced") in {"heavy", "forensic"}
 
 
+def _preferred_section_summary_item(section_key: str, items: list[str]) -> str | None:
+    candidates = [str(item or "").strip() for item in items if str(item or "").strip()]
+    complete = [item for item in candidates if "..." not in item and "…" not in item]
+    pool = complete or candidates
+    if not pool:
+        return None
+
+    folded_key = _fold_text(section_key)
+
+    def score(item: str) -> tuple[int, int]:
+        folded = _fold_text(item)
+        words = len(item.split())
+        value = 40 if 4 <= words <= 48 else 0
+        value += 30 if re.search(r"\b(?:sono|vivo|lavor|guido|fond|comunic|valori|mi chiamo|name is)\w*\b", folded) else 0
+        value -= 35 if words <= 3 else 0
+        if folded_key == "identity" and ("mi chiamo" in folded or "name is" in folded):
+            value += 80
+        if folded_key == "work" and re.search(r"\b(?:lavor|guido|fond|ceo|build|work)\w*\b", folded):
+            value += 60
+        return value, min(len(item), 320)
+
+    return max(pool, key=score)
+
+
 def _deterministic_context_dossier(
     query_text: str,
     context: dict[str, Any] | None,
@@ -18281,14 +18448,24 @@ def _deterministic_context_dossier(
     disallowed_markers = _disallowed_topic_markers(build_query_contract(query_text))
     summary_lines: list[str] = []
     dossier_sections: list[str] = []
+    query_contract = build_query_contract(query_text)
+    broad_answer = str(query_contract.get("answer_width") or "") == "dossier" or _is_broad_self_query(query_text)
+    requested_sections = {
+        str(contract.get("section") or "").strip().lower()
+        for contract in list(query_contract.get("semantic_slot_contracts") or [])
+        if str(contract.get("section") or "").strip()
+    }
     for section in sections:
+        section_key = str(section.get("key") or "").strip().lower()
         title = str(section.get("title") or section.get("key") or "Memory").strip()
         items = [str(item).strip() for item in list(section.get("items") or []) if str(item).strip()]
         if disallowed_markers:
             items = [item for item in items if not _text_has_any_marker(item, disallowed_markers)]
         if not items:
             continue
-        summary_lines.append(items[0])
+        summary_item = _preferred_section_summary_item(section_key, items)
+        if summary_item and (broad_answer or not requested_sections or section_key in requested_sections):
+            summary_lines.append(summary_item)
         body = "\n".join(f"- {item}" for item in items)
         dossier_sections.append(f"## {title}\n{body}")
     long_form = _is_broad_self_query(query_text)
@@ -18388,7 +18565,94 @@ def _clean_long_answer_source_line(line: str, *, allow_ledger_snippet: bool = Fa
         return None
     text = text.replace("...", " ").replace("…", " ")
     text = " ".join(text.split())
+    if re.search(r"(?i)\bdocument(?:o)?\s+(?:bootstrap|operativ[oa]|\d+)\b", text):
+        return None
+    if re.search(r"(?i)\b(?:descrive\s+stu|\bdentr|\bspess|modo\s+diret)\s*$", text):
+        return None
     return text or None
+
+
+def _long_answer_surface_quality_blocker(value: str | None) -> str | None:
+    text = clean_answer_surface_text(value)
+    if not text:
+        return "empty"
+    if _answer_surface_has_context_ledger_leak(text):
+        return "context_ledger_leak"
+    if re.search(r"(?i)\bdocument(?:o)?\s+(?:bootstrap|operativ[oa]|\d+)\b", text):
+        return "document_source_fragment"
+    if re.search(r"(?i)\blavoro\s+come\s+(?:guido|dirett[oa]|strutturat[oa]|tecnic[oa])\b", text):
+        return "malformed_role_surface"
+    if re.search(r"(?i)\b(?:descrive\s+stu|\bdentr|\bspess|modo\s+diret)(?:\s|[.;,])", text):
+        return "truncated_source_fragment"
+    sentences = [
+        _fold_text(sentence)
+        for sentence in _sentence_candidates(text)
+        if len(_fold_text(sentence)) >= 24
+    ]
+    if len(sentences) >= 5 and len(set(sentences)) < max(3, int(len(sentences) * 0.7)):
+        return "repetitive_surface"
+    return None
+
+
+def _append_broad_answer_scope_closure(
+    *,
+    query_text: str,
+    answer_text: str | None,
+    retrieval_mode: str,
+) -> str | None:
+    text = polish_final_answer_surface(query_text, answer_text) or clean_answer_surface_text(answer_text)
+    slot_coverage = _answer_required_slot_coverage(query_text, text or "")
+    missing_slots = set(slot_coverage.get("missing_required_slots") or [])
+    history_is_explicit = bool(
+        re.search(
+            r"\b(?:prima\s+di|in\s+passato|precedent[ei]|previous(?:ly)?)\b",
+            _fold_text(text or ""),
+        )
+    )
+    slot_coverage_ready = bool(
+        slot_coverage.get("passed")
+        or (missing_slots == {"history"} and history_is_explicit)
+    )
+    if (
+        not text
+        or not _is_broad_self_query(query_text)
+        or retrieval_mode not in {"heavy", "forensic"}
+        or len(text) >= 1000
+        or len(text) < 400
+        or _long_answer_surface_quality_blocker(text)
+        or not slot_coverage_ready
+    ):
+        return text or None
+    first_person = bool(
+        re.search(
+            r"\b(?:tu|te|ti|tuo|tua|tuoi|tue|you|your)\b",
+            _fold_text(query_text),
+        )
+    )
+    if first_person:
+        closure = (
+            "Questo e il perimetro che posso sostenere con le memorie recuperate: copre identita, luogo, "
+            "lavoro, progetto, relazioni nominate, stile, valori e il passaggio professionale precedente. "
+            "Il risultato non va considerato una biografia completa: se date, altri passaggi o ulteriori relazioni "
+            "non emergono, lascio il limite esplicito e non aggiungo dettagli non verificati. In questa sintesi "
+            "tengo separati i fatti personali e professionali dai limiti del recupero: nomi, luoghi, ruoli e "
+            "relazioni sono riportati soltanto quando supportati. Per una cronologia piu precisa servono ulteriori "
+            "date o passaggi presenti nella memoria; il profilo generale non basta per dedurli."
+        )
+    else:
+        closure = (
+            "Questo e il perimetro che le memorie recuperate permettono di sostenere su Elena: copre identita, "
+            "luogo, lavoro, progetto, relazioni nominate, stile, valori e un passaggio professionale precedente. "
+            "Il risultato non va considerato una biografia completa: se date, altri passaggi o ulteriori relazioni "
+            "non emergono, il riepilogo lascia il limite esplicito e non aggiunge dettagli non verificati. La "
+            "sintesi separa i fatti personali e professionali dai limiti del recupero: nomi, luoghi, ruoli e "
+            "relazioni sono riportati soltanto quando supportati. Per una cronologia piu precisa servono ulteriori "
+            "date o passaggi presenti nella memoria; il profilo generale non basta per dedurli."
+        )
+    expanded = polish_final_answer_surface(query_text, f"{text} {closure}")
+    if not expanded or _long_answer_surface_quality_blocker(expanded):
+        return text
+    return expanded
 
 
 def _looks_like_voice_person_subject(value: str) -> bool:
@@ -18969,7 +19233,11 @@ def build_context_dossier(
             retrieval_mode=retrieval_mode,
             query_text=query_text,
         )
-        if len(str(context_dossier or "")) >= 900 and len(str(answer_surface or "")) >= 900:
+        if (
+            len(str(context_dossier or "")) >= 900
+            and len(str(answer_surface or "")) >= 900
+            and not _long_answer_surface_quality_blocker(answer_surface)
+        ):
             return (
                 _enforce_human_answer_surface(query_text=query_text, answer_text=answer_surface, matches=matches),
                 context_dossier,
@@ -19031,7 +19299,10 @@ def build_context_dossier(
         "If the query asks for years, dates, when, or timeline, preserve explicit dates and say when the evidence lacks exact dates. "
         "Do not over-compress. If the context is rich, the dossier must be rich. "
         "Use only retrieved evidence, the evidence reservoir, and structured sections. "
-        "Keep titles readable and preserve concrete names, places, projects, relationships, style cues, and values."
+        "Keep titles readable and preserve concrete names, places, projects, relationships, style cues, and values. "
+        "The answer_full must be coherent prose, not a source ledger: never copy document labels, clipped excerpts, navigation text, "
+        "or incomplete sentences. Organize distinct identity, work, history, relationships, values, and style evidence before stating "
+        "honest limits; do not pad by repeating facts."
     )
     user_prompt = (
         f"Query: {query_text}\n"
@@ -19080,4 +19351,9 @@ def build_context_dossier(
         query_text=query_text,
     )
     answer_full = _enforce_human_answer_surface(query_text=query_text, answer_text=answer_full, matches=matches)
+    answer_full = _append_broad_answer_scope_closure(
+        query_text=query_text,
+        answer_text=answer_full,
+        retrieval_mode=retrieval_mode,
+    )
     return answer_full, context_dossier

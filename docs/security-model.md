@@ -23,6 +23,11 @@ cloud infrastructure.
   capabilities unless server-side account, plan, brain, provider and credit
   checks pass.
 
+Brain Profile activation, paid fitting and paid backfill follow the same
+server-authorized boundary. The public profile schema and preview contract do
+not grant entitlement. A local process without authority receives a structured
+Cloud action contract and must not simulate activation.
+
 ## Secrets
 
 Provider keys belong in backend-managed environment storage, `.env` files that

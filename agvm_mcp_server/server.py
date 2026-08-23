@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import json
@@ -26,6 +30,8 @@ MUTATION_TOOLS = {
     "write_memory_commit",
     "sleep_apply",
     "evolve_apply",
+    "geometry_calibration_apply",
+    "geometry_calibration_rollback",
     "matrix_calibration_apply",
 }
 MUTATING_PERMISSION_FAMILIES = {"registry_write", "explicit_apply", "destructive"}
@@ -419,6 +425,7 @@ class AgvmHttpClient:
         payload: dict[str, Any] | None,
         brain_id: str | None,
         hosted_scope: dict[str, str | None] | None,
+        transport_retries_remaining: int = 1,
     ) -> dict[str, Any]:
         if method.upper() == "GET" and payload:
             path = _path_with_query(path, payload)
@@ -459,7 +466,27 @@ class AgvmHttpClient:
                 decoded = {"raw": raw}
             raise AgvmMcpHttpError(status=exc.code, message=f"AGVM API HTTP {exc.code} for {path}", payload=decoded) from exc
         except urllib.error.URLError as exc:
+            if method.upper() in {"GET", "HEAD"} and transport_retries_remaining > 0:
+                return self._request_json(
+                    method,
+                    path,
+                    payload=payload,
+                    brain_id=brain_id,
+                    hosted_scope=hosted_scope,
+                    transport_retries_remaining=transport_retries_remaining - 1,
+                )
             raise AgvmMcpHttpError(status=None, message=f"AGVM API unreachable at {url}: {exc.reason}", payload=None) from exc
+        except (ConnectionError, TimeoutError) as exc:
+            if method.upper() in {"GET", "HEAD"} and transport_retries_remaining > 0:
+                return self._request_json(
+                    method,
+                    path,
+                    payload=payload,
+                    brain_id=brain_id,
+                    hosted_scope=hosted_scope,
+                    transport_retries_remaining=transport_retries_remaining - 1,
+                )
+            raise AgvmMcpHttpError(status=None, message=f"AGVM API transport failed at {url}: {exc}", payload=None) from exc
         except json.JSONDecodeError as exc:
             raise AgvmMcpHttpError(status=None, message=f"AGVM API returned invalid JSON for {path}", payload=str(exc)) from exc
 
@@ -763,7 +790,13 @@ class AgvmMcpServer:
         if brain_id:
             endpoint_path = endpoint_path.replace("{brain_id}", urllib.parse.quote(brain_id, safe=""))
         http_method = str(contract.get("http_method") or "POST").upper()
-        result = self.client.request_json(http_method, endpoint_path, payload, brain_id=brain_id, hosted_scope=hosted_scope_arg)
+        result = self._client_request_json(
+            http_method,
+            endpoint_path,
+            payload,
+            brain_id=brain_id,
+            hosted_scope=hosted_scope_arg,
+        )
         return self._tool_result(result)
 
     def _call_paid_tool_through_hosted_mcp(
@@ -841,6 +874,22 @@ class AgvmMcpServer:
         if self._has_hosted_scope(hosted_scope):
             return self.client.get_json("/mcp/contracts", brain_id=brain_id, hosted_scope=hosted_scope)
         return self.client.get_json("/mcp/contracts", brain_id=brain_id)
+
+    def _client_request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        brain_id: str | None,
+        hosted_scope: dict[str, str | None] | None,
+    ) -> dict[str, Any]:
+        request_json = getattr(self.client, "request_json", None)
+        if callable(request_json):
+            return request_json(method, path, payload, brain_id=brain_id, hosted_scope=hosted_scope)
+        if method.upper() == "GET":
+            return self.client.get_json(path, brain_id=brain_id, hosted_scope=hosted_scope)
+        return self.client.post_json(path, payload, brain_id=brain_id, hosted_scope=hosted_scope)
 
     def _contract_for_tool(
         self,

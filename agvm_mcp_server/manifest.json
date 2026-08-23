@@ -42,7 +42,7 @@
     "AGVM_MCP_READ_ONLY": "Optional true/false override for mutation tool execution; tools remain visible and blocked calls return structured reasons",
     "AGVM_MCP_ALLOWED_PERMISSION_FAMILIES": "Optional comma-separated override such as read_only,read_only_export,registry_write,preview_only",
     "AGVM_MCP_BLOCKED_PERMISSION_FAMILIES": "Optional comma-separated override such as explicit_apply,destructive",
-    "AGVM_MCP_MODULE_VISIBILITY_POLICY": "Optional module tool visibility policy: metadata_only, hide_unlicensed, or block_unlicensed. The public Core default keeps all 37 tools discoverable and blocks unlicensed paid-module calls before API execution.",
+    "AGVM_MCP_MODULE_VISIBILITY_POLICY": "Optional module tool visibility policy: metadata_only, hide_unlicensed, or block_unlicensed. The public Core default keeps all 52 V1 tool contracts discoverable and blocks unlicensed paid-module calls before API execution.",
     "AGVM_MCP_LOCAL_LICENSE_PATH": "Optional explicit path to agvm_local_license.json; defaults to AGVM_LAB_DATA_DIR/agvm_local_license.json inside the API container",
     "AGVM_MCP_TIMEOUT_SECONDS": "Optional HTTP timeout override"
   },
@@ -54,7 +54,7 @@
     "policies": {
       "metadata_only": "Do not enforce local module leases; expose registry metadata only.",
       "hide_unlicensed": "Hide module-required tools from tools/list and block direct calls when the local lease is missing, invalid, expired or lacks that module.",
-      "block_unlicensed": "Keep all 37 Core registry tools visible for discoverability but block direct module-required calls before API execution when the local lease is missing, invalid, expired or lacks that module."
+      "block_unlicensed": "Keep all 52 V1 tool contracts visible for discoverability but block direct module-required calls before API execution when the local lease is missing, invalid, expired or lacks that module."
     }
   },
   "permission_families": {

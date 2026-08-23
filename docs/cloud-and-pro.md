@@ -46,8 +46,8 @@ module source:
 - metered Cloud AGVM actions and receipts.
 
 Local AGVM does not download Clone, Teach or Maintain runtime source. Grow is a
-free Core capability. The local MCP bridge nevertheless exposes all 37 public
-tool contracts so an AI client can discover the complete workflow. A paid-tool
+free Core capability. The local MCP bridge nevertheless exposes the public
+contract catalog so an AI client can discover the complete workflow. A paid-tool
 call without valid module access is blocked before local API execution and
 returns a structured action contract directing the user to Detwin Cloud. Tool
 visibility is never treated as authorization.

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared module-release hardening helpers for AGVM core and Pro modules.
 
 This file is intentionally small and dependency-free: public core, the private

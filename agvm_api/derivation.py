@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import hashlib
@@ -28,7 +32,7 @@ from projection import (
 )
 from retrieval import build_index, finalize_node, node_for_index, shortlist_atlas_buckets
 from memory_hygiene import build_hygiene_metadata, effective_hygiene
-from active_matrix_placement import apply_active_spatial_revision_to_seed
+from public_v1_geometry_placement import apply_public_v1_geometry_profile_to_seed
 
 
 CLAIM_TYPES = {
@@ -3030,7 +3034,7 @@ def build_seed(
     merge_target_node_id: str | None = None,
     identity_resolution_target_node_id: str | None = None,
     identity_resolution_type: str | None = None,
-    active_spatial_revision_context: dict[str, Any] | None = None,
+    geometry_profile_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     projection = heuristic_projection(raw_text, input_mode=input_mode, node_kind_hint=node_kind_hint)
     routing_scores = normalize_scores(routing_scores_override or projection["routing_semantic_scores"], ROUTING_FIELDS)
@@ -3135,7 +3139,7 @@ def build_seed(
         "identity_resolution_target_node_id": identity_resolution_target_node_id,
         "identity_resolution_type": identity_resolution_type,
     }
-    return apply_active_spatial_revision_to_seed(seed, active_spatial_revision_context)
+    return apply_public_v1_geometry_profile_to_seed(seed, geometry_profile_context)
 
 
 def classify_claim_type(text: str) -> str:
@@ -5206,7 +5210,7 @@ def preview_bundle(
     source_context: dict[str, Any] | None = None,
     compiler_timeout_seconds: float | None = None,
     derivation_timeout_seconds: float | None = None,
-    active_spatial_revision_context: dict[str, Any] | None = None,
+    geometry_profile_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     warnings: list[dict[str, str]] = []
     source_investigation_scope = _is_source_investigation_scope(source_type=source_type, source_sections=source_sections)
@@ -5448,7 +5452,7 @@ def preview_bundle(
         merge_target_node_id=(primary_merge or {}).get("target_node_id"),
         identity_resolution_target_node_id=(primary_identity or {}).get("resolved_node_id"),
         identity_resolution_type=(primary_identity or {}).get("resolution_type"),
-        active_spatial_revision_context=active_spatial_revision_context,
+        geometry_profile_context=geometry_profile_context,
     )
     primary_node = finalize_node(primary_seed, graph, index_payload, fixed_id="preview_primary")
     primary_hygiene = effective_hygiene(primary_node)
@@ -5775,7 +5779,7 @@ def preview_bundle(
             merge_target_node_id=(merge_decision or {}).get("target_node_id"),
             identity_resolution_target_node_id=(identity_decision or {}).get("resolved_node_id"),
             identity_resolution_type=(identity_decision or {}).get("resolution_type"),
-            active_spatial_revision_context=active_spatial_revision_context,
+            geometry_profile_context=geometry_profile_context,
         )
         node = finalize_node(seed, working_graph, working_index, fixed_id=preview_id)
         preview_confidence = float(item.get("confidence") or 0.75)
@@ -5924,7 +5928,7 @@ def persist_selection(
     clarification_answers: dict[str, str] | list[dict[str, Any]] | None = None,
     approved_preview_ids: list[str] | None = None,
     question_limit: int | None = None,
-    active_spatial_revision_context: dict[str, Any] | None = None,
+    geometry_profile_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str], int, list[str], dict[str, Any]]:
     selected_ids = set(selected_preview_ids)
     selected_ids.add(bundle["primary_node_preview"]["id"])
@@ -6087,7 +6091,7 @@ def persist_selection(
         anchor_ref = str(seed.get("document_anchor_id") or "").strip()
         if anchor_ref in preview_to_persisted:
             seed["document_anchor_id"] = preview_to_persisted[anchor_ref]
-        seed = apply_active_spatial_revision_to_seed(seed, active_spatial_revision_context)
+        seed = apply_public_v1_geometry_profile_to_seed(seed, geometry_profile_context)
         persisted = finalize_node(seed, working_graph, current_index)
         if str(persisted.get("document_role") or "") == "anchor":
             persisted["document_anchor_id"] = persisted["id"]

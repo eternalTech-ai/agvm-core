@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+// SPDX-FileContributor: Lorenzo Massaro
+// SPDX-License-Identifier: Apache-2.0
+
 export const AGVM_MODULE_MANIFEST_SCHEMA_VERSION = "agvm.module_manifest.v1";
 export const LEGACY_CLONE_APP_MODULE_MANIFEST_SCHEMA_VERSION = "agvm.clone.module_manifest.v1";
 

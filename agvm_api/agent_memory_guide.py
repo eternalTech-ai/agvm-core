@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 from typing import Any
@@ -106,7 +110,15 @@ def build_agvm_usage_guide() -> dict[str, Any]:
         "inspection": ["inspect_context_package", "inspect_route", "inspect_path_corridor", "inspect_memory_object"],
         "memory_growth": ["grow_source_preview", "grow_source_status", "write_memory_preview", "ask_memory_clarification"],
         "bootstrap_from_zero": ["ensure_brain", "grow_source_preview", "grow_source_apply", "brain_health", "sleep_preview", "evolve_preview"],
-        "apply_gated": ["grow_source_apply", "write_memory_commit", "grow_apply", "sleep_apply", "evolve_apply", "matrix_calibration_apply"],
+        "apply_gated": [
+            "grow_source_apply",
+            "write_memory_commit",
+            "grow_apply",
+            "sleep_apply",
+            "evolve_apply",
+            "geometry_calibration_apply",
+            "geometry_calibration_rollback",
+        ],
     }
     markdown_guide = """# AGVM MCP Usage Guide
 
