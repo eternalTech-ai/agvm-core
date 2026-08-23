@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 from typing import Any
@@ -38,6 +42,24 @@ MCP_OUTPUT_LAWS = [
     "grow_sleep_evolve_lifecycle_states_are_normalized_and_mutation_gated",
 ]
 
+BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES = [
+    "brain_bootstrap_start",
+    "brain_bootstrap_status",
+    "brain_bootstrap_answer",
+    "brain_bootstrap_add_source",
+    "brain_bootstrap_preview",
+    "brain_bootstrap_apply",
+    "brain_bootstrap_resume",
+    "brain_bootstrap_recover",
+    "brain_bootstrap_cancel",
+]
+
+BRAIN_PROFILE_V1_MCP_TOOL_NAMES = [
+    "brain_profile_preview",
+    "brain_profile_apply",
+    "brain_profile_rollback",
+]
+
 REQUIRED_MCP_TOOL_NAMES = [
     "retrieve_context",
     "retrieve_document",
@@ -60,6 +82,9 @@ REQUIRED_MCP_TOOL_NAMES = [
     "grow_apply",
     "grow_status",
     "brain_health",
+    "geometry_calibration_preview",
+    "geometry_calibration_apply",
+    "geometry_calibration_rollback",
     "matrix_calibration_preview",
     "matrix_calibration_apply",
     "sleep_preview",
@@ -82,6 +107,8 @@ AGENT_MEMORY_MCP_TOOL_NAMES = [
     "create_brain",
     "select_brain",
     "ensure_brain",
+    *BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES,
+    *BRAIN_PROFILE_V1_MCP_TOOL_NAMES,
 ]
 
 PR12J_B_IMPLEMENTED_TOOL_NAMES = {
@@ -111,6 +138,9 @@ PR12J_C_IMPLEMENTED_TOOL_NAMES = {
 }
 
 PR12J_D_IMPLEMENTED_TOOL_NAMES = {
+    "geometry_calibration_preview",
+    "geometry_calibration_apply",
+    "geometry_calibration_rollback",
     "matrix_calibration_preview",
     "matrix_calibration_apply",
     "sleep_preview",
@@ -134,6 +164,7 @@ IMPLEMENTED_MCP_TOOL_NAMES = (
     | PR12J_E_IMPLEMENTED_TOOL_NAMES
     | set(GUIDE_MCP_TOOL_NAMES)
     | set(AGENT_MEMORY_MCP_TOOL_NAMES)
+    | set(BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES)
 )
 
 MCP_CONTRACT_HTTP_METHODS = {"GET", "POST"}
@@ -553,6 +584,17 @@ def _matrix_calibration_apply_input_schema() -> dict[str, Any]:
     return schema
 
 
+def _geometry_calibration_rollback_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "plan_signature": _string("Exact plan_signature of the applied Geometry Calibration revision to restore."),
+            "confirm_rollback": _boolean("Explicit rollback confirmation.", default=False),
+        },
+        required=["plan_signature"],
+        description="Guarded Geometry Calibration rollback request. The MCP bridge supplies the selected brain_id.",
+    )
+
+
 def _matrix_calibration_output_schema() -> dict[str, Any]:
     return _schema_object(
         properties={
@@ -589,6 +631,32 @@ def _matrix_calibration_output_schema() -> dict[str, Any]:
             "safety_contract",
         ],
         description="Matrix calibration MCP output contract.",
+    )
+
+
+def _geometry_calibration_rollback_output_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "schema_version": _string("Tool output schema version."),
+            "brain_id": _string("Brain restored by the rollback."),
+            "tool_name": _string("Canonical Geometry Calibration rollback tool name."),
+            "status": _string("Rollback state.", enum=["rolled_back", "already_rolled_back"]),
+            "plan_signature": _string("Applied Geometry Calibration plan restored by this operation."),
+            "rollback_result": _object("Atomic rollback result and idempotency proof."),
+            "mutation_surface": _object("Restored nodes and revision state."),
+            "safety_contract": _object("Atomicity, full-snapshot and exactly-once guarantees."),
+        },
+        required=[
+            "schema_version",
+            "brain_id",
+            "tool_name",
+            "status",
+            "plan_signature",
+            "rollback_result",
+            "mutation_surface",
+            "safety_contract",
+        ],
+        description="Geometry Calibration rollback MCP output contract.",
     )
 
 
@@ -732,6 +800,164 @@ def _usage_guide_output_schema() -> dict[str, Any]:
         },
         required=["schema_version", "guide_name", "markdown_guide", "policy", "recommended_flow", "query_recipes", "tool_map", "first_call"],
         description="AGVM MCP usage guide response.",
+    )
+
+
+def _brain_bootstrap_v1_input_schema(operation: str) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "brain_id": _string("Explicit local brain scope.", nullable=True),
+        "session_id": _string("Immutable Bootstrap V1 session id.", nullable=True),
+        "idempotency_key": _string("Stable idempotency key for a mutating Bootstrap command.", nullable=True),
+        "expected_revision": _integer("CAS revision expected by the caller.", minimum=1),
+        "capability": _string(
+            "Execution capability. AI capabilities return a Detwin Cloud action contract locally.",
+            enum=["manual_interview", "manual_source", "grow_review", "ai_research", "fitting", "backfill", "activation"],
+        ),
+    }
+    required: list[str] = []
+    if operation == "start":
+        properties.update(
+            {
+                "goal": _string("Bounded bootstrap goal.", nullable=True),
+                "questions": _array("Optional manual interview questions.", item_type="string"),
+            }
+        )
+        required = ["idempotency_key"]
+    elif operation == "status":
+        required = ["session_id"]
+    else:
+        required = ["session_id", "idempotency_key", "expected_revision"]
+    if operation == "answer":
+        properties.update(
+            {
+                "question_id": _string("Question being answered."),
+                "answer_id": _string("Optional stable answer id.", nullable=True),
+                "answer": _string("Manual answer. It remains session-only until explicit apply."),
+            }
+        )
+        required.extend(["question_id", "answer"])
+    elif operation == "add_source":
+        properties.update(
+            {
+                "source_id": _string("Optional stable source id.", nullable=True),
+                "source_label": _string("Human-readable source label.", nullable=True),
+                "source_kind": _string("manual_text or url_reference.", nullable=True),
+                "source_text": _string("Manual source text. No network fetching occurs in local V1.", nullable=True),
+                "source_uri": _string("Reference URI. It is not fetched by local V1.", nullable=True),
+                "source_trust": _string("Declared source trust.", nullable=True),
+            }
+        )
+    elif operation == "apply":
+        properties.update(
+            {
+                "confirm_apply": _boolean("Must be true to cross the only brain-write boundary.", default=False),
+                "selected_preview_ids": _array("Reviewed Grow candidate ids to apply.", item_type="string"),
+            }
+        )
+        required.append("confirm_apply")
+    return _schema_object(
+        properties=properties,
+        required=required,
+        description=f"Bounded Brain Bootstrap V1 {operation} input.",
+    )
+
+
+def _brain_bootstrap_v1_output_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "schema_version": _string("Bootstrap response schema version."),
+            "operation": _string("Executed Bootstrap operation."),
+            "status": _string("Terminal or review state for this call."),
+            "brain_id": _string("Resolved brain scope."),
+            "session_id": _string("Bootstrap session id.", nullable=True),
+            "revision": _integer("Current immutable session revision.", minimum=0),
+            "revision_digest": _string("Immutable revision digest.", nullable=True),
+            "lifecycle_state": _string("Current lifecycle state.", nullable=True),
+            "session": _object("Current immutable session snapshot."),
+            "action_contract": _object("Cloud action contract for AI-only capabilities."),
+            "idempotent_replay": _boolean("Whether this response replays an existing idempotent revision."),
+            "mutation_contract": _object("Explicit no-hidden-write contract."),
+        },
+        required=["schema_version", "operation", "status", "brain_id", "revision", "idempotent_replay", "mutation_contract"],
+        description="Bounded Brain Bootstrap V1 response.",
+    )
+
+
+def _brain_profile_v1_input_schema(operation: str) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "brain_id": _string("Explicit brain scope.", nullable=True),
+    }
+    required: list[str] = []
+    if operation in {"preview", "apply"}:
+        properties["profile"] = _object(
+            "Signed immutable agvm.brain_profile.v1 payload with exactly 12 canonical routing dimensions."
+        )
+        properties["benchmark"] = _object(
+            "Benchmark evidence. Apply requires complete=true and all three green release metrics."
+        )
+        required.append("profile")
+    if operation == "apply":
+        properties.update(
+            {
+                "expected_revision": _integer("Expected runtime revision for CAS.", minimum=0),
+                "idempotency_key": _string("Stable idempotency key for this activation."),
+                "confirm_apply": _boolean("Must be true for atomic activation.", default=False),
+                "authority": _object(
+                    "Authenticated HMAC authority bound to operation, profile, benchmark, brain, tenant and revisions."
+                ),
+            }
+        )
+        required.extend(["benchmark", "expected_revision", "idempotency_key", "confirm_apply", "authority"])
+    if operation == "rollback":
+        properties.update(
+            {
+                "expected_revision": _integer("Expected current runtime revision for CAS.", minimum=1),
+                "target_revision": _integer("Immediately previous revision to restore byte-for-byte.", minimum=1),
+                "idempotency_key": _string("Stable idempotency key for this rollback."),
+                "confirm_rollback": _boolean("Must be true for atomic rollback.", default=False),
+                "authority": _object(
+                    "Authenticated HMAC authority bound to rollback, archived profile and benchmark, brain, tenant and revisions."
+                ),
+            }
+        )
+        required.extend(
+            ["expected_revision", "target_revision", "idempotency_key", "confirm_rollback", "authority"]
+        )
+    return _schema_object(
+        properties=properties,
+        required=required,
+        description=f"Brain Profile V1 {operation} input.",
+    )
+
+
+def _brain_profile_v1_output_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "schema_version": _string("Brain Profile runtime response schema."),
+            "operation": _string("preview, apply, or rollback."),
+            "status": _string("preview_ready, applied, rolled_back, or cloud_required."),
+            "brain_id": _string("Resolved brain scope."),
+            "current_revision": _integer("Monotonic runtime operation revision.", minimum=0),
+            "current_profile_revision": _integer("Signed profile revision currently active.", minimum=0),
+            "previous_revision": _integer("Only revision eligible for rollback.", minimum=1),
+            "profile": _object("Validated signed profile payload."),
+            "benchmark": _object("Benchmark evidence bound to activation."),
+            "authority": _object("Verified authority envelope persisted with the active runtime revision."),
+            "action_contract": _object("Paid Detwin Cloud action contract when a lease is absent."),
+            "idempotent_replay": _boolean("True when the exact request was replayed."),
+            "mutation_contract": _object("Shadow, activation and rollback safety laws."),
+        },
+        required=[
+            "schema_version",
+            "operation",
+            "status",
+            "brain_id",
+            "current_revision",
+            "current_profile_revision",
+            "idempotent_replay",
+            "mutation_contract",
+        ],
+        description="Brain Profile V1 runtime response.",
     )
 
 
@@ -1167,10 +1393,66 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
 
     contracts.append(
         _tool_contract(
-            name="matrix_calibration_preview",
-            title="Matrix Calibration Preview",
+            name="geometry_calibration_preview",
+            title="Geometry Calibration Preview",
             description=(
-                "Return a non-mutating geometry/matrix calibration preview when brain health reports radial or semantic distribution drift."
+                "Prepare a non-mutating Geometry Calibration preview for brain placement and distribution drift. "
+                "This is the canonical V1 tool; it does not expose a user-facing matrix."
+                + _advanced_module_visibility_note()
+            ),
+            category="maintenance",
+            planned_slice="PR-12J-D",
+            default_output_package="brain_geometry_calibration",
+            input_schema=_matrix_calibration_input_schema(),
+            output_schema=_matrix_calibration_output_schema(),
+            candidate_backend_routes=["POST /memory/mcp/geometry-calibration-preview", "GET /memory/geometry-calibration"],
+            mutation_policy="preview_only",
+        )
+    )
+
+    contracts.append(
+        _tool_contract(
+            name="geometry_calibration_apply",
+            title="Geometry Calibration Apply",
+            description=(
+                "Apply one reviewed Geometry Calibration plan with explicit confirmation, a complete rollback snapshot and before/after proof."
+                + _advanced_module_visibility_note()
+            ),
+            category="maintenance",
+            planned_slice="PR-12J-D",
+            default_output_package="before_after_audit",
+            input_schema=_matrix_calibration_apply_input_schema(),
+            output_schema=_matrix_calibration_output_schema(),
+            candidate_backend_routes=["POST /memory/mcp/geometry-calibration-apply"],
+            mutation_policy="explicit_apply",
+        )
+    )
+
+    contracts.append(
+        _tool_contract(
+            name="geometry_calibration_rollback",
+            title="Geometry Calibration Rollback",
+            description=(
+                "Atomically restore the complete snapshot for one applied Geometry Calibration plan. "
+                "Requires its exact plan_signature and explicit confirmation."
+                + _advanced_module_visibility_note()
+            ),
+            category="maintenance",
+            planned_slice="PR-12J-D",
+            default_output_package="rollback_result",
+            input_schema=_geometry_calibration_rollback_input_schema(),
+            output_schema=_geometry_calibration_rollback_output_schema(),
+            candidate_backend_routes=["POST /memory/mcp/geometry-calibration-rollback"],
+            mutation_policy="explicit_apply",
+        )
+    )
+
+    contracts.append(
+        _tool_contract(
+            name="matrix_calibration_preview",
+            title="Matrix Calibration Preview (Deprecated Alias)",
+            description=(
+                "Backward-compatible alias for geometry_calibration_preview. New clients must use the Geometry Calibration name."
                 + _advanced_module_visibility_note()
             ),
             category="maintenance",
@@ -1186,9 +1468,9 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
     contracts.append(
         _tool_contract(
             name="matrix_calibration_apply",
-            title="Matrix Calibration Apply",
+            title="Matrix Calibration Apply (Deprecated Alias)",
             description=(
-                "Apply a reviewed matrix calibration position plan with explicit confirmation, rollback metadata and before/after proof."
+                "Backward-compatible alias for geometry_calibration_apply. New clients must use the Geometry Calibration name."
                 + _advanced_module_visibility_note()
             ),
             category="maintenance",
@@ -1264,6 +1546,8 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
         )
     contracts.extend(_build_usage_guide_tool_contracts())
     contracts.extend(_build_agent_memory_tool_contracts())
+    contracts.extend(_build_brain_bootstrap_v1_tool_contracts())
+    contracts.extend(_build_brain_profile_v1_tool_contracts())
     order = {name: index for index, name in enumerate([*GUIDE_MCP_TOOL_NAMES, *REQUIRED_MCP_TOOL_NAMES, *AGENT_MEMORY_MCP_TOOL_NAMES])}
     contracts.sort(key=lambda tool: order.get(str(tool.get("name") or ""), len(order)))
     return contracts
@@ -1300,6 +1584,96 @@ def _build_usage_guide_tool_contracts() -> list[dict[str, Any]]:
             },
         )
     ]
+
+
+def _build_brain_bootstrap_v1_tool_contracts() -> list[dict[str, Any]]:
+    contracts: list[dict[str, Any]] = []
+    for operation in ("start", "status", "answer", "add_source", "preview", "apply", "resume", "recover", "cancel"):
+        tool_name = f"brain_bootstrap_{operation}"
+        mutation_policy = (
+            "read_only"
+            if operation == "status"
+            else "preview_only"
+            if operation == "preview"
+            else "explicit_apply"
+            if operation == "apply"
+            else "registry_write"
+        )
+        contracts.append(
+            _tool_contract(
+                name=tool_name,
+                title=f"Brain Bootstrap {operation.replace('_', ' ').title()}",
+                description=(
+                    f"Run bounded Brain Bootstrap V1 {operation}. Manual interview, manual sources and Grow review are local and free. "
+                    "AI research, fitting, backfill and activation return a cloud-required action_contract. "
+                    "Answers and sources never enter memory before brain_bootstrap_apply with explicit confirmation."
+                ),
+                category="agent_memory",
+                planned_slice="Brain-Bootstrap-V1",
+                default_output_package="session",
+                input_schema=_brain_bootstrap_v1_input_schema(operation),
+                output_schema=_brain_bootstrap_v1_output_schema(),
+                candidate_backend_routes=[f"POST /mcp/brain-bootstrap-{operation.replace('_', '-')}"],
+                endpoint_path=f"/mcp/brain-bootstrap-{operation.replace('_', '-')}",
+                mutation_policy=mutation_policy,
+                permission_family=mutation_policy,
+                scope_policy=("brain" if operation == "status" else "brain_apply" if operation == "apply" else "brain_preview"),
+                client_usage={
+                    "when_to_use": f"Use for bounded Bootstrap V1 {operation} in an explicitly selected brain.",
+                    "default_output_package": "session",
+                    "mutation_policy": mutation_policy,
+                    "must_not": [
+                        "Do not claim that interview answers or sources are memory before explicit apply.",
+                        "Do not execute AI research, fitting, backfill or activation locally; follow action_contract.",
+                        "Do not retry a mutating command with a new idempotency key after an ambiguous failure.",
+                    ],
+                    "followups": ["brain_bootstrap_status", "brain_bootstrap_preview", "brain_bootstrap_apply"],
+                },
+            )
+        )
+    return contracts
+
+
+def _build_brain_profile_v1_tool_contracts() -> list[dict[str, Any]]:
+    contracts: list[dict[str, Any]] = []
+    for operation in ("preview", "apply", "rollback"):
+        tool_name = f"brain_profile_{operation}"
+        mutation_policy = "preview_only" if operation == "preview" else "explicit_apply"
+        contracts.append(
+            _tool_contract(
+                name=tool_name,
+                title=f"Brain Profile {operation.title()}",
+                description=(
+                    f"Run bounded Brain Profile V1 {operation} over exactly 12 canonical routing dimensions. "
+                    "Preview is shadow-only and non-mutating. Apply requires a signed active profile, complete green benchmark, "
+                    "explicit confirmation, expected-revision CAS and idempotency. Rollback restores the immediately previous "
+                    "runtime revision byte-for-byte. Fitting, backfill and activation require a paid lease or return action_contract."
+                ),
+                category="agent_memory",
+                planned_slice="Brain-Profile-V1",
+                default_output_package="brain_profile_runtime",
+                input_schema=_brain_profile_v1_input_schema(operation),
+                output_schema=_brain_profile_v1_output_schema(),
+                candidate_backend_routes=[f"POST /mcp/brain-profile-{operation}"],
+                endpoint_path=f"/mcp/brain-profile-{operation}",
+                mutation_policy=mutation_policy,
+                permission_family=mutation_policy,
+                scope_policy="brain_preview" if operation == "preview" else "brain_apply",
+                client_usage={
+                    "when_to_use": f"Use for Brain Profile V1 {operation} in one explicitly selected brain.",
+                    "default_output_package": "brain_profile_runtime",
+                    "mutation_policy": mutation_policy,
+                    "must_not": [
+                        "Do not treat a shadow preview as active configuration.",
+                        "Do not activate without a complete green benchmark and explicit confirmation.",
+                        "Do not retry an ambiguous mutation with a different idempotency key.",
+                        "Do not execute paid fitting, backfill or activation locally without a valid lease; follow action_contract.",
+                    ],
+                    "followups": ["brain_profile_preview", "brain_profile_apply", "brain_profile_rollback"],
+                },
+            )
+        )
+    return contracts
 
 
 def _build_agent_memory_tool_contracts() -> list[dict[str, Any]]:

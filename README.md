@@ -52,8 +52,9 @@ operations are needed. The browser UI must not store raw provider keys in
 localStorage; keys belong in backend-managed environment storage or an OS secret
 manager.
 
-See [Local Install](docs/local-install.md) and [Brain Bootstrap](docs/brain-bootstrap.md)
-for the full setup flow.
+See [Local Install](docs/local-install.md), [Brain Bootstrap](docs/brain-bootstrap.md),
+[Brain Profile V1](docs/brain-profile-v1.md) and [Brain Core](docs/brain-core.md)
+for the setup, personalization and visualization boundaries.
 
 ## Connect An MCP Client
 
@@ -77,6 +78,7 @@ The public Docker UI boots the Local AGVM cockpit. It uses the same visual
 system as Detwin Cloud, scoped to the AGPL Core boundary:
 
 - Brain Center: create, import, switch and inspect local brains;
+- Brain Core: inspect a real-node-only 3D projection of the selected brain;
 - Context: retrieve from the selected local brain;
 - Grow: add text, URL, website or uploaded source material through preview and
   explicit apply;

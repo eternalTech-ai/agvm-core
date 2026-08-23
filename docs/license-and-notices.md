@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # License And Notices
 
 Status: AGPLv3 public-core license selected; locked third-party license metadata is inventoried.
@@ -22,6 +28,7 @@ Paid platform and Pro module implementations are not part of the public core and
 ## License Locations
 
 - Public core: `LICENSE`, SPDX `AGPL-3.0-only`.
+- Design tokens: `packages/detwin-design-tokens/package.json`, SPDX `AGPL-3.0-only`.
 - Python SDK metadata: `sdk/python/pyproject.toml`, SPDX `Apache-2.0`.
 - TypeScript SDK metadata: `sdk/typescript/package.json`, SPDX `Apache-2.0`.
 - Private modules/platform: proprietary commercial terms kept outside the public export.

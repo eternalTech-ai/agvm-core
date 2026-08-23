@@ -1,6 +1,7 @@
 {
   "_spdx": {
     "copyright": "2026 Eternal Tech SRL <info@eternaltech.ai>",
+    "contributor": "Lorenzo Massaro",
     "license": "AGPL-3.0-only"
   },
   "schema_version": "detwin.design_token_manifest.v1",
@@ -19,7 +20,7 @@
   },
   "source": {
     "path": "src/tokens.json",
-    "sha256": "70ec94071a3c6895d54731b7c685e2ed13d36a995b01871ecfdd21afc6a2d454"
+    "sha256": "d396127c722df0160e71dd22839fd97449ad8418b55325874cb42d4d290ed2ae"
   },
   "outputs": [
     {

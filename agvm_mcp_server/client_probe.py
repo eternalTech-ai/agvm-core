@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import json
@@ -20,7 +24,7 @@ DEFAULT_REQUIRED_TOOLS = (
     "inspect_route",
     "inspect_path_corridor",
     "grow_source_preview",
-    "matrix_calibration_preview",
+    "geometry_calibration_preview",
     "sleep_preview",
 )
 
@@ -395,11 +399,11 @@ def run_local_mcp_client_probe(
             if grow_profile.get("mode") != "source_unit_only":
                 result.failures.append(f"grow_source_preview_fast_profile_missing:{grow_profile}")
 
-            matrix_calibration = client.call_tool("matrix_calibration_preview", {"max_nodes_considered": 4000})
-            matrix_payload = _record_tool_call(result, "matrix_calibration_preview", matrix_calibration)
+            matrix_calibration = client.call_tool("geometry_calibration_preview", {"max_nodes_considered": 4000})
+            matrix_payload = _record_tool_call(result, "geometry_calibration_preview", matrix_calibration)
             _validate_tool_payload(
                 result,
-                "matrix_calibration_preview",
+                "geometry_calibration_preview",
                 matrix_payload,
                 required_field="brain_geometry_calibration",
                 allow_blocked=False,

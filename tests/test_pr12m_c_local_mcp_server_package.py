@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import json
@@ -18,7 +22,15 @@ if str(ROOT) not in sys.path:
 if str(API_DIR) not in sys.path:
     sys.path.insert(0, str(API_DIR))
 
-from agvm_mcp_server.server import AgvmMcpConfig, AgvmMcpServer, ToolPermissions, load_config, run_stdio  # noqa: E402
+from agvm_mcp_server.server import (  # noqa: E402
+    AgvmHttpClient,
+    AgvmMcpConfig,
+    AgvmMcpHttpError,
+    AgvmMcpServer,
+    ToolPermissions,
+    load_config,
+    run_stdio,
+)
 from mcp_contracts import AGENT_MEMORY_MCP_TOOL_NAMES, GUIDE_MCP_TOOL_NAMES, REQUIRED_MCP_TOOL_NAMES, build_mcp_contract_registry  # noqa: E402
 
 
@@ -176,7 +188,7 @@ def test_pr12m_c_tools_list_is_mcp_protocol_registry_projection_with_brain_scope
     assert response is not None
     result = response["result"]
     tools = result["tools"]
-    assert len(tools) == 37
+    assert len(tools) == len(GUIDE_MCP_TOOL_NAMES) + len(REQUIRED_MCP_TOOL_NAMES) + len(AGENT_MEMORY_MCP_TOOL_NAMES)
     assert [tool["name"] for tool in tools] == [*GUIDE_MCP_TOOL_NAMES, *REQUIRED_MCP_TOOL_NAMES, *AGENT_MEMORY_MCP_TOOL_NAMES]
     for name in GUIDE_MCP_TOOL_NAMES:
         assert name in {tool["name"] for tool in tools}
@@ -422,7 +434,7 @@ def test_pr12m_c_tools_call_uses_contract_endpoint_method_and_registry_scope() -
     assert ensure_response["result"]["isError"] is False
     assert create_response is not None
     assert create_response["result"]["isError"] is False
-    assert handler.get_requests == [
+    expected_get_requests = [
         {"path": "/mcp/contracts", "brain_header": None},
         {"path": "/mcp/contracts", "brain_header": None},
         {"path": "/mcp/usage-guide", "brain_header": None},
@@ -431,6 +443,9 @@ def test_pr12m_c_tools_call_uses_contract_endpoint_method_and_registry_scope() -
         {"path": "/mcp/contracts", "brain_header": None},
         {"path": "/mcp/contracts", "brain_header": None},
     ]
+    observed_get_requests = iter(handler.get_requests)
+    assert all(any(observed == expected for observed in observed_get_requests) for expected in expected_get_requests)
+    assert all(observed in expected_get_requests for observed in handler.get_requests)
     assert handler.post_requests[-2] == {
         "path": "/mcp/brains/ensure",
         "brain_header": None,
@@ -446,6 +461,49 @@ def test_pr12m_c_tools_call_uses_contract_endpoint_method_and_registry_scope() -
             "make_default": False,
         },
     }
+
+
+def test_pr12m_c_http_client_retries_only_idempotent_transport_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"status":"ok"}'
+
+    def abort_first_get(request: Any, *, timeout: float) -> Response:
+        del timeout
+        calls.append(request.get_method())
+        if len(calls) == 1:
+            raise ConnectionAbortedError(10053, "host software aborted the connection")
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", abort_first_get)
+    client = AgvmHttpClient(AgvmMcpConfig(api_base_url="http://127.0.0.1:1"))
+
+    assert client.get_json("/mcp/contracts") == {"status": "ok"}
+    assert calls == ["GET", "GET"]
+
+    calls.clear()
+
+    def abort_post(request: Any, *, timeout: float) -> Response:
+        del timeout
+        calls.append(request.get_method())
+        raise ConnectionAbortedError(10053, "host software aborted the connection")
+
+    monkeypatch.setattr("urllib.request.urlopen", abort_post)
+    with pytest.raises(AgvmMcpHttpError, match="AGVM API transport failed"):
+        client.post_json("/mcp/brains/create", {"brain_id": "must_not_retry"})
+    assert calls == ["POST"]
 
 
 def test_pr12m_c_read_only_config_lists_and_blocks_mutation_tools() -> None:
@@ -510,6 +568,9 @@ def test_pr12m_c_default_module_policy_lists_paid_tools_but_blocks_unlicensed_ca
     listed_names = [tool["name"] for tool in listed["result"]["tools"]]  # type: ignore[index]
     assert "sleep_preview" in listed_names
     assert "evolve_preview" in listed_names
+    assert "geometry_calibration_preview" in listed_names
+    assert "geometry_calibration_apply" in listed_names
+    assert "geometry_calibration_rollback" in listed_names
     assert "matrix_calibration_preview" in listed_names
     assert called is not None
     assert called["result"]["isError"] is True
@@ -526,6 +587,79 @@ def test_pr12m_c_default_module_policy_lists_paid_tools_but_blocks_unlicensed_ca
     assert action_contract["credential_environment_variable"] == "AGVM_HOSTED_MCP_API_KEY"
     assert action_contract["cloud_workspace_url"].startswith("https://cloud.detwin.ai/")
     assert "Detwin Cloud" in payload["data"]["recovery"]
+    assert handler.post_requests == []
+
+
+def test_pr12m_c_stdio_lists_and_cloud_blocks_canonical_geometry_tools() -> None:
+    http_server, handler, base_url = _stub_api()
+    input_messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "geometry_calibration_preview",
+                "arguments": {"max_nodes_considered": 50, "max_position_updates": 10},
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "geometry_calibration_apply",
+                "arguments": {
+                    "max_nodes_considered": 50,
+                    "max_position_updates": 10,
+                    "confirm_apply": True,
+                    "rollback_consent": True,
+                    "preview_signature": "geometry-preview::test",
+                },
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "geometry_calibration_rollback",
+                "arguments": {
+                    "plan_signature": "geometry-preview::test",
+                    "confirm_rollback": True,
+                },
+            },
+        },
+    ]
+    stdin = StringIO("".join(json.dumps(message) + "\n" for message in input_messages))
+    stdout = StringIO()
+    try:
+        exit_code = run_stdio(
+            AgvmMcpServer(
+                AgvmMcpConfig(api_base_url=base_url, active_brain_id="alpha_brain")
+            ),
+            stdin=stdin,
+            stdout=stdout,
+        )
+    finally:
+        _shutdown(http_server)
+
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    listed_names = [tool["name"] for tool in responses[0]["result"]["tools"]]
+    assert exit_code == 0
+    assert len(listed_names) == 52
+    assert {
+        "geometry_calibration_preview",
+        "geometry_calibration_apply",
+        "geometry_calibration_rollback",
+    }.issubset(listed_names)
+    for response in responses[1:]:
+        result = response["result"]
+        assert result["isError"] is True
+        assert result["structuredContent"]["reason"] == "detwin_cloud_auth_required"
+        action = result["structuredContent"]["data"]["action_contract"]
+        assert action["action"] == "use_detwin_cloud_for_advanced_tool"
+        assert action["execution_surface"] == "hosted_mcp"
     assert handler.post_requests == []
 
 
@@ -588,6 +722,62 @@ def test_pr12m_c_paid_tool_uses_hosted_mcp_while_core_grow_stays_local() -> None
     metering = sleep["result"]["structuredContent"]["metering"]
     assert metering["estimated_credit_units"] == 180
     assert metering["settled_credit_units"] == 193
+
+
+def test_pr12m_c_stdio_proxies_canonical_geometry_preview_to_hosted_mcp() -> None:
+    http_server, handler, base_url = _stub_api()
+    hosted = _FakeHostedMcpClient()
+    stdin = StringIO(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "geometry-hosted-stdio",
+                "method": "tools/call",
+                "params": {
+                    "name": "geometry_calibration_preview",
+                    "arguments": {
+                        "brain_id": "alpha_brain",
+                        "max_nodes_considered": 50,
+                        "max_position_updates": 10,
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+    stdout = StringIO()
+    try:
+        exit_code = run_stdio(
+            AgvmMcpServer(
+                AgvmMcpConfig(
+                    api_base_url=base_url,
+                    active_brain_id="alpha_brain",
+                    hosted_mcp_api_key="agvm_mcp_test_secret_not_logged",
+                ),
+                hosted_client=hosted,  # type: ignore[arg-type]
+            ),
+            stdin=stdin,
+            stdout=stdout,
+        )
+    finally:
+        _shutdown(http_server)
+
+    response = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert response["result"]["isError"] is False
+    assert response["result"]["structuredContent"]["status"] == "preview_ready"
+    assert hosted.calls == [
+        {
+            "tool_name": "geometry_calibration_preview",
+            "arguments": {
+                "brain_id": "alpha_brain",
+                "max_nodes_considered": 50,
+                "max_position_updates": 10,
+            },
+            "request_id": "geometry-hosted-stdio",
+        }
+    ]
+    assert handler.post_requests == []
 
 
 def test_pr12m_c_hosted_mcp_secret_is_environment_only_and_redacted_from_metadata(

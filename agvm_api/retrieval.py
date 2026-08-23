@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,7 +45,7 @@ from answering import (
     _apply_answer_contract,
     _query_named_targets,
 )
-from ai_spatial_contract import build_ai_spatial_landing_contract
+from public_v1_landing_contract import build_public_v1_landing_contract
 from config import ATLAS_VERSION, BUCKET_SIZE, FACET_FIELDS, INDEX_VERSION, ROUTING_FIELDS
 from document_evidence_lane import rank_document_evidence_candidates
 from document_need_contract import build_target_document_need_contract
@@ -72,6 +76,7 @@ from projection import (
 )
 from schemas import RetrieveRequest
 from runtime_scope import current_brain_id
+from brain_profile_runtime import rerank_selected_top_k_with_brain_profile
 from sqlite_store import (
     clear_warm_thread_state,
     fetch_document_child_nodes,
@@ -475,7 +480,7 @@ def node_for_index(node: dict[str, Any]) -> dict[str, Any]:
         "matrix_calibration_plan_signature": node.get("matrix_calibration_plan_signature"),
         "matrix_calibrated_at": node.get("matrix_calibrated_at"),
         "active_matrix_projection": dict(node.get("active_matrix_projection") or {}),
-        "active_spatial_revision_context": dict(node.get("active_spatial_revision_context") or {}),
+        "geometry_profile_context": dict(node.get("geometry_profile_context") or {}),
     }
 
 
@@ -4542,7 +4547,13 @@ def _branch_controller_recommendation(
 ) -> dict[str, Any]:
     fallback = _controller_recommendation_fallback(branch, query_class=query_class)
     fallback_action = str(fallback.get("action") or "")
-    if not _should_use_ai_branch_controller(retrieval_mode=retrieval_mode, query_class=query_class, branch=branch):
+    controller_selected = _should_use_ai_branch_controller(
+        retrieval_mode=retrieval_mode,
+        query_class=query_class,
+        branch=branch,
+    )
+    ai_planned_branch = str(branch.get("planner_family") or "").strip().lower() == "ai"
+    if not controller_selected and not ai_planned_branch:
         return {
             **fallback,
             "decision_source": "fallback_disabled",
@@ -12143,14 +12154,15 @@ def _warm_reuse_budget_decision(
     warm_answerability: str,
 ) -> dict[str, Any]:
     source_pressure = _query_has_source_pressure(query_text)
+    mode = str(retrieval_mode or "balanced").strip().lower()
     query_contract = build_query_contract(query_text, retrieval_mode=retrieval_mode)
     contract_validation_required = bool(query_contract.get("requires_expansion")) and not bool(query_contract.get("fast_final_allowed"))
-    route_validation_required = bool(
+    independent_route_validation_required = bool(
         source_pressure
         or query_class == "document_lookup"
-        or str(retrieval_mode or "").strip().lower() == "forensic"
-        or contract_validation_required
+        or mode == "forensic"
     )
+    route_validation_required = bool(independent_route_validation_required or contract_validation_required)
     base = {
         "max_rounds": None,
         "final_scout_wait_seconds": None,
@@ -12166,13 +12178,21 @@ def _warm_reuse_budget_decision(
     answerability = str(warm_answerability or "").strip()
     partial_direct_warm_ok = bool(
         answerability == "partial"
-        and not route_validation_required
+        and continuity_state == "high_continuity"
+        and not independent_route_validation_required
         and query_class in {"direct_fact", "relation_fact"}
     )
+    warm_contract_satisfied = bool(
+        warm_usable
+        and query_class in {"direct_fact", "relation_fact"}
+        and (answerability == "grounded" or partial_direct_warm_ok)
+    )
+    effective_contract_validation_required = bool(contract_validation_required and not warm_contract_satisfied)
+    route_validation_required = bool(independent_route_validation_required or effective_contract_validation_required)
+    base = {**base, "route_validation_required": route_validation_required}
     if not warm_usable or (answerability != "grounded" and not partial_direct_warm_ok):
         return {**base, "reason": "warm_answer_not_grounded"}
     base = {**base, "answer_sufficient": True}
-    mode = str(retrieval_mode or "balanced").strip().lower()
     if query_class == "document_lookup" or mode == "forensic":
         return {**base, "reason": "document_or_forensic_requires_full_validation"}
     if source_pressure:
@@ -12182,7 +12202,7 @@ def _warm_reuse_budget_decision(
             "final_scout_wait_seconds": 0.75 if mode == "flash" else 1.25,
             "reason": "warm_context_with_source_validation",
         }
-    if contract_validation_required:
+    if effective_contract_validation_required:
         return {
             **base,
             "max_rounds": 1 if mode in {"flash", "balanced"} else 2,
@@ -12741,6 +12761,20 @@ def final_answer_approval_llm(
     payload["confidence"] = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
     payload["should_continue_expanding"] = bool(payload.get("should_continue_expanding", not payload["approve_final"]))
     return payload, None
+
+
+def _final_answer_approval_needed(
+    *,
+    ai_validation_gate: dict[str, Any],
+    answer_surface_content_ready: bool,
+) -> bool:
+    blockers = {str(item) for item in list((ai_validation_gate or {}).get("blockers") or [])}
+    return bool(
+        (ai_validation_gate or {}).get("blocked")
+        and (ai_validation_gate or {}).get("ai_material")
+        and answer_surface_content_ready
+        and "ai_final_judge_missing" in blockers
+    )
 
 
 def _fallback_master_decide(
@@ -15514,7 +15548,7 @@ def _build_ai_spatial_probes_from_contract(
     materialized = bool(contract.get("materialized") and contract.get("certifiable") and paths)
     if not materialized:
         return {
-            "schema_version": "agvm.ai_spatial_probe_materialization.v1",
+            "schema_version": "agvm.public_v1_landing_probe_materialization.v1",
             "status": "blocked",
             "probes": [],
             "snap_events": [],
@@ -15662,7 +15696,7 @@ def _build_ai_spatial_probes_from_contract(
         snap_events.append(snap_event)
 
     return {
-        "schema_version": "agvm.ai_spatial_probe_materialization.v1",
+        "schema_version": "agvm.public_v1_landing_probe_materialization.v1",
         "status": "materialized" if probes else "blocked",
         "probes": probes,
         "snap_events": snap_events,
@@ -15689,18 +15723,69 @@ def _mark_heuristic_provisional(
     return marked
 
 
+def _consolidate_broad_ai_spatial_probes(
+    query_text: str,
+    probes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows = [dict(item) for item in list(probes or []) if isinstance(item, dict)]
+    if not _is_broad_summary_query(query_text):
+        return rows
+    consolidated: list[dict[str, Any]] = []
+    index_by_slot: dict[str, int] = {}
+    for row in rows:
+        slot = _goal_to_slot(str(row.get("goal") or row.get("expected_answer_field") or ""))
+        if not slot or slot not in index_by_slot:
+            if slot:
+                index_by_slot[slot] = len(consolidated)
+            consolidated.append(row)
+            continue
+        target_index = index_by_slot[slot]
+        target = dict(consolidated[target_index])
+        merged_queue, _appended = _merge_semantic_destination_queue(
+            [dict(item) for item in list(target.get("destination_queue") or [])],
+            [dict(item) for item in list(row.get("destination_queue") or [])],
+        )
+        target["destination_queue"] = merged_queue
+        mission_ids = [
+            str(item or "").strip()
+            for item in (
+                *list(target.get("consolidated_path_mission_ids") or []),
+                _probe_path_mission_id(target),
+                _probe_path_mission_id(row),
+            )
+            if str(item or "").strip()
+        ]
+        target["consolidated_path_mission_ids"] = list(dict.fromkeys(mission_ids))
+        target["consolidated_ai_probe_ids"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in list(target.get("consolidated_ai_probe_ids") or []) if str(item).strip()],
+                    str(target.get("probe_id") or "").strip(),
+                    str(row.get("probe_id") or "").strip(),
+                ]
+            )
+        )
+        target["branch_priority"] = max(
+            float(target.get("branch_priority") or 0.0),
+            float(row.get("branch_priority") or 0.0),
+        )
+        consolidated[target_index] = target
+    return consolidated
+
+
 def _reserve_capacity_for_ai_spatial_probes(
     current_probes: list[dict[str, Any]],
     ai_spatial_probes: list[dict[str, Any]],
     *,
     max_total_branches: int,
+    query_text: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     current = [dict(item) for item in list(current_probes or []) if isinstance(item, dict)]
     ai_rows = [dict(item) for item in list(ai_spatial_probes or []) if isinstance(item, dict)]
     branch_cap = max(1, int(max_total_branches or 1))
     if not ai_rows or len(current) + len(ai_rows) <= branch_cap:
         return current, {
-            "schema_version": "agvm.ai_spatial_capacity_reservation.v1",
+            "schema_version": "agvm.public_v1_landing_capacity_reservation.v1",
             "reserved": False,
             "branch_cap": branch_cap,
             "heuristic_landing_count": len(current),
@@ -15720,9 +15805,30 @@ def _reserve_capacity_for_ai_spatial_probes(
         }
     reserved_ai_slots = min(len(ai_rows), max(1, branch_cap // 2))
     heuristic_keep = max(0, branch_cap - reserved_ai_slots)
+    ai_slots = {
+        _goal_to_slot(str(probe.get("goal") or ""))
+        for probe in ai_rows[:reserved_ai_slots]
+        if str(probe.get("goal") or "").strip()
+    }
+    broad_goal_order = {
+        goal: index
+        for index, goal in enumerate(_broad_summary_probe_goal_order())
+    }
+    broad_required_slots = set(_required_slots_for_query(query_text)) if _is_broad_summary_query(query_text) else set()
     ranked_current = sorted(
         enumerate(current),
         key=lambda item: (
+            int(
+                _is_broad_summary_query(query_text)
+                and _goal_to_slot(str(item[1].get("goal") or "")) in ai_slots
+            ),
+            int(
+                _is_broad_summary_query(query_text)
+                and _goal_to_slot(str(item[1].get("goal") or "")) not in broad_required_slots
+            ),
+            broad_goal_order.get(str(item[1].get("goal") or "").strip().lower(), len(broad_goal_order))
+            if _is_broad_summary_query(query_text)
+            else 0,
             -float(item[1].get("branch_priority") or item[1].get("family_plan_confidence") or item[1].get("weight") or 0.0),
             item[0],
         ),
@@ -15736,7 +15842,7 @@ def _reserve_capacity_for_ai_spatial_probes(
     ]
     dropped = len(current) - len(kept)
     return kept, {
-        "schema_version": "agvm.ai_spatial_capacity_reservation.v1",
+        "schema_version": "agvm.public_v1_landing_capacity_reservation.v1",
         "reserved": dropped > 0,
         "branch_cap": branch_cap,
         "heuristic_landing_count": len(current),
@@ -16652,7 +16758,7 @@ def _ai_spatial_contract_is_materialized(contract: dict[str, Any] | None) -> boo
 def _ai_spatial_contract_runtime(contract: dict[str, Any] | None) -> dict[str, Any]:
     payload = dict(contract or {})
     return {
-        "schema_version": "agvm.ai_spatial_landing_contract_runtime.v1",
+        "schema_version": "agvm.public_v1_landing_landing_contract_runtime.v1",
         "status": str(payload.get("status") or ""),
         "source": str(payload.get("source") or ""),
         "materialized": bool(payload.get("materialized")),
@@ -20846,6 +20952,7 @@ def materialize_ai_spatial_contract_into_plan(
         for item in list(probe_materialization.get("probes") or [])
         if isinstance(item, dict)
     ]
+    ai_spatial_probes = _consolidate_broad_ai_spatial_probes(query.query_text, ai_spatial_probes)
     if not ai_spatial_probes:
         planner_runtime = dict(updated.get("planner_runtime") or {})
         merge_summary = _mission_aware_merge_runtime_summary(
@@ -20872,6 +20979,7 @@ def materialize_ai_spatial_contract_into_plan(
         existing_probes,
         ai_spatial_probes,
         max_total_branches=int(query.max_total_branches),
+        query_text=query.query_text,
     )
     kept_probe_ids = {str(probe.get("probe_id") or "") for probe in kept_probes if str(probe.get("probe_id") or "")}
     kept_branches = [
@@ -21263,7 +21371,7 @@ def prepare_runtime_plan(
         ai_spatial_initial_mode_budget["cache_only"] = True
         ai_spatial_initial_mode_budget["first_payload_deferred_initial_plan"] = True
     phase_started = time.perf_counter()
-    ai_spatial_landing_contract = build_ai_spatial_landing_contract(
+    ai_spatial_landing_contract = build_public_v1_landing_contract(
         query_text=query.query_text,
         retrieval_mode=selected_retrieval_mode,
         semantic_contract=semantic_contract,
@@ -21285,7 +21393,7 @@ def prepare_runtime_plan(
     )
     mark_stage("spatial_ai_ms", phase_started)
     ai_spatial_landing_contract_runtime = {
-        "schema_version": "agvm.ai_spatial_landing_contract_runtime.v1",
+        "schema_version": "agvm.public_v1_landing_landing_contract_runtime.v1",
         "status": str(ai_spatial_landing_contract.get("status") or ""),
         "source": str(ai_spatial_landing_contract.get("source") or ""),
         "materialized": bool(ai_spatial_landing_contract.get("materialized")),
@@ -21375,11 +21483,13 @@ def prepare_runtime_plan(
     )
     mark_stage("mission_materialization_ms", phase_started)
     ai_spatial_probes = [dict(item) for item in list(ai_spatial_probe_materialization.get("probes") or []) if isinstance(item, dict)]
+    ai_spatial_probes = _consolidate_broad_ai_spatial_probes(query.query_text, ai_spatial_probes)
     phase_started = time.perf_counter()
     probes, ai_spatial_capacity_reservation = _reserve_capacity_for_ai_spatial_probes(
         probes,
         ai_spatial_probes,
         max_total_branches=int(query.max_total_branches),
+        query_text=query.query_text,
     )
     atlas_shortlists = _apply_probe_shortlists(probes, query, atlas_payload)
     branches = [_create_branch_from_probe(query, probe) for probe in probes]
@@ -22086,13 +22196,18 @@ def _process_branch_round(
         max(query.max_matches * 2, int(branch["budget"]["max_fulltexts"]) * 2, 12),
     )
     rerank_pool = _prepare_rerank_pool(ranked, hydrate_limit=hydrate_limit)
-    top_matches = rerank_hydrated_matches(
+    reranked_matches = rerank_hydrated_matches(
         ranking_probe,
         rerank_pool,
         hydrate_limit=hydrate_limit,
         max_nodes_fulltext=int(branch["budget"]["max_fulltexts"]),
         identity_context=identity_context,
-    )[: query.max_matches]
+    )
+    top_matches = rerank_selected_top_k_with_brain_profile(
+        ranking_probe,
+        reranked_matches,
+        top_k=query.max_matches,
+    )
     satisfaction = compute_satisfaction(top_matches)
     center_bucket_key = position_to_bucket(route_anchor_position)["key"]
 
@@ -24087,7 +24202,7 @@ def retrieve_runtime(
                     "policy": "ai_places_inverse_answer_paths_before_backend_traversal",
                 },
             )
-            spatial_contract = build_ai_spatial_landing_contract(
+            spatial_contract = build_public_v1_landing_contract(
                 query_text=query.query_text,
                 retrieval_mode=retrieval_mode,
                 semantic_contract=semantic_contract_payload,
@@ -24108,7 +24223,7 @@ def retrieve_runtime(
                 cache_scope="retrieve_ai_spatial_contract",
             )
             spatial_runtime = {
-                "schema_version": "agvm.ai_spatial_landing_contract_runtime.v1",
+                "schema_version": "agvm.public_v1_landing_landing_contract_runtime.v1",
                 "status": str(spatial_contract.get("status") or ""),
                 "source": str(spatial_contract.get("source") or ""),
                 "materialized": bool(spatial_contract.get("materialized")),
@@ -28460,6 +28575,7 @@ def retrieve_runtime(
         retrieval_mode=retrieval_mode,
         path_corridors=path_corridors,
     )
+    document_refs = list(document_workspace.get("document_refs") or [])
     if context is not None and document_workspace:
         context["document_workspace"] = {
             key: value
@@ -28547,11 +28663,6 @@ def retrieve_runtime(
             or _answer_surface_contract_blocked(query.query_text, answer_full)
         )
     )
-    answer_surface_non_ai_fallback = bool(
-        answer_surface_content_ready
-        and (ai_material_contribution or bool(semantic_contract_runtime_payload.get("material")))
-        and str((answer or {}).get("mode") or "").lower() in {"heuristic", "grounded_facts"}
-    )
     answer_surface_needs_package_rewrite = answer_demo_surface_needs_context_package_rewrite(
         query_text=query.query_text,
         answer_text=answer_short,
@@ -28572,7 +28683,6 @@ def retrieve_runtime(
             not answer_surface_content_ready
             or answer_alignment_only_unresolved
             or answer_surface_guard_blocked
-            or answer_surface_non_ai_fallback
             or answer_surface_needs_package_rewrite
         )
         and context_package_contract_passed
@@ -28668,12 +28778,9 @@ def retrieve_runtime(
         response_mode=query.response_mode,
     )
     final_ai_approval_payload: dict[str, Any] = {}
-    if (
-        bool(ai_validation_gate.get("blocked"))
-        and bool(ai_validation_gate.get("ai_material"))
-        and answer_surface_content_ready
-        and "ai_final_judge_missing" in set(str(item) for item in list(ai_validation_gate.get("blockers") or []))
-        and not partial_terminal_fast_materialization
+    if _final_answer_approval_needed(
+        ai_validation_gate=ai_validation_gate,
+        answer_surface_content_ready=answer_surface_content_ready,
     ):
         approval_payload, approval_error = final_answer_approval_llm(
             query_text=query.query_text,
@@ -28913,6 +29020,7 @@ def retrieve_runtime(
         retrieval_mode=retrieval_mode,
         path_corridors=path_corridors,
     )
+    document_refs = list(document_workspace.get("document_refs") or [])
     if context is not None and document_workspace:
         context["document_workspace"] = {
             key: value
@@ -28939,11 +29047,6 @@ def retrieve_runtime(
             or _answer_surface_contract_blocked(query.query_text, answer_full)
         )
     )
-    final_answer_surface_non_ai_fallback = bool(
-        answer_surface_content_ready
-        and (ai_material_contribution or bool(semantic_contract_runtime_payload.get("material")))
-        and str((answer or {}).get("mode") or "").lower() in {"heuristic", "grounded_facts"}
-    )
     final_answer_surface_needs_package_rewrite = answer_demo_surface_needs_context_package_rewrite(
         query_text=query.query_text,
         answer_text=answer_short,
@@ -28964,7 +29067,6 @@ def retrieve_runtime(
             not answer_surface_content_ready
             or final_answer_alignment_only_unresolved
             or final_answer_surface_guard_blocked
-            or final_answer_surface_non_ai_fallback
             or final_answer_surface_needs_package_rewrite
         )
         and context_package_contract_passed

@@ -63,20 +63,27 @@ Ask the client to call `get_agvm_usage_guide` and then list the AGVM tools it
 can see. If the tool is missing, check the process working directory, Python
 environment and `AGVM_API_BASE_URL`.
 
-With the default public Core configuration the bridge exposes 37 tools. Grow,
+The current V1 contract registry defines 52 tool contracts. `tools/list` is the
+runtime authority because client permission policy can expose a filtered set. Grow,
 brain registry, retrieval, write-preview/commit and local graph inspection
-tools are Core tools. Maintain-family module tools such as `sleep_preview`,
+tools are Core tools. The registry also includes nine bounded
+`brain_bootstrap_*` tools and three `brain_profile_*` tools. Maintain-family
+module tools such as `sleep_preview`,
 `sleep_apply`, `evolve_preview`, `evolve_apply`,
-`matrix_calibration_preview`, `matrix_calibration_apply` and
+`geometry_calibration_preview`, `geometry_calibration_apply`,
+`geometry_calibration_rollback` and
 `list_memory_os_processes` stay visible so AI clients can plan correctly, but a
 direct call requires a Detwin Hosted MCP key. Without one, the bridge returns
 `detwin_cloud_auth_required` with an action contract. With one, the bridge can
 send a certified paid operation to Hosted MCP; Platform checks the account,
 plan, cloud brain, provider and credits before dispatch and settles dynamic
-usage from the Core terminal receipt. In this release the certified stdio to
-Hosted adapters are `sleep_preview` and `evolve_preview`. Other paid tools stay
-discoverable but return a structured unavailable response until their Hosted
-adapter passes the same execution and metering gate.
+usage from the Core terminal receipt. The certified stdio to Hosted paths include
+`sleep_preview`, `evolve_preview` and the canonical Geometry Calibration
+preview/apply/rollback tools. Other paid tools stay discoverable but return a
+structured unavailable response until their Hosted adapter passes the same
+execution and metering gate. The legacy
+`matrix_calibration_preview` and `matrix_calibration_apply` names remain visible
+only as backward-compatible aliases; new clients must use Geometry Calibration.
 
 Create the key in Detwin Account, then expose it only to the MCP process:
 
@@ -101,6 +108,18 @@ the server-side Hosted MCP gate. Missing credentials, entitlement or credits
 return structured recovery responses; paid operations never fall back to local
 execution. Grow remains a local Core operation and does not consume Detwin
 credits.
+
+Brain Profile preview is shadow-only. Profile fitting, activation and rollback
+authority are cloud-backed and must return an action contract when the local
+process lacks the required Detwin capability. See
+[Brain Profile V1](brain-profile-v1.md).
+
+The public distribution contains no local Brain Profile benchmark/runtime or
+Geometry Calibration apply/rollback implementation. Those tool names remain in
+`tools/list`, but calls are either forwarded by the MCP bridge to Hosted MCP or
+answered by a fail-closed public route with a Detwin Cloud `action_contract`.
+Installing or forging a local lease cannot turn those public stubs into paid
+execution code.
 
 ## Brain And Graph Export
 

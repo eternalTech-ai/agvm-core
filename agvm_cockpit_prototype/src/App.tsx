@@ -5,16 +5,20 @@
 import {
   Activity,
   ArrowRight,
+  BarChart3,
+  Blocks,
   Brain,
   CheckCircle2,
   CircleAlert,
   Cloud,
+  CloudUpload,
   ClipboardCheck,
   Database,
   Download,
   FileUp,
   GitBranch,
   Globe2,
+  HeartPulse,
   Layers3,
   Link2,
   Lock,
@@ -22,11 +26,15 @@ import {
   MessageSquareText,
   Moon,
   Network,
+  PanelLeftClose,
+  PanelLeftOpen,
   Play,
+  Plug,
   PlusCircle,
   RefreshCw,
   Search,
   Server,
+  Settings,
   ShieldCheck,
   Sparkles,
   Sun,
@@ -106,7 +114,18 @@ type McpRegistry = {
   };
 };
 
-type RouteId = "brain" | "context" | "grow" | "mcp" | "modules" | "health" | "settings";
+type RouteId =
+  | "context"
+  | "results"
+  | "brain_explorer"
+  | "health"
+  | "bench"
+  | "modules"
+  | "grow"
+  | "maintain"
+  | "mcp"
+  | "brain_sync"
+  | "settings";
 type Tone = "ready" | "active" | "pending" | "blocked" | "neutral";
 type ThemeMode = "light" | "dark";
 type GrowSourceKind = "manual_text" | "url" | "website" | "pdf" | "docx" | "transcript" | "mixed_bundle";
@@ -129,14 +148,18 @@ type BrainPoint3d = {
 const apiBaseUrl = String(import.meta.env.VITE_API_URL || "http://localhost:8010").replace(/\/$/, "");
 const cloudUrl = String(import.meta.env.VITE_DETWIN_CLOUD_URL || "https://app.detwin.ai").replace(/\/$/, "");
 
-const routes: Array<{ id: RouteId; label: string; eyebrow: string; icon: LucideIcon }> = [
-  { id: "brain", label: "Brain", eyebrow: "Memory shape", icon: Brain },
-  { id: "context", label: "Context", eyebrow: "Retrieve", icon: Search },
-  { id: "grow", label: "Grow", eyebrow: "Core write", icon: Sparkles },
-  { id: "mcp", label: "MCP", eyebrow: "Raw tools", icon: TerminalSquare },
-  { id: "modules", label: "Modules", eyebrow: "Core vs Cloud", icon: Layers3 },
-  { id: "health", label: "Health", eyebrow: "Runtime proof", icon: Activity },
-  { id: "settings", label: "Settings", eyebrow: "Local only", icon: ShieldCheck },
+const routes: Array<{ id: RouteId; label: string; shortLabel?: string; eyebrow: string; icon: LucideIcon }> = [
+  { id: "context", label: "Context", eyebrow: "Core", icon: Search },
+  { id: "results", label: "Results", eyebrow: "Core", icon: BarChart3 },
+  { id: "brain_explorer", label: "Brain Explorer", shortLabel: "Explorer", eyebrow: "Core", icon: Brain },
+  { id: "health", label: "Health", eyebrow: "Core", icon: HeartPulse },
+  { id: "bench", label: "Bench", eyebrow: "Core", icon: Activity },
+  { id: "modules", label: "Modules", eyebrow: "Core + Cloud", icon: Blocks },
+  { id: "grow", label: "Grow", eyebrow: "Core", icon: Database },
+  { id: "maintain", label: "Maintain", eyebrow: "Cloud-backed", icon: Activity },
+  { id: "mcp", label: "MCP", eyebrow: "Connect", icon: Plug },
+  { id: "brain_sync", label: "Brain Sync", shortLabel: "Sync", eyebrow: "Explicit", icon: CloudUpload },
+  { id: "settings", label: "Settings", eyebrow: "Local", icon: Settings },
 ];
 
 const growSourceModes: Array<{ kind: GrowSourceKind; label: string; meta: string; icon: LucideIcon }> = [
@@ -151,6 +174,14 @@ const growSourceModes: Array<{ kind: GrowSourceKind; label: string; meta: string
 
 export function CockpitApp() {
   const [route, setRoute] = useState<RouteId>(() => routeFromLocation());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      const stored = window.localStorage?.getItem("agvm.sidebar.collapsed");
+      return stored === null ? window.innerWidth <= 1100 : stored === "true";
+    } catch {
+      return false;
+    }
+  });
   const [health, setHealth] = useState<HealthState | null>(null);
   const [registry, setRegistry] = useState<BrainRegistry | null>(null);
   const [graph, setGraph] = useState<GraphResponse | null>(null);
@@ -319,108 +350,113 @@ export function CockpitApp() {
   }
 
   return (
-    <main className="core-shell" data-route={route}>
-      <header className="core-topbar" aria-label="Local AGVM status">
-        <div className="core-brand topbar-product">
-          <span className="core-mark"><Brain size={19} /></span>
-          <div>
-            <strong>AGVM</strong>
-            <small>Local Core</small>
-          </div>
+    <section
+      className={`agvm-product-shell agvm-product-shell-local ${sidebarCollapsed ? "sidebar-collapsed" : "sidebar-expanded"}`}
+      data-active-route={route}
+      data-runtime-mode="local"
+    >
+      <header className="agvm-product-topbar" aria-label="Local AGVM status">
+        <div className="agvm-product-brand">
+          <span className="agvm-product-mark"><Brain size={20} /></span>
+          <div><strong>AGVM</strong><span>Local AGVM</span></div>
         </div>
-        <StatusTile label="Workspace" value="Local Workspace" tone="neutral" />
-        <BrainSelector
-          activeBrainId={activeBrainId}
-          brains={brains}
-          busyAction={busyAction}
-          importBrainDisplayName={importBrainDisplayName}
-          importBrainId={importBrainId}
-          newBrainDisplayName={newBrainDisplayName}
-          newBrainId={newBrainId}
-          onBootstrap={bootstrapRegistry}
-          onCreateBrain={() => createLocalBrain()}
-          onExportBrain={exportActiveBrain}
-          onImportFile={importLocalBrain}
-          onRefresh={refresh}
-          onSelect={(brain) =>
-            runAction("select-brain", async () => {
-              const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/select-brain", "/memory/brains/select", { brain_id: brain, make_default: false });
-              await refresh();
-              return response;
-            })
-          }
-          setImportBrainDisplayName={setImportBrainDisplayName}
-          setImportBrainId={setImportBrainId}
-          setNewBrainDisplayName={setNewBrainDisplayName}
-          setNewBrainId={setNewBrainId}
-        />
-        <StatusTile label="Plan" value="AGVM Core" tone="neutral" />
-        <StatusTile label="Graph" value={graph?.graph?.nodes?.length ? `${graph.graph.nodes.length} nodes` : "Empty brain"} tone={graph?.graph?.nodes?.length ? "active" : "pending"} />
-        <StatusTile label="Runtime" value={health?.ok ? "Local ready" : loading ? "Checking" : "Offline"} tone={health?.ok ? "ready" : loading ? "pending" : "blocked"} />
-        <button className="icon-button" onClick={refresh} title="Refresh local runtime" type="button">
-          <RefreshCw size={17} />
-        </button>
+        <div className="agvm-product-context-strip" aria-label="Workspace context">
+          <StatusTile label="Workspace" value="Local Workspace" tone="neutral" />
+          <BrainSelector
+            activeBrainId={activeBrainId}
+            brains={brains}
+            busyAction={busyAction}
+            importBrainDisplayName={importBrainDisplayName}
+            importBrainId={importBrainId}
+            newBrainDisplayName={newBrainDisplayName}
+            newBrainId={newBrainId}
+            onBootstrap={bootstrapRegistry}
+            onCreateBrain={() => createLocalBrain()}
+            onExportBrain={exportActiveBrain}
+            onImportFile={importLocalBrain}
+            onRefresh={refresh}
+            onSelect={(brain) =>
+              runAction("select-brain", async () => {
+                const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/select-brain", "/memory/brains/select", { brain_id: brain, make_default: false });
+                await refresh();
+                return response;
+              })
+            }
+            setImportBrainDisplayName={setImportBrainDisplayName}
+            setImportBrainId={setImportBrainId}
+            setNewBrainDisplayName={setNewBrainDisplayName}
+            setNewBrainId={setNewBrainId}
+          />
+          <StatusTile label="Plan" value="Local Core" tone="neutral" />
+          <StatusTile label="Brain detail" value={nodes.length ? `${nodes.length} nodes` : "0 / 0 nodes"} tone={nodes.length ? "active" : "pending"} />
+        </div>
+        <div className="agvm-product-session">
+          <i className={`runtime-dot ${health?.ok ? "ready" : loading ? "pending" : "blocked"}`} />
+          <div>
+            <strong>{health?.ok ? "Verified local access" : loading ? "Checking local runtime" : "Local runtime offline"}</strong>
+            <span>{health?.service || "Docker backend"}</span>
+          </div>
+          <button className="icon-button" onClick={refresh} title="Refresh local runtime" type="button"><RefreshCw size={17} /></button>
+        </div>
       </header>
 
-      <div className="core-layout">
-        <aside className="core-rail" aria-label="Local AGVM navigation">
-          <div className="rail-context">
-            <routeModel.icon size={17} />
-            <div>
-              <span>{routeModel.eyebrow}</span>
-              <strong>{routeModel.label}</strong>
-            </div>
-          </div>
+      <div className="agvm-product-layout without-module-rail">
+        <aside className="agvm-product-sidebar" aria-label="AGVM navigation">
+          <button
+            aria-label={sidebarCollapsed ? "Expand navigation" : "Collapse navigation"}
+            className="agvm-sidebar-toggle"
+            onClick={() => setSidebarCollapsed((current) => {
+              const next = !current;
+              window.localStorage?.setItem("agvm.sidebar.collapsed", String(next));
+              return next;
+            })}
+            title={sidebarCollapsed ? "Expand navigation" : "Collapse navigation"}
+            type="button"
+          >
+            {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+            <span>{sidebarCollapsed ? "Expand" : "Collapse"}</span>
+          </button>
           <nav>
             {routes.map((item) => (
-              <a className={route === item.id ? "active" : ""} href={`#${item.id}`} key={item.id} onClick={() => setRoute(item.id)}>
+              <button
+                aria-current={route === item.id ? "page" : undefined}
+                aria-label={item.label}
+                className={`agvm-product-nav-item ${route === item.id ? "active" : ""}`}
+                data-tooltip={item.label}
+                key={item.id}
+                onClick={() => {
+                  setRoute(item.id);
+                  window.location.hash = item.id;
+                }}
+                title={item.label}
+                type="button"
+              >
                 <item.icon size={17} />
-                <span>{item.label}</span>
-                <small>{item.eyebrow}</small>
-              </a>
+                <span className="agvm-product-nav-copy"><strong>{item.shortLabel || item.label}</strong><em>{item.eyebrow}</em></span>
+              </button>
             ))}
           </nav>
-          <div className="rail-card">
-            <Server size={16} />
-            <strong>{health?.ok ? "Local Core connected" : loading ? "Checking runtime" : "Runtime offline"}</strong>
-            <span>{apiBaseUrl}</span>
+          <div className="agvm-product-sidebar-card">
+            <span>Mode</span><strong>Local</strong>
+            <p>Local runtime keeps control on this device.</p>
           </div>
         </aside>
 
-        <section className="core-main">
-
-        <section className="workspace">
-          <div className="workspace-head">
-            <div>
-              <span>{routeModel.eyebrow.toUpperCase()}</span>
-              <h1>{headlineForRoute(route, activeBrain)}</h1>
-              <p>{descriptionForRoute(route)}</p>
-            </div>
-            <div className="workspace-actions">
-              {!activeBrainId ? (
-                <button
-                  className="primary"
-                  disabled={busyAction === "create-brain"}
-                  onClick={createDemoBrain}
-                  type="button"
-                >
-                  {busyAction === "create-brain" ? <RefreshCw size={16} /> : <Brain size={16} />}
-                  Create starter brain
-                </button>
-              ) : null}
-              <a className="secondary" href={`${cloudUrl}/modules`}>
-                <Cloud size={16} />
-                Use Detwin Cloud
-              </a>
-            </div>
-          </div>
-
-          {lastError ? <Notice tone="blocked" title="Local request did not complete" detail={lastError} /> : null}
-          {!activeBrainId ? (
-            <BrainBootstrapNotice busyAction={busyAction} onBootstrap={bootstrapRegistry} onCreateDemo={createDemoBrain} />
+        <main className="agvm-product-main">
+          <section className="agvm-product-content">
+          {route !== "context" && route !== "brain_explorer" ? (
+            <header className="workspace-head agvm-product-page-header">
+              <div><span>{routeModel.eyebrow.toUpperCase()}</span><h1>{headlineForRoute(route, activeBrain)}</h1><p>{descriptionForRoute(route)}</p></div>
+              <div className="workspace-actions">
+                {!activeBrainId ? <button className="primary" disabled={busyAction === "create-brain"} onClick={createDemoBrain} type="button"><Brain size={16} />Create starter brain</button> : null}
+                <a className="secondary" href={`${cloudUrl}/modules`}><Cloud size={16} />Use Detwin Cloud</a>
+              </div>
+            </header>
           ) : null}
+          {lastError ? <Notice tone="blocked" title="Local request did not complete" detail={lastError} /> : null}
+          {!activeBrainId && route !== "context" ? <BrainBootstrapNotice busyAction={busyAction} onBootstrap={bootstrapRegistry} onCreateDemo={createDemoBrain} /> : null}
 
-          {route === "brain" ? <BrainRoute activeBrain={activeBrain} activeBrainId={activeBrainId} activity={activity} graph={graph} nodes={nodes} /> : null}
+          {route === "brain_explorer" ? <BrainRoute activeBrain={activeBrain} activeBrainId={activeBrainId} activity={activity} graph={graph} nodes={nodes} /> : null}
           {route === "context" ? (
             <ContextRoute
               activeBrainId={activeBrainId}
@@ -444,6 +480,7 @@ export function CockpitApp() {
               }
             />
           ) : null}
+          {route === "results" ? <ResultsRoute nodes={nodes} result={result} /> : null}
           {route === "grow" ? (
             <GrowRoute
               activeBrainId={activeBrainId}
@@ -501,6 +538,7 @@ export function CockpitApp() {
             />
           ) : null}
           {route === "modules" ? <ModulesRoute /> : null}
+          {route === "maintain" ? <CloudMaintainRoute /> : null}
           {route === "health" ? (
             <HealthRoute
               activeBrainId={activeBrainId}
@@ -519,11 +557,13 @@ export function CockpitApp() {
               }
             />
           ) : null}
+          {route === "bench" ? <BenchRoute activeBrainId={activeBrainId} graph={graph} health={health} /> : null}
+          {route === "brain_sync" ? <BrainSyncRoute activeBrain={activeBrain} activeBrainId={activeBrainId} /> : null}
           {route === "settings" ? <SettingsRoute activeBrainId={activeBrainId} health={health} mcpRegistry={mcpRegistry} setTheme={setTheme} theme={theme} /> : null}
-        </section>
-        </section>
+          </section>
+        </main>
       </div>
-    </main>
+    </section>
   );
 }
 
@@ -541,9 +581,14 @@ function BrainRoute({
   nodes: GraphNode[];
 }) {
   return (
-    <div className="brain-grid">
-      <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} />
-      <aside className="proof-panel">
+    <section className="brain-explorer-workspace">
+      <header className="brain-explorer-header">
+        <div><span>Brain Core</span><h2>Brain Explorer</h2><p>Inspect real memory nodes and their current position in the active local brain.</p></div>
+        <strong>{nodes.length ? `${nodes.length} loaded nodes` : "Waiting for local graph"}</strong>
+      </header>
+      <div className="brain-explorer-layout">
+        <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} />
+        <aside className="proof-panel brain-explorer-inspector">
         <PanelEyebrow icon={Database} label="Active memory" />
         <h2>{activeBrain ? brainName(activeBrain) : "No local brain selected"}</h2>
         <MetricGrid
@@ -557,10 +602,11 @@ function BrainRoute({
         <div className="receipt-list">
           <Receipt title="Brain shape" detail="The 3D projection is derived only from the nodes currently stored in this brain." tone="active" />
           <Receipt title="Runtime boundary" detail="No Detwin account, billing state or cloud workspace is required for this local Core UI." tone="ready" />
-          <Receipt title="Advanced modules" detail="Clone, Teach and Maintain are cloud surfaces. Local Core links to Detwin Cloud instead of downloading paid modules." tone="pending" />
+          <Receipt title="Advanced modules" detail="Paid workflows remain cloud surfaces. Local Core links to Detwin Cloud instead of downloading their source." tone="pending" />
         </div>
-      </aside>
-    </div>
+        </aside>
+      </div>
+    </section>
   );
 }
 
@@ -584,21 +630,29 @@ function ContextRoute({
   setQuery: (value: string) => void;
 }) {
   return (
-    <div className="operation-grid">
-      <section className="command-surface">
-        <PanelEyebrow icon={Search} label="Retrieve Context" />
-        <textarea onChange={(event) => setQuery(event.target.value)} value={query} />
-        <button className="primary wide" disabled={busy || !query.trim()} onClick={onRun} type="button">
-          {busy ? <RefreshCw size={17} /> : <Play size={17} />}
-          Run local retrieval
+    <section className="context-core-workspace">
+      <div className="context-command-bar">
+        <Search size={17} />
+        <input aria-label="Context query" onChange={(event) => setQuery(event.target.value)} placeholder="Ask the brain for context..." value={query} />
+        <button className="secondary" disabled={!activeBrainId} type="button">
+          <Brain size={16} />{activeBrainId ? "Active brain" : "Choose brain"}
         </button>
-        <p className="fine-print">Runs against `/memory/query` on the local AGVM API. Local retrieval does not consume Detwin credits.</p>
-      </section>
-      <div className="live-result-stack">
-        <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
-        <ResultPanel emptyTitle={activeBrainId ? "Awaiting retrieval" : "Select or create a brain first"} result={result} />
+        <button className="primary" disabled={busy || !activeBrainId || !query.trim()} onClick={onRun} type="button">
+          {busy ? <RefreshCw size={17} /> : <Play size={17} />}
+          {activeBrainId ? "Run retrieval" : "Create, import or select a brain"}
+        </button>
       </div>
-    </div>
+      <div className="context-live-layout">
+        <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
+        <aside className="context-insight-rail">
+          <PanelEyebrow icon={Search} label="Search status" />
+          <strong>{busy ? "Retrieval active" : result ? "Result ready" : "Awaiting mission"}</strong>
+          <div className="context-progress" aria-label="Context progress"><i style={{ width: busy ? "58%" : result ? "100%" : "0%" }} /></div>
+          <ResultPanel emptyTitle={activeBrainId ? "No evidence yet" : "Select or create a brain first"} result={result} />
+          <article className="context-transparency"><span>Transparency</span><strong>See what the brain relied on</strong><p>Every returned memory and source remains inspectable in the local result receipt.</p></article>
+        </aside>
+      </div>
+    </section>
   );
 }
 
@@ -849,6 +903,66 @@ function ModulesRoute() {
   );
 }
 
+function ResultsRoute({ nodes, result }: { nodes: GraphNode[]; result: Record<string, unknown> | null }) {
+  return (
+    <div className="operation-grid">
+      <section className="command-surface">
+        <PanelEyebrow icon={BarChart3} label="Local result history" />
+        <h2>Review the latest Core receipt.</h2>
+        <p>Context, Grow, MCP and health operations publish their latest bounded response here without creating a cloud history dependency.</p>
+        <MetricGrid metrics={[{ label: "Graph nodes", value: String(nodes.length) }, { label: "Latest receipt", value: result ? "available" : "not run" }, { label: "Storage", value: "local" }, { label: "Cloud credits", value: "not used" }]} />
+      </section>
+      <ResultPanel emptyTitle="Run a Local Core workflow to create a receipt" result={result} />
+    </div>
+  );
+}
+
+function BenchRoute({ activeBrainId, graph, health }: { activeBrainId: string; graph: GraphResponse | null; health: HealthState | null }) {
+  return (
+    <div className="operation-grid">
+      <section className="command-surface">
+        <PanelEyebrow icon={Activity} label="Local readiness bench" />
+        <h2>Reproducible checks stay explicit.</h2>
+        <p>Use the public MCP contract to run retrieval and memory checks against the selected local brain.</p>
+        <MetricGrid metrics={[{ label: "Runtime", value: health?.ok ? "ready" : "offline" }, { label: "Brain", value: activeBrainId || "required" }, { label: "Graph", value: graph?.graph?.meta?.load_error ? "load error" : "available" }, { label: "Writes", value: "review gated" }]} />
+      </section>
+      <aside className="proof-panel">
+        <Receipt title="Health first" detail="Verify the runtime and active brain before comparing retrieval behavior." tone={health?.ok ? "ready" : "pending"} />
+        <Receipt title="Real-node evidence" detail="Brain Core never fills an empty graph with synthetic memory nodes." tone="active" />
+        <Receipt title="Public boundary" detail="Bench actions use public Core contracts only." tone="ready" />
+      </aside>
+    </div>
+  );
+}
+
+function CloudMaintainRoute() {
+  return (
+    <section className="cloud-handoff-workspace">
+      <Activity size={28} />
+      <div><span>Cloud-backed workflow</span><h2>Maintain is visible, but not executable in Local Core.</h2><p>Sleep, evolve and calibration source is not included in this public checkout. Use the cloud handoff to run account- and credit-gated maintenance.</p></div>
+      <a className="secondary link-button" href={`${cloudUrl}/modules`}><Cloud size={16} />Open Maintain in Detwin Cloud</a>
+    </section>
+  );
+}
+
+function BrainSyncRoute({ activeBrain, activeBrainId }: { activeBrain: BrainSummary | null; activeBrainId: string }) {
+  return (
+    <div className="operation-grid">
+      <section className="command-surface">
+        <PanelEyebrow icon={CloudUpload} label="Explicit Brain Sync" />
+        <h2>{activeBrain ? brainName(activeBrain) : "Select a local brain first."}</h2>
+        <p>Local brains remain on this device until an explicit Detwin Cloud sync handoff is opened.</p>
+        <MetricGrid metrics={[{ label: "Brain id", value: activeBrainId || "not selected" }, { label: "Local state", value: activeBrain ? "available" : "required" }, { label: "Automatic upload", value: "off" }, { label: "Cloud account", value: "optional" }]} />
+      </section>
+      <aside className="proof-panel">
+        <Receipt title="Local by default" detail="No brain archive is transmitted by this standalone UI." tone="ready" />
+        <Receipt title="Explicit handoff" detail="Cloud sync starts only after opening Detwin and authorizing the account workflow there." tone="active" />
+        <a className="secondary link-button" href={`${cloudUrl}/brains`}><CloudUpload size={16} />Open Brain Sync</a>
+      </aside>
+    </div>
+  );
+}
+
 function HealthRoute({
   activeBrainId,
   activity,
@@ -947,7 +1061,9 @@ function BrainCanvas({
   nodes: GraphNode[];
   variant?: "stage" | "compact";
 }) {
-  const visibleNodes = nodes.slice(0, 90);
+  const [density, setDensity] = useState<"focus" | "balanced" | "detailed" | "full">("balanced");
+  const nodeLimit = density === "focus" ? 30 : density === "balanced" ? 90 : density === "detailed" ? 240 : nodes.length;
+  const visibleNodes = nodes.slice(0, nodeLimit);
   const liveGraph = Boolean(activeBrainId && nodes.length);
   const theme = readTheme();
   const points = useMemo(() => visibleNodes.map((node, index) => nodePoint3d(node, index, visibleNodes.length)), [visibleNodes]);
@@ -973,6 +1089,21 @@ function BrainCanvas({
       <div className="brain-hud top-left">
         <span>{liveGraph ? "Active brain" : activeBrainId ? "Empty brain" : "Brain required"}</span>
         <strong>{liveGraph ? activeBrainId : activeBrainId ? "Grow the first memory" : "Create or import a brain"}</strong>
+      </div>
+      {!liveGraph ? (
+        <div className="brain-empty-state">
+          <Brain size={28} />
+          <strong>{activeBrainId ? "Brain Core is ready for its first memory" : "Brain preview waiting for data"}</strong>
+          <span>{activeBrainId ? "Use Grow to preview real memory candidates." : "Create, import or select a brain to load live nodes into this 3D field."}</span>
+        </div>
+      ) : null}
+      <div className="brain-density-controls" aria-label="Brain node density">
+        <span>Brain detail</span>
+        {(["focus", "balanced", "detailed", "full"] as const).map((option) => (
+          <button aria-pressed={density === option} key={option} onClick={() => setDensity(option)} type="button">
+            {option[0].toUpperCase() + option.slice(1)}
+          </button>
+        ))}
       </div>
       <div className="brain-hud bottom-right">
         <span>{activity.label}</span>
@@ -1154,7 +1285,7 @@ function BrainSelector({
             <button disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={15} />Scan local brains</button>
             <button disabled={busy || !activeBrainId} onClick={onExportBrain} type="button"><Download size={15} />Export active</button>
             <button disabled={busy} onClick={onRefresh} type="button"><RefreshCw size={15} />Refresh</button>
-            <a href="#brain"><Brain size={15} />Open Brain Center</a>
+            <a href="#brain_explorer"><Brain size={15} />Open Brain Explorer</a>
           </div>
         </div>
       </details>
@@ -1344,8 +1475,8 @@ async function requestApi<T>(path: string, init: RequestInit, jsonBody = true): 
 }
 
 function routeFromLocation(): RouteId {
-  const raw = window.location.hash.replace(/^#/, "") || new URLSearchParams(window.location.search).get("route") || "brain";
-  return routes.some((item) => item.id === raw) ? (raw as RouteId) : "brain";
+  const raw = window.location.hash.replace(/^#/, "") || new URLSearchParams(window.location.search).get("route") || "context";
+  return routes.some((item) => item.id === raw) ? (raw as RouteId) : "context";
 }
 
 function readTheme(): ThemeMode {
@@ -1378,22 +1509,30 @@ function activityFor(busyAction: string | null, route: RouteId): BrainActivity {
 }
 
 function headlineForRoute(route: RouteId, activeBrain: BrainSummary | null) {
-  if (route === "brain") return activeBrain ? brainName(activeBrain) : "Shape a local brain before you run.";
   if (route === "context") return "Retrieve from local memory.";
+  if (route === "results") return "Inspect bounded Local Core results.";
+  if (route === "brain_explorer") return activeBrain ? brainName(activeBrain) : "Explore a real local brain.";
   if (route === "grow") return "Grow remains local and explicit.";
   if (route === "mcp") return "Inspect and invoke raw Core MCP tools.";
-  if (route === "modules") return "Core here. Advanced modules in Cloud.";
+  if (route === "modules") return "Core here. Advanced workflows in Cloud.";
+  if (route === "maintain") return "Maintain runs through Detwin Cloud.";
   if (route === "health") return "Prove the runtime before changing memory.";
+  if (route === "bench") return "Benchmark local memory with reproducible checks.";
+  if (route === "brain_sync") return "Sync remains explicit and account-controlled.";
   return "Local settings stay on this machine.";
 }
 
 function descriptionForRoute(route: RouteId) {
-  if (route === "brain") return "The brain selector, runtime status and animated projection stay visible while you move across Core routes.";
   if (route === "context") return "Ask the selected local brain for a context package and inspect the receipt returned by the local API.";
+  if (route === "results") return "Review the latest local operation response without creating a cloud history dependency.";
+  if (route === "brain_explorer") return "Inspect the same real-node-only Brain Core projection used throughout Local AGVM.";
   if (route === "grow") return "Preview source growth through the local MCP contract. Nothing is applied without an explicit tool call.";
   if (route === "mcp") return "Load the local MCP catalog, select a contract and execute it directly against the Core server.";
-  if (route === "modules") return "Grow is included in AGVM Core. Clone, Teach, Maintain and automation are Cloud-only surfaces.";
+  if (route === "modules") return "Grow is included in AGVM Core. Paid workflows are visible as non-executable cloud handoffs.";
+  if (route === "maintain") return "Local Core exposes no paid maintenance runtime or executable source.";
   if (route === "health") return "Run health proof against the selected brain and keep the result separate from cloud readiness.";
+  if (route === "bench") return "Use public Core contracts to compare runtime, graph and retrieval readiness.";
+  if (route === "brain_sync") return "Keep local brains on-device until an explicit cloud sync workflow is authorized.";
   return "Configure local API and Cloud handoff links without storing account, billing or provider state here.";
 }
 

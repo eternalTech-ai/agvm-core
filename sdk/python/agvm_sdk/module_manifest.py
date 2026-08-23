@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: Apache-2.0
+
 """Generic AGVM module manifest contract.
 
 This module is intentionally dependency-free. Public core, private modules and

@@ -1,5 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -21,6 +26,7 @@ from config import (
     FACET_FIELDS,
     FINE_BUCKET_SIZE,
     GRAPH_VERSION,
+    ROUTING_FIELDS,
 )
 from graph_view import build_graph_view
 from memory_hygiene import build_hygiene_metadata
@@ -41,7 +47,7 @@ from cognitive_jobs import (
     evaluate_cognitive_job_policy,
     normalize_cognitive_job,
 )
-from projection import color_from_brainhex, position_to_bucket, position_to_topology_brainhex
+from projection import color_from_brainhex, normalize_scores, position_to_bucket, position_to_topology_brainhex
 from runtime_scope import current_atlas_path, current_brain_id, current_graph_path, current_graph_view_path, current_index_path, current_sqlite_path
 from storage import atomic_write_json, empty_atlas, empty_graph, empty_graph_view, empty_index, ensure_data_dir, utc_timestamp
 from stream_contract import annotate_stream_event
@@ -60,6 +66,37 @@ _RUNTIME_RETENTION_PINNED_EVENT_TYPES = {
     "search_failed",
     "search_stopped",
 }
+
+GEOMETRY_CALIBRATION_OPERATION_SCHEMA_VERSION = "agvm.geometry_calibration_operation.v1"
+GEOMETRY_CALIBRATION_ROLLBACK_SCHEMA_VERSION = "agvm.geometry_calibration_rollback.v1"
+_GEOMETRY_NODE_STATE_COLUMNS = (
+    "id",
+    "x",
+    "y",
+    "z",
+    "coarse_bucket_x",
+    "coarse_bucket_y",
+    "coarse_bucket_z",
+    "coarse_bucket_key",
+    "fine_bucket_x",
+    "fine_bucket_y",
+    "fine_bucket_z",
+    "fine_bucket_key",
+    "topology_brainhex_json",
+    "topology_color_json",
+    "matrix_revision_id",
+    "topology_revision_id",
+    "matrix_calibration_plan_signature",
+    "matrix_calibrated_at",
+)
+
+
+class GeometryCalibrationStoreError(ValueError):
+    def __init__(self, code: str, *, status_code: int = 409, context: dict[str, Any] | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+        self.context = dict(context or {})
 
 
 def _json_dump(value: Any) -> str:
@@ -917,6 +954,26 @@ def bootstrap_runtime_store() -> None:
                 FOREIGN KEY (matrix_revision_id) REFERENCES matrix_revisions(matrix_revision_id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS geometry_calibration_operations (
+                operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schema_version TEXT NOT NULL,
+                brain_id TEXT NOT NULL,
+                plan_signature TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                operation_state TEXT NOT NULL,
+                matrix_revision_id TEXT NOT NULL,
+                topology_revision_id TEXT NOT NULL,
+                apply_event_id TEXT NOT NULL,
+                rollback_event_id TEXT,
+                rollback_snapshot_json TEXT NOT NULL,
+                apply_result_json TEXT NOT NULL,
+                rollback_result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                rolled_back_at TEXT,
+                UNIQUE (brain_id, plan_signature)
+            );
+
             CREATE TABLE IF NOT EXISTS memory_policy_revisions (
                 policy_revision_id TEXT PRIMARY KEY,
                 schema_version TEXT NOT NULL,
@@ -1035,6 +1092,8 @@ def bootstrap_runtime_store() -> None:
               ON matrix_revisions (brain_id, activated_at DESC, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_topology_revisions_brain_active
               ON topology_field_revisions (brain_id, activated_at DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_geometry_calibration_operations_brain_state
+              ON geometry_calibration_operations (brain_id, operation_state, operation_id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_policy_revisions_brain_status
               ON memory_policy_revisions (brain_id, status, activated_at DESC, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_policy_revisions_brain_active
@@ -2745,13 +2804,24 @@ def _row_to_node(
     final_position = {"x": float(row["x"]), "y": float(row["y"]), "z": float(row["z"])}
     topology_brainhex = _json_load(row["topology_brainhex_json"], {})
     topology_color = _json_load(row["topology_color_json"], {})
-    routing_scores = _json_load(row["routing_scores_json"], {})
-    routing_facets = _json_load(row["routing_facets_json"], {})
+    routing_scores = normalize_scores(_json_load(row["routing_scores_json"], {}), ROUTING_FIELDS)
+    routing_facets = normalize_scores(_json_load(row["routing_facets_json"], {}), FACET_FIELDS)
     routing_brainhex = _json_load(row["routing_brainhex_json"], {})
     semantic_color = _json_load(row["semantic_color_json"], {})
     base_position = _json_load(row["base_position_json"], {})
+    if not _mapping_has_keys(base_position, ("x", "y", "z")):
+        base_position = dict(final_position)
+    if not _mapping_has_keys(topology_brainhex, ("theta_bin", "phi_bin", "radius_bin", "code")):
+        topology_brainhex = position_to_topology_brainhex(final_position)
+    if not _mapping_has_keys(topology_color, ("h", "s", "l", "hex")):
+        topology_color = color_from_brainhex(topology_brainhex)
+    if not _mapping_has_keys(routing_brainhex, ("theta_bin", "phi_bin", "radius_bin", "code")):
+        routing_brainhex = position_to_topology_brainhex(base_position)
+    if not _mapping_has_keys(semantic_color, ("h", "s", "l", "hex")):
+        semantic_color = color_from_brainhex(routing_brainhex)
     if "provenance_json" in available:
         provenance = _json_load(row["provenance_json"], {})
+        provenance.setdefault("mode", "runtime_navigation_store")
     else:
         provenance = {
             "mode": "runtime_navigation_store",
@@ -2850,6 +2920,10 @@ def _row_to_node(
         "matrix_calibration_plan_signature": row["matrix_calibration_plan_signature"] if "matrix_calibration_plan_signature" in available else None,
         "matrix_calibrated_at": row["matrix_calibrated_at"] if "matrix_calibrated_at" in available else None,
     }
+
+
+def _mapping_has_keys(value: Any, keys: tuple[str, ...]) -> bool:
+    return isinstance(value, dict) and all(value.get(key) is not None for key in keys)
 
 
 def _fetch_node_rows(conn: sqlite3.Connection, *, node_ids: list[str] | None = None) -> list[sqlite3.Row]:
@@ -3840,8 +3914,9 @@ def replace_runtime_graph(graph: dict[str, Any]) -> dict[str, Any]:
         conn.commit()
     rebuild_identity_nucleus_cache()
     atlas = rebuild_atlas_cache()
-    write_legacy_exports(graph, atlas)
-    return graph
+    canonical_graph = fetch_graph_snapshot()
+    write_legacy_exports(canonical_graph, atlas)
+    return canonical_graph
 
 
 def _clean_position_updates(updates: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -3967,314 +4042,8 @@ def apply_node_position_updates(updates: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
-def apply_matrix_calibration_position_updates_with_revisions(
-    updates: list[dict[str, Any]],
-    *,
-    revision_bundle: dict[str, Any] | None = None,
-    rollback_snapshot: dict[str, Any] | None = None,
-    plan_signature: str | None = None,
-) -> dict[str, Any]:
-    """Apply reviewed coordinate updates and activate matrix/topology revisions in one DB transaction."""
-    bootstrap_runtime_store()
-    cleaned = _clean_position_updates(updates)
-    bundle = _json_dict(revision_bundle)
-    matrix_revision = _json_dict(bundle.get("matrix_revision"))
-    topology_revision = _json_dict(bundle.get("topology_field_revision"))
-    matrix_revision_id = _text_or_none(matrix_revision.get("matrix_revision_id"))
-    topology_revision_id = _text_or_none(topology_revision.get("topology_revision_id"))
-    if not cleaned:
-        return {
-            "schema_version": "agvm.matrix_position_apply_result.v1",
-            "requested_update_count": 0,
-            "applied_update_count": 0,
-            "missing_node_ids": [],
-            "updated_node_ids": [],
-            "matrix_revision_id": matrix_revision_id,
-            "topology_revision_id": topology_revision_id,
-            "revision_apply_blocked_reason": "no_position_updates",
-        }
-    if not matrix_revision_id or not topology_revision_id:
-        raise ValueError("matrix_and_topology_revision_candidates_required")
-    active_brain = _active_brain_id(_text_or_none(matrix_revision.get("brain_id")) or _text_or_none(bundle.get("brain_id")))
-    activated_at = utc_timestamp()
-    normalized_plan_signature = str(plan_signature or bundle.get("plan_signature") or "").strip()
-    rollback_payload = {
-        **_json_dict(matrix_revision.get("rollback_payload")),
-        "apply_rollback_snapshot": _json_dict(rollback_snapshot),
-        "activated_at": activated_at,
-    }
-    updated_node_ids: list[str] = []
-    missing_node_ids: list[str] = []
-    event_id = f"memory_learning_event::{uuid.uuid4()}"
-    with connect() as conn:
-        for item in cleaned:
-            node_id = str(item["node_id"])
-            row = conn.execute("SELECT id FROM nodes_nav WHERE id = ?", (node_id,)).fetchone()
-            if not row:
-                missing_node_ids.append(node_id)
-                continue
-            position = dict(item["to_position"])
-            coarse_bucket = _bucket_at(position, COARSE_BUCKET_SIZE)
-            fine_bucket = _bucket_at(position, FINE_BUCKET_SIZE)
-            topology_brainhex = position_to_topology_brainhex(position)
-            topology_color = color_from_brainhex(topology_brainhex)
-            conn.execute(
-                """
-                UPDATE nodes_nav
-                SET x = ?,
-                    y = ?,
-                    z = ?,
-                    coarse_bucket_x = ?,
-                    coarse_bucket_y = ?,
-                    coarse_bucket_z = ?,
-                    coarse_bucket_key = ?,
-                    fine_bucket_x = ?,
-                    fine_bucket_y = ?,
-                    fine_bucket_z = ?,
-                    fine_bucket_key = ?,
-                    topology_brainhex_json = ?,
-                    topology_color_json = ?,
-                    matrix_revision_id = ?,
-                    topology_revision_id = ?,
-                    matrix_calibration_plan_signature = ?,
-                    matrix_calibrated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    float(position["x"]),
-                    float(position["y"]),
-                    float(position["z"]),
-                    int(coarse_bucket["x"]),
-                    int(coarse_bucket["y"]),
-                    int(coarse_bucket["z"]),
-                    str(coarse_bucket["key"]),
-                    int(fine_bucket["x"]),
-                    int(fine_bucket["y"]),
-                    int(fine_bucket["z"]),
-                    str(fine_bucket["key"]),
-                    _json_dump(topology_brainhex),
-                    _json_dump(topology_color),
-                    matrix_revision_id,
-                    topology_revision_id,
-                    normalized_plan_signature,
-                    activated_at,
-                    node_id,
-                ),
-            )
-            updated_node_ids.append(node_id)
-        existing_matrix = conn.execute(
-            "SELECT created_at FROM matrix_revisions WHERE matrix_revision_id = ?",
-            (matrix_revision_id,),
-        ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO matrix_revisions (
-                matrix_revision_id, schema_version, brain_id, parent_revision_id,
-                base_projection_version, semantic_axis_transform_json,
-                radial_band_transform_json, guide_area_transform_json,
-                quality_before_json, quality_after_json, source_event_ids_json,
-                apply_policy, rollback_payload_json, created_at, activated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(matrix_revision_id) DO UPDATE SET
-                schema_version=excluded.schema_version,
-                brain_id=excluded.brain_id,
-                parent_revision_id=excluded.parent_revision_id,
-                base_projection_version=excluded.base_projection_version,
-                semantic_axis_transform_json=excluded.semantic_axis_transform_json,
-                radial_band_transform_json=excluded.radial_band_transform_json,
-                guide_area_transform_json=excluded.guide_area_transform_json,
-                quality_before_json=excluded.quality_before_json,
-                quality_after_json=excluded.quality_after_json,
-                source_event_ids_json=excluded.source_event_ids_json,
-                apply_policy=excluded.apply_policy,
-                rollback_payload_json=excluded.rollback_payload_json,
-                activated_at=excluded.activated_at
-            """,
-            (
-                matrix_revision_id,
-                str(matrix_revision.get("schema_version") or MATRIX_REVISION_SCHEMA_VERSION),
-                active_brain,
-                _text_or_none(matrix_revision.get("parent_revision_id")),
-                _text_or_none(matrix_revision.get("base_projection_version")),
-                _json_dump(_json_dict(matrix_revision.get("semantic_axis_transform"))),
-                _json_dump(_json_dict(matrix_revision.get("radial_band_transform"))),
-                _json_dump(_json_dict(matrix_revision.get("guide_area_transform"))),
-                _json_dump(_json_dict(matrix_revision.get("quality_before"))),
-                _json_dump(_json_dict(matrix_revision.get("quality_after"))),
-                _json_dump(_json_list(matrix_revision.get("source_event_ids"))),
-                str(matrix_revision.get("apply_policy") or "preview_apply_required"),
-                _json_dump(rollback_payload),
-                str(existing_matrix["created_at"]) if existing_matrix else str(matrix_revision.get("created_at") or activated_at),
-                activated_at,
-            ),
-        )
-        existing_topology = conn.execute(
-            "SELECT created_at FROM topology_field_revisions WHERE topology_revision_id = ?",
-            (topology_revision_id,),
-        ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO topology_field_revisions (
-                topology_revision_id, schema_version, brain_id, matrix_revision_id,
-                attraction_priors_json, repulsion_priors_json, rotation_hints_json,
-                density_constraints_json, bridge_corridors_json, unstable_regions_json,
-                saturated_regions_json, source_event_ids_json, quality_before_json,
-                quality_after_json, apply_policy, rollback_payload_json, created_at,
-                activated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(topology_revision_id) DO UPDATE SET
-                schema_version=excluded.schema_version,
-                brain_id=excluded.brain_id,
-                matrix_revision_id=excluded.matrix_revision_id,
-                attraction_priors_json=excluded.attraction_priors_json,
-                repulsion_priors_json=excluded.repulsion_priors_json,
-                rotation_hints_json=excluded.rotation_hints_json,
-                density_constraints_json=excluded.density_constraints_json,
-                bridge_corridors_json=excluded.bridge_corridors_json,
-                unstable_regions_json=excluded.unstable_regions_json,
-                saturated_regions_json=excluded.saturated_regions_json,
-                source_event_ids_json=excluded.source_event_ids_json,
-                quality_before_json=excluded.quality_before_json,
-                quality_after_json=excluded.quality_after_json,
-                apply_policy=excluded.apply_policy,
-                rollback_payload_json=excluded.rollback_payload_json,
-                activated_at=excluded.activated_at
-            """,
-            (
-                topology_revision_id,
-                str(topology_revision.get("schema_version") or TOPOLOGY_FIELD_REVISION_SCHEMA_VERSION),
-                active_brain,
-                matrix_revision_id,
-                _json_dump(_json_list(topology_revision.get("attraction_priors"))),
-                _json_dump(_json_list(topology_revision.get("repulsion_priors"))),
-                _json_dump(_json_list(topology_revision.get("rotation_hints"))),
-                _json_dump(_json_dict(topology_revision.get("density_constraints"))),
-                _json_dump(_json_list(topology_revision.get("bridge_corridors"))),
-                _json_dump(_json_list(topology_revision.get("unstable_regions"))),
-                _json_dump(_json_list(topology_revision.get("saturated_regions"))),
-                _json_dump(_json_list(topology_revision.get("source_event_ids"))),
-                _json_dump(_json_dict(topology_revision.get("quality_before"))),
-                _json_dump(_json_dict(topology_revision.get("quality_after"))),
-                str(topology_revision.get("apply_policy") or "preview_apply_required"),
-                _json_dump({**_json_dict(topology_revision.get("rollback_payload")), "apply_rollback_snapshot": _json_dict(rollback_snapshot), "activated_at": activated_at}),
-                str(existing_topology["created_at"]) if existing_topology else str(topology_revision.get("created_at") or activated_at),
-                activated_at,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO memory_learning_events (
-                event_id, schema_version, brain_id, thread_id, operation_id,
-                event_kind, event_source, source_unit_id, source_asset_id,
-                preview_id, persisted_node_id, related_node_ids_json,
-                memory_act_type, claim_status, source_trust, confidence,
-                duplicate_targets_json, contradiction_targets_json,
-                clarification_questions_json, clarification_answers_json,
-                human_decision, apply_decision, sleep_evolve_priority,
-                matrix_hint_json, topology_hint_json, payload_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_id,
-                MEMORY_LEARNING_EVENT_SCHEMA_VERSION,
-                active_brain,
-                None,
-                normalized_plan_signature or None,
-                "matrix_revision_applied",
-                "matrix_calibration_apply",
-                None,
-                None,
-                normalized_plan_signature or None,
-                None,
-                _json_dump(updated_node_ids),
-                "geometry_revision",
-                None,
-                "system_reviewed",
-                1.0 if updated_node_ids else 0.0,
-                _json_dump([]),
-                _json_dump([]),
-                _json_dump([]),
-                _json_dump({}),
-                "approved",
-                "applied",
-                0.8,
-                _json_dump(
-                    {
-                        "matrix_revision_id": matrix_revision_id,
-                        "plan_signature": normalized_plan_signature,
-                        "updated_node_count": len(updated_node_ids),
-                    }
-                ),
-                _json_dump(
-                    {
-                        "topology_revision_id": topology_revision_id,
-                        "matrix_revision_id": matrix_revision_id,
-                        "updated_node_count": len(updated_node_ids),
-                    }
-                ),
-                _json_dump(
-                    {
-                        "schema_version": "agvm.matrix_revision_apply_event_payload.v1",
-                        "revision_bundle_schema": bundle.get("schema_version"),
-                        "matrix_revision_id": matrix_revision_id,
-                        "topology_revision_id": topology_revision_id,
-                        "plan_signature": normalized_plan_signature,
-                        "rollback_snapshot": _json_dict(rollback_snapshot),
-                        "missing_node_ids": missing_node_ids,
-                    }
-                ),
-                activated_at,
-            ),
-        )
-        conn.commit()
-    atlas = rebuild_atlas_cache()
-    graph = fetch_graph_snapshot()
-    write_legacy_exports(graph, atlas)
-    return {
-        "schema_version": "agvm.matrix_position_apply_result.v1",
-        "requested_update_count": len(cleaned),
-        "applied_update_count": len(updated_node_ids),
-        "missing_node_ids": missing_node_ids,
-        "updated_node_ids": updated_node_ids,
-        "atlas_bucket_count": int(atlas.get("bucket_count") or 0),
-        "graph_view_refreshed": True,
-        "matrix_revision_id": matrix_revision_id,
-        "topology_revision_id": topology_revision_id,
-        "active_revision_ids": {
-            "matrix_revision_id": matrix_revision_id,
-            "topology_revision_id": topology_revision_id,
-        },
-        "matrix_revision_applied_event_id": event_id,
-        "node_revision_metadata_applied": True,
-        "rollback_snapshot_recorded": bool(rollback_snapshot),
-        "touched_fields": [
-            "nodes_nav.x",
-            "nodes_nav.y",
-            "nodes_nav.z",
-            "nodes_nav.coarse_bucket_*",
-            "nodes_nav.fine_bucket_*",
-            "nodes_nav.topology_brainhex_json",
-            "nodes_nav.topology_color_json",
-            "nodes_nav.matrix_revision_id",
-            "nodes_nav.topology_revision_id",
-            "nodes_nav.matrix_calibration_plan_signature",
-            "nodes_nav.matrix_calibrated_at",
-            "matrix_revisions.activated_at",
-            "topology_field_revisions.activated_at",
-            "memory_learning_events",
-        ],
-        "untouched_surfaces": [
-            "node_text",
-            "node_semantics.base_position_json",
-            "links",
-            "highways",
-            "graph_edges",
-            "answer_eligible",
-            "profile_eligible",
-            "document_eligible",
-        ],
-    }
 
+# Paid Geometry Calibration apply and rollback persistence is not part of Public Core.
 
 def write_legacy_exports(graph: dict[str, Any], atlas_payload: dict[str, Any]) -> None:
     nodes = list(graph.get("nodes") or [])
@@ -7542,19 +7311,11 @@ def fetch_runtime_audit() -> dict[str, Any]:
     latest_route_richness_benchmark = fetch_latest_benchmark_run(phase="route_richness")
     latest_master_closure_benchmark = fetch_latest_benchmark_run(phase="master_closure")
     latest_evaluation_benchmark = fetch_latest_benchmark_run(phase="evaluation")
-    latest_evaluation_v2_benchmark = fetch_latest_benchmark_run(phase="evaluation_v2")
-    final_evaluation_matrix_v2 = dict((latest_evaluation_v2_benchmark or {}).get("report", {}).get("final_evaluation_matrix_v2") or {})
-    if not final_evaluation_matrix_v2:
-        final_evaluation_matrix_v2 = dict((latest_evaluation_v2_benchmark or {}).get("report", {}).get("final_evaluation_matrix") or {})
-    final_evaluation_matrix = dict(final_evaluation_matrix_v2)
-    if not final_evaluation_matrix:
-        final_evaluation_matrix = dict((latest_evaluation_benchmark or {}).get("report", {}).get("final_evaluation_matrix") or {})
+    final_evaluation_matrix = dict((latest_evaluation_benchmark or {}).get("report", {}).get("final_evaluation_matrix") or {})
     if not final_evaluation_matrix:
         final_evaluation_matrix = dict(((latest_benchmark or {}).get("report") or {}).get("final_evaluation_matrix") or {})
     if not final_evaluation_matrix:
-        final_evaluation_matrix = dict(((((latest_benchmark or {}).get("report") or {}).get("suites") or {}).get("evaluation") or {}).get("final_evaluation_matrix") or {})
-    if not final_evaluation_matrix_v2:
-        final_evaluation_matrix_v2 = dict(((((latest_benchmark or {}).get("report") or {}).get("suites") or {}).get("evaluation_v2") or {}).get("final_evaluation_matrix_v2") or {})
+        final_evaluation_matrix = dict((((latest_benchmark or {}).get("report") or {}).get("suites") or {}).get("evaluation", {}).get("final_evaluation_matrix") or {})
     sleep_vs_evolve_overlap_ratio = round(
         len(sleep_changed_nodes & evolve_changed_nodes) / max(1, len(sleep_changed_nodes | evolve_changed_nodes)),
         6,
@@ -7758,8 +7519,6 @@ def fetch_runtime_audit() -> dict[str, Any]:
         "latest_route_richness_benchmark": latest_route_richness_benchmark or {},
         "latest_master_closure_benchmark": latest_master_closure_benchmark or {},
         "latest_evaluation_benchmark": latest_evaluation_benchmark or {},
-        "latest_evaluation_v2_benchmark": latest_evaluation_v2_benchmark or {},
         "final_evaluation_matrix": final_evaluation_matrix,
-        "final_evaluation_matrix_v2": final_evaluation_matrix_v2,
         "maintenance_quality_scores": [round(value, 6) for value in maintenance_quality_scores[:8]],
     }

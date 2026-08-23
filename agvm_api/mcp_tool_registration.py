@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -18,10 +22,15 @@ MAINTAIN_LIST_TOOL_NAMES = {
     "list_memory_os_processes",
 }
 
+BRAIN_BOOTSTRAP_V1_TOOL_PREFIX = "brain_bootstrap_"
+BRAIN_BOOTSTRAP_V1_CLOUD_CAPABILITIES = ["ai_research", "fitting", "backfill", "activation"]
+BRAIN_PROFILE_V1_TOOL_PREFIX = "brain_profile_"
+BRAIN_PROFILE_V1_CLOUD_CAPABILITIES = ["fitting", "backfill", "activation"]
+
 
 def required_module_id_for_tool_name(tool_name: str) -> str | None:
     clean = str(tool_name or "").strip()
-    if clean.startswith(("matrix_calibration_", "sleep_", "evolve_")) or clean in MAINTAIN_LIST_TOOL_NAMES:
+    if clean.startswith(("matrix_calibration_", "geometry_calibration_", "sleep_", "evolve_")) or clean in MAINTAIN_LIST_TOOL_NAMES:
         return MAINTAIN_MODULE_ID
     return None
 
@@ -39,7 +48,7 @@ def build_mcp_tool_registration(
     module_id = _optional_text(required_module_id) or required_module_id_for_tool_name(clean_name)
     module_required = bool(module_id)
     owner_id = module_id or MCP_CORE_TOOL_OWNER_ID
-    return {
+    registration = {
         "schema_version": MCP_TOOL_REGISTRATION_SCHEMA_VERSION,
         "state": MCP_TOOL_REGISTRATION_STATE,
         "tool_name": clean_name,
@@ -57,6 +66,26 @@ def build_mcp_tool_registration(
         "module_manifest_field": "mcp_tools.uses_core_tools" if module_required else None,
         "current_runtime_binding": "core_compatibility_endpoint",
     }
+    if clean_name.startswith(BRAIN_BOOTSTRAP_V1_TOOL_PREFIX):
+        registration.update(
+            {
+                "bootstrap_version": "v1",
+                "execution_surface_policy": "local_manual_or_cloud_action_contract",
+                "local_free_capabilities": ["manual_interview", "manual_source", "grow_review"],
+                "cloud_required_capabilities": list(BRAIN_BOOTSTRAP_V1_CLOUD_CAPABILITIES),
+            }
+        )
+    if clean_name.startswith(BRAIN_PROFILE_V1_TOOL_PREFIX):
+        registration.update(
+            {
+                "brain_profile_version": "v1",
+                "execution_surface_policy": "local_shadow_or_cloud_action_contract",
+                "fixed_dimension_count": 12,
+                "local_free_capabilities": ["manual_profile", "manual_review"],
+                "cloud_required_capabilities": list(BRAIN_PROFILE_V1_CLOUD_CAPABILITIES),
+            }
+        )
+    return registration
 
 
 def build_module_requirement_from_registration(registration: Mapping[str, Any]) -> dict[str, Any]:

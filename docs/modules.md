@@ -20,8 +20,9 @@ release:
 The public Core UI may show Cloud module entry points, but it must route users
 to Detwin Cloud instead of installing or serving paid module source locally.
 
-The local MCP bridge intentionally keeps all 37 registry tools discoverable by
-default. This is for AI-client planning, not for entitlement. Paid-module calls
+The local MCP bridge keeps the complete current contract catalog discoverable
+subject to client permission policy. This is for AI-client planning, not for
+entitlement. Paid-module calls
 that require a paid module never run against the local API. Without a Hosted MCP
 key or active module lease they return
 `module_tool_not_enabled_by_local_mcp_lease` with a structured Detwin Cloud
@@ -35,6 +36,11 @@ Hosted adapter is certified. Grow remains local and free.
 
 For the public core repository, module code is not copied. Only public contracts
 and generic placeholders are allowed.
+
+This includes Brain Profile activation/runtime/benchmark code and Geometry
+Calibration apply/rollback code. Public API compatibility routes are
+fail-closed Cloud action stubs; they never mutate local nodes or settle local
+credits.
 
 ## SDK Contracts
 

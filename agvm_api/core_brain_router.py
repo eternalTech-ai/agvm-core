@@ -1,5 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 from pathlib import Path
@@ -21,6 +26,7 @@ from brain_registry import (
     set_active_brain,
 )
 from runtime_scope import use_runtime_brain
+from storage import load_graph, load_graph_view
 from schemas import (
     BrainAdminOperationResponse,
     BrainCreateRequest,
@@ -59,6 +65,22 @@ def create_core_brain_router() -> APIRouter:
     @router.get("/mcp/brains/active")
     def mcp_active_brain() -> dict[str, Any]:
         return active_brain()
+
+    @router.get("/memory/brains/{brain_id}/sync-snapshot")
+    def brain_sync_snapshot(brain_id: str, max_nodes: int = 5000) -> dict[str, Any]:
+        """Project one real local brain into the bounded Cloud sync contract."""
+
+        if max_nodes < 1 or max_nodes > 5000:
+            raise HTTPException(status_code=422, detail="brain_sync_snapshot_max_nodes_out_of_bounds")
+        try:
+            brain = resolve_brain_scope(brain_id=brain_id, require_explicit=True)
+        except BrainRegistryError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        with use_runtime_brain(brain):
+            graph = load_graph()
+            if not list(graph.get("nodes") or []):
+                graph = load_graph_view()
+        return _brain_sync_snapshot_payload(brain, graph, max_nodes=max_nodes)
 
     @router.post("/memory/brains/bootstrap", response_model=BrainRegistryResponse)
     def bootstrap_brain_registry(payload: BrainRegistryBootstrapRequest) -> BrainRegistryResponse:
@@ -305,6 +327,142 @@ def _brain_record_by_id(registry: dict[str, Any], brain_id: str | None) -> dict[
     if not target:
         return {}
     return next((dict(item) for item in list(registry.get("brains") or []) if str((item or {}).get("brain_id") or "") == target), {})
+
+
+def _brain_sync_snapshot_payload(
+    brain: dict[str, Any],
+    graph: dict[str, Any],
+    *,
+    max_nodes: int,
+) -> dict[str, Any]:
+    graph_nodes = [
+        dict(item)
+        for item in list(graph.get("nodes") or [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    selected_nodes = graph_nodes[:max_nodes]
+    selected_ids = {str(item.get("id") or "").strip() for item in selected_nodes}
+    selected_ids.discard("")
+    selected_edges: list[dict[str, Any]] = []
+    for item in list(graph.get("edges") or []):
+        if not isinstance(item, dict):
+            continue
+        source = str(
+            item.get("source")
+            or item.get("source_id")
+            or item.get("source_node_id")
+            or ""
+        ).strip()
+        target = str(
+            item.get("target")
+            or item.get("target_id")
+            or item.get("target_node_id")
+            or ""
+        ).strip()
+        if source not in selected_ids or target not in selected_ids:
+            continue
+        selected_edges.append({**dict(item), "source": source, "target": target})
+
+    sources: dict[str, dict[str, Any]] = {}
+    for node in selected_nodes:
+        source_id = str(node.get("source_unit_id") or node.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        sources.setdefault(
+            source_id,
+            {
+                "id": source_id,
+                "kind": str(node.get("source_type") or "memory_source"),
+                "label": str(node.get("source_label") or source_id),
+                "uri": str(node.get("source_uri") or "") or None,
+                "trust": str(node.get("source_trust") or "") or None,
+            },
+        )
+
+    storage_path = Path(str(brain.get("storage_path") or "")).expanduser().resolve()
+    materialized_sources = _read_json_value(storage_path / "brain_sync_sources.json")
+    materialized_profile = _read_json_value(storage_path / "brain_sync_profile.json")
+    materialized_revisions = _read_json_value(storage_path / "brain_sync_revisions.json")
+    profile_envelope = _read_json_object(storage_path / "brain_profile_v1.json")
+    profile = dict(profile_envelope.get("profile") or {}) if profile_envelope else {}
+    if profile:
+        profile = {
+            "schema_version": "agvm.brain_profile_sync.v1",
+            "dimensions": len(list(profile.get("routing_fields") or [])) or 12,
+            "basis": list(profile.get("routing_fields") or []),
+            "state": str(profile_envelope.get("state") or "shadow"),
+            "profile": profile,
+            "benchmark": dict(profile_envelope.get("benchmark") or {}),
+        }
+
+    lifecycle = dict(brain.get("lifecycle") or {})
+    profile_revision = int(lifecycle.get("profile_revision") or 0)
+    bootstrap_session_id = str(lifecycle.get("bootstrap_session_id") or "").strip()
+    revision = max(1, profile_revision)
+    history = [
+        {
+            "revision": revision,
+            "profile_state": str(lifecycle.get("profile_state") or "not_reported"),
+            "benchmark_state": str(lifecycle.get("benchmark_state") or "not_reported"),
+            "bootstrap_state": str(lifecycle.get("bootstrap_state") or "not_started"),
+            "bootstrap_session_id": bootstrap_session_id or None,
+        }
+    ]
+    exposed_sources = (
+        list(materialized_sources)
+        if isinstance(materialized_sources, list)
+        else list(sources.values())
+    )
+    exposed_profile = (
+        dict(materialized_profile)
+        if isinstance(materialized_profile, dict)
+        else profile
+    )
+    exposed_revisions = (
+        dict(materialized_revisions)
+        if isinstance(materialized_revisions, dict)
+        else {"current_revision": revision, "history": history}
+    )
+    return {
+        "schema_version": "agvm.local_brain_sync_snapshot.v1",
+        "brain_id": str(brain.get("brain_id") or ""),
+        "display_name": str(brain.get("display_name") or brain.get("brain_id") or "Local brain"),
+        "node_count": len(selected_nodes),
+        "edge_count": len(selected_edges),
+        "source_count": len(exposed_sources),
+        "truncated": max(
+            int(brain.get("node_count") or 0),
+            int(_read_json_object_value(graph.get("meta"), "total_node_count") or 0),
+            len(graph_nodes),
+        ) > len(selected_nodes),
+        "source_revision": revision,
+        "snapshot": {
+            "nodes": selected_nodes,
+            "edges": selected_edges,
+            "sources": exposed_sources,
+            "profile": exposed_profile,
+            "revisions": exposed_revisions,
+        },
+    }
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _read_json_value(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _read_json_object_value(value: Any, key: str) -> Any:
+    return value.get(key) if isinstance(value, dict) else None
 
 
 def _brain_record_by_display_name(registry: dict[str, Any], display_name: str | None) -> dict[str, Any]:

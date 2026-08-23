@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+SPDX-FileContributor: Lorenzo Massaro
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Third-Party Notices
 
 Status: generated candidate notice inventory. Locked dependency artifacts were verified.
@@ -9,9 +15,9 @@ Do not treat this notice inventory as approved independently of the technical re
 
 ## Summary
 
-- Total dependencies: `196`
+- Total dependencies: `203`
 - Python dependencies: `10`
-- NPM dependencies: `186`
+- NPM dependencies: `193`
 - Dependencies requiring manual legal review: `0`
 - Main AGVM Core license placeholder still present: `false`
 
@@ -19,10 +25,11 @@ Do not treat this notice inventory as approved independently of the technical re
 
 | License | Count |
 | --- | ---: |
-| MIT | 166 |
+| MIT | 172 |
 | Apache-2.0 | 10 |
 | ISC | 10 |
 | BSD-3-Clause | 7 |
+| AGPL-3.0-only | 1 |
 | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | 1 |
 | CC-BY-4.0 | 1 |
 | MIT-CMU | 1 |
@@ -50,50 +57,54 @@ No dependency is currently marked for manual review by the generator.
 
 | Ecosystem | Package | Version / Specifier | License | Review |
 | --- | --- | --- | --- | --- |
-| npm | `@babel/code-frame` | `7.29.0` | MIT | standard |
-| npm | `@babel/compat-data` | `7.29.3` | MIT | standard |
-| npm | `@babel/core` | `7.29.0` | MIT | standard |
-| npm | `@babel/generator` | `7.29.1` | MIT | standard |
-| npm | `@babel/helper-compilation-targets` | `7.28.6` | MIT | standard |
-| npm | `@babel/helper-globals` | `7.28.0` | MIT | standard |
-| npm | `@babel/helper-module-imports` | `7.28.6` | MIT | standard |
-| npm | `@babel/helper-module-transforms` | `7.28.6` | MIT | standard |
+| npm | `@babel/code-frame` | `7.29.7` | MIT | standard |
+| npm | `@babel/compat-data` | `7.29.7` | MIT | standard |
+| npm | `@babel/core` | `7.29.7` | MIT | standard |
+| npm | `@babel/generator` | `7.29.8` | MIT | standard |
+| npm | `@babel/helper-compilation-targets` | `7.29.7` | MIT | standard |
+| npm | `@babel/helper-globals` | `7.29.7` | MIT | standard |
+| npm | `@babel/helper-module-imports` | `7.29.7` | MIT | standard |
+| npm | `@babel/helper-module-transforms` | `7.29.7` | MIT | standard |
 | npm | `@babel/helper-plugin-utils` | `7.28.6` | MIT | standard |
-| npm | `@babel/helper-string-parser` | `7.27.1` | MIT | standard |
-| npm | `@babel/helper-validator-identifier` | `7.28.5` | MIT | standard |
-| npm | `@babel/helper-validator-option` | `7.27.1` | MIT | standard |
-| npm | `@babel/helpers` | `7.29.2` | MIT | standard |
-| npm | `@babel/parser` | `7.29.3` | MIT | standard |
+| npm | `@babel/helper-string-parser` | `7.29.7` | MIT | standard |
+| npm | `@babel/helper-validator-identifier` | `7.29.7` | MIT | standard |
+| npm | `@babel/helper-validator-option` | `7.29.7` | MIT | standard |
+| npm | `@babel/helpers` | `7.29.7` | MIT | standard |
+| npm | `@babel/parser` | `7.29.8` | MIT | standard |
 | npm | `@babel/plugin-transform-react-jsx-self` | `7.27.1` | MIT | standard |
 | npm | `@babel/plugin-transform-react-jsx-source` | `7.27.1` | MIT | standard |
 | npm | `@babel/runtime` | `7.29.2` | MIT | standard |
-| npm | `@babel/template` | `7.28.6` | MIT | standard |
-| npm | `@babel/traverse` | `7.29.0` | MIT | standard |
-| npm | `@babel/types` | `7.29.0` | MIT | standard |
+| npm | `@babel/template` | `7.29.7` | MIT | standard |
+| npm | `@babel/traverse` | `7.29.8` | MIT | standard |
+| npm | `@babel/types` | `7.29.8` | MIT | standard |
+| npm | `@detwin/design-tokens` |  | AGPL-3.0-only | standard |
 | npm | `@dimforge/rapier3d-compat` | `0.12.0` | Apache-2.0 | standard |
-| npm | `@esbuild/aix-ppc64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/android-arm` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/android-arm64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/android-x64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/darwin-arm64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/darwin-x64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/freebsd-arm64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/freebsd-x64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-arm` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-arm64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-ia32` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-loong64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-mips64el` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-ppc64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-riscv64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-s390x` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/linux-x64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/netbsd-x64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/openbsd-x64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/sunos-x64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/win32-arm64` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/win32-ia32` | `0.21.5` | MIT | standard |
-| npm | `@esbuild/win32-x64` | `0.21.5` | MIT | standard |
+| npm | `@esbuild/aix-ppc64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/android-arm` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/android-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/android-x64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/darwin-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/darwin-x64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/freebsd-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/freebsd-x64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-arm` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-ia32` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-loong64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-mips64el` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-ppc64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-riscv64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-s390x` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/linux-x64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/netbsd-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/netbsd-x64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/openbsd-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/openbsd-x64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/openharmony-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/sunos-x64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/win32-arm64` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/win32-ia32` | `0.25.12` | MIT | standard |
+| npm | `@esbuild/win32-x64` | `0.25.12` | MIT | standard |
 | npm | `@jridgewell/gen-mapping` | `0.3.13` | MIT | standard |
 | npm | `@jridgewell/remapping` | `2.3.5` | MIT | standard |
 | npm | `@jridgewell/resolve-uri` | `3.1.2` | MIT | standard |
@@ -151,12 +162,12 @@ No dependency is currently marked for manual review by the generator.
 | npm | `@webgpu/types` | `0.1.70` | BSD-3-Clause | standard |
 | npm | `@xmldom/xmldom` | `0.8.13` | MIT | standard |
 | npm | `base64-js` | `1.5.1` | MIT | standard |
-| npm | `baseline-browser-mapping` | `2.10.32` | Apache-2.0 | standard |
+| npm | `baseline-browser-mapping` | `2.11.18` | Apache-2.0 | standard |
 | npm | `bidi-js` | `1.0.3` | MIT | standard |
-| npm | `browserslist` | `4.28.2` | MIT | standard |
+| npm | `browserslist` | `4.28.8` | MIT | standard |
 | npm | `buffer` | `6.0.3` | MIT | standard |
 | npm | `camera-controls` | `3.1.0` | MIT | standard |
-| npm | `caniuse-lite` | `1.0.30001793` | CC-BY-4.0 | standard |
+| npm | `caniuse-lite` | `1.0.30001809` | CC-BY-4.0 | standard |
 | npm | `convert-source-map` | `2.0.0` | MIT | standard |
 | npm | `cross-env` | `7.0.3` | MIT | standard |
 | npm | `cross-spawn` | `7.0.6` | MIT | standard |
@@ -165,10 +176,11 @@ No dependency is currently marked for manual review by the generator.
 | npm | `detect-gpu` | `5.0.70` | MIT | standard |
 | npm | `draco3d` | `1.5.7` | Apache-2.0 | standard |
 | npm | `earcut` | `3.0.2` | ISC | standard |
-| npm | `electron-to-chromium` | `1.5.361` | ISC | standard |
-| npm | `esbuild` | `0.21.5` | MIT | standard |
+| npm | `electron-to-chromium` | `1.5.412` | ISC | standard |
+| npm | `esbuild` | `0.25.12` | MIT | standard |
 | npm | `escalade` | `3.2.0` | MIT | standard |
 | npm | `eventemitter3` | `5.0.4` | MIT | standard |
+| npm | `fdir` | `6.5.0` | MIT | standard |
 | npm | `fflate` | `0.8.3` | MIT | standard |
 | npm | `fflate` | `0.6.10` | MIT | standard |
 | npm | `fsevents` | `2.3.3` | MIT | standard |
@@ -193,13 +205,14 @@ No dependency is currently marked for manual review by the generator.
 | npm | `meshline` | `3.3.1` | MIT | standard |
 | npm | `meshoptimizer` | `1.1.1` | MIT | standard |
 | npm | `ms` | `2.1.3` | MIT | standard |
-| npm | `nanoid` | `3.3.12` | MIT | standard |
-| npm | `node-releases` | `2.0.46` | MIT | standard |
+| npm | `nanoid` | `3.3.18` | MIT | standard |
+| npm | `node-releases` | `2.0.53` | MIT | standard |
 | npm | `parse-svg-path` | `0.1.2` | MIT | standard |
 | npm | `path-key` | `3.1.1` | MIT | standard |
 | npm | `picocolors` | `1.1.1` | ISC | standard |
+| npm | `picomatch` | `4.0.5` | MIT | standard |
 | npm | `pixi.js` | `8.18.1` | MIT | standard |
-| npm | `postcss` | `8.5.15` | MIT | standard |
+| npm | `postcss` | `8.5.26` | MIT | standard |
 | npm | `potpack` | `1.0.2` | ISC | standard |
 | npm | `promise-worker-transferable` | `1.0.4` | Apache-2.0 | standard |
 | npm | `react` | `19.2.6` | MIT | standard |
@@ -221,15 +234,16 @@ No dependency is currently marked for manual review by the generator.
 | npm | `three-mesh-bvh` | `0.8.3` | MIT | standard |
 | npm | `three-stdlib` | `2.36.1` | MIT | standard |
 | npm | `tiny-lru` | `11.4.7` | BSD-3-Clause | standard |
+| npm | `tinyglobby` | `0.2.17` | MIT | standard |
 | npm | `troika-three-text` | `0.52.4` | MIT | standard |
 | npm | `troika-three-utils` | `0.52.4` | MIT | standard |
 | npm | `troika-worker-utils` | `0.52.0` | MIT | standard |
 | npm | `tunnel-rat` | `0.1.2` | MIT | standard |
 | npm | `typescript` | `5.9.3` | Apache-2.0 | standard |
-| npm | `update-browserslist-db` | `1.2.3` | MIT | standard |
+| npm | `update-browserslist-db` | `1.3.1` | MIT | standard |
 | npm | `use-sync-external-store` | `1.6.0` | MIT | standard |
 | npm | `utility-types` | `3.11.0` | MIT | standard |
-| npm | `vite` | `5.4.21` | MIT | standard |
+| npm | `vite` | `6.4.3` | MIT | standard |
 | npm | `webgl-constants` | `1.1.1` | MIT | standard |
 | npm | `webgl-sdf-generator` | `1.1.1` | MIT | standard |
 | npm | `which` | `2.0.2` | ISC | standard |

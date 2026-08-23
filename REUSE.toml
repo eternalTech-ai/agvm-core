@@ -1,13 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
 version = 1
 SPDX-PackageName = "AGVM Core"
 SPDX-PackageSupplier = "Eternal Tech SRL <info@eternaltech.ai>"
 SPDX-PackageDownloadLocation = "https://github.com/eternalTech-ai/agvm-core"
 
 [[annotations]]
-path = [".agvm-public-export-marker", ".env.example", ".github/**", ".gitignore", "CHANGELOG.md", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "Dockerfile.mcp", "LICENSE", "NOTICE", "README.md", "SECURITY.md", "SUPPORT.md", "THIRD_PARTY_NOTICES.md", "docker-compose.yml", "agvm_api/**", "agvm_cockpit_prototype/**", "agvm_mcp_server/**", "docs/**", "repo-policy/**", "scripts/**", "tests/**"]
+path = [".agvm-public-export-marker", ".agvm-public-export.json", ".env.example", ".github/**", ".gitignore", "CHANGELOG.md", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "Dockerfile.mcp", "LICENSE", "NOTICE", "README.md", "SECURITY.md", "SUPPORT.md", "THIRD_PARTY_NOTICES.md", "docker-compose.yml", "agvm_api/**", "agvm_cockpit_prototype/**", "agvm_mcp_server/**", "docs/**", "repo-policy/**", "scripts/**", "tests/**", "ui-tsconfig.app.json"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Eternal Tech SRL <info@eternaltech.ai>"
 SPDX-License-Identifier = "AGPL-3.0-only"
+SPDX-FileComment = "SPDX-FileContributor: Lorenzo Massaro"
+
+[[annotations]]
+path = "LICENSES/AGPL-3.0-only.txt"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Eternal Tech SRL <info@eternaltech.ai>"
+SPDX-License-Identifier = "AGPL-3.0-only"
+SPDX-FileComment = "SPDX-FileContributor: Lorenzo Massaro"
+
+[[annotations]]
+path = "LICENSES/Apache-2.0.txt"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Eternal Tech SRL <info@eternaltech.ai>"
+SPDX-License-Identifier = "Apache-2.0"
 SPDX-FileComment = "SPDX-FileContributor: Lorenzo Massaro"
 
 [[annotations]]
