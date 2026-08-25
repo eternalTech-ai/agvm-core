@@ -18,20 +18,20 @@ export const visualColorProjectionMetadata = {
 } as const;
 export const tokens = {
   "color": {
-    "ink": "#1d1d1d",
+    "ink": "#080b0d",
     "white": "#ffffff",
-    "paper": "#ececec",
-    "graphite": "#404040",
-    "teal": "#00e9b1",
-    "tealDeep": "#0e6e5a",
-    "mint": "#c9f1e8",
-    "lavender": "#ded5ed",
-    "violet": "#8b55e7",
-    "line": "rgba(29,29,29,.12)",
-    "lineStrong": "rgba(29,29,29,.22)",
+    "paper": "#ffffff",
+    "graphite": "#080b0d",
+    "teal": "#00d8aa",
+    "tealDeep": "#007f69",
+    "mint": "#00d8aa",
+    "lavender": "#7857e8",
+    "violet": "#7857e8",
+    "line": "rgba(8,11,13,.14)",
+    "lineStrong": "rgba(8,11,13,.28)",
     "darkLine": "rgba(255,255,255,.16)",
-    "muted": "rgba(29,29,29,.64)",
-    "mutedDark": "rgba(255,255,255,.68)"
+    "muted": "rgba(8,11,13,.66)",
+    "mutedDark": "rgba(255,255,255,.72)"
   },
   "font": {
     "sans": "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif"
@@ -131,9 +131,9 @@ export const tokens = {
     "flatReference": {
       "ink": "#1E1E1E",
       "white": "#FFFFFF",
-      "paper": "#EDEDED",
-      "graphite": "#404040",
-      "teal": "#00E9B1"
+      "paper": "#FFFFFF",
+      "graphite": "#080B0D",
+      "teal": "#00D8AA"
     },
     "localRuntime": {
       "near": "#192E28",

@@ -240,16 +240,23 @@ def structured_json(
     timeout: float = 45.0,
     role: str = "compiler",
     max_output_tokens: int | None = None,
+    api_key_override: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     resolved_model = model or llm_model()
-    if not llm_enabled():
+    resolved_api_key = (
+        str(api_key_override or "").strip()
+        if api_key_override is not None
+        else os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    provider_disabled = os.getenv("AGVM_LLM_ENABLED", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if provider_disabled or not resolved_api_key:
         record_llm_result(role, path="fallback", error="llm_disabled", model=resolved_model, timeout_seconds=timeout)
         return None, "llm_disabled"
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        record_llm_result(role, path="fallback", error="missing_api_key", model=resolved_model, timeout_seconds=timeout)
-        return None, "missing_api_key"
 
     request_body = {
         "model": resolved_model,
@@ -280,7 +287,7 @@ def structured_json(
         method="POST",
         data=json.dumps(request_body).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {resolved_api_key}",
             "Content-Type": "application/json",
         },
     )

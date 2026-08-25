@@ -350,6 +350,7 @@ _LEGACY_TARGET_IDS = {
 }
 
 _GENERALIZED_TARGET_IDS = {
+    "knowledge",
     "identity",
     "work_company",
     "project",
@@ -369,6 +370,7 @@ _GENERALIZED_TARGET_IDS = {
 _CANONICAL_TARGET_IDS = _LEGACY_TARGET_IDS | _GENERALIZED_TARGET_IDS
 
 _SEMANTIC_SLOT_SECTIONS = {
+    "knowledge": "knowledge",
     "identity": "identity",
     "work_company": "work",
     "project": "work",
@@ -942,12 +944,43 @@ def _claim_shape_for_target(target_id: str, fallback_claim_shape: str) -> str:
     return fallback or _claim_shape_for_slot(target_id, target_id)
 
 
+def _explicit_document_lookup_query(query_text: str) -> bool:
+    lowered = _fold_text(query_text)
+    padded = f" {lowered} "
+    return bool(
+        any(
+            marker in lowered
+            for marker in (
+                "documento",
+                "documenti",
+                "document",
+                "pdf",
+                "file",
+                "spec",
+                "report",
+                "note",
+                "appunto",
+                "doc ",
+                "quali fonti",
+                "fonti supportano",
+                "fonti dimostrano",
+                "fonti provano",
+                "source trace",
+                "sources support",
+                "sources prove",
+                "sources confirm",
+            )
+        )
+        or " memo " in padded
+    )
+
+
 def _contract_intent_from_legacy(query_text: str, legacy_contract: dict[str, Any]) -> str:
     query_kind = str(legacy_contract.get("query_kind") or "").strip()
     lowered = _fold_text(query_text)
     if _broad_self_query(query_text):
         return "broad_dossier"
-    if query_kind == "document_lookup" or any(token in lowered for token in ("documento", "documenti", "fonte", "fonti", "source")):
+    if query_kind == "document_lookup" or _explicit_document_lookup_query(query_text):
         return "document_lookup"
     if query_kind == "broad_profile":
         return "broad_dossier"
@@ -959,9 +992,10 @@ def _contract_intent_from_legacy(query_text: str, legacy_contract: dict[str, Any
         return "temporal"
     if query_kind in {"narrative_relation", "exact_relation_fact"}:
         return "relationship"
-    if query_kind == "multi_fact":
-        return "identity"
-    return "identity" if query_kind in {"exact_fact", ""} else "unknown"
+    if query_kind in {"multi_fact", "exact_fact", ""}:
+        required_slots = {str(slot or "").strip() for slot in list(legacy_contract.get("required_slots") or [])}
+        return "unknown" if "knowledge" in required_slots else "identity"
+    return "unknown"
 
 
 def _broad_self_query(query_text: str) -> bool:
@@ -1226,6 +1260,7 @@ def _canonical_context_section(value: Any, text: Any = "") -> str:
 
 def _claim_shape_for_slot(slot: str, intent_primary: str) -> str:
     mapping = {
+        "knowledge": "direct knowledge that answers the user's exact question",
         "identity": "person identity, name, self description, or stable profile claim",
         "work": "person work, role, company, project, or operating activity",
         "work_detail": "specific work/project details, responsibilities, products, or concrete initiatives",
@@ -1256,6 +1291,7 @@ def _claim_shape_for_slot(slot: str, intent_primary: str) -> str:
 
 def _required_fields_for_slot(slot: str) -> list[str]:
     mapping = {
+        "knowledge": ["subject", "answering_claim"],
         "identity": ["person", "identity_claim"],
         "work": ["person", "role_or_project"],
         "work_detail": ["person", "project_or_company", "detail"],
@@ -1307,6 +1343,7 @@ def _negative_conditions(slot: str, legacy_contract: dict[str, Any]) -> list[str
 
 def _semantic_positive_evidence(slot_id: str, relation_subtype: str = "") -> list[str]:
     mapping = {
+        "knowledge": ["direct claim matching the query subject", "answering evidence", "source-backed context"],
         "identity": ["self-name evidence", "stable identity claim", "remembered person surface"],
         "work_company": ["company or organization name", "role or operating relation", "timeframe when available"],
         "project": ["project/workstream name", "concrete activity", "responsibility or product detail"],
@@ -1512,7 +1549,7 @@ def _build_expected_evidence(
     legacy_contract: dict[str, Any],
     query_text: str = "",
 ) -> list[dict[str, Any]]:
-    slots = _unique(list(legacy_contract.get("required_slots") or []), limit=10) or ["identity"]
+    slots = _unique(list(legacy_contract.get("required_slots") or []), limit=10) or ["knowledge"]
     work_inventory = _work_entity_inventory_query(query_text)
     targets: list[dict[str, Any]] = []
     for slot in slots:
@@ -1922,7 +1959,7 @@ def _build_fallback_contract(
     intent_primary = _contract_intent_from_legacy(query_text, legacy_contract)
     document_mode = _document_mode(query_text, intent_primary)
     exact_field_request = extract_exact_user_field_request(query_text)
-    required_slots = _unique(list(legacy_contract.get("required_slots") or []), limit=12) or ["identity"]
+    required_slots = _unique(list(legacy_contract.get("required_slots") or []), limit=12) or ["knowledge"]
     if exact_field_request:
         intent_primary = "unknown"
         document_mode = "none"
@@ -1975,7 +2012,7 @@ def _build_fallback_contract(
         {
             "landing_id": f"L{index + 1}",
             "target_evidence_ids": [target["target_id"]],
-            "textual_probe": target["claim_shape"],
+            "textual_probe": query_text if str(target.get("target_id") or "") == "knowledge" else target["claim_shape"],
             "route_budget": {
                 "max_hops": 5 if not deterministic_seal_allowed else 2,
                 "max_nodes": 24 if not deterministic_seal_allowed else 8,
@@ -2048,8 +2085,8 @@ def _build_fallback_contract(
             "dossier_goal": "document_review" if document_mode != "none" else "context_for_clone" if intent_primary == "broad_dossier" else "answer_support",
             "hot_context_policy": "contract_relevant_only",
             "cold_context_policy": "reservoir_not_promoted",
-            "required_sections": required_slots,
-            "optional_sections": optional_slots,
+            "required_sections": [str(slot) for slot in required_slots],
+            "optional_sections": [str(slot) for slot in optional_slots],
             "semantic_required_slot_keys": [
                 str(item.get("slot_key") or "")
                 for item in semantic_slot_contracts

@@ -75,6 +75,10 @@ from projection import (
     semantic_similarity,
 )
 from schemas import RetrieveRequest
+from retrieval_limits import (
+    DEFAULT_RETRIEVAL_CANDIDATES_PER_STEP,
+    MAX_RETRIEVAL_CANDIDATES_PER_STEP,
+)
 from runtime_scope import current_brain_id
 from brain_profile_runtime import rerank_selected_top_k_with_brain_profile
 from sqlite_store import (
@@ -208,6 +212,99 @@ CANONICAL_QUERY_GOALS = {
     "history",
     "documents",
 }
+
+
+_UNIT_SCORE_KEYS = {
+    "abstraction_level",
+    "agency",
+    "branch_priority",
+    "confidence",
+    "controller_confidence",
+    "corroboration_yield",
+    "conceptual",
+    "derivation_confidence",
+    "destination_progress_gain",
+    "destination_relevance",
+    "documental",
+    "emotional",
+    "episodic",
+    "evidence_confidence",
+    "exact_match_score",
+    "expression_intensity",
+    "family_plan_confidence",
+    "fit_score",
+    "highway_usefulness_memory",
+    "identity_centrality",
+    "identity_resolution_confidence",
+    "identity_style",
+    "institutional_vs_personal",
+    "intimacy",
+    "memory_confidence",
+    "merge_score",
+    "modality_bias",
+    "novelty",
+    "operational",
+    "overall_score",
+    "priority",
+    "projectual",
+    "query_fit_score",
+    "raw_score",
+    "recurrence_strength",
+    "relational",
+    "role_density",
+    "route_richness_score",
+    "route_score",
+    "route_yield",
+    "satisfaction_score",
+    "score",
+    "seed_confidence",
+    "self_core",
+    "source_grounding_score",
+    "source_reliability",
+    "stability_confidence",
+    "strength",
+    "technical",
+    "temporal_confidence",
+    "temporal_scope",
+    "topology_efficiency",
+    "values",
+}
+
+_UNIT_SCORE_MAP_KEYS = {
+    "confidence_by_goal",
+    "coverage_by_slot",
+}
+
+
+def _unit_float_or_none(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric != numeric or numeric in {float("inf"), float("-inf")}:
+        return None
+    return round(max(0.0, min(1.0, numeric)), 6)
+
+
+def _normalize_unit_scores(value: Any) -> Any:
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for key, child in value.items():
+            if str(key) in _UNIT_SCORE_KEYS:
+                bounded = _unit_float_or_none(child)
+                normalized[key] = bounded if bounded is not None else child
+            elif str(key) in _UNIT_SCORE_MAP_KEYS and isinstance(child, dict):
+                bounded_map: dict[str, Any] = {}
+                for score_key, score_value in child.items():
+                    bounded = _unit_float_or_none(score_value)
+                    bounded_map[str(score_key)] = bounded if bounded is not None else score_value
+                normalized[key] = bounded_map
+            else:
+                normalized[key] = _normalize_unit_scores(child)
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_unit_scores(item) for item in value]
+    return value
 
 
 _COMPANY_AFFILIATION_TERMS: tuple[str, ...] = (
@@ -2225,6 +2322,27 @@ def _explicit_temporal_terms(query_text: str) -> list[str]:
     return list(dict.fromkeys([*years, *numeric_dates]))
 
 
+def _explicit_identifier_terms(query_text: str) -> list[str]:
+    terms = re.findall(
+        r"\b(?:[A-Za-z][A-Za-z0-9]*(?:[-_:][A-Za-z0-9]+)+|[A-Za-z]+\d+[A-Za-z0-9_-]*)\b",
+        str(query_text or ""),
+    )
+    return list(dict.fromkeys(term for term in terms if any(character.isdigit() for character in term)))
+
+
+def _identifier_exact_match_score(query_text: str, text: str) -> float:
+    terms = _explicit_identifier_terms(query_text)
+    if not terms:
+        return 0.0
+    haystack = re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+    hits = sum(
+        1
+        for term in terms
+        if re.sub(r"[^a-z0-9]+", "", term.lower()) in haystack
+    )
+    return hits / max(1, len(terms))
+
+
 def _temporal_query_terms(query_text: str, *, max_range_years: int = 25) -> list[str]:
     explicit_terms = _explicit_temporal_terms(query_text)
     year_terms = [term for term in explicit_terms if re.fullmatch(r"(?:19|20)\d{2}", term)]
@@ -2886,6 +3004,9 @@ def _contract_match_priority(query_text: str, match: dict[str, Any]) -> float:
     if "goal_support" in sources and slots & required_slots:
         priority += 0.35
     node = dict(match.get("node") or {})
+    identifier_fit = _identifier_exact_match_score(query_text, _node_retrieval_surface(node))
+    if identifier_fit:
+        priority += 6.0 * identifier_fit
     memory_type = str(match.get("memory_type") or node.get("memory_type") or "").strip().lower()
     if "relationships" in slots and memory_type == "relational":
         priority += 0.75
@@ -7200,8 +7321,145 @@ def _build_unknown_not_in_memory_answer(
     }
 
 
+_CONTEXT_READY_AI_UNAVAILABLE_STOP_REASON = "context_ready_ai_unavailable"
+_CONTEXT_READY_AI_UNAVAILABLE_MESSAGE = (
+    "Context is ready and usable from matched memory. AI synthesis is unavailable because the LLM provider is "
+    "disabled; no AI-generated answer was produced."
+)
+
+
+def _context_package_node_ids(value: Any) -> set[str]:
+    node_ids: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key) in {"node_id", "source_node_id", "memory_node_id", "anchor_node_id"}:
+                node_id = str(child or "").strip()
+                if node_id:
+                    node_ids.add(node_id)
+            node_ids.update(_context_package_node_ids(child))
+    elif isinstance(value, list):
+        for child in value:
+            node_ids.update(_context_package_node_ids(child))
+    return node_ids
+
+
+def _context_payload_integrity_passed(result: dict[str, Any]) -> bool:
+    existing = dict(result.get("payload_integrity") or {})
+    if existing and not bool(existing.get("passed")):
+        return False
+
+    answer = dict(result.get("answer") or {}) if isinstance(result.get("answer"), dict) else {}
+    context_package = dict(result.get("context_package") or {})
+    context_contract = dict(context_package.get("contract") or {})
+    alignment = dict(context_contract.get("answer_context_alignment") or {})
+    answer_node_ids = {
+        str(item).strip()
+        for item in list(answer.get("evidence_node_ids") or [])
+        if str(item).strip()
+    }
+    package_node_ids = _context_package_node_ids(context_package)
+    missing_answer_nodes = answer_node_ids - package_node_ids
+    missing_alignment_nodes = {
+        str(item).strip()
+        for item in list(alignment.get("missing_evidence_node_ids") or [])
+        if str(item).strip()
+    }
+    return bool(
+        not missing_answer_nodes
+        and not missing_alignment_nodes
+        and alignment.get("passed", True)
+    )
+
+
+def _provider_is_explicitly_llm_unavailable(result: dict[str, Any]) -> bool:
+    planner_runtime = dict(result.get("planner_runtime") or {})
+    semantic_runtime = dict(
+        result.get("semantic_contract_runtime")
+        or planner_runtime.get("semantic_contract_runtime")
+        or {}
+    )
+    provider_state = str(semantic_runtime.get("provider_state") or "").strip().lower()
+    if provider_state in {"disabled", "llm_unavailable", "missing_api_key", "not_configured", "unavailable"}:
+        return True
+
+    diagnostics = [
+        semantic_runtime,
+        dict(semantic_runtime.get("provider_retry_policy") or {}),
+        dict(result.get("ai_landing_materialization") or planner_runtime.get("ai_landing_materialization") or {}),
+        dict(result.get("ai_materialization_hard_gate") or planner_runtime.get("ai_materialization_hard_gate") or {}),
+        dict(result.get("ai_spatial_landing_contract") or planner_runtime.get("ai_spatial_landing_contract") or {}),
+    ]
+    stack: list[Any] = list(diagnostics)
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif str(value or "").strip().lower() == "llm_disabled":
+            return True
+    return False
+
+
+def _apply_context_ready_ai_unavailable_degradation(result: dict[str, Any]) -> None:
+    completion = dict(result.get("completion_contract") or {})
+    existing_degradation = dict(completion.get("degradation") or {})
+    already_applied = bool(existing_degradation.get("applied"))
+    stop_reason = str(result.get("stop_reason") or "").strip()
+    if stop_reason not in {"blocked_ai_material_missing", _CONTEXT_READY_AI_UNAVAILABLE_STOP_REASON}:
+        return
+
+    context_package = dict(result.get("context_package") or {})
+    context_contract = dict(context_package.get("contract") or {})
+    materialization = dict(result.get("context_package_materialization") or {})
+    materialization_state = str(materialization.get("state") or "").strip()
+    package_status = str(context_package.get("status") or "").strip()
+    package_ready = bool(
+        package_status in {"context_ready", "contract_satisfied"}
+        and materialization_state == "context_ready"
+        and context_contract.get("passed") is True
+        and materialization.get("contract_passed") is True
+        and not list(context_contract.get("unresolved_sections") or [])
+        and str(context_package.get("agent_markdown") or "").strip()
+    )
+    if not (
+        package_ready
+        and list(result.get("matches") or [])
+        and _context_payload_integrity_passed(result)
+        and (already_applied or _provider_is_explicitly_llm_unavailable(result))
+    ):
+        return
+
+    degradation = {
+        "schema_version": "agvm.context_ready_ai_unavailable.v1",
+        "applied": True,
+        "mode": "context_only",
+        "reason": "llm_disabled",
+        "usable": True,
+        "ai_answer_generated": False,
+        "message": _CONTEXT_READY_AI_UNAVAILABLE_MESSAGE,
+        "original_stop_reason": str(existing_degradation.get("original_stop_reason") or "blocked_ai_material_missing"),
+    }
+    completion.update(
+        {
+            "state": "finalized",
+            "status": "partial",
+            "visible_reason": _CONTEXT_READY_AI_UNAVAILABLE_STOP_REASON,
+            "operator_message": _CONTEXT_READY_AI_UNAVAILABLE_MESSAGE,
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "degradation": degradation,
+        }
+    )
+    result["stop_reason"] = _CONTEXT_READY_AI_UNAVAILABLE_STOP_REASON
+    result["answerability_state"] = "partial"
+    result["final_materialization_pending"] = False
+    result["result_ready_terminal"] = True
+    result["completion_contract"] = completion
+
+
 def normalize_retrieve_response_payload(result: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(result or {})
+    normalized = _normalize_unit_scores(dict(result or {}))
     if not isinstance(normalized.get("probes"), list):
         normalized["probes"] = []
     if not isinstance(normalized.get("matches"), list):
@@ -7478,6 +7736,7 @@ def normalize_retrieve_response_payload(result: dict[str, Any]) -> dict[str, Any
         )
     planner_runtime.setdefault("search_map_2d_truth", dict(normalized.get("search_map_2d_truth") or {}))
     normalized["planner_runtime"] = planner_runtime
+    _apply_context_ready_ai_unavailable_degradation(normalized)
     return normalized
 
 
@@ -8579,6 +8838,12 @@ def _document_evidence_expansion_matches(
                     }
                 )
                 existing["document_hit"] = existing_document_hit
+                existing.setdefault("probe_id", f"document:{anchor_id or node_id}")
+                if not str(existing.get("reason") or "").strip():
+                    existing["reason"] = _document_evidence_match_reason(
+                        matched_terms=list(existing_document_hit.get("matched_terms") or matched_terms),
+                        source_label=str(existing_document_hit.get("source_label") or ""),
+                    )
                 support_slots = list(existing.get("support_slots") or [])
                 if "document" not in support_slots:
                     support_slots.append("document")
@@ -8599,7 +8864,12 @@ def _document_evidence_expansion_matches(
         expanded.append(
             {
                 "node_id": node_id,
+                "probe_id": f"document:{anchor_id or node_id}",
                 "summary": str(payload.get("summary") or provenance.get("source_label") or node_id),
+                "reason": _document_evidence_match_reason(
+                    matched_terms=matched_terms,
+                    source_label=str(provenance.get("source_label") or ""),
+                ),
                 "evidence_snippet": _evidence_snippet(query.query_text, query.query_text, raw_text or str(payload.get("summary") or ""), limit=360),
                 "node": payload,
                 "raw_score": score,
@@ -8632,6 +8902,17 @@ def _document_evidence_expansion_matches(
             break
     expanded.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item.get("node_id") or "")))
     return expanded
+
+
+def _document_evidence_match_reason(*, matched_terms: list[str], source_label: str) -> str:
+    terms = [str(term).strip() for term in matched_terms[:8] if str(term).strip()]
+    term_detail = ", ".join(terms)
+    source_detail = str(source_label or "").strip()
+    if source_detail and term_detail:
+        return f"Document evidence from {source_detail} matched: {term_detail}."
+    if term_detail:
+        return f"Document evidence matched: {term_detail}."
+    return f"Document evidence selected from {source_detail}." if source_detail else "Document evidence selected by the document retrieval lane."
 
 
 def _split_document_text_into_chunks(
@@ -13822,6 +14103,8 @@ def _source_prior_for_probe(probe: dict[str, Any], candidate: dict[str, Any], so
         prior = max(prior, 0.96)
     if "goal_text" in sources:
         prior = max(prior, 0.9)
+    if "query_text" in sources:
+        prior = max(prior, 0.94)
     if "exact_temporal" in sources:
         prior = max(prior, 1.0)
     if candidate.get("is_document_anchor"):
@@ -16032,6 +16315,7 @@ def rank_candidate(
     goal = str(probe.get("goal") or "").strip().lower()
     candidate_text = retrieval_surface.lower()
     temporal_exact_fit = _temporal_exact_match_score(str(probe.get("query_text") or ""), candidate_text)
+    identifier_exact_fit = _identifier_exact_match_score(str(probe.get("query_text") or ""), retrieval_surface)
     candidate_area = str(candidate["provenance"].get("guide_conceptual_area") or "")
     guide_area_alignment = (
         1.0
@@ -16054,6 +16338,8 @@ def rank_candidate(
         support_bonus = 0.18
     elif "goal_text" in sources:
         support_bonus = 0.16
+    elif "query_text" in sources:
+        support_bonus = 0.18
     elif "exact_temporal" in sources:
         support_bonus = 0.22
     elif "identity_core" in sources and str(probe.get("goal") or "") in {"name", "birthplace", "residence", "role", "family", "father", "partner", "mentor", "sibling"}:
@@ -16070,6 +16356,7 @@ def rank_candidate(
         + 0.02 * confidence_fit
         + 0.02 * source_prior
         + support_bonus
+        + 0.58 * identifier_exact_fit
     )
     if goal == "style":
         if candidate_area == "Expression":
@@ -16118,12 +16405,13 @@ def rank_candidate(
         "summary": candidate["summary"],
         "score": round(raw_score * float(probe["weight"]), 6),
         "raw_score": round(raw_score, 6),
+        "identifier_exact_fit": round(identifier_exact_fit, 6),
         "probe_id": probe["probe_id"],
         "label": probe["label"],
         "reason": (
             f"summary={summary_grounding:.2f}; routing={routing_similarity:.2f}; "
             f"spatial={spatial_fit:.2f}; type={type_compatibility:.2f}; identity={identity_fit:.2f}; "
-            f"temporal={temporal_exact_fit:.2f}; confidence={confidence_fit:.2f}"
+            f"temporal={temporal_exact_fit:.2f}; identifier={identifier_exact_fit:.2f}; confidence={confidence_fit:.2f}"
         ),
         "sources": sources,
         "evidence_snippet": None,
@@ -16167,6 +16455,7 @@ def rerank_hydrated_matches(
             "goal_support" in sources
             or "goal_subject_text" in sources
             or "goal_text" in sources
+            or "query_text" in sources
             or "exact_temporal" in sources
             or ("identity_core" in sources and str(probe.get("goal") or "") in {"name", "birthplace", "residence", "family", "father", "partner", "mentor", "sibling", "role"})
             or (match.get("node") or {}).get("is_document_anchor")
@@ -16208,16 +16497,20 @@ def rerank_hydrated_matches(
         goal = str(probe.get("goal") or "")
         node_text = retrieval_surface.lower()
         temporal_exact_fit = _temporal_exact_match_score(str(probe.get("query_text") or ""), node_text)
+        identifier_exact_fit = _identifier_exact_match_score(str(probe.get("query_text") or ""), retrieval_surface)
         if "goal_support" in sources:
             raw_score += 0.22
         elif "goal_subject_text" in sources:
             raw_score += 0.24
         elif "goal_text" in sources:
             raw_score += 0.2
+        elif "query_text" in sources:
+            raw_score += 0.24
         elif "exact_temporal" in sources:
             raw_score += 0.24
         elif "identity_core" in sources and goal in {"name", "birthplace", "residence", "role", "family", "father", "partner", "mentor", "sibling"}:
             raw_score += 0.08
+        raw_score += 0.62 * identifier_exact_fit
         if goal in {"family", "father", "partner", "mentor", "sibling"} and node.get("is_document_anchor") and identity_fit >= 0.85:
             raw_score += 0.16
         if goal == "role" and any(token in node_text for token in ("lavora come", "works as", "lavoro come", "role")):
@@ -16275,9 +16568,11 @@ def rerank_hydrated_matches(
                 "summary": str(node.get("summary") or match["summary"]),
                 "score": round(raw_score * float(probe["weight"]), 6),
                 "raw_score": round(raw_score, 6),
+                "identifier_exact_fit": round(identifier_exact_fit, 6),
                 "reason": (
                     f"grounding={hypothesis_lexical:.2f}; lexical={lexical:.2f}; "
-                    f"type={type_compatibility:.2f}; identity={identity_fit:.2f}; temporal={temporal_exact_fit:.2f}; spatial={spatial_fit:.2f}"
+                    f"type={type_compatibility:.2f}; identity={identity_fit:.2f}; temporal={temporal_exact_fit:.2f}; "
+                    f"identifier={identifier_exact_fit:.2f}; spatial={spatial_fit:.2f}"
                 ),
                 "evidence_snippet": _evidence_snippet(
                     probe["query_text"],
@@ -16287,7 +16582,7 @@ def rerank_hydrated_matches(
                 "node": node,
             }
         )
-    reranked.sort(key=lambda item: (-item["raw_score"], item["node_id"]))
+    reranked.sort(key=lambda item: (-float(item.get("identifier_exact_fit") or 0.0), -item["raw_score"], item["node_id"]))
     return reranked
 
 
@@ -16535,7 +16830,11 @@ def _hydrate_top_matches(matches: list[dict[str, Any]], *, max_nodes_fulltext: i
 
 
 def _prepare_rerank_pool(matches: list[dict[str, Any]], *, hydrate_limit: int) -> list[dict[str, Any]]:
-    pool_limit = min(len(matches), max(hydrate_limit * 4, 24))
+    pool_limit = min(
+        len(matches),
+        MAX_RETRIEVAL_CANDIDATES_PER_STEP,
+        max(DEFAULT_RETRIEVAL_CANDIDATES_PER_STEP, hydrate_limit * 4),
+    )
     pool: list[dict[str, Any]] = list(matches[:pool_limit])
     seen_ids = {match["node_id"] for match in pool}
     for match in matches:
@@ -22097,7 +22396,7 @@ def _process_branch_round(
         _register_candidates(
             fetch_nodes_by_text_terms(
                 list(goal_text_terms),
-                limit=max(min(query.max_matches * 2, 24), 12),
+                limit=max(4, min(query.max_candidates_per_step, query.max_matches * 2)),
                 include_raw_text=False,
             ),
             "goal_text",
@@ -22108,9 +22407,21 @@ def _process_branch_round(
                     goal,
                     tuple(goal_text_terms),
                     identity_context,
-                    limit=max(min(query.max_matches * 2, 24), 12),
+                    limit=max(4, min(query.max_candidates_per_step, query.max_matches * 2)),
                 ),
                 "goal_subject_text",
+            )
+
+    if goal == "generic_context" or query_class == "direct_fact":
+        query_text_terms = _document_lookup_terms(query.query_text)
+        if query_text_terms:
+            _register_candidates(
+                fetch_nodes_by_text_terms(
+                    query_text_terms,
+                    limit=max(8, min(query.max_candidates_per_step, query.max_matches * 3)),
+                    include_raw_text=False,
+                ),
+                "query_text",
             )
 
     if query.allow_highway_expansion:
@@ -22236,7 +22547,9 @@ def _process_branch_round(
     updated_branch["visited_node_ids"] = list(
         dict.fromkeys(list(branch["visited_node_ids"]) + ([str(route_anchor_node_id)] if route_anchor_node_id else []) + [match["node_id"] for match in top_matches])
     )
-    updated_branch["candidate_node_ids"] = list(dict.fromkeys(str(node_id) for node_id in candidate_map.keys() if str(node_id).strip()))[:24]
+    updated_branch["candidate_node_ids"] = list(
+        dict.fromkeys(str(node_id) for node_id in candidate_map.keys() if str(node_id).strip())
+    )[: query.max_candidates_per_step]
     studied_round_ids = list(
         dict.fromkeys(
             ([str(route_anchor_node_id)] if route_anchor_node_id else [])
@@ -24812,23 +25125,6 @@ def retrieve_runtime(
             {
                 "result": detached_result_snapshot_payload,
                 "result_snapshot": detached_result_snapshot_payload,
-                "detached_result_snapshot": True,
-                "result_snapshot_kind": "early_final_surface",
-                "runtime_phase": "background_enrichment",
-                "background_enrichment_state": background_enrichment_state,
-                "background_enrichment_budget": dict(background_enrichment_budget),
-                "early_final_sealed": bool(early_final_surface_sealed),
-                "early_final_seal_reason": early_final_seal_reason,
-                "early_final_seal_source": early_final_seal_source,
-            },
-        )
-        emit(
-            "result_ready",
-            {
-                "result": detached_result_snapshot_payload,
-                "result_materialization_state": "snapshot_ready",
-                "final_materialization_pending": True,
-                "result_ready_terminal": False,
                 "detached_result_snapshot": True,
                 "result_snapshot_kind": "early_final_surface",
                 "runtime_phase": "background_enrichment",

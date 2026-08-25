@@ -60,7 +60,7 @@ GROW_MANIFEST = LocalModuleManifestDefinition(
         "write_memory_preview",
         "write_memory_commit",
     ),
-    fallback_message="Grow Studio is locked. Sign in or activate a Pro local lease before opening this module.",
+    fallback_message="Grow is included with AGVM Core and runs on this local brain.",
 )
 
 MAINTAIN_MANIFEST = LocalModuleManifestDefinition(
@@ -106,14 +106,15 @@ def create_local_module_manifest_router() -> APIRouter:
 
 def build_local_module_manifest(definition: LocalModuleManifestDefinition) -> dict[str, Any]:
     status = _module_status(definition.module_id)
-    granted = bool(status.get("granted"))
-    license_state = _manifest_license_state(str(status.get("license_state") or "missing"))
+    included_in_core = definition.module_id == GROW_MODULE_ID
+    granted = included_in_core or bool(status.get("granted"))
+    license_state = "not_required" if included_in_core else _manifest_license_state(str(status.get("license_state") or "missing"))
     backend_status = "healthy"
     payload = {
         "schema_version": AGVM_MODULE_MANIFEST_SCHEMA_VERSION,
         "module_id": definition.module_id,
         "module_version": definition.module_version,
-        "edition": "paid",
+        "edition": "free_stub" if included_in_core else "paid",
         "backend_status": backend_status,
         "license_state": license_state,
         "available": granted and backend_status == "healthy",
@@ -141,8 +142,8 @@ def build_local_module_manifest(definition: LocalModuleManifestDefinition) -> di
             "uses_core_tools": list(definition.uses_core_tools),
         },
         "license": {
-            "plan_required": "pro",
-            "lease_expires_at": status.get("lease_expires_at"),
+            "plan_required": None if included_in_core else "pro",
+            "lease_expires_at": None if included_in_core else status.get("lease_expires_at"),
         },
         "safe_fallback_message": definition.fallback_message,
         "diagnostics": {
@@ -155,13 +156,15 @@ def build_local_module_manifest(definition: LocalModuleManifestDefinition) -> di
             "module_grant_present": bool(status.get("module_grant")),
             "module_grant": status.get("module_grant"),
             "dev_fixture_allowed": status.get("dev_fixture_allowed"),
-            "source": "local_license_supervisor",
+            "source": "public_core" if included_in_core else "local_license_supervisor",
         },
     }
     return normalize_module_manifest(payload).as_dict()
 
 
 def ensure_local_module_entitled(module_id: str) -> None:
+    if module_id == GROW_MODULE_ID:
+        return
     status = _module_status(module_id)
     if bool(status.get("granted")):
         return

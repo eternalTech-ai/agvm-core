@@ -160,6 +160,14 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         ),
     ),
     RouteRule(
+        name="brain_bootstrap_v1",
+        category="core",
+        owner="agvm_core_mcp",
+        public_core_allowed=True,
+        rationale="Brain Bootstrap V1 creates the reviewed initial memory nodes required before a brain can be used.",
+        prefixes=("/mcp/brain-bootstrap-", "/memory/mcp/brain-bootstrap-"),
+    ),
+    RouteRule(
         name="brain_profile_v1",
         category="core",
         owner="agvm_core_mcp",

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 import time
 import uuid
 
@@ -27,13 +27,44 @@ from schemas import (
     McpWriteMemoryCommitRequest,
     McpWriteMemoryPreviewRequest,
 )
-from sqlite_store import bootstrap_runtime_store, fetch_atlas, fetch_graph_snapshot, replace_runtime_graph
+from sqlite_store import (
+    bootstrap_runtime_store,
+    fetch_atlas,
+    fetch_graph_snapshot,
+    replace_runtime_graph,
+    store_maintenance_run,
+)
 
 
 _GROW_PREVIEW_RUNS: dict[str, dict[str, Any]] = {}
 
 
-def create_core_mcp_ops_router() -> APIRouter:
+class MaintenanceMutationRuntime(Protocol):
+    def preview(
+        self,
+        *,
+        graph: dict[str, Any],
+        mode: str,
+        focus_node_id: str | None,
+        max_nodes_considered: int,
+    ) -> dict[str, Any]: ...
+
+    def apply(
+        self,
+        *,
+        graph: dict[str, Any],
+        mode: str,
+        focus_node_id: str | None,
+        max_nodes_considered: int,
+        expected_preview_signature: str | None = None,
+        selected_proposal_ids: list[str] | None = None,
+    ) -> dict[str, Any]: ...
+
+
+def create_core_mcp_ops_router(
+    *,
+    maintenance_runtime: MaintenanceMutationRuntime | None = None,
+) -> APIRouter:
     router = APIRouter()
 
     @router.post("/memory/mcp/grow-source-preview", response_model=McpGrowToolExecutionResponse, response_model_exclude_none=True)
@@ -92,26 +123,54 @@ def create_core_mcp_ops_router() -> APIRouter:
     @router.post("/memory/mcp/sleep-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/sleep-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def sleep_preview(payload: McpMaintenanceRequest) -> McpMaintenanceToolExecutionResponse:
+        brain_record = _resolve_bootstrap_ready_brain_record(payload.brain_id)
         _ensure_maintain_studio_entitled()
-        return _maintenance_preview("sleep_preview", "sleep", payload)
+        return _maintenance_preview(
+            "sleep_preview",
+            "sleep",
+            payload,
+            brain_record=brain_record,
+            runtime=maintenance_runtime,
+        )
 
     @router.post("/memory/mcp/evolve-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/evolve-preview", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def evolve_preview(payload: McpMaintenanceRequest) -> McpMaintenanceToolExecutionResponse:
+        brain_record = _resolve_bootstrap_ready_brain_record(payload.brain_id)
         _ensure_maintain_studio_entitled()
-        return _maintenance_preview("evolve_preview", "evolve", payload)
+        return _maintenance_preview(
+            "evolve_preview",
+            "evolve",
+            payload,
+            brain_record=brain_record,
+            runtime=maintenance_runtime,
+        )
 
     @router.post("/memory/mcp/sleep-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/sleep-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def sleep_apply(payload: McpMaintenanceApplyRequest) -> McpMaintenanceToolExecutionResponse:
+        brain_record = _resolve_bootstrap_ready_brain_record(payload.brain_id)
         _ensure_maintain_studio_entitled()
-        return _maintenance_apply("sleep_apply", "sleep", payload)
+        return _maintenance_apply(
+            "sleep_apply",
+            "sleep",
+            payload,
+            brain_record=brain_record,
+            runtime=maintenance_runtime,
+        )
 
     @router.post("/memory/mcp/evolve-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/evolve-apply", response_model=McpMaintenanceToolExecutionResponse, response_model_exclude_none=True)
     def evolve_apply(payload: McpMaintenanceApplyRequest) -> McpMaintenanceToolExecutionResponse:
+        brain_record = _resolve_bootstrap_ready_brain_record(payload.brain_id)
         _ensure_maintain_studio_entitled()
-        return _maintenance_apply("evolve_apply", "evolve", payload)
+        return _maintenance_apply(
+            "evolve_apply",
+            "evolve",
+            payload,
+            brain_record=brain_record,
+            runtime=maintenance_runtime,
+        )
 
     return router
 
@@ -129,6 +188,20 @@ def _resolve_brain_record(brain_id: str | None = None) -> dict[str, Any]:
         return resolve_brain_scope(brain_id=str(brain_id or "").strip() or None)
     except BrainRegistryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _resolve_bootstrap_ready_brain_record(brain_id: str | None = None) -> dict[str, Any]:
+    brain_record = _resolve_brain_record(brain_id)
+    if int(brain_record.get("node_count") or 0) > 0:
+        return brain_record
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "brain_bootstrap_required",
+            "message": "Complete Brain Bootstrap before using Grow, Sleep or Evolve.",
+            "brain_id": _brain_record_id(brain_record) or None,
+        },
+    )
 
 
 def _brain_record_id(record: dict[str, Any]) -> str:
@@ -206,7 +279,7 @@ def _bind_preview_bundle_to_source_unit(bundle: dict[str, Any], source_unit: dic
 
 def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGrowToolExecutionResponse:
     started = time.perf_counter()
-    brain_record = _resolve_brain_record(payload.brain_id)
+    brain_record = _resolve_bootstrap_ready_brain_record(payload.brain_id)
     brain_id = _brain_record_id(brain_record)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
@@ -308,7 +381,7 @@ def _grow_source_apply(tool_name: str, payload: McpGrowApplyRequest) -> McpGrowT
         return _grow_blocked(tool_name, brain_id, "preview_bundle_required", started)
     if not payload.confirm_apply:
         return _grow_blocked(tool_name, brain_id, "confirm_apply_required", started, preview_bundle=bundle)
-    brain_record = _resolve_brain_record(brain_id)
+    brain_record = _resolve_bootstrap_ready_brain_record(brain_id)
     resolved_brain_id = _brain_record_id(brain_record)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
@@ -325,6 +398,7 @@ def _grow_source_apply(tool_name: str, payload: McpGrowApplyRequest) -> McpGrowT
             question_limit=payload.question_limit,
         )
         replace_runtime_graph(updated_graph)
+    idempotent_replay = bool(selected_ids and not persisted_ids and merged_ids and persisted_edge_count == 0)
     return McpGrowToolExecutionResponse(
         schema_version="agvm.mcp_grow_tool_output.v1",
         brain_id=resolved_brain_id,
@@ -355,12 +429,14 @@ def _grow_source_apply(tool_name: str, payload: McpGrowApplyRequest) -> McpGrowT
             "persisted_edge_count": persisted_edge_count,
             "merged_into_existing_ids": merged_ids,
             "selected_preview_ids": selected_ids,
+            "idempotent_replay": idempotent_replay,
         },
         learning_policy=learning_policy,
         completeness={
             "applied": True,
             "persisted_node_count": len(persisted_ids),
             "persisted_edge_count": persisted_edge_count,
+            "idempotent_replay": idempotent_replay,
             "source_unit_count": len(list((stored.get("source_investigation") or investigation).get("source_units") or [])),
         },
         mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
@@ -479,6 +555,7 @@ def _write_memory_commit(tool_name: str, payload: McpWriteMemoryCommitRequest) -
             question_limit=payload.question_limit,
         )
         replace_runtime_graph(updated_graph)
+    idempotent_replay = bool(selected_ids and not persisted_ids and merged_ids and persisted_edge_count == 0)
     return McpGrowToolExecutionResponse(
         schema_version="agvm.mcp_grow_tool_output.v1",
         brain_id=resolved_brain_id,
@@ -491,6 +568,7 @@ def _write_memory_commit(tool_name: str, payload: McpWriteMemoryCommitRequest) -
             "persisted_edge_count": persisted_edge_count,
             "merged_into_existing_ids": merged_ids,
             "selected_preview_ids": selected_ids,
+            "idempotent_replay": idempotent_replay,
         },
         learning_policy=learning_policy,
         memory_operation_lifecycle_contract={
@@ -500,7 +578,11 @@ def _write_memory_commit(tool_name: str, payload: McpWriteMemoryCommitRequest) -
             "confirm_apply": True,
             "partial_merge_allowed": False,
         },
-        completeness={"applied": True, "persisted_node_count": len(persisted_ids)},
+        completeness={
+            "applied": True,
+            "persisted_node_count": len(persisted_ids),
+            "idempotent_replay": idempotent_replay,
+        },
         mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
         budget={"credits_required": 0, "runtime": "local_core"},
     )
@@ -574,25 +656,57 @@ def _grow_blocked(
     )
 
 
-def _maintenance_preview(tool_name: str, mode: str, payload: McpMaintenanceRequest) -> McpMaintenanceToolExecutionResponse:
+def _maintenance_preview(
+    tool_name: str,
+    mode: str,
+    payload: McpMaintenanceRequest,
+    *,
+    brain_record: dict[str, Any] | None = None,
+    runtime: MaintenanceMutationRuntime | None = None,
+) -> McpMaintenanceToolExecutionResponse:
     started = time.perf_counter()
-    brain_record = _resolve_brain_record(payload.brain_id)
+    brain_record = brain_record or _resolve_bootstrap_ready_brain_record(payload.brain_id)
     brain_id = _brain_record_id(brain_record)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
-        report = _build_core_maintenance_report(
-            graph,
+        if runtime is None:
+            report = _build_core_maintenance_report(
+                graph,
+                mode=mode,
+                preview_only=True,
+                focus_node_id=payload.focus_node_id,
+                max_nodes_considered=payload.max_nodes_considered,
+                selected_proposal_ids=[],
+            )
+        else:
+            report = runtime.preview(
+                graph=graph,
+                mode=mode,
+                focus_node_id=payload.focus_node_id,
+                max_nodes_considered=payload.max_nodes_considered,
+            )
+        maintenance_id = str(report.get("maintenance_id") or uuid.uuid4())
+        report["maintenance_id"] = maintenance_id
+        store_maintenance_run(
+            maintenance_id=maintenance_id,
             mode=mode,
+            applied=False,
             preview_only=True,
             focus_node_id=payload.focus_node_id,
-            max_nodes_considered=payload.max_nodes_considered,
-            selected_proposal_ids=[],
+            report=report,
         )
     return _maintenance_response(tool_name, brain_id, "preview_ready", report, started)
 
 
-def _maintenance_apply(tool_name: str, mode: str, payload: McpMaintenanceApplyRequest) -> McpMaintenanceToolExecutionResponse:
+def _maintenance_apply(
+    tool_name: str,
+    mode: str,
+    payload: McpMaintenanceApplyRequest,
+    *,
+    brain_record: dict[str, Any] | None = None,
+    runtime: MaintenanceMutationRuntime | None = None,
+) -> McpMaintenanceToolExecutionResponse:
     started = time.perf_counter()
     if not payload.confirm_apply:
         return _maintenance_response(
@@ -610,21 +724,259 @@ def _maintenance_apply(tool_name: str, mode: str, payload: McpMaintenanceApplyRe
             },
             started,
         )
-    brain_record = _resolve_brain_record(payload.brain_id)
+    if not payload.preview_signature:
+        return _maintenance_response(
+            tool_name,
+            payload.brain_id,
+            "blocked",
+            {
+                "applied": False,
+                "mode": mode,
+                "apply_policy_guard": {
+                    "blocked": True,
+                    "blocked_reason": "maintenance_preview_signature_required",
+                    "blocked_reasons": ["maintenance_preview_signature_required"],
+                    "partial_merge_allowed": False,
+                    "graph_mutation": "none",
+                },
+            },
+            started,
+        )
+    brain_record = brain_record or _resolve_bootstrap_ready_brain_record(payload.brain_id)
     brain_id = _brain_record_id(brain_record)
+    requested_ids = _normalized_proposal_ids(payload.proposal_ids)
+    if payload.preview_signature and runtime is not None:
+        with use_runtime_brain(brain_record):
+            bootstrap_runtime_store()
+            graph = fetch_graph_snapshot()
+            applied_report = runtime.apply(
+                graph=graph,
+                mode=mode,
+                focus_node_id=payload.focus_node_id,
+                max_nodes_considered=payload.max_nodes_considered,
+                expected_preview_signature=payload.preview_signature,
+                selected_proposal_ids=requested_ids,
+            )
+        available_ids = _normalized_proposal_ids(
+            [item.get("proposal_id") for item in list(applied_report.get("maintenance_proposals") or [])]
+        )
+        missing_ids = [proposal_id for proposal_id in requested_ids if proposal_id not in available_ids]
+        unselected_ids = [proposal_id for proposal_id in available_ids if proposal_id not in requested_ids]
+        if not bool(applied_report.get("applied")):
+            runtime_guard = dict(applied_report.get("apply_policy_guard") or {})
+            runtime_reasons = [str(item) for item in list(runtime_guard.get("blocked_reasons") or []) if str(item)]
+            runtime_blocked_reason = runtime_reasons[0] if runtime_reasons else "maintenance_safety_guard_blocked_apply"
+            _mark_core_maintenance_apply_blocked(
+                applied_report,
+                blocked_reason=runtime_blocked_reason,
+                requested_ids=requested_ids,
+                available_ids=available_ids,
+                missing_ids=missing_ids,
+                unselected_ids=unselected_ids,
+            )
+            return _maintenance_response(tool_name, brain_id, "blocked", applied_report, started)
+        _mark_core_maintenance_apply_succeeded(
+            applied_report,
+            requested_ids=requested_ids,
+            available_ids=available_ids,
+        )
+        return _maintenance_response(tool_name, brain_id, "applied", applied_report, started)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
-        report = _build_core_maintenance_report(
-            graph,
-            mode=mode,
-            preview_only=False,
-            focus_node_id=payload.focus_node_id,
-            max_nodes_considered=payload.max_nodes_considered,
-            selected_proposal_ids=payload.proposal_ids,
+        if runtime is None:
+            report = _build_core_maintenance_report(
+                graph,
+                mode=mode,
+                preview_only=True,
+                focus_node_id=payload.focus_node_id,
+                max_nodes_considered=payload.max_nodes_considered,
+                selected_proposal_ids=[],
+            )
+        else:
+            report = runtime.preview(
+                graph=graph,
+                mode=mode,
+                focus_node_id=payload.focus_node_id,
+                max_nodes_considered=payload.max_nodes_considered,
+            )
+    available_ids = _normalized_proposal_ids(
+        [item.get("proposal_id") for item in list(report.get("maintenance_proposals") or [])]
+    )
+    missing_ids = [proposal_id for proposal_id in requested_ids if proposal_id not in available_ids]
+    unselected_ids = [proposal_id for proposal_id in available_ids if proposal_id not in requested_ids]
+    blocked_reason = _core_maintenance_apply_blocked_reason(
+        requested_ids=requested_ids,
+        available_ids=available_ids,
+        missing_ids=missing_ids,
+        unselected_ids=unselected_ids,
+    )
+    if blocked_reason is None and runtime is None:
+        blocked_reason = "maintain_apply_runtime_not_configured"
+    if blocked_reason is None:
+        with use_runtime_brain(brain_record):
+            bootstrap_runtime_store()
+            graph = fetch_graph_snapshot()
+            applied_report = runtime.apply(
+                graph=graph,
+                mode=mode,
+                focus_node_id=payload.focus_node_id,
+                max_nodes_considered=payload.max_nodes_considered,
+            )
+        if not bool(applied_report.get("applied")):
+            runtime_guard = dict(applied_report.get("apply_policy_guard") or {})
+            runtime_reasons = [str(item) for item in list(runtime_guard.get("blocked_reasons") or []) if str(item)]
+            runtime_blocked_reason = runtime_reasons[0] if runtime_reasons else "maintenance_safety_guard_blocked_apply"
+            _mark_core_maintenance_apply_blocked(
+                applied_report,
+                blocked_reason=runtime_blocked_reason,
+                requested_ids=requested_ids,
+                available_ids=available_ids,
+                missing_ids=[],
+                unselected_ids=[],
+            )
+            return _maintenance_response(tool_name, brain_id, "blocked", applied_report, started)
+        _mark_core_maintenance_apply_succeeded(
+            applied_report,
+            requested_ids=requested_ids,
+            available_ids=available_ids,
         )
-        replace_runtime_graph(graph)
-    return _maintenance_response(tool_name, brain_id, "applied", report, started)
+        return _maintenance_response(tool_name, brain_id, "applied", applied_report, started)
+    _mark_core_maintenance_apply_blocked(
+        report,
+        blocked_reason=blocked_reason,
+        requested_ids=requested_ids,
+        available_ids=available_ids,
+        missing_ids=missing_ids,
+        unselected_ids=unselected_ids,
+    )
+    return _maintenance_response(tool_name, brain_id, "blocked", report, started)
+
+
+def _mark_core_maintenance_apply_succeeded(
+    report: dict[str, Any],
+    *,
+    requested_ids: list[str],
+    available_ids: list[str],
+) -> None:
+    report["maintenance_proposal_summary"] = {
+        **dict(report.get("maintenance_proposal_summary") or {}),
+        "selected_for_apply_count": len(requested_ids),
+    }
+    report["apply_policy_guard"] = {
+        **dict(report.get("apply_policy_guard") or {}),
+        "applied": True,
+        "blocked": False,
+        "blocked_reason": None,
+        "guard_passed": True,
+        "partial_merge_allowed": False,
+        "available_proposal_ids": available_ids,
+        "selected_proposal_ids": requested_ids,
+        "selected_missing_proposal_ids": [],
+        "unselected_available_proposal_ids": [],
+        "graph_mutation": "committed",
+    }
+    contract = dict(report.get("maintenance_contract") or {})
+    contract.update(
+        {
+            "preview_non_mutating": False,
+            "hidden_mutation_allowed": False,
+            "apply_runtime": "local_core_maintain_runtime",
+            "selection_exactness": {
+                "exact": True,
+                "requested_proposal_ids": requested_ids,
+                "available_proposal_ids": available_ids,
+                "missing_requested_proposal_ids": [],
+                "unselected_available_proposal_ids": [],
+            },
+        }
+    )
+    report["maintenance_contract"] = contract
+
+
+def _normalized_proposal_ids(values: list[Any]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in list(values or []):
+        proposal_id = str(value or "").strip()
+        if not proposal_id or proposal_id in seen:
+            continue
+        seen.add(proposal_id)
+        normalized.append(proposal_id)
+    return normalized
+
+
+def _core_maintenance_apply_blocked_reason(
+    *,
+    requested_ids: list[str],
+    available_ids: list[str],
+    missing_ids: list[str],
+    unselected_ids: list[str],
+) -> str | None:
+    if not requested_ids:
+        return "proposal_ids_required_for_exact_apply"
+    if missing_ids:
+        return "requested_proposal_ids_not_available"
+    if not available_ids:
+        return "no_applicable_proposals"
+    if unselected_ids:
+        return "partial_proposal_apply_not_supported"
+    return None
+
+
+def _mark_core_maintenance_apply_blocked(
+    report: dict[str, Any],
+    *,
+    blocked_reason: str,
+    requested_ids: list[str],
+    available_ids: list[str],
+    missing_ids: list[str],
+    unselected_ids: list[str],
+) -> None:
+    exact_selection = bool(requested_ids and not missing_ids and not unselected_ids)
+    report["applied"] = False
+    report["maintenance_proposal_summary"] = {
+        **dict(report.get("maintenance_proposal_summary") or {}),
+        "selected_for_apply_count": len(requested_ids),
+    }
+    report["apply_policy_guard"] = {
+        "applied": False,
+        "blocked": True,
+        "blocked_reason": blocked_reason,
+        "blocked_reasons": list(
+            dict.fromkeys(
+                [blocked_reason]
+                + [
+                    str(reason)
+                    for reason in list(dict(report.get("apply_policy_guard") or {}).get("blocked_reasons") or [])
+                    if str(reason) and str(reason) != "preview_only"
+                ]
+            )
+        ),
+        "guard_passed": False,
+        "partial_merge_allowed": False,
+        "available_proposal_ids": available_ids,
+        "selected_proposal_ids": requested_ids,
+        "selected_missing_proposal_ids": missing_ids,
+        "unselected_available_proposal_ids": unselected_ids,
+        "graph_mutation": "none",
+    }
+    contract = dict(report.get("maintenance_contract") or {})
+    contract.update(
+        {
+            "preview_non_mutating": True,
+            "hidden_mutation_allowed": False,
+            "apply_runtime": "maintain_module_or_detwin_cloud",
+            "selection_exactness": {
+                "exact": exact_selection,
+                "requested_proposal_ids": requested_ids,
+                "available_proposal_ids": available_ids,
+                "missing_requested_proposal_ids": missing_ids,
+                "unselected_available_proposal_ids": unselected_ids,
+            },
+        }
+    )
+    report["maintenance_contract"] = contract
 
 
 def _maintenance_response(
@@ -648,15 +1000,17 @@ def _maintenance_response(
             "schema_version": "agvm.sleep_evolve_lifecycle_contract.v1",
             "tool_name": tool_name,
             "mode": report.get("mode"),
+            "state": status,
             "applied": bool(report.get("applied")),
             "partial_merge_allowed": False,
+            "approval_gate": dict(report.get("apply_policy_guard") or {}),
         },
         maintenance_transaction=dict(report.get("maintenance_transaction") or {}),
         preview_budget_guard=dict(report.get("preview_budget_guard") or {}),
         maintenance_preview_plan=dict(report.get("maintenance_preview_plan") or {}),
         memory_operation_lifecycle_contract={
             "operation": "sleep_evolve",
-            "phase": "applied" if bool(report.get("applied")) else "preview",
+            "phase": "blocked" if status == "blocked" else "applied" if bool(report.get("applied")) else "preview",
             "tool_name": tool_name,
             "requires_confirm_apply_for_mutation": True,
         },
@@ -664,7 +1018,7 @@ def _maintenance_response(
             {
                 "proposal_id": str(item.get("proposal_id") or item.get("id") or ""),
                 "kind": item.get("kind") or item.get("proposal_kind"),
-                "summary": item.get("summary") or item.get("reason") or item.get("title"),
+                "summary": item.get("summary") or item.get("reason") or item.get("title") or item.get("proposed_action"),
             }
             for item in proposals[:40]
         ],
@@ -673,15 +1027,34 @@ def _maintenance_response(
         rollback_snapshot=dict(report.get("rollback_snapshot") or {}),
         before_after_audit=dict(report.get("before_after_audit") or {}),
         no_corruption_guards=dict(report.get("no_corruption_guards") or {}),
-        mutation_surface={"runtime": "local_core", "credits_required": 0},
+        mutation_surface={
+            "runtime": "local_core",
+            "credits_required": 0,
+            "status": status,
+            "applied": bool(report.get("applied")),
+            "graph_mutation": dict(report.get("apply_policy_guard") or {}).get("graph_mutation", "none"),
+            "preview_non_mutating": not bool(report.get("applied")),
+            "hidden_mutation_allowed": False,
+        },
         maintenance_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
         open_questions=list(report.get("open_questions") or []),
         hypotheses=list(report.get("hypotheses") or []),
         contradictions=list(report.get("contradictions") or []),
         processes=list(report.get("processes") or []),
         source_trace=list(report.get("source_trace") or []),
-        completeness={"proposal_count": len(proposals), "status": status},
-        budget={"credits_required": 0, "runtime": "local_core"},
+        completeness={
+            "proposal_count": len(proposals),
+            "status": status,
+            "selected_proposal_ids": list(dict(report.get("apply_policy_guard") or {}).get("selected_proposal_ids") or []),
+            "selected_missing_proposal_ids": list(
+                dict(report.get("apply_policy_guard") or {}).get("selected_missing_proposal_ids") or []
+            ),
+        },
+        budget={
+            "credits_required": 0,
+            "runtime": "local_core",
+            "blocked_reason": dict(report.get("apply_policy_guard") or {}).get("blocked_reason"),
+        },
     )
 
 
@@ -756,8 +1129,8 @@ def _build_core_maintenance_report(
                     "preview_only": bool(preview_only),
                 }
             )
-    selected_ids = [str(item) for item in list(selected_proposal_ids or []) if str(item or "").strip()]
-    applied_ids = selected_ids or [str(item.get("proposal_id") or "") for item in proposals[:3] if item.get("proposal_id")]
+    selected_ids = _normalized_proposal_ids(selected_proposal_ids)
+    applied_ids = [] if preview_only else selected_ids
     return {
         "schema_version": "agvm.core_maintenance_report.v1",
         "applied": not preview_only,
@@ -778,8 +1151,10 @@ def _build_core_maintenance_report(
         "maintenance_contract": {
             "schema_version": "agvm.core_maintenance_contract.v1",
             "runtime": "local_core",
-            "advanced_maintain_runtime": "detwin_cloud_only",
+            "advanced_maintain_runtime": "maintain_module_or_detwin_cloud",
             "mutation_requires_confirm_apply": True,
+            "preview_non_mutating": bool(preview_only),
+            "hidden_mutation_allowed": False,
         },
         "metamemory_snapshot": {
             "node_count": len(nodes),

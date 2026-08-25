@@ -35,6 +35,8 @@ KNOWN_MODULE_IDS = {
     "agvm_advanced_cockpit",
 }
 PRO_PLAN = "pro"
+PRO_PLUS_PLAN = "pro_plus"
+PAID_PLAN_IDS = frozenset({PRO_PLAN, PRO_PLUS_PLAN})
 
 
 class LocalEntitlementError(ValueError):
@@ -473,7 +475,7 @@ def _clean_module_ids(value: Sequence[str] | Any) -> list[str]:
 
 def _clean_plan(value: str) -> str:
     plan = str(value or "").strip().lower()
-    if plan != PRO_PLAN:
+    if plan not in PAID_PLAN_IDS:
         raise LocalEntitlementError(f"unsupported_plan:{plan or '<missing>'}")
     return plan
 

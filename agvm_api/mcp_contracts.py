@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from retrieval_limits import DEFAULT_RETRIEVAL_MAX_MATCHES, MAX_RETRIEVAL_MATCHES
+
 from mcp_tool_registration import (
     MCP_TOOL_REGISTRATION_STATE,
     build_mcp_module_tool_registration_summary,
@@ -203,10 +205,18 @@ def _schema_object(
     return schema
 
 
-def _string(description: str, *, enum: list[str] | None = None, nullable: bool = False) -> dict[str, Any]:
+def _string(
+    description: str,
+    *,
+    enum: list[str] | None = None,
+    nullable: bool = False,
+    default: str | None = None,
+) -> dict[str, Any]:
     schema: dict[str, Any] = {"type": ["string", "null"] if nullable else "string", "description": description}
     if enum:
         schema["enum"] = enum
+    if default is not None:
+        schema["default"] = default
     return schema
 
 
@@ -248,8 +258,14 @@ def _query_input_schema(*, document_target: bool = False, include_thread: bool =
         "document_text_policy": _string(
             "Raw document hydration policy for retrieve_context. refs_only returns actionable refs; top_raw/all_raw attach bounded raw document packets when explicitly requested.",
             enum=["refs_only", "top_raw", "all_raw"],
+            default="refs_only",
         ),
-        "max_matches": _integer("Maximum number of memory matches to expose.", minimum=1, maximum=24, default=12),
+        "max_matches": _integer(
+            "Maximum number of memory matches to expose.",
+            minimum=1,
+            maximum=MAX_RETRIEVAL_MATCHES,
+            default=DEFAULT_RETRIEVAL_MAX_MATCHES,
+        ),
         "include_raw_text": _boolean("Request full raw source/document text when available.", default=False),
         "include_answer_demo": _boolean("Optionally include downstream answer demo; never default MCP output.", default=False),
         "complete_paths": _boolean("Ask retrieval to spend extra route budget so planned path corridors complete, stop, or remain explicitly pending.", default=False),

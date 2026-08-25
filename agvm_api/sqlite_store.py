@@ -99,6 +99,14 @@ class GeometryCalibrationStoreError(ValueError):
         self.context = dict(context or {})
 
 
+class MaintenancePreviewStoreError(ValueError):
+    def __init__(self, code: str, *, status_code: int = 409, context: dict[str, Any] | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+        self.context = dict(context or {})
+
+
 def _json_dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -788,6 +796,26 @@ def bootstrap_runtime_store() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS maintenance_previews (
+                preview_signature TEXT PRIMARY KEY,
+                brain_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                brain_revision TEXT NOT NULL,
+                candidate_revision TEXT NOT NULL,
+                proposal_hash TEXT NOT NULL,
+                proposal_ids_json TEXT NOT NULL,
+                before_graph_json TEXT NOT NULL,
+                candidate_graph_json TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                apply_result_json TEXT NOT NULL DEFAULT '{}',
+                rollback_result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                applied_at TEXT,
+                rolled_back_at TEXT,
+                invalidated_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS heuristic_calibration_store (
                 scope_key TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL,
@@ -1054,6 +1082,8 @@ def bootstrap_runtime_store() -> None:
               ON maintenance_runs (created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_maintenance_runs_mode_applied
               ON maintenance_runs (mode, applied, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_maintenance_previews_brain_state
+              ON maintenance_previews (brain_id, state, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_heuristic_calibration_store_updated_at
               ON heuristic_calibration_store (updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_heuristic_calibration_events_created_at
@@ -2982,19 +3012,18 @@ def _fetch_node_rows(conn: sqlite3.Connection, *, node_ids: list[str] | None = N
     return conn.execute(sql, params).fetchall()
 
 
-def fetch_graph_snapshot() -> dict[str, Any]:
-    with connect() as conn:
-        rows = _fetch_node_rows(conn)
-        node_ids = [str(row["id"]) for row in rows]
-        links_map = _fetch_links_map(conn, node_ids, "links")
-        highways_map = _fetch_links_map(conn, node_ids, "highways")
-        nodes = []
-        for row in rows:
-            node = _row_to_node(row)
-            node["links"] = links_map.get(node["id"], [])
-            node["highways"] = highways_map.get(node["id"], [])
-            nodes.append(node)
-        edges = _fetch_edge_rows(conn)
+def _fetch_graph_snapshot_conn(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = _fetch_node_rows(conn)
+    node_ids = [str(row["id"]) for row in rows]
+    links_map = _fetch_links_map(conn, node_ids, "links")
+    highways_map = _fetch_links_map(conn, node_ids, "highways")
+    nodes = []
+    for row in rows:
+        node = _row_to_node(row)
+        node["links"] = links_map.get(node["id"], [])
+        node["highways"] = highways_map.get(node["id"], [])
+        nodes.append(node)
+    edges = _fetch_edge_rows(conn)
     return {
         "version": GRAPH_VERSION,
         "graph_name": APP_NAME,
@@ -3006,6 +3035,41 @@ def fetch_graph_snapshot() -> dict[str, Any]:
             "node_count": len(nodes),
         },
     }
+
+
+def fetch_graph_snapshot() -> dict[str, Any]:
+    with connect() as conn:
+        return _fetch_graph_snapshot_conn(conn)
+
+
+def maintenance_graph_revision(graph: dict[str, Any]) -> str:
+    def canonical(value: Any) -> Any:
+        if isinstance(value, float):
+            return round(value, 6)
+        if isinstance(value, dict):
+            return {str(key): canonical(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [canonical(item) for item in value]
+        return value
+
+    nodes = [canonical(dict(node)) for node in list(graph.get("nodes") or []) if isinstance(node, dict)]
+    nodes.sort(key=lambda node: str(node.get("id") or ""))
+    edges = [canonical(dict(edge)) for edge in list(graph.get("edges") or []) if isinstance(edge, dict)]
+    edges.sort(key=lambda edge: json.dumps(edge, ensure_ascii=True, sort_keys=True, default=str))
+    encoded = json.dumps(
+        {"nodes": nodes, "edges": edges},
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def maintenance_proposal_hash(proposals: list[dict[str, Any]]) -> str:
+    normalized = [dict(item) for item in proposals if isinstance(item, dict)]
+    normalized.sort(key=lambda item: str(item.get("proposal_id") or ""))
+    encoded = json.dumps(normalized, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def fetch_nodes_by_ids(
@@ -3893,29 +3957,38 @@ def fetch_nav_node(node_id: str) -> dict[str, Any] | None:
     return nodes[0] if nodes else None
 
 
-def replace_runtime_graph(graph: dict[str, Any]) -> dict[str, Any]:
-    bootstrap_runtime_store()
-    with connect() as conn:
-        nodes = list(graph.get("nodes") or [])
-        valid_node_ids = {str(node.get("id") or "") for node in nodes}
-        conn.execute("DELETE FROM graph_edges")
-        conn.execute("DELETE FROM links")
-        conn.execute("DELETE FROM highways")
-        conn.execute("DELETE FROM node_semantics")
-        conn.execute("DELETE FROM node_text")
-        conn.execute("DELETE FROM nodes_nav")
-        conn.execute("DELETE FROM atlas_cache")
-        conn.execute("DELETE FROM identity_nucleus_cache")
-        for node in nodes:
-            _upsert_node(conn, node)
-        for node in nodes:
-            _set_node_relations(conn, node, valid_target_ids=valid_node_ids)
-        _set_graph_edges(conn, list(graph.get("edges") or []), valid_node_ids=valid_node_ids)
-        conn.commit()
+def _replace_runtime_graph_conn(conn: sqlite3.Connection, graph: dict[str, Any]) -> None:
+    nodes = list(graph.get("nodes") or [])
+    valid_node_ids = {str(node.get("id") or "") for node in nodes}
+    conn.execute("DELETE FROM graph_edges")
+    conn.execute("DELETE FROM links")
+    conn.execute("DELETE FROM highways")
+    conn.execute("DELETE FROM node_semantics")
+    conn.execute("DELETE FROM node_text")
+    conn.execute("DELETE FROM nodes_nav")
+    conn.execute("DELETE FROM atlas_cache")
+    conn.execute("DELETE FROM identity_nucleus_cache")
+    for node in nodes:
+        _upsert_node(conn, node)
+    for node in nodes:
+        _set_node_relations(conn, node, valid_target_ids=valid_node_ids)
+    _set_graph_edges(conn, list(graph.get("edges") or []), valid_node_ids=valid_node_ids)
+
+
+def _refresh_graph_exports() -> tuple[dict[str, Any], dict[str, Any]]:
     rebuild_identity_nucleus_cache()
     atlas = rebuild_atlas_cache()
     canonical_graph = fetch_graph_snapshot()
     write_legacy_exports(canonical_graph, atlas)
+    return canonical_graph, atlas
+
+
+def replace_runtime_graph(graph: dict[str, Any]) -> dict[str, Any]:
+    bootstrap_runtime_store()
+    with connect() as conn:
+        _replace_runtime_graph_conn(conn, graph)
+        conn.commit()
+    canonical_graph, _ = _refresh_graph_exports()
     return canonical_graph
 
 
@@ -4384,6 +4457,10 @@ def fetch_atlas() -> dict[str, Any]:
 def reset_runtime_store() -> tuple[dict[str, Any], dict[str, Any]]:
     bootstrap_runtime_store()
     with connect() as conn:
+        conn.execute(
+            "UPDATE maintenance_previews SET state = 'invalidated', invalidated_at = ? WHERE state = 'active'",
+            (utc_timestamp(),),
+        )
         conn.execute("DELETE FROM graph_edges")
         conn.execute("DELETE FROM links")
         conn.execute("DELETE FROM highways")
@@ -5992,6 +6069,359 @@ def fetch_region_summary(region_id: str) -> dict[str, Any] | None:
         return payload
     summaries = rebuild_region_summaries()
     return next((item for item in summaries if str(item.get("region_id")) == str(region_id)), None)
+
+
+def _maintenance_preview_error(
+    code: str,
+    *,
+    status_code: int = 409,
+    **context: Any,
+) -> MaintenancePreviewStoreError:
+    return MaintenancePreviewStoreError(code, status_code=status_code, context=context)
+
+
+def _maintenance_preview_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "preview_signature": str(row["preview_signature"]),
+        "brain_id": str(row["brain_id"]),
+        "mode": str(row["mode"]),
+        "brain_revision": str(row["brain_revision"]),
+        "candidate_revision": str(row["candidate_revision"]),
+        "proposal_hash": str(row["proposal_hash"]),
+        "proposal_ids": list(_json_load(row["proposal_ids_json"], [])),
+        "before_graph": dict(_json_load(row["before_graph_json"], {})),
+        "candidate_graph": dict(_json_load(row["candidate_graph_json"], {})),
+        "report": dict(_json_load(row["report_json"], {})),
+        "state": str(row["state"]),
+        "apply_result": dict(_json_load(row["apply_result_json"], {})),
+        "rollback_result": dict(_json_load(row["rollback_result_json"], {})),
+        "created_at": str(row["created_at"]),
+        "applied_at": str(row["applied_at"]) if row["applied_at"] is not None else None,
+        "rolled_back_at": str(row["rolled_back_at"]) if row["rolled_back_at"] is not None else None,
+        "invalidated_at": str(row["invalidated_at"]) if row["invalidated_at"] is not None else None,
+    }
+
+
+def store_maintenance_preview(
+    *,
+    brain_id: str,
+    mode: str,
+    before_graph: dict[str, Any],
+    candidate_graph: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    bootstrap_runtime_store()
+    normalized_brain_id = str(brain_id or "").strip()
+    normalized_mode = str(mode or "").strip().lower()
+    proposals = [dict(item) for item in list(report.get("maintenance_proposals") or []) if isinstance(item, dict)]
+    proposal_ids = [str(item.get("proposal_id") or "").strip() for item in proposals if str(item.get("proposal_id") or "").strip()]
+    brain_revision = maintenance_graph_revision(before_graph)
+    candidate_revision = maintenance_graph_revision(candidate_graph)
+    proposal_hash = maintenance_proposal_hash(proposals)
+    signature_seed = {
+        "brain_id": normalized_brain_id,
+        "mode": normalized_mode,
+        "brain_revision": brain_revision,
+        "candidate_revision": candidate_revision,
+        "proposal_hash": proposal_hash,
+    }
+    preview_signature = "maintenance_preview::" + hashlib.sha256(
+        json.dumps(signature_seed, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:24]
+    authority = {
+        "schema_version": "agvm.maintenance_reviewed_preview.v1",
+        "signature_id": preview_signature,
+        "brain_id": normalized_brain_id,
+        "mode": normalized_mode,
+        "brain_revision": brain_revision,
+        "candidate_revision": candidate_revision,
+        "proposal_hash": proposal_hash,
+        "proposal_ids": proposal_ids,
+        "persisted": True,
+        "state": "active",
+    }
+    stored_report = dict(report)
+    transaction = dict(stored_report.get("maintenance_transaction") or {})
+    transaction["preview_signature"] = authority
+    stored_report["maintenance_transaction"] = transaction
+    guard = dict(stored_report.get("apply_policy_guard") or {})
+    guard["reviewed_preview_authority"] = authority
+    stored_report["apply_policy_guard"] = guard
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != brain_revision:
+            conn.rollback()
+            raise _maintenance_preview_error(
+                "maintenance_preview_brain_revision_conflict",
+                expected_brain_revision=brain_revision,
+                current_brain_revision=current_revision,
+            )
+        conn.execute(
+            """
+            INSERT INTO maintenance_previews (
+                preview_signature, brain_id, mode, brain_revision, candidate_revision,
+                proposal_hash, proposal_ids_json, before_graph_json, candidate_graph_json,
+                report_json, state, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+            ON CONFLICT(preview_signature) DO UPDATE SET
+                report_json=excluded.report_json
+            WHERE maintenance_previews.state = 'active'
+              AND maintenance_previews.brain_revision = excluded.brain_revision
+              AND maintenance_previews.candidate_revision = excluded.candidate_revision
+              AND maintenance_previews.proposal_hash = excluded.proposal_hash
+            """,
+            (
+                preview_signature,
+                normalized_brain_id,
+                normalized_mode,
+                brain_revision,
+                candidate_revision,
+                proposal_hash,
+                _json_dump(proposal_ids),
+                _json_dump(before_graph),
+                _json_dump(candidate_graph),
+                _json_dump(stored_report),
+                utc_timestamp(),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM maintenance_previews WHERE preview_signature = ?",
+            (preview_signature,),
+        ).fetchone()
+        if row is None or str(row["state"]) != "active":
+            conn.rollback()
+            raise _maintenance_preview_error("maintenance_preview_signature_not_active")
+        conn.commit()
+    return {"authority": authority, "report": stored_report}
+
+
+def fetch_maintenance_preview(preview_signature: str) -> dict[str, Any] | None:
+    bootstrap_runtime_store()
+    with connect_readonly() as conn:
+        row = conn.execute(
+            "SELECT * FROM maintenance_previews WHERE preview_signature = ?",
+            (str(preview_signature or "").strip(),),
+        ).fetchone()
+    return _maintenance_preview_row(row) if row is not None else None
+
+
+def apply_maintenance_preview(
+    *,
+    preview_signature: str,
+    brain_id: str,
+    mode: str,
+    proposal_ids: list[str],
+) -> dict[str, Any]:
+    bootstrap_runtime_store()
+    signature = str(preview_signature or "").strip()
+    normalized_brain_id = str(brain_id or "").strip()
+    normalized_mode = str(mode or "").strip().lower()
+    selected_ids = list(dict.fromkeys(str(item or "").strip() for item in proposal_ids if str(item or "").strip()))
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM maintenance_previews WHERE preview_signature = ?", (signature,)).fetchone()
+        if row is None:
+            conn.rollback()
+            raise _maintenance_preview_error("maintenance_preview_not_found", status_code=404)
+        preview = _maintenance_preview_row(row)
+        if preview["brain_id"] != normalized_brain_id or preview["mode"] != normalized_mode:
+            conn.rollback()
+            raise _maintenance_preview_error("maintenance_preview_scope_mismatch")
+        if selected_ids != preview["proposal_ids"]:
+            conn.rollback()
+            raise _maintenance_preview_error(
+                "maintenance_preview_proposal_hash_mismatch",
+                expected_proposal_ids=preview["proposal_ids"],
+                selected_proposal_ids=selected_ids,
+            )
+        guard = dict(preview["report"].get("apply_policy_guard") or {})
+        if not bool(guard.get("guard_passed")):
+            conn.rollback()
+            raise _maintenance_preview_error(
+                "maintenance_preview_safety_guard_failed",
+                blocked_reasons=list(guard.get("blocked_reasons") or []),
+            )
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if preview["state"] == "applied":
+            if current_revision != preview["candidate_revision"]:
+                conn.rollback()
+                raise _maintenance_preview_error("maintenance_preview_already_consumed_graph_advanced")
+            conn.rollback()
+            finalized_report = dict(preview["apply_result"].get("report") or preview["report"])
+            canonical_graph, atlas = _refresh_graph_exports()
+            return {
+                **preview["apply_result"],
+                "idempotent_replay": True,
+                "graph": canonical_graph,
+                "atlas": atlas,
+                "report": finalized_report,
+            }
+        if preview["state"] != "active":
+            conn.rollback()
+            raise _maintenance_preview_error("maintenance_preview_not_active", state=preview["state"])
+        if current_revision != preview["brain_revision"]:
+            invalidated_at = utc_timestamp()
+            conn.execute(
+                "UPDATE maintenance_previews SET state = 'invalidated', invalidated_at = ? WHERE preview_signature = ? AND state = 'active'",
+                (invalidated_at, signature),
+            )
+            conn.commit()
+            raise _maintenance_preview_error(
+                "maintenance_preview_brain_revision_conflict",
+                expected_brain_revision=preview["brain_revision"],
+                current_brain_revision=current_revision,
+            )
+        _replace_runtime_graph_conn(conn, preview["candidate_graph"])
+        committed_graph = _fetch_graph_snapshot_conn(conn)
+        committed_revision = maintenance_graph_revision(committed_graph)
+        if committed_revision != preview["candidate_revision"]:
+            conn.rollback()
+            raise _maintenance_preview_error(
+                "maintenance_candidate_round_trip_mismatch",
+                expected_candidate_revision=preview["candidate_revision"],
+                committed_candidate_revision=committed_revision,
+            )
+        applied_at = utc_timestamp()
+        apply_result = {
+            "schema_version": "agvm.maintenance_preview_apply.v1",
+            "preview_signature": signature,
+            "brain_id": normalized_brain_id,
+            "mode": normalized_mode,
+            "brain_revision": preview["brain_revision"],
+            "applied_revision": committed_revision,
+            "proposal_hash": preview["proposal_hash"],
+            "proposal_ids": selected_ids,
+            "applied_at": applied_at,
+            "idempotent_replay": False,
+        }
+        conn.execute(
+            """
+            UPDATE maintenance_previews
+            SET state = 'applied', apply_result_json = ?, applied_at = ?
+            WHERE preview_signature = ? AND state = 'active'
+            """,
+            (_json_dump(apply_result), applied_at, signature),
+        )
+        conn.execute(
+            """
+            UPDATE maintenance_previews
+            SET state = 'invalidated', invalidated_at = ?
+            WHERE brain_id = ? AND state = 'active' AND preview_signature <> ?
+            """,
+            (applied_at, normalized_brain_id, signature),
+        )
+        conn.commit()
+    canonical_graph, atlas = _refresh_graph_exports()
+    return {**apply_result, "graph": canonical_graph, "atlas": atlas, "report": preview["report"]}
+
+
+def finalize_maintenance_preview_apply(
+    *,
+    preview_signature: str,
+    maintenance_id: str,
+    report: dict[str, Any],
+) -> None:
+    bootstrap_runtime_store()
+    signature = str(preview_signature or "").strip()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT state, apply_result_json FROM maintenance_previews WHERE preview_signature = ?",
+            (signature,),
+        ).fetchone()
+        if row is None or str(row["state"]) != "applied":
+            raise _maintenance_preview_error("maintenance_preview_not_applied")
+        result = dict(_json_load(row["apply_result_json"], {}))
+        result.update(
+            {
+                "maintenance_id": str(maintenance_id),
+                "bookkeeping_complete": True,
+                "report": dict(report),
+            }
+        )
+        conn.execute(
+            "UPDATE maintenance_previews SET apply_result_json = ? WHERE preview_signature = ? AND state = 'applied'",
+            (_json_dump(result), signature),
+        )
+        conn.commit()
+
+
+def rollback_maintenance_preview(
+    *,
+    preview_signature: str,
+    brain_id: str,
+    mode: str,
+) -> dict[str, Any]:
+    bootstrap_runtime_store()
+    signature = str(preview_signature or "").strip()
+    normalized_brain_id = str(brain_id or "").strip()
+    normalized_mode = str(mode or "").strip().lower()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM maintenance_previews WHERE preview_signature = ?", (signature,)).fetchone()
+        if row is None:
+            conn.rollback()
+            raise _maintenance_preview_error("maintenance_preview_not_found", status_code=404)
+        preview = _maintenance_preview_row(row)
+        if preview["brain_id"] != normalized_brain_id or preview["mode"] != normalized_mode:
+            conn.rollback()
+            raise _maintenance_preview_error("maintenance_preview_scope_mismatch")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if preview["state"] == "rolled_back":
+            if current_revision != preview["brain_revision"]:
+                conn.rollback()
+                raise _maintenance_preview_error("maintenance_rollback_graph_advanced")
+            conn.rollback()
+            canonical_graph, atlas = _refresh_graph_exports()
+            return {
+                **preview["rollback_result"],
+                "idempotent_replay": True,
+                "graph": canonical_graph,
+                "atlas": atlas,
+            }
+        if preview["state"] != "applied":
+            conn.rollback()
+            raise _maintenance_preview_error("maintenance_preview_not_applied", state=preview["state"])
+        if current_revision != preview["candidate_revision"]:
+            conn.rollback()
+            raise _maintenance_preview_error(
+                "maintenance_rollback_revision_conflict",
+                expected_applied_revision=preview["candidate_revision"],
+                current_brain_revision=current_revision,
+            )
+        _replace_runtime_graph_conn(conn, preview["before_graph"])
+        restored_graph = _fetch_graph_snapshot_conn(conn)
+        restored_revision = maintenance_graph_revision(restored_graph)
+        if restored_revision != preview["brain_revision"]:
+            conn.rollback()
+            raise _maintenance_preview_error(
+                "maintenance_rollback_round_trip_mismatch",
+                expected_brain_revision=preview["brain_revision"],
+                restored_brain_revision=restored_revision,
+            )
+        rolled_back_at = utc_timestamp()
+        rollback_result = {
+            "schema_version": "agvm.maintenance_preview_rollback.v1",
+            "preview_signature": signature,
+            "brain_id": normalized_brain_id,
+            "mode": normalized_mode,
+            "rolled_back_revision": preview["candidate_revision"],
+            "restored_revision": restored_revision,
+            "rolled_back_at": rolled_back_at,
+            "idempotent_replay": False,
+        }
+        conn.execute(
+            """
+            UPDATE maintenance_previews
+            SET state = 'rolled_back', rollback_result_json = ?, rolled_back_at = ?
+            WHERE preview_signature = ? AND state = 'applied'
+            """,
+            (_json_dump(rollback_result), rolled_back_at, signature),
+        )
+        conn.commit()
+    canonical_graph, atlas = _refresh_graph_exports()
+    return {**rollback_result, "graph": canonical_graph, "atlas": atlas}
 
 
 def store_maintenance_run(
