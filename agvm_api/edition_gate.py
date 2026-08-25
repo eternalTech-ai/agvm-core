@@ -103,6 +103,16 @@ def classify_runtime_route_path(path: str) -> SurfaceClassification | None:
 
 def route_decision(path: str, settings: EditionSettings) -> RuntimeRouteDecision:
     normalized = str(path or "").strip() or "/"
+    if settings.edition == "cloud" and normalized.startswith(
+        ("/mcp/brain-bootstrap-", "/memory/mcp/brain-bootstrap-")
+    ):
+        return RuntimeRouteDecision(
+            False,
+            "core",
+            "agvm_core",
+            normalized,
+            "Cloud Brain Bootstrap requires the signed tenant memory gateway",
+        )
     if normalized in FRAMEWORK_ROUTE_PATHS:
         return RuntimeRouteDecision(True, "framework", "fastapi", normalized, "framework route")
     if normalized in INTERNAL_SERVICE_ROUTE_PATHS:

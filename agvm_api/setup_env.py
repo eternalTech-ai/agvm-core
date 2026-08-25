@@ -5,7 +5,12 @@
 from __future__ import annotations
 
 import os
+import socket
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +24,9 @@ except ImportError:  # pragma: no cover - dependency is present in the packaged 
 API_DIR = Path(__file__).resolve().parent
 MANAGED_ENV_FILENAME = "agvm_runtime.env"
 MANAGED_ENV_SCHEMA_VERSION = "agvm.setup_env.v1"
+PROVIDER_KEY_TEST_SCHEMA_VERSION = "agvm.provider_key_test.v1"
+PROVIDER_KEY_TEST_TIMEOUT_SECONDS = 5.0
+PROVIDER_KEY_TEST_TIMEOUT_MAX_SECONDS = 8.0
 
 MANAGED_ENV_KEYS = {
     "AGVM_DEFAULT_BRAIN_ID",
@@ -35,6 +43,35 @@ MANAGED_ENV_KEYS = {
     "AGVM_CLONE_APP_TEACH_MODEL",
     "OPENAI_API_KEY",
 }
+
+
+class ProviderKeyTestError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        *,
+        message: str,
+        retryable: bool,
+        status: str,
+        status_code: int,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.status = status
+        self.status_code = status_code
+
+    def response_detail(self) -> dict[str, Any]:
+        return _provider_key_test_payload(
+            ok=False,
+            status=self.status,
+            error={
+                "code": self.code,
+                "message": self.message,
+                "retryable": self.retryable,
+            },
+        )
 
 
 def managed_env_path() -> Path:
@@ -142,6 +179,122 @@ def managed_env_status() -> dict[str, Any]:
             "default_brain_id": _env_or_managed(managed_values, "AGVM_DEFAULT_BRAIN_ID"),
         },
     }
+
+
+def test_openai_provider_key(
+    api_key: str,
+    *,
+    timeout_seconds: float = PROVIDER_KEY_TEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    candidate = str(api_key or "").strip()
+    if not candidate:
+        raise ProviderKeyTestError(
+            "provider_key_required",
+            message="Enter a provider key before testing.",
+            retryable=False,
+            status="invalid_request",
+            status_code=400,
+        )
+    if len(candidate) > 4096 or "\n" in candidate or "\r" in candidate:
+        raise ProviderKeyTestError(
+            "provider_key_invalid_format",
+            message="The provider key must be a single value no longer than 4096 characters.",
+            retryable=False,
+            status="invalid_request",
+            status_code=400,
+        )
+
+    model = str(os.getenv("AGVM_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+    timeout = max(1.0, min(float(timeout_seconds), PROVIDER_KEY_TEST_TIMEOUT_MAX_SECONDS))
+    request = urllib.request.Request(
+        url=f"https://api.openai.com/v1/models/{urllib.parse.quote(model, safe='')}",
+        method="GET",
+        headers={"Authorization": f"Bearer {candidate}", "Accept": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if int(getattr(response, "status", 200)) != 200:
+                raise ProviderKeyTestError(
+                    "provider_capability_unavailable",
+                    message="The provider could not verify model access.",
+                    retryable=True,
+                    status="unavailable",
+                    status_code=503,
+                )
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403, 404}:
+            raise ProviderKeyTestError(
+                "provider_key_rejected",
+                message="The provider rejected this key. Check the key and organization access.",
+                retryable=False,
+                status="rejected",
+                status_code=401,
+            ) from None
+        if exc.code == 429:
+            raise ProviderKeyTestError(
+                "provider_rate_limited",
+                message="The provider is temporarily rate limited. Try the test again shortly.",
+                retryable=True,
+                status="unavailable",
+                status_code=503,
+            ) from None
+        raise ProviderKeyTestError(
+            "provider_unavailable",
+            message="The provider could not be reached. The current saved key was not changed.",
+            retryable=True,
+            status="unavailable",
+            status_code=503,
+        ) from None
+    except (TimeoutError, socket.timeout):
+        raise ProviderKeyTestError(
+            "provider_timeout",
+            message="The provider capability check timed out. The current saved key was not changed.",
+            retryable=True,
+            status="timeout",
+            status_code=504,
+        ) from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise ProviderKeyTestError(
+                "provider_timeout",
+                message="The provider capability check timed out. The current saved key was not changed.",
+                retryable=True,
+                status="timeout",
+                status_code=504,
+            ) from None
+        raise ProviderKeyTestError(
+            "provider_unavailable",
+            message="The provider could not be reached. The current saved key was not changed.",
+            retryable=True,
+            status="unavailable",
+            status_code=503,
+        ) from None
+
+    return _provider_key_test_payload(ok=True, status="valid", model=model)
+
+
+def _provider_key_test_payload(
+    *,
+    ok: bool,
+    status: str,
+    model: str | None = None,
+    error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": PROVIDER_KEY_TEST_SCHEMA_VERSION,
+        "ok": ok,
+        "provider": "openai",
+        "status": status,
+        "capability": "model_access",
+        "persisted": False,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if model:
+        payload["model"] = model
+    if error:
+        payload["error"] = error
+    return payload
 
 
 def _env_or_managed(managed_values: dict[str, str], key: str) -> str:

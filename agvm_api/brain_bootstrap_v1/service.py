@@ -7,6 +7,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
+import unicodedata
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from brain_registry import BrainRegistryError, brain_root_path, resolve_brain_scope
-from derivation import persist_selection, preview_bundle
+from derivation import _source_grounding_assessment, persist_selection, preview_bundle, resolve_persist_selection
 from retrieval import build_index
 from runtime_scope import use_runtime_brain
 from sqlite_store import bootstrap_runtime_store, fetch_atlas, fetch_graph_snapshot, replace_runtime_graph
@@ -33,6 +35,18 @@ MAX_ANSWERS = 128
 MAX_SOURCES = 32
 MAX_ANSWER_CHARS = 16_000
 MAX_SOURCE_CHARS = 100_000
+GUIDED_SEED_QUALITY_POLICY = "guided_seed_v1"
+GUIDED_SEED_MIN_CANDIDATES = 12
+GUIDED_SEED_TARGET_CANDIDATES = 24
+GUIDED_SEED_MAX_CANDIDATES = 30
+GUIDED_SEED_MIN_ANSWERS = 6
+GUIDED_SEED_MIN_SOURCE_TEXT_CHARS = 240
+ADAPTIVE_INTERVIEW_MODE = "adaptive_ai"
+ADAPTIVE_INTERVIEW_MIN_QUESTIONS = 6
+ADAPTIVE_INTERVIEW_MAX_QUESTIONS = 16
+SEED_CANDIDATE_MIN_LEXICAL_UNITS = 8
+SEED_CANDIDATE_MIN_ALNUM_CHARS = 36
+SEED_CANDIDATE_MAX_LEXICAL_UNITS = 80
 
 
 class BootstrapV1Error(RuntimeError):
@@ -51,12 +65,14 @@ class BrainBootstrapV1Service:
         preview_builder: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
         apply_executor: Callable[[dict[str, Any], dict[str, Any], list[str]], dict[str, Any]] | None = None,
         mutation_probe: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+        question_generator: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self._brain_resolver = brain_resolver
         self._brain_root_resolver = brain_root_resolver
         self._preview_builder = preview_builder or _build_manual_grow_preview
         self._apply_executor = apply_executor or _apply_manual_grow_preview
         self._mutation_probe = mutation_probe or _probe_manual_grow_mutation
+        self._question_generator = question_generator or _generate_adaptive_interview
 
     def execute(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         if operation not in OPERATIONS:
@@ -115,20 +131,56 @@ class BrainBootstrapV1Service:
                 )
             if history:
                 raise BootstrapV1Error("bootstrap_session_already_exists", status_code=409)
+            goal = str(payload.get("goal") or "Build a reviewed initial memory seed.")[:4_000]
+            quality_policy = (
+                GUIDED_SEED_QUALITY_POLICY
+                if str(payload.get("quality_policy") or "").strip() == GUIDED_SEED_QUALITY_POLICY
+                else None
+            )
+            interview_mode = str(payload.get("interview_mode") or "manual").strip().lower()
             questions = _bounded_text_list(payload.get("questions"), max_items=32, max_chars=2_000)
+            interview_plan: dict[str, Any] | None = None
+            minimum_answer_count = GUIDED_SEED_MIN_ANSWERS
+            if interview_mode == ADAPTIVE_INTERVIEW_MODE:
+                if questions:
+                    raise BootstrapV1Error("bootstrap_adaptive_interview_questions_forbidden", status_code=422)
+                interview_plan = self._question_generator(goal, brain_record)
+                questions = _validated_adaptive_questions(interview_plan)
+                minimum_answer_count = _validated_adaptive_required_answer_count(
+                    interview_plan,
+                    question_count=len(questions),
+                )
+            elif interview_mode != "manual":
+                raise BootstrapV1Error("bootstrap_interview_mode_not_supported", status_code=422)
             snapshot = {
                 "session_id": session_id,
                 "lifecycle_state": "interview_active",
                 "created_at": _utc_now(),
                 "updated_at": _utc_now(),
-                "goal": str(payload.get("goal") or "Build a reviewed initial memory seed.")[:4_000],
+                "goal": goal,
+                "quality_policy": quality_policy,
+                "interview_mode": interview_mode,
+                "interview_plan": interview_plan,
                 "questions": questions,
                 "answers": [],
                 "sources": [],
+                "quality_requirements": {
+                    "minimum_candidate_count": GUIDED_SEED_MIN_CANDIDATES,
+                    "target_candidate_count": GUIDED_SEED_TARGET_CANDIDATES,
+                    "maximum_candidate_count": GUIDED_SEED_MAX_CANDIDATES,
+                    "minimum_answer_count": minimum_answer_count,
+                    "minimum_source_text_chars": GUIDED_SEED_MIN_SOURCE_TEXT_CHARS,
+                },
                 "preview": None,
                 "apply_result": None,
                 "request": _request_record("start", key, digest),
             }
+            if quality_policy == GUIDED_SEED_QUALITY_POLICY:
+                snapshot["quality"] = _bootstrap_seed_quality(
+                    session=snapshot,
+                    bundle={},
+                    selected_ids=[],
+                )
             created = store.append(snapshot, expected_revision=0)
             return bootstrap_response(operation="start", status="started", brain_id=store.brain_id, session=created)
 
@@ -242,6 +294,8 @@ class BrainBootstrapV1Service:
         )
         updated = copy.deepcopy(current)
         updated.update({"answers": answers, "preview": None, "lifecycle_state": "interview_active"})
+        if str(updated.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
+            updated["quality"] = _bootstrap_seed_quality(session=updated, bundle={}, selected_ids=[])
         return self._append_response(store, updated, "answer", key, digest, status="answer_recorded")
 
     def _add_source(
@@ -274,6 +328,8 @@ class BrainBootstrapV1Service:
         )
         updated = copy.deepcopy(current)
         updated.update({"sources": sources, "preview": None, "lifecycle_state": "interview_active"})
+        if str(updated.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
+            updated["quality"] = _bootstrap_seed_quality(session=updated, bundle={}, selected_ids=[])
         return self._append_response(store, updated, "add_source", key, digest, status="source_recorded")
 
     def _preview(
@@ -289,7 +345,13 @@ class BrainBootstrapV1Service:
         if not list(preview.get("selected_preview_ids") or []):
             raise BootstrapV1Error("bootstrap_preview_has_no_reviewable_candidates", status_code=409)
         updated = copy.deepcopy(current)
-        updated.update({"preview": preview, "lifecycle_state": "preview_ready"})
+        updated.update(
+            {
+                "preview": preview,
+                "quality": dict(preview.get("quality") or {}),
+                "lifecycle_state": "preview_ready",
+            }
+        )
         return self._append_response(store, updated, "preview", key, digest, status="preview_ready")
 
     def _apply(
@@ -308,8 +370,16 @@ class BrainBootstrapV1Service:
             raise BootstrapV1Error("bootstrap_preview_required_before_apply", status_code=409)
         available = [str(value) for value in list(preview.get("selected_preview_ids") or []) if str(value)]
         selected = [str(value) for value in list(payload.get("selected_preview_ids") or available) if str(value)]
-        if not selected or not set(selected).issubset(set(available)):
+        if not selected or len(selected) != len(set(selected)) or not set(selected).issubset(set(available)):
             raise BootstrapV1Error("bootstrap_selected_preview_ids_invalid", status_code=422)
+        if str(current.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
+            quality = _bootstrap_seed_quality(
+                session=current,
+                bundle=dict(preview.get("preview_bundle") or {}),
+                selected_ids=selected,
+            )
+            if quality.get("ready_to_apply") is not True:
+                raise BootstrapV1Error("bootstrap_seed_quality_gate_not_met", status_code=409)
 
         mutation_receipt = _build_mutation_receipt(
             brain_record=brain_record,
@@ -444,12 +514,108 @@ class BrainBootstrapV1Service:
         return BootstrapSessionStore(brain_record, brain_root=self._brain_root_resolver())
 
 
+def _generate_adaptive_interview(goal: str, brain_record: dict[str, Any]) -> dict[str, Any]:
+    from hosted_credential_context import resolved_openai_api_key
+    from llm import compiler_model, structured_json
+
+    api_key = resolved_openai_api_key()
+    if not api_key:
+        raise BootstrapV1Error("bootstrap_question_generation_unavailable", status_code=503)
+    schema = {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "minItems": ADAPTIVE_INTERVIEW_MIN_QUESTIONS,
+                "maxItems": ADAPTIVE_INTERVIEW_MAX_QUESTIONS,
+                "items": {"type": "string", "minLength": 12, "maxLength": 500},
+            },
+            "required_answer_count": {
+                "type": "integer",
+                "minimum": ADAPTIVE_INTERVIEW_MIN_QUESTIONS,
+                "maximum": ADAPTIVE_INTERVIEW_MAX_QUESTIONS,
+            },
+            "coverage_dimensions": {
+                "type": "array",
+                "minItems": ADAPTIVE_INTERVIEW_MIN_QUESTIONS,
+                "maxItems": ADAPTIVE_INTERVIEW_MAX_QUESTIONS,
+                "items": {"type": "string", "minLength": 3, "maxLength": 80},
+            },
+        },
+        "required": ["questions", "required_answer_count", "coverage_dimensions"],
+        "additionalProperties": False,
+    }
+    brain_name = str(brain_record.get("display_name") or brain_record.get("brain_id") or "New brain").strip()
+    generated, error = structured_json(
+        system_prompt=(
+            "Design an adaptive human-in-the-loop interview for a new memory brain. "
+            "Every question must be specific to the supplied purpose and necessary to establish the users, "
+            "decisions, trusted evidence, uncertainty and clarification rules, privacy and safety boundaries, "
+            "correction behavior, and success criteria. Choose the number of questions according to domain "
+            "complexity within the schema bounds. Do not answer the questions and do not use generic filler."
+        ),
+        user_prompt=json.dumps(
+            {"brain_name": brain_name, "brain_purpose": goal},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        schema_name="agvm_brain_bootstrap_adaptive_interview_v1",
+        schema=schema,
+        model=compiler_model(),
+        timeout=45.0,
+        role="compiler",
+        max_output_tokens=3_000,
+        api_key_override=api_key,
+    )
+    if error or not isinstance(generated, dict):
+        raise BootstrapV1Error("bootstrap_question_generation_unavailable", status_code=503)
+    return {
+        **generated,
+        "schema_version": "agvm.brain_bootstrap_v1.adaptive_interview.v1",
+        "generation_source": "provider",
+        "model": compiler_model(),
+    }
+
+
+def _validated_adaptive_questions(interview_plan: dict[str, Any]) -> list[str]:
+    questions = _bounded_text_list(
+        interview_plan.get("questions"),
+        max_items=ADAPTIVE_INTERVIEW_MAX_QUESTIONS,
+        max_chars=500,
+    )
+    normalized = [" ".join(question.lower().split()) for question in questions]
+    if (
+        len(questions) < ADAPTIVE_INTERVIEW_MIN_QUESTIONS
+        or len(questions) > ADAPTIVE_INTERVIEW_MAX_QUESTIONS
+        or len(set(normalized)) != len(questions)
+        or any(len(question) < 12 for question in questions)
+    ):
+        raise BootstrapV1Error("bootstrap_question_generation_invalid", status_code=502)
+    return questions
+
+
+def _validated_adaptive_required_answer_count(
+    interview_plan: dict[str, Any],
+    *,
+    question_count: int,
+) -> int:
+    value = interview_plan.get("required_answer_count")
+    if isinstance(value, bool):
+        raise BootstrapV1Error("bootstrap_question_generation_invalid", status_code=502)
+    try:
+        required = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BootstrapV1Error("bootstrap_question_generation_invalid", status_code=502) from exc
+    if not ADAPTIVE_INTERVIEW_MIN_QUESTIONS <= required <= question_count:
+        raise BootstrapV1Error("bootstrap_question_generation_invalid", status_code=502)
+    return required
+
+
 def _build_manual_grow_preview(session: dict[str, Any], brain_record: dict[str, Any]) -> dict[str, Any]:
-    chunks = [f"{item.get('question_id')}: {item.get('answer')}" for item in list(session.get("answers") or [])]
-    chunks.extend(str(item.get("source_text") or "") for item in list(session.get("sources") or []) if item.get("source_text"))
-    raw_text = "\n\n".join(value.strip() for value in chunks if value.strip())
+    raw_text = _bootstrap_reviewed_material(session)
     if not raw_text:
         raise BootstrapV1Error("bootstrap_manual_material_required_before_preview", status_code=409)
+    requirements = _guided_seed_requirements(session)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
@@ -464,16 +630,353 @@ def _build_manual_grow_preview(session: dict[str, Any], brain_record: dict[str, 
             source_trust="user_asserted",
             learning_mode="strict_review",
             source_purpose="bootstrap_seed",
-            operator_instruction="Create reviewable bootstrap candidates without writing memory.",
+            operator_instruction=(
+                "Create atomic, provenance-preserving bootstrap candidates without writing memory. "
+                "Every reviewable memory must be one complete, self-contained, informative sentence with explicit "
+                "context and terminal punctuation; titles, labels, fragments, and semantic duplicates are not "
+                "reviewable memories. "
+                f"When the reviewed material supports it, target {requirements['target_candidate_count']} distinct memories "
+                f"and never exceed {requirements['maximum_candidate_count']}; do not invent content to meet the target."
+            ),
+            source_context={
+                "bootstrap_quality_policy": str(session.get("quality_policy") or "legacy"),
+                "candidate_target": requirements["target_candidate_count"],
+                "candidate_maximum": requirements["maximum_candidate_count"],
+            },
         )
-    selected = _preview_ids(bundle)
+    screening: dict[str, Any] | None = None
+    if str(session.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
+        selected, screening = _screen_seed_candidates(session=session, bundle=bundle)
+    else:
+        selected = _preview_ids(bundle)
+    quality = _bootstrap_seed_quality(session=session, bundle=bundle, selected_ids=selected)
     return {
         "schema_version": "agvm.brain_bootstrap_v1.grow_review.v1",
         "preview_bundle": bundle,
         "selected_preview_ids": selected,
         "candidate_count": len(selected),
+        "candidate_screening": screening,
+        "quality": quality,
         "mutates_brain": False,
     }
+
+
+def _bootstrap_seed_quality(
+    *,
+    session: dict[str, Any],
+    bundle: dict[str, Any],
+    selected_ids: list[str],
+) -> dict[str, Any]:
+    policy = str(session.get("quality_policy") or "").strip()
+    requirements = _guided_seed_requirements(session)
+    candidates = [dict(bundle.get("primary_node_preview") or {})]
+    candidates.extend(dict(item) for item in list(bundle.get("derived_nodes") or []) if isinstance(item, dict))
+    selected = {str(value).strip() for value in selected_ids if str(value).strip()}
+    selected_candidates = [
+        item
+        for item in candidates
+        if str(item.get("preview_id") or item.get("node_id") or item.get("id") or "").strip() in selected
+    ]
+    selected_candidate_ids = {
+        str(item.get("preview_id") or item.get("node_id") or item.get("id") or "").strip()
+        for item in selected_candidates
+    }
+    missing_candidate_ids = sorted(selected - selected_candidate_ids)
+    reviewed_material = _bootstrap_reviewed_material(session)
+    ungrounded_candidate_ids: list[str] = []
+    incomplete_candidate_ids: list[str] = []
+    low_information_candidate_ids: list[str] = []
+    non_atomic_candidate_ids: list[str] = []
+    unverifiable_provenance_candidate_ids: list[str] = []
+    semantic_representatives: list[tuple[str, str, set[str]]] = []
+    duplicate_candidate_ids: list[str] = []
+    for item in selected_candidates:
+        candidate_id = str(item.get("preview_id") or item.get("node_id") or item.get("id") or "").strip()
+        candidate_text = str(item.get("raw_text") or item.get("summary_full") or item.get("summary") or "").strip()
+        candidate_shape = _seed_candidate_shape(candidate_text)
+        if not candidate_shape["complete_sentence"]:
+            incomplete_candidate_ids.append(candidate_id)
+        if not candidate_shape["informative"]:
+            low_information_candidate_ids.append(candidate_id)
+        if not candidate_shape["atomic"]:
+            non_atomic_candidate_ids.append(candidate_id)
+        if not _seed_candidate_has_verifiable_provenance(item):
+            unverifiable_provenance_candidate_ids.append(candidate_id)
+        assessment = _source_grounding_assessment(
+            reviewed_material,
+            candidate_text,
+            role=str(item.get("derivation_role") or "claim"),
+        )
+        if not bool(assessment.get("supported")):
+            ungrounded_candidate_ids.append(candidate_id)
+        semantic_text, semantic_tokens = _seed_candidate_semantic_form(candidate_text)
+        if any(
+            _seed_candidates_are_duplicates(semantic_text, semantic_tokens, prior_text, prior_tokens)
+            for _prior_id, prior_text, prior_tokens in semantic_representatives
+        ):
+            duplicate_candidate_ids.append(candidate_id)
+        else:
+            semantic_representatives.append((candidate_id, semantic_text, semantic_tokens))
+    unique_count = len(semantic_representatives)
+    duplicate_ratio = 0.0 if not selected_candidates else len(duplicate_candidate_ids) / len(selected_candidates)
+    answer_count = len([item for item in list(session.get("answers") or []) if str(item.get("answer") or "").strip()])
+    source_text_chars = sum(
+        len(str(item.get("source_text") or "").strip())
+        for item in list(session.get("sources") or [])
+        if isinstance(item, dict)
+    )
+    issues: list[str] = []
+    if policy == GUIDED_SEED_QUALITY_POLICY:
+        if answer_count < requirements["minimum_answer_count"]:
+            issues.append("more_structured_answers_required")
+        if source_text_chars < requirements["minimum_source_text_chars"]:
+            issues.append("trusted_foundation_text_required")
+        if (
+            len(selected) < requirements["minimum_candidate_count"]
+            or unique_count < requirements["minimum_candidate_count"]
+        ):
+            issues.append("too_few_atomic_candidates")
+        if len(selected) > requirements["maximum_candidate_count"]:
+            issues.append("too_many_atomic_candidates")
+        if missing_candidate_ids:
+            issues.append("selected_candidates_missing_from_preview")
+        if incomplete_candidate_ids:
+            issues.append("incomplete_candidate_sentences_detected")
+        if low_information_candidate_ids:
+            issues.append("candidate_information_below_minimum")
+        if non_atomic_candidate_ids:
+            issues.append("non_atomic_candidates_detected")
+        if duplicate_candidate_ids:
+            issues.append("duplicate_candidates_detected")
+        if unverifiable_provenance_candidate_ids:
+            issues.append("candidate_provenance_unverifiable")
+        if ungrounded_candidate_ids:
+            issues.append("ungrounded_candidates_detected")
+    return {
+        "schema_version": "agvm.brain_bootstrap_v1.seed_quality.v1",
+        "policy": policy or "legacy",
+        "ready_to_apply": not issues,
+        "issues": issues,
+        "candidate_count": len(selected),
+        "unique_candidate_count": unique_count,
+        "duplicate_ratio": round(duplicate_ratio, 4),
+        "duplicate_candidate_ids": duplicate_candidate_ids,
+        "missing_candidate_ids": missing_candidate_ids,
+        "incomplete_candidate_ids": incomplete_candidate_ids,
+        "low_information_candidate_ids": low_information_candidate_ids,
+        "non_atomic_candidate_ids": non_atomic_candidate_ids,
+        "unverifiable_provenance_candidate_ids": unverifiable_provenance_candidate_ids,
+        "ungrounded_candidate_count": len(ungrounded_candidate_ids),
+        "ungrounded_candidate_ids": ungrounded_candidate_ids,
+        "answer_count": answer_count,
+        "source_text_chars": source_text_chars,
+        **requirements,
+    }
+
+
+def _seed_candidate_shape(value: str) -> dict[str, Any]:
+    text = _seed_candidate_content_text(value)
+    lexical_units = _seed_candidate_lexical_units(text)
+    alnum_chars = sum(1 for char in text if char.isalnum())
+    terminal_count = len(re.findall(r"[.!?\u3002\uff01\uff1f]+(?:[\"'\)\]\u201d\u2019]+)?(?=\s|$)", text))
+    first_cased = next((char for char in text if char.isalpha() and char.lower() != char.upper()), "")
+    complete_sentence = bool(
+        text
+        and terminal_count == 1
+        and re.search(r"[.!?\u3002\uff01\uff1f](?:[\"'\)\]\u201d\u2019]*)$", text)
+        and (not first_cased or first_cased.isupper())
+    )
+    informative = bool(
+        len(lexical_units) >= SEED_CANDIDATE_MIN_LEXICAL_UNITS
+        and alnum_chars >= SEED_CANDIDATE_MIN_ALNUM_CHARS
+        and len(set(lexical_units)) >= max(5, SEED_CANDIDATE_MIN_LEXICAL_UNITS // 2)
+    )
+    atomic = bool(terminal_count == 1 and len(lexical_units) <= SEED_CANDIDATE_MAX_LEXICAL_UNITS)
+    return {
+        "complete_sentence": complete_sentence,
+        "informative": informative,
+        "atomic": atomic,
+        "lexical_unit_count": len(lexical_units),
+        "alnum_char_count": alnum_chars,
+        "terminal_count": terminal_count,
+    }
+
+
+def _seed_candidate_content_text(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    prefix = re.match(r"^[^:\n]{1,64}:\s+(.+)$", text)
+    return str(prefix.group(1) if prefix else text).strip()
+
+
+def _seed_candidate_lexical_units(value: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    words = re.findall(r"[^\W_]+(?:['\u2019-][^\W_]+)*", normalized, flags=re.UNICODE)
+    if len(words) >= 2:
+        return words
+    ideographs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", normalized)
+    return ideographs or words
+
+
+def _seed_candidate_semantic_form(value: str) -> tuple[str, set[str]]:
+    units = [unit for unit in _seed_candidate_lexical_units(_seed_candidate_content_text(value)) if not unit.isdigit()]
+    return " ".join(units), set(units)
+
+
+def _seed_candidates_are_duplicates(
+    left_text: str,
+    left_tokens: set[str],
+    right_text: str,
+    right_tokens: set[str],
+) -> bool:
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    if min(len(left_tokens), len(right_tokens)) < 5:
+        return False
+    overlap = len(left_tokens & right_tokens)
+    containment = overlap / min(len(left_tokens), len(right_tokens))
+    union = len(left_tokens | right_tokens)
+    jaccard = overlap / union if union else 0.0
+    return containment >= 0.88 and jaccard >= 0.78
+
+
+def _seed_candidate_has_verifiable_provenance(item: dict[str, Any]) -> bool:
+    provenance = dict(item.get("provenance") or {})
+    source_label = str(provenance.get("source_label") or item.get("source_label") or "").strip()
+    source_type = str(provenance.get("source_type") or item.get("source_type") or "").strip()
+    source_trust = str(item.get("source_trust") or provenance.get("source_trust") or "").strip()
+    provenance_mode = str(provenance.get("mode") or "").strip()
+    return bool(source_label and source_type and source_trust and provenance_mode)
+
+
+def _screen_seed_candidates(*, session: dict[str, Any], bundle: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    reviewed_material = _bootstrap_reviewed_material(session)
+    candidates = [dict(item) for item in list(bundle.get("derived_nodes") or []) if isinstance(item, dict)]
+    primary = dict(bundle.get("primary_node_preview") or {})
+    if primary:
+        candidates.append(primary)
+    accepted_ids: list[str] = []
+    rejected: list[dict[str, Any]] = []
+    semantic_representatives: list[tuple[str, set[str]]] = []
+    for item in candidates:
+        candidate_id = str(item.get("preview_id") or item.get("node_id") or item.get("id") or "").strip()
+        candidate_text = str(item.get("raw_text") or item.get("summary_full") or item.get("summary") or "").strip()
+        shape = _seed_candidate_shape(candidate_text)
+        reasons: list[str] = []
+        if not candidate_id:
+            reasons.append("candidate_identity_missing")
+        if not shape["complete_sentence"]:
+            reasons.append("incomplete_sentence")
+        if not shape["informative"]:
+            reasons.append("information_below_minimum")
+        if not shape["atomic"]:
+            reasons.append("not_atomic")
+        if not _seed_candidate_has_verifiable_provenance(item):
+            reasons.append("provenance_unverifiable")
+        grounding = _source_grounding_assessment(
+            reviewed_material,
+            candidate_text,
+            role=str(item.get("derivation_role") or "claim"),
+        )
+        if not bool(grounding.get("supported")):
+            reasons.append("not_grounded_in_reviewed_material")
+        semantic_text, semantic_tokens = _seed_candidate_semantic_form(candidate_text)
+        if any(
+            _seed_candidates_are_duplicates(semantic_text, semantic_tokens, prior_text, prior_tokens)
+            for prior_text, prior_tokens in semantic_representatives
+        ):
+            reasons.append("semantic_duplicate")
+        if reasons:
+            rejected.append({"preview_id": candidate_id or None, "reasons": reasons})
+            continue
+        accepted_ids.append(candidate_id)
+        semantic_representatives.append((semantic_text, semantic_tokens))
+    return accepted_ids, {
+        "schema_version": "agvm.brain_bootstrap_v1.candidate_screening.v1",
+        "fail_closed": True,
+        "accepted_count": len(accepted_ids),
+        "rejected_count": len(rejected),
+        "rejected": rejected,
+    }
+
+
+def _guided_seed_requirements(session: dict[str, Any]) -> dict[str, int]:
+    configured = session.get("quality_requirements")
+    values = dict(configured) if isinstance(configured, dict) else {}
+    requirements = {
+        "minimum_candidate_count": _bounded_requirement(
+            values.get("minimum_candidate_count"),
+            default=GUIDED_SEED_MIN_CANDIDATES,
+            minimum=1,
+            maximum=GUIDED_SEED_MAX_CANDIDATES,
+        ),
+        "target_candidate_count": _bounded_requirement(
+            values.get("target_candidate_count"),
+            default=GUIDED_SEED_TARGET_CANDIDATES,
+            minimum=1,
+            maximum=GUIDED_SEED_MAX_CANDIDATES,
+        ),
+        "maximum_candidate_count": _bounded_requirement(
+            values.get("maximum_candidate_count"),
+            default=GUIDED_SEED_MAX_CANDIDATES,
+            minimum=1,
+            maximum=GUIDED_SEED_MAX_CANDIDATES,
+        ),
+        "minimum_answer_count": _bounded_requirement(
+            values.get("minimum_answer_count"),
+            default=GUIDED_SEED_MIN_ANSWERS,
+            minimum=1,
+            maximum=MAX_ANSWERS,
+        ),
+        "minimum_source_text_chars": _bounded_requirement(
+            values.get("minimum_source_text_chars"),
+            default=GUIDED_SEED_MIN_SOURCE_TEXT_CHARS,
+            minimum=1,
+            maximum=MAX_SOURCE_CHARS * MAX_SOURCES,
+        ),
+    }
+    if not (
+        requirements["minimum_candidate_count"]
+        <= requirements["target_candidate_count"]
+        <= requirements["maximum_candidate_count"]
+    ):
+        raise BootstrapV1Error("bootstrap_quality_requirements_invalid", status_code=409)
+    question_count = len(list(session.get("questions") or []))
+    if (
+        str(session.get("interview_mode") or "") == ADAPTIVE_INTERVIEW_MODE
+        and requirements["minimum_answer_count"] > question_count
+    ):
+        raise BootstrapV1Error("bootstrap_quality_requirements_invalid", status_code=409)
+    return requirements
+
+
+def _bounded_requirement(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise BootstrapV1Error("bootstrap_quality_requirements_invalid", status_code=409)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BootstrapV1Error("bootstrap_quality_requirements_invalid", status_code=409) from exc
+    if not minimum <= parsed <= maximum:
+        raise BootstrapV1Error("bootstrap_quality_requirements_invalid", status_code=409)
+    return parsed
+
+
+def _bootstrap_reviewed_material(session: dict[str, Any]) -> str:
+    chunks = [
+        f"{str(item.get('question_id') or '').strip()}: {str(item.get('answer') or '').strip()}".strip(": ")
+        for item in list(session.get("answers") or [])
+        if isinstance(item, dict) and str(item.get("answer") or "").strip()
+    ]
+    chunks.extend(
+        str(item.get("source_text") or "").strip()
+        for item in list(session.get("sources") or [])
+        if isinstance(item, dict) and str(item.get("source_text") or "").strip()
+    )
+    return "\n\n".join(value for value in chunks if value)
 
 
 def _apply_manual_grow_preview(
@@ -490,6 +993,7 @@ def _apply_manual_grow_preview(
             build_index(list(graph.get("nodes") or [])),
             learning_mode="strict_review",
             approved_preview_ids=selected_ids,
+            include_primary=False,
         )
         replace_runtime_graph(updated_graph)
     return {
@@ -513,7 +1017,17 @@ def _build_mutation_receipt(
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
-    witnesses = _selected_preview_witnesses(preview, selected_ids)
+    bundle = dict(preview.get("preview_bundle") or {})
+    effective_selected_ids, learning_policy = resolve_persist_selection(
+        bundle,
+        selected_ids,
+        learning_mode="strict_review",
+        approved_preview_ids=selected_ids,
+        include_primary=False,
+    )
+    if not effective_selected_ids:
+        raise BootstrapV1Error("bootstrap_selected_preview_ids_not_persistable", status_code=409)
+    witnesses = _selected_preview_witnesses(preview, effective_selected_ids)
     baseline_nodes = [dict(node) for node in list(graph.get("nodes") or []) if isinstance(node, dict)]
     baseline_node_digests = {
         str(node.get("id") or ""): _canonical_digest(node)
@@ -541,6 +1055,10 @@ def _build_mutation_receipt(
         "baseline_node_digests": baseline_node_digests,
         "baseline_edge_digests": baseline_edge_digests,
         "selected_preview_ids": sorted(selected_ids),
+        "effective_selected_preview_ids": effective_selected_ids,
+        "suppressed_preview_ids": list(
+            (learning_policy.get("selection_resolution") or {}).get("suppressed_preview_ids") or []
+        ),
         "witnesses": witnesses,
     }
 
@@ -588,8 +1106,6 @@ def _probe_manual_grow_mutation(brain_record: dict[str, Any], receipt: dict[str,
     if not baseline_node_id_set.issubset(current_node_id_set):
         return {"state": "ambiguous", "reason": "unrelated_graph_mutation_detected"}
     new_node_ids = current_node_id_set - baseline_node_id_set
-    if not new_node_ids.issubset(matched_node_id_set):
-        return {"state": "ambiguous", "reason": "unrelated_graph_mutation_detected"}
     changed_baseline_ids = {
         node_id
         for node_id, baseline_digest in baseline_node_digests.items()
@@ -616,14 +1132,38 @@ def _probe_manual_grow_mutation(brain_record: dict[str, Any], receipt: dict[str,
         if not source_id or not target_id or not ({source_id, target_id} & matched_node_id_set):
             return {"state": "ambiguous", "reason": "unrelated_graph_mutation_detected"}
 
+    # Grow materializes one implicit primary anchor even when the UI submits only
+    # its reviewed derived candidates. Accept that root only when every edge it
+    # adds is a derives_from edge into a witnessed candidate.
+    auxiliary_new_node_ids = new_node_ids - matched_node_id_set
+    if len(auxiliary_new_node_ids) > 1:
+        return {"state": "ambiguous", "reason": "unrelated_graph_mutation_detected"}
+    for auxiliary_node_id in auxiliary_new_node_ids:
+        auxiliary_edges = [
+            edge
+            for edge in added_edges
+            if auxiliary_node_id in set(_edge_endpoints(edge))
+        ]
+        if not auxiliary_edges:
+            return {"state": "ambiguous", "reason": "unrelated_graph_mutation_detected"}
+        for edge in auxiliary_edges:
+            source_id, target_id = _edge_endpoints(edge)
+            if (
+                source_id != auxiliary_node_id
+                or target_id not in matched_node_id_set
+                or str(edge.get("edge_type") or "").strip() != "derives_from"
+            ):
+                return {"state": "ambiguous", "reason": "unrelated_graph_mutation_detected"}
+
     witnessed_change_ids = matched_node_id_set & (new_node_ids | changed_baseline_ids)
     if not witnessed_change_ids and not added_edges:
         return {"state": "ambiguous", "reason": "mutation_witness_preexisted_without_change"}
     edge_delta = len(added_edges)
+    verified_node_ids = [*matched_node_ids, *sorted(auxiliary_new_node_ids)]
     verified_receipt = {
         **dict(receipt),
         "post_graph_digest": current_digest,
-        "matched_node_ids": matched_node_ids,
+        "matched_node_ids": verified_node_ids,
         "verified": True,
     }
     return {
@@ -632,7 +1172,7 @@ def _probe_manual_grow_mutation(brain_record: dict[str, Any], receipt: dict[str,
         "apply_result": {
             "schema_version": "agvm.brain_bootstrap_v1.apply_result.v1",
             "status": "applied",
-            "persisted_node_ids": matched_node_ids,
+            "persisted_node_ids": verified_node_ids,
             "persisted_edge_count": edge_delta,
             "merged_into_existing_ids": [],
             "recovered_from_mutation_receipt": True,

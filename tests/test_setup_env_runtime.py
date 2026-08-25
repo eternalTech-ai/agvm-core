@@ -5,11 +5,16 @@
 from __future__ import annotations
 
 import importlib
+import io
 import os
+import socket
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,3 +141,133 @@ def test_setup_env_router_accepts_clone_app_model_policy() -> None:
     assert updates["AGVM_CLONE_APP_SPEAKER_MODEL"] == "clone-speaker-model"
     assert updates["AGVM_CLONE_APP_PREFETCH_MODEL"] == "clone-prefetch-model"
     assert updates["AGVM_CLONE_APP_TEACH_MODEL"] == "clone-teach-model"
+
+
+def test_provider_key_test_is_bounded_non_persisting_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_env = _setup_env_module()
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    candidate = "fixture-provider-key-non-persisting-1234567890"
+    observed: dict[str, object] = {}
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    def _urlopen(request, *, timeout):
+        observed["authorization"] = request.get_header("Authorization")
+        observed["timeout"] = timeout
+        observed["url"] = request.full_url
+        return _Response()
+
+    monkeypatch.setattr(setup_env.urllib.request, "urlopen", _urlopen)
+    response = _setup_provider_client().post("/setup/provider/test", json={"api_key": candidate})
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["status"] == "valid"
+    assert response.json()["capability"] == "model_access"
+    assert response.json()["persisted"] is False
+    assert observed["authorization"] == f"Bearer {candidate}"
+    assert float(observed["timeout"]) <= setup_env.PROVIDER_KEY_TEST_TIMEOUT_MAX_SECONDS
+    assert str(observed["url"]).startswith("https://api.openai.com/v1/models/")
+    assert candidate not in response.text
+    assert candidate not in caplog.text
+    assert os.getenv("OPENAI_API_KEY") is None
+    assert not (tmp_path / setup_env.MANAGED_ENV_FILENAME).exists()
+
+
+def test_provider_key_test_returns_structured_rejection_without_upstream_body(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    candidate = "fixture-provider-key-rejected-0987654321"
+
+    def _urlopen(request, *, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(f'{{"error":"rejected {candidate}"}}'.encode()),
+        )
+
+    monkeypatch.setattr(setup_env.urllib.request, "urlopen", _urlopen)
+    response = _setup_provider_client().post("/setup/provider/test", json={"api_key": candidate})
+    payload = response.json()["detail"]
+
+    assert response.status_code == 401
+    assert payload["ok"] is False
+    assert payload["status"] == "rejected"
+    assert payload["persisted"] is False
+    assert payload["error"] == {
+        "code": "provider_key_rejected",
+        "message": "The provider rejected this key. Check the key and organization access.",
+        "retryable": False,
+    }
+    assert candidate not in response.text
+    assert not (tmp_path / setup_env.MANAGED_ENV_FILENAME).exists()
+
+
+def test_provider_key_test_validation_never_reflects_candidate() -> None:
+    candidate = "fixture-provider-key-reflection-guard-1234567890"
+    client = _setup_provider_client()
+
+    malformed = client.post(
+        "/setup/provider/test",
+        content=f'{{"api_key":"{candidate}"',
+        headers={"Content-Type": "application/json"},
+    )
+    wrong_shape = client.post("/setup/provider/test", json={"api_key": {"secret": candidate}})
+
+    assert malformed.status_code == 400
+    assert wrong_shape.status_code == 400
+    assert malformed.json()["detail"]["error"]["code"] == "invalid_json"
+    assert wrong_shape.json()["detail"]["error"]["code"] == "provider_key_required"
+    assert candidate not in malformed.text
+    assert candidate not in wrong_shape.text
+
+
+def test_provider_key_test_timeout_is_structured_and_non_persisting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+
+    def _urlopen(_request, *, timeout):
+        raise socket.timeout()
+
+    monkeypatch.setattr(setup_env.urllib.request, "urlopen", _urlopen)
+    response = _setup_provider_client().post(
+        "/setup/provider/test",
+        json={"api_key": "fixture-provider-key-timeout-1234567890"},
+    )
+
+    assert response.status_code == 504
+    assert response.json()["detail"]["status"] == "timeout"
+    assert response.json()["detail"]["error"]["code"] == "provider_timeout"
+    assert response.json()["detail"]["persisted"] is False
+    assert not (tmp_path / setup_env.MANAGED_ENV_FILENAME).exists()
+
+
+def _setup_provider_client() -> TestClient:
+    if "core_runtime_router" in sys.modules:
+        router_module = importlib.reload(sys.modules["core_runtime_router"])
+    else:
+        router_module = importlib.import_module("core_runtime_router")
+
+    app = FastAPI()
+    app.include_router(router_module.create_core_runtime_router(app_name="AGVM test", app_version="test"))
+    return TestClient(app)

@@ -7,6 +7,9 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from brain_bootstrap_v1 import create_brain_bootstrap_v1_router
+from brain_profile_v1_api import create_brain_profile_v1_router
+from brain_sync_restore_materializer import create_brain_sync_restore_router
 from config import APP_NAME, APP_VERSION
 from core_brain_router import create_core_brain_router
 from core_graph_router import create_core_graph_router
@@ -16,13 +19,7 @@ from core_mcp_matrix_router import create_core_mcp_matrix_router
 from core_mcp_ops_router import create_core_mcp_ops_router
 from core_retrieve_router import create_core_retrieve_router
 from core_runtime_router import create_core_runtime_router
-from brain_bootstrap_v1 import create_brain_bootstrap_v1_router
-from brain_profile_v1_api import create_brain_profile_v1_router
 from edition_gate import install_edition_route_gate, read_edition_settings
-try:
-    from hosted_mcp_core_service_router import create_hosted_mcp_core_service_router
-except ImportError:  # pragma: no cover - public Core export omits hosted internals.
-    create_hosted_mcp_core_service_router = None
 
 
 def create_core_app() -> FastAPI:
@@ -50,8 +47,7 @@ def create_core_app() -> FastAPI:
     app.include_router(create_brain_profile_v1_router())
     app.include_router(create_core_retrieve_router())
     app.include_router(create_core_license_router())
-    if create_hosted_mcp_core_service_router is not None:
-        app.include_router(create_hosted_mcp_core_service_router())
+    app.include_router(create_brain_sync_restore_router())
     install_edition_route_gate(app, read_edition_settings())
     return app
 

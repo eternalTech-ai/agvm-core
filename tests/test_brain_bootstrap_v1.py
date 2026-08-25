@@ -38,7 +38,35 @@ def _brain(tmp_path: Path) -> dict:
     }
 
 
-def _service(tmp_path: Path, *, fail_apply: bool = False) -> tuple[BrainBootstrapV1Service, list[dict]]:
+def _seed_candidate(index: int, *, prefix: str = "Reviewed operational policy") -> dict:
+    label = f"domain{index:02x}"
+    text = (
+        f"{prefix} {label} connects control{label}, evidence{label}, and workflow{label} "
+        "to one independently traceable brain decision."
+    )
+    return {
+        "id": f"preview-{index}",
+        "preview_id": f"preview-{index}",
+        "raw_text": text,
+        "summary": text,
+        "derivation_role": "claim",
+        "memory_type": "knowledge",
+        "node_kind": "fact",
+        "source_trust": "user_asserted",
+        "provenance": {
+            "mode": "agvm_lab_preview_claim",
+            "source_label": "Reviewed Bootstrap material",
+            "source_type": "manual_bootstrap",
+        },
+    }
+
+
+def _service(
+    tmp_path: Path,
+    *,
+    fail_apply: bool = False,
+    question_generator=None,
+) -> tuple[BrainBootstrapV1Service, list[dict]]:
     brain = _brain(tmp_path)
     apply_calls: list[dict] = []
     mutation_state = {"applied": False}
@@ -90,6 +118,7 @@ def _service(tmp_path: Path, *, fail_apply: bool = False) -> tuple[BrainBootstra
             preview_builder=preview_builder,
             apply_executor=apply_executor,
             mutation_probe=mutation_probe,
+            question_generator=question_generator,
         ),
         apply_calls,
     )
@@ -225,6 +254,267 @@ def test_bootstrap_v1_is_immutable_cas_guarded_and_writes_only_on_explicit_apply
     assert replay["idempotent_replay"] is True
     assert replay["revision"] == 6
     assert len(apply_calls) == 1
+
+
+def test_adaptive_bootstrap_generates_domain_questions_and_exposes_runtime_quality_gates(tmp_path: Path) -> None:
+    generated_goals: list[str] = []
+
+    def generate_questions(goal, brain_record):
+        generated_goals.append(goal)
+        assert brain_record["brain_id"] == "bootstrap_v1_test_brain"
+        return {
+            "schema_version": "agvm.brain_bootstrap_v1.adaptive_interview.v1",
+            "generation_source": "provider",
+            "questions": [
+                f"How should the product intelligence brain handle domain requirement {index}?"
+                for index in range(1, 10)
+            ],
+            "required_answer_count": 8,
+            "coverage_dimensions": [f"dimension-{index}" for index in range(1, 10)],
+        }
+
+    service, _apply_calls = _service(tmp_path, question_generator=generate_questions)
+    started = service.execute(
+        "start",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "adaptive-interview",
+            "idempotency_key": "adaptive-start",
+            "goal": "Support product intelligence with reviewed architectural evidence.",
+            "interview_mode": bootstrap_service.ADAPTIVE_INTERVIEW_MODE,
+            "quality_policy": bootstrap_service.GUIDED_SEED_QUALITY_POLICY,
+        },
+    )
+
+    session = started["session"]
+    assert generated_goals == ["Support product intelligence with reviewed architectural evidence."]
+    assert session["interview_mode"] == bootstrap_service.ADAPTIVE_INTERVIEW_MODE
+    assert len(session["questions"]) == 9
+    assert session["interview_plan"]["generation_source"] == "provider"
+    assert session["quality"]["minimum_answer_count"] == 8
+    assert session["quality"]["minimum_source_text_chars"] == bootstrap_service.GUIDED_SEED_MIN_SOURCE_TEXT_CHARS
+    assert session["quality"]["ready_to_apply"] is False
+    assert "more_structured_answers_required" in session["quality"]["issues"]
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_adaptive_interview_questions_forbidden"):
+        service.execute(
+            "start",
+            {
+                "brain_id": "bootstrap_v1_test_brain",
+                "session_id": "adaptive-static-questions",
+                "idempotency_key": "adaptive-static-start",
+                "goal": "A second brain.",
+                "interview_mode": bootstrap_service.ADAPTIVE_INTERVIEW_MODE,
+                "quality_policy": bootstrap_service.GUIDED_SEED_QUALITY_POLICY,
+                "questions": ["This must never replace the provider-authored interview plan."],
+            },
+        )
+def test_guided_bootstrap_cannot_apply_without_a_passing_seed_quality_report(tmp_path: Path) -> None:
+    service, apply_calls = _service(tmp_path)
+    started = service.execute(
+        "start",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "guided-quality",
+            "idempotency_key": "guided-start",
+            "quality_policy": bootstrap_service.GUIDED_SEED_QUALITY_POLICY,
+        },
+    )
+    assert started["session"]["quality_policy"] == bootstrap_service.GUIDED_SEED_QUALITY_POLICY
+    service.execute(
+        "answer",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "guided-quality",
+            "expected_revision": 1,
+            "idempotency_key": "guided-answer",
+            "question_id": "purpose",
+            "answer": "A real but deliberately incomplete seed.",
+        },
+    )
+    service.execute(
+        "preview",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "guided-quality",
+            "expected_revision": 2,
+            "idempotency_key": "guided-preview",
+        },
+    )
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_seed_quality_gate_not_met"):
+        service.execute(
+            "apply",
+            {
+                "brain_id": "bootstrap_v1_test_brain",
+                "session_id": "guided-quality",
+                "expected_revision": 3,
+                "idempotency_key": "guided-apply",
+                "confirm_apply": True,
+            },
+        )
+    assert apply_calls == []
+
+
+def test_guided_bootstrap_quality_reports_real_material_and_unique_candidates() -> None:
+    answers = [{"answer": f"Reviewed answer {index}"} for index in range(6)]
+    derived_nodes = [_seed_candidate(index) for index in range(12)]
+    source_text = " ".join(str(item["raw_text"]) for item in derived_nodes)
+
+    quality = bootstrap_service._bootstrap_seed_quality(
+        session={
+            "quality_policy": bootstrap_service.GUIDED_SEED_QUALITY_POLICY,
+            "answers": answers,
+            "sources": [{"source_text": source_text}],
+        },
+        bundle={"derived_nodes": derived_nodes},
+        selected_ids=[item["preview_id"] for item in derived_nodes],
+    )
+
+    assert quality["ready_to_apply"] is True
+    assert quality["candidate_count"] == 12
+    assert quality["unique_candidate_count"] == 12
+    assert quality["ungrounded_candidate_count"] == 0
+    assert quality["issues"] == []
+
+
+def test_guided_bootstrap_quality_enforces_inclusive_12_to_30_candidate_bounds() -> None:
+    derived_nodes = [_seed_candidate(index, prefix="Reviewed bounded policy") for index in range(31)]
+    session = {
+        "quality_policy": bootstrap_service.GUIDED_SEED_QUALITY_POLICY,
+        "answers": [{"answer": f"Reviewed answer {index}"} for index in range(6)],
+        "sources": [{"source_text": " ".join(str(item["raw_text"]) for item in derived_nodes)}],
+    }
+    bundle = {"derived_nodes": derived_nodes}
+
+    too_few = bootstrap_service._bootstrap_seed_quality(
+        session=session,
+        bundle=bundle,
+        selected_ids=[f"preview-{index}" for index in range(11)],
+    )
+    minimum = bootstrap_service._bootstrap_seed_quality(
+        session=session,
+        bundle=bundle,
+        selected_ids=[f"preview-{index}" for index in range(12)],
+    )
+    maximum = bootstrap_service._bootstrap_seed_quality(
+        session=session,
+        bundle=bundle,
+        selected_ids=[f"preview-{index}" for index in range(30)],
+    )
+    too_many = bootstrap_service._bootstrap_seed_quality(
+        session=session,
+        bundle=bundle,
+        selected_ids=[f"preview-{index}" for index in range(31)],
+    )
+
+    assert too_few["ready_to_apply"] is False
+    assert "too_few_atomic_candidates" in too_few["issues"]
+    assert minimum["ready_to_apply"] is True
+    assert maximum["ready_to_apply"] is True
+    assert too_many["ready_to_apply"] is False
+    assert "too_many_atomic_candidates" in too_many["issues"]
+
+
+def test_guided_bootstrap_apply_rechecks_the_actual_selected_subset(tmp_path: Path) -> None:
+    service, apply_calls = _service(tmp_path)
+    derived_nodes = [_seed_candidate(index, prefix="Reviewed selected policy") for index in range(12)]
+    candidate_texts = [str(item["raw_text"]) for item in derived_nodes]
+    service._preview_builder = lambda *_args: {
+        "schema_version": "agvm.brain_bootstrap_v1.grow_review.v1",
+        "preview_bundle": {"derived_nodes": derived_nodes},
+        "selected_preview_ids": [item["preview_id"] for item in derived_nodes],
+        "candidate_count": len(derived_nodes),
+        "quality": {"ready_to_apply": True},
+        "mutates_brain": False,
+    }
+    service.execute(
+        "start",
+        {
+            "session_id": "guided-selected-subset",
+            "idempotency_key": "guided-selected-start",
+            "quality_policy": bootstrap_service.GUIDED_SEED_QUALITY_POLICY,
+        },
+    )
+    revision = 1
+    for index in range(6):
+        service.execute(
+            "answer",
+            {
+                "session_id": "guided-selected-subset",
+                "expected_revision": revision,
+                "idempotency_key": f"guided-selected-answer-{index}",
+                "question_id": f"question-{index}",
+                "answer": f"Reviewed answer {index}",
+            },
+        )
+        revision += 1
+    service.execute(
+        "add_source",
+        {
+            "session_id": "guided-selected-subset",
+            "expected_revision": revision,
+            "idempotency_key": "guided-selected-source",
+            "source_text": " ".join(candidate_texts),
+        },
+    )
+    revision += 1
+    service.execute(
+        "preview",
+        {
+            "session_id": "guided-selected-subset",
+            "expected_revision": revision,
+            "idempotency_key": "guided-selected-preview",
+        },
+    )
+    revision += 1
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_seed_quality_gate_not_met"):
+        service.execute(
+            "apply",
+            {
+                "session_id": "guided-selected-subset",
+                "expected_revision": revision,
+                "idempotency_key": "guided-selected-apply-eleven",
+                "confirm_apply": True,
+                "selected_preview_ids": [f"preview-{index}" for index in range(11)],
+            },
+        )
+    assert apply_calls == []
+
+    applied = service.execute(
+        "apply",
+        {
+            "session_id": "guided-selected-subset",
+            "expected_revision": revision,
+            "idempotency_key": "guided-selected-apply-twelve",
+            "confirm_apply": True,
+            "selected_preview_ids": [f"preview-{index}" for index in range(12)],
+        },
+    )
+    assert applied["status"] == "applied"
+    assert apply_calls[0]["selected_ids"] == [f"preview-{index}" for index in range(12)]
+
+
+def test_guided_bootstrap_quality_rejects_ungrounded_candidates() -> None:
+    candidates = [_seed_candidate(index, prefix="Reviewed grounded policy") for index in range(12)]
+    supported = [str(item["raw_text"]) for item in candidates]
+    candidates[-1]["raw_text"] = "Invented Zephyr Corporation acquired an orbital laboratory in 2047."
+
+    quality = bootstrap_service._bootstrap_seed_quality(
+        session={
+            "quality_policy": bootstrap_service.GUIDED_SEED_QUALITY_POLICY,
+            "answers": [{"answer": f"Reviewed answer {index}"} for index in range(6)],
+            "sources": [{"source_text": " ".join(supported)}],
+        },
+        bundle={"derived_nodes": candidates},
+        selected_ids=[item["preview_id"] for item in candidates],
+    )
+
+    assert quality["ready_to_apply"] is False
+    assert quality["ungrounded_candidate_count"] == 1
+    assert quality["ungrounded_candidate_ids"] == ["preview-11"]
+    assert "ungrounded_candidates_detected" in quality["issues"]
 
 
 def test_bootstrap_v1_rejects_stale_cas_and_idempotency_key_reuse(tmp_path: Path) -> None:
@@ -470,6 +760,73 @@ def test_bootstrap_recovery_rejects_unrelated_graph_mutation_even_when_witness_p
         "state": "ambiguous",
         "reason": "unrelated_graph_mutation_detected",
     }
+
+
+def test_bootstrap_recovery_accepts_the_single_implicit_primary_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brain = _brain(tmp_path)
+    graphs = {"current": {"nodes": [], "edges": []}}
+    monkeypatch.setattr(bootstrap_service, "bootstrap_runtime_store", lambda: None)
+    monkeypatch.setattr(bootstrap_service, "fetch_graph_snapshot", lambda: graphs["current"])
+    preview = {
+        "preview_bundle": {
+            "primary_node_preview": {
+                "id": "preview-primary",
+                "raw_text": "Reviewed root",
+                "summary": "Reviewed root",
+                "memory_type": "project",
+                "node_kind": "project",
+            },
+            "derived_nodes": [
+                {
+                    "preview_id": "preview-1",
+                    "raw_text": "Reviewed seed",
+                    "summary": "Reviewed seed",
+                    "memory_type": "knowledge",
+                    "node_kind": "fact",
+                }
+            ],
+        }
+    }
+    receipt = bootstrap_service._build_mutation_receipt(
+        brain_record=brain,
+        session={"session_id": "implicit-primary"},
+        preview=preview,
+        selected_ids=["preview-1"],
+        idempotency_key="apply-implicit-primary",
+    )
+    graphs["current"] = {
+        "nodes": [
+            {
+                "id": "root-node",
+                "raw_text": "Reviewed root",
+                "summary": "Reviewed root",
+                "memory_type": "project",
+                "node_kind": "project",
+            },
+            {
+                "id": "seed-node",
+                "raw_text": "Reviewed seed",
+                "summary": "Reviewed seed",
+                "memory_type": "knowledge",
+                "node_kind": "fact",
+            },
+        ],
+        "edges": [
+            {
+                "source_node_id": "root-node",
+                "target_node_id": "seed-node",
+                "edge_type": "derives_from",
+            }
+        ],
+    }
+
+    observation = bootstrap_service._probe_manual_grow_mutation(brain, receipt)
+
+    assert observation["state"] == "applied"
+    assert set(observation["apply_result"]["persisted_node_ids"]) == {"root-node", "seed-node"}
 
 
 def test_bootstrap_v1_rejects_registry_brain_path_outside_canonical_root(tmp_path: Path) -> None:

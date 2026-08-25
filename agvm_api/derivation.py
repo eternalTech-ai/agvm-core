@@ -12,6 +12,8 @@ import unicodedata
 from collections import defaultdict
 from typing import Any
 
+from source_security import sanitize_source_uri_for_persistence
+
 from config import BUCKET_SIZE, CLAIM_MEMORY_TYPES, ENTITY_MEMORY_TYPES, FACET_FIELDS, ROUTING_FIELDS
 from llm import compiler_model, llm_enabled, structured_json
 from metamemory import build_metamemory_package
@@ -2997,6 +2999,8 @@ def build_seed(
     provenance_mode: str,
     source_label: str | None = None,
     source_type: str | None = None,
+    source_uri: str | None = None,
+    source_ref_id: str | None = None,
     source_trust: str | None = None,
     claim_status: str | None = None,
     node_kind_hint: str | None = None,
@@ -3073,6 +3077,8 @@ def build_seed(
         "mode": provenance_mode,
         "source_label": source_label,
         "source_type": resolved_source_type,
+        "source_uri": sanitize_source_uri_for_persistence(source_uri),
+        "source_ref_id": str(source_ref_id or "").strip() or None,
         "guide_conceptual_area": guide_conceptual_area,
     }
     hygiene = build_hygiene_metadata(
@@ -5238,6 +5244,31 @@ def preview_bundle(
         "source_section_count": source_section_count,
         "source_unit_formation_status": dict(source_unit_formation or {}).get("status"),
     }
+    source_request = dict(resolved_source_context.get("source_request") or {})
+    source_sections_by_id = {
+        str(section.get("section_id") or section.get("unit_id") or "").strip(): dict(section)
+        for section in list(source_sections or [])
+        if isinstance(section, dict) and str(section.get("section_id") or section.get("unit_id") or "").strip()
+    }
+    primary_source_uri = sanitize_source_uri_for_persistence(
+        source_request.get("source_uri")
+        or next(
+            (
+                section.get("source_uri")
+                for section in source_sections_by_id.values()
+                if section.get("source_uri")
+            ),
+            None,
+        )
+    )
+    source_ref_id = (
+        str(
+            source_request.get("source_ref_id")
+            or resolved_source_context.get("source_ref_id")
+            or (f"source_ref::{source_investigation_id}" if source_investigation_id else "")
+        ).strip()
+        or None
+    )
 
     if direct_source_unit_preview:
         compiler_payload = None
@@ -5433,6 +5464,8 @@ def preview_bundle(
         provenance_mode="agvm_lab_preview_primary",
         source_label=source_label,
         source_type=source_type,
+        source_uri=primary_source_uri,
+        source_ref_id=source_ref_id,
         source_trust=source_trust,
         summary_override=str(primary_compiled.get("summary") or summarize_text(text)),
         memory_type_override=map_runtime_memory_type(primary_compiled.get("memory_type")),
@@ -5734,12 +5767,19 @@ def preview_bundle(
             if item_document_role in {"chunk", "summary", "fact"}
             else map_runtime_memory_type(item_memory_type, claim_type=claim_type, entity_type=entity_type)
         )
+        item_source_unit_id = str(item.get("source_unit_id") or "").strip()
+        item_source_section = source_sections_by_id.get(item_source_unit_id, {})
+        item_source_uri = sanitize_source_uri_for_persistence(
+            item.get("source_uri") or item_source_section.get("source_uri") or primary_source_uri
+        )
         seed = build_seed(
             raw_text=raw_text_value,
             input_mode=node_input_mode,
             provenance_mode=f"agvm_lab_preview_{role}",
             source_label=source_label,
             source_type=source_type,
+            source_uri=item_source_uri,
+            source_ref_id=source_ref_id,
             source_trust=str(primary_hygiene.get("source_trust") or source_trust or "") or None,
             claim_status="test_artifact" if str(primary_hygiene.get("claim_status") or "") == "test_artifact" else None,
             node_kind_hint=claim_type or entity_type or str(item_memory_type or role),
@@ -5751,7 +5791,7 @@ def preview_bundle(
             document_role=item_document_role,
             document_anchor_id=item_document_anchor_id,
             document_chunk_index=item_document_chunk_index,
-            source_unit_id=str(item.get("source_unit_id") or "").strip() or None,
+            source_unit_id=item_source_unit_id or None,
             source_unit_title=str(item.get("source_unit_title") or "").strip() or None,
             source_unit_kind=str(item.get("source_unit_kind") or "").strip() or None,
             source_unit_role=str(item.get("source_unit_role") or "").strip() or None,
@@ -5918,6 +5958,63 @@ def preview_bundle(
     }
 
 
+def resolve_persist_selection(
+    bundle: dict[str, Any],
+    selected_preview_ids: list[str],
+    *,
+    learning_mode: str | None = None,
+    clarification_answers: dict[str, str] | list[dict[str, Any]] | None = None,
+    approved_preview_ids: list[str] | None = None,
+    question_limit: int | None = None,
+    include_primary: bool = True,
+) -> tuple[list[str], dict[str, Any]]:
+    """Resolve the exact preview IDs a persistence call is allowed to write."""
+    normalized_bundle = _normalize_persist_selection_bundle(bundle)
+    requested_ids = {str(value) for value in selected_preview_ids if str(value)}
+    primary_preview_id = str(dict(normalized_bundle.get("primary_node_preview") or {}).get("id") or "").strip()
+    if include_primary and primary_preview_id:
+        requested_ids.add(primary_preview_id)
+    learning_policy = _build_learning_policy(
+        normalized_bundle,
+        learning_mode=learning_mode,
+        selected_preview_ids=list(requested_ids),
+        clarification_answers=clarification_answers,
+        approved_preview_ids=approved_preview_ids,
+        question_limit=question_limit,
+        phase="persist",
+    )
+    persistable_ids = {
+        str(value)
+        for value in list((learning_policy.get("selection_resolution") or {}).get("persist_preview_ids") or [])
+        if str(value)
+    }
+    preview_nodes = [dict(normalized_bundle.get("primary_node_preview") or {})]
+    preview_nodes.extend(
+        dict(node) for node in list(normalized_bundle.get("derived_nodes") or []) if isinstance(node, dict)
+    )
+    resolved_ids = [
+        str(node.get("id") or "")
+        for node in preview_nodes
+        if str(node.get("id") or "") in requested_ids and str(node.get("id") or "") in persistable_ids
+    ]
+    return resolved_ids, learning_policy
+
+
+def _normalize_persist_selection_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    def normalized_node(value: Any) -> dict[str, Any]:
+        node = dict(value) if isinstance(value, dict) else {}
+        node_id = str(node.get("id") or node.get("preview_id") or node.get("node_id") or "").strip()
+        return {**node, "id": node_id} if node_id else node
+
+    return {
+        **bundle,
+        "primary_node_preview": normalized_node(bundle.get("primary_node_preview")),
+        "derived_nodes": [
+            normalized_node(node) for node in list(bundle.get("derived_nodes") or []) if isinstance(node, dict)
+        ],
+    }
+
+
 def persist_selection(
     bundle: dict[str, Any],
     selected_preview_ids: list[str],
@@ -5929,20 +6026,22 @@ def persist_selection(
     approved_preview_ids: list[str] | None = None,
     question_limit: int | None = None,
     geometry_profile_context: dict[str, Any] | None = None,
+    include_primary: bool = True,
 ) -> tuple[dict[str, Any], list[str], int, list[str], dict[str, Any]]:
-    selected_ids = set(selected_preview_ids)
-    selected_ids.add(bundle["primary_node_preview"]["id"])
-    learning_policy = _build_learning_policy(
+    normalized_bundle = _normalize_persist_selection_bundle(bundle)
+    bundle.clear()
+    bundle.update(normalized_bundle)
+    resolved_ids, learning_policy = resolve_persist_selection(
         bundle,
+        selected_preview_ids,
         learning_mode=learning_mode,
-        selected_preview_ids=list(selected_ids),
         clarification_answers=clarification_answers,
         approved_preview_ids=approved_preview_ids,
         question_limit=question_limit,
-        phase="persist",
+        include_primary=include_primary,
     )
     bundle["learning_policy"] = learning_policy
-    selected_ids = selected_ids & set(str(item) for item in list((learning_policy.get("selection_resolution") or {}).get("persist_preview_ids") or []))
+    selected_ids = set(resolved_ids)
 
     preview_nodes = [bundle["primary_node_preview"], *list(bundle.get("derived_nodes") or [])]
     preview_map = {node["id"]: node for node in preview_nodes if node["id"] in selected_ids}
@@ -5961,6 +6060,38 @@ def persist_selection(
     preview_to_persisted: dict[str, str] = {}
     current_index = index_payload
     merged_into_existing_ids: list[str] = []
+
+    def _source_identity_key(node: dict[str, Any]) -> tuple[Any, ...] | None:
+        source_unit_id = str(node.get("source_unit_id") or "").strip()
+        provenance = dict(node.get("provenance") or {})
+        source_ref_id = str(provenance.get("source_ref_id") or "").strip()
+        if not source_unit_id or not source_ref_id:
+            return None
+        node_kind = str(node.get("node_kind") or "").strip()
+        memory_type = str(node.get("memory_type") or "").strip()
+        document_role = str(node.get("document_role") or "").strip()
+        if not document_role and (node_kind == "document_anchor" or memory_type == "document_anchor"):
+            document_role = "anchor"
+        return (
+            source_unit_id,
+            source_ref_id,
+            str(provenance.get("mode") or "").strip(),
+            node_kind,
+            memory_type,
+            document_role,
+            node.get("document_chunk_index"),
+            " ".join(str(node.get("raw_text") or "").split()),
+            " ".join(str(node.get("summary") or "").split()),
+        )
+
+    existing_by_source_identity: dict[tuple[Any, ...], str] = {}
+    for existing_node in list(working_graph.get("nodes") or []):
+        if not isinstance(existing_node, dict):
+            continue
+        identity_key = _source_identity_key(existing_node)
+        existing_id = str(existing_node.get("id") or "").strip()
+        if identity_key is not None and existing_id:
+            existing_by_source_identity.setdefault(identity_key, existing_id)
 
     def _merge_target_is_compatible(preview_node: dict[str, Any], target_node_id: str) -> bool:
         target = next(
@@ -5995,6 +6126,16 @@ def persist_selection(
         return True
 
     for preview_node in ordered_nodes:
+        source_identity_key = _source_identity_key(preview_node)
+        existing_source_node_id = (
+            existing_by_source_identity.get(source_identity_key)
+            if source_identity_key is not None
+            else None
+        )
+        if existing_source_node_id:
+            preview_to_persisted[preview_node["id"]] = existing_source_node_id
+            merged_into_existing_ids.append(existing_source_node_id)
+            continue
         persist_mode = str(preview_node.get("persist_mode") or "create")
         merge_target_node_id = preview_node.get("merge_target_node_id")
         if persist_mode in {"merge_into_existing", "attach_as_alias_or_variant"} and merge_target_node_id:
@@ -6102,6 +6243,9 @@ def persist_selection(
         preview_to_persisted[preview_node["id"]] = persisted["id"]
         working_graph["nodes"].append(persisted)
         persisted_nodes.append(persisted)
+        persisted_source_identity_key = _source_identity_key(persisted)
+        if persisted_source_identity_key is not None:
+            existing_by_source_identity[persisted_source_identity_key] = str(persisted["id"])
         current_index = {
             **current_index,
             "spatial_index": {**dict(current_index.get("spatial_index") or {}), persisted["id"]: node_for_index(persisted)},
@@ -6120,10 +6264,22 @@ def persist_selection(
             current_index["highway_index"].setdefault(target, []).append(persisted["id"])
 
     edge_count = 0
+    existing_edge_keys = {
+        (
+            str(edge.get("source_node_id") or edge.get("source") or edge.get("source_id") or ""),
+            str(edge.get("target_node_id") or edge.get("target") or edge.get("target_id") or ""),
+            str(edge.get("edge_type") or edge.get("type") or ""),
+        )
+        for edge in list(working_graph.get("edges") or [])
+        if isinstance(edge, dict)
+    }
     for edge in list(bundle.get("derived_edges") or []):
         source_id = preview_to_persisted.get(edge["source_preview_id"])
         target_id = preview_to_persisted.get(edge["target_preview_id"])
         if not source_id or not target_id:
+            continue
+        edge_key = (str(source_id), str(target_id), str(edge["edge_type"]))
+        if edge_key in existing_edge_keys:
             continue
         working_graph["edges"].append(
             {
@@ -6134,6 +6290,7 @@ def persist_selection(
                 "reason": edge["reason"],
             }
         )
+        existing_edge_keys.add(edge_key)
         edge_count += 1
 
     return working_graph, [node["id"] for node in persisted_nodes], edge_count, list(dict.fromkeys(merged_into_existing_ids)), current_index

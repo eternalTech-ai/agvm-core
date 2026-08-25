@@ -8,6 +8,14 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
+from retrieval_limits import (
+    DEFAULT_RETRIEVAL_CANDIDATES_PER_STEP,
+    DEFAULT_RETRIEVAL_MAX_MATCHES,
+    MAX_RETRIEVAL_CANDIDATES_PER_STEP,
+    MAX_RETRIEVAL_MATCHES,
+    scaled_retrieval_candidate_limit,
+)
+
 DocumentLookupKind = Literal[
     "none",
     "exact_document_lookup",
@@ -90,6 +98,8 @@ class Provenance(BaseModel):
     mode: str
     source_label: str | None = None
     source_type: str | None = None
+    source_uri: str | None = None
+    source_ref_id: str | None = None
     guide_conceptual_area: str | None = None
 
 
@@ -131,7 +141,7 @@ class DebugPayload(BaseModel):
 class GraphEdge(BaseModel):
     source_node_id: str
     target_node_id: str
-    edge_type: Literal["derives_from", "mentions_entity"]
+    edge_type: Literal["derives_from", "mentions_entity", "semantic_link"]
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
 
@@ -259,7 +269,7 @@ class PreviewNode(VectorNode):
 class PreviewEdge(BaseModel):
     source_preview_id: str
     target_preview_id: str
-    edge_type: Literal["derives_from", "mentions_entity"]
+    edge_type: Literal["derives_from", "mentions_entity", "semantic_link"]
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
 
@@ -546,7 +556,7 @@ class McpRetrievalToolRequest(BaseModel):
     context_package_mode: Literal["answer_minimal", "mcp_operational", "broad_dossier", "document_full", "forensic_trace"] | None = None
     document_text_policy: Literal["refs_only", "top_raw", "all_raw"] = "refs_only"
     thread_id: str | None = None
-    max_matches: int = Field(default=12, ge=1, le=24)
+    max_matches: int = Field(default=DEFAULT_RETRIEVAL_MAX_MATCHES, ge=1, le=MAX_RETRIEVAL_MATCHES)
     include_raw_text: bool = False
     include_answer_demo: bool = False
     complete_paths: bool = False
@@ -830,7 +840,16 @@ class McpMaintenanceRequest(BaseModel):
 
 class McpMaintenanceApplyRequest(McpMaintenanceRequest):
     proposal_ids: list[str] = Field(default_factory=list)
+    preview_signature: str | None = Field(default=None, min_length=1)
     confirm_apply: bool = False
+
+    @field_validator("preview_signature")
+    @classmethod
+    def trim_optional_maintenance_preview_signature(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
 
 class McpMemoryOSListRequest(BaseModel):
@@ -944,6 +963,7 @@ class McpMatrixCalibrationToolExecutionResponse(BaseModel):
     matrix_delta: dict[str, Any] = Field(default_factory=dict)
     position_update_plan: dict[str, Any] = Field(default_factory=dict)
     projected_after: dict[str, Any] = Field(default_factory=dict)
+    quality_gate: dict[str, Any] = Field(default_factory=dict)
     apply_policy_guard: dict[str, Any] = Field(default_factory=dict)
     rollback_snapshot: dict[str, Any] = Field(default_factory=dict)
     before_after_audit: dict[str, Any] = Field(default_factory=dict)
@@ -1309,7 +1329,7 @@ class RetrieveContext(BaseModel):
 
 class BranchBudget(BaseModel):
     max_steps: int = Field(default=2, ge=1, le=8)
-    max_candidate_reads: int = Field(default=10, ge=1, le=64)
+    max_candidate_reads: int = Field(default=10, ge=1, le=MAX_RETRIEVAL_CANDIDATES_PER_STEP)
     max_nearby_bundles: int = Field(default=2, ge=1, le=8)
     max_fulltexts: int = Field(default=3, ge=0, le=24)
     max_text_chars: int = Field(default=3200, ge=200, le=32000)
@@ -1587,8 +1607,12 @@ class RetrieveRequest(BaseModel):
     complete_paths: bool = False
     max_probe_count: int = Field(default=6, ge=1, le=6)
     max_steps: int = Field(default=4, ge=1, le=8)
-    max_candidates_per_step: int = Field(default=24, ge=4, le=64)
-    max_matches: int = Field(default=12, ge=1, le=24)
+    max_candidates_per_step: int = Field(
+        default=DEFAULT_RETRIEVAL_CANDIDATES_PER_STEP,
+        ge=4,
+        le=MAX_RETRIEVAL_CANDIDATES_PER_STEP,
+    )
+    max_matches: int = Field(default=DEFAULT_RETRIEVAL_MAX_MATCHES, ge=1, le=MAX_RETRIEVAL_MATCHES)
     max_total_branches: int = Field(default=6, ge=1, le=6)
     max_total_steps: int = Field(default=4, ge=1, le=12)
     max_total_text_chars: int = Field(default=6400, ge=500, le=64000)
@@ -1613,6 +1637,12 @@ class RetrieveRequest(BaseModel):
             return None
         value = value.strip()
         return value or None
+
+    @model_validator(mode="after")
+    def scale_default_candidate_budget(self) -> "RetrieveRequest":
+        if "max_candidates_per_step" not in self.model_fields_set:
+            self.max_candidates_per_step = scaled_retrieval_candidate_limit(self.max_matches)
+        return self
 
 
 class RetrieveResponse(BaseModel):

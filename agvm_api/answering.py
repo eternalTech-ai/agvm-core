@@ -725,6 +725,23 @@ def _text_mentions_requested_relation(folded_text: str, relation: str) -> bool:
         return _text_mentions_partner_relationship(folded)
     if relation_key == "family":
         return _text_mentions_family_relationship(folded)
+    if relation_key == "generic":
+        return _text_mentions_personal_relationship(folded) or any(
+            marker in folded
+            for marker in (
+                "rapporto",
+                "relazione",
+                "legame",
+                "collabora",
+                "collega",
+                "specchio critico",
+                "relationship",
+                "relation",
+                "connection",
+                "collaborat",
+                "critical mirror",
+            )
+        )
     aliases = _RELATION_ALIAS_MAP.get(relation_key, ())
     return bool(aliases and any(alias in folded for alias in aliases))
 
@@ -1084,7 +1101,7 @@ def _temporal_source_rows(
         seen_sources.add(key)
         rows.append(row)
 
-    for match in _eligible_answer_matches(matches)[:32]:
+    for retrieval_rank, match in enumerate(_eligible_answer_matches(matches)[:32], start=1):
         node = dict(match.get("node") or {})
         provenance = dict(node.get("provenance") or {})
         add_row(
@@ -1098,6 +1115,7 @@ def _temporal_source_rows(
                 "guide_area": str(provenance.get("guide_conceptual_area") or node.get("guide_area") or ""),
                 "source_label": str(provenance.get("source_label") or ""),
                 "source_kind": "match",
+                "retrieval_rank": retrieval_rank,
                 "support_slots": list(match.get("support_slots") or []),
                 "planner_families": list(match.get("planner_families") or match.get("origin_families") or []),
             }
@@ -1219,6 +1237,7 @@ def build_temporal_inventory(
                     "guide_area": guide_area,
                     "source_label": str(row.get("source_label") or ""),
                     "source_kind": source_kind,
+                    "retrieval_rank": int(row.get("retrieval_rank") or 1_000_000),
                     "support_slots": list(row.get("support_slots") or []),
                     "planner_families": list(row.get("planner_families") or []),
                 }
@@ -1471,6 +1490,7 @@ def _rank_temporal_entries_for_query(
             1 if _temporal_text_is_source_metadata(str(entry.get("text") or "")) else 0,
             -_temporal_query_overlap(query_text, str(entry.get("text") or "")),
             -_temporal_event_score(str(entry.get("text") or "")),
+            int(entry.get("retrieval_rank") or 1_000_000),
             -float(entry.get("confidence") or 0.0),
             -float(entry.get("score") or 0.0),
             len(str(entry.get("text") or "")),
@@ -1661,7 +1681,7 @@ def detect_query_aspects(query_text: str) -> list[str]:
             "relationships",
         )
     ) or _text_mentions_child_relation(lowered)
-    role_query = any(token in lowered for token in ("che lavoro", "what does", "lavora come", "works as", "ruolo", "job"))
+    role_query = any(token in lowered for token in ("che lavoro", "what does he do", "what does she do", "what do you do", "lavora come", "works as", "ruolo", "job"))
     project_query = any(token in lowered for token in ("su cosa lavora", "su cosa lavori", "a cosa lavori", "what is she working on", "what is he working on", "what are you working on", "cosa sta costruendo", "cosa stai costruendo", "come si collega", "si collega a", "collega a", "project", "progetto", "progetti", "lavora su", "lavori su", "works on", "building"))
     company_query = any(token in lowered for token in ("azienda", "aziende", "societa", "company", "companies", "startup", "impresa", "imprese", "business"))
     company_founding_query = company_query and any(
@@ -1859,11 +1879,15 @@ def detect_query_aspects(query_text: str) -> list[str]:
     if any(token in lowered for token in ("identita", "profilo")) and "name" not in aspects:
         aspects.append("name")
     if any(token in lowered for token in ("lavoro", "attivita", "work")):
-        for aspect in ("role", "projects"):
-            if aspect not in aspects:
-                aspects.append(aspect)
+        if "role" not in aspects:
+            aspects.append("role")
+        # A profession question (for example "che lavoro fa?") asks for the
+        # role, not every project associated with the person. Project evidence
+        # is added only when the wording requests an active project/workstream.
+        if (project_query or not role_query) and "projects" not in aspects:
+            aspects.append("projects")
     if role_query:
-        want("role", ("che lavoro", "what does", "lavora come", "works as", "ruolo", "job"))
+        want("role", ("che lavoro", "what does he do", "what does she do", "what do you do", "lavora come", "works as", "ruolo", "job"))
     if project_query:
         want("projects", ("su cosa lavora", "su cosa lavori", "a cosa lavori", "what is she working on", "what is he working on", "what are you working on", "cosa sta costruendo", "cosa stai costruendo", "come si collega", "si collega a", "collega a", "project", "progetto", "progetti", "lavora su", "lavori su", "works on", "building"))
     if company_founding_query or company_affiliation_query:
@@ -1880,19 +1904,16 @@ def detect_query_aspects(query_text: str) -> list[str]:
     person_like_targets = [
         target for target in query_target_values if target not in org_or_project_targets
     ]
-    work_scoped_role_query = role_query and any(
-        marker in lowered
-        for marker in (
-            "nel tuo lavoro",
-            "nel mio lavoro",
-            "in your work",
-            "in my work",
-            "nel lavoro",
-        )
-    )
+    work_scoped_role_query = role_query and _query_is_work_scoped_person_role_request(query_text)
     if person_like_targets and work_scoped_role_query and "partner" not in aspects:
         aspects.append("partner")
-    if org_or_project_targets:
+    explicit_org_or_project_scope = bool(
+        named_target_info_query
+        or project_query
+        or company_query
+        or any(marker in lowered for marker in ("che ruolo", "ruolo ha", "role", "works on", "lavora su"))
+    )
+    if org_or_project_targets and explicit_org_or_project_scope:
         if "projects" not in aspects:
             aspects.append("projects")
         if ("che ruolo" in lowered or "ruolo ha" in lowered or "role" in lowered) and "role" not in aspects:
@@ -1923,6 +1944,51 @@ _RELATION_ALIAS_MAP: dict[str, tuple[str, ...]] = {
 }
 
 
+def _query_is_implicit_person_relationship_request(query_text: str) -> bool:
+    """Recognize 'who is X to Y' without guessing a relationship subtype."""
+    folded = _fold_text(_positive_query_scope(query_text))
+    if not (
+        re.search(r"\bchi\s+e\b.+\bper\b.+", folded)
+        or re.search(r"\bwho\s+is\b.+\bto\b.+", folded)
+    ):
+        return False
+    try:
+        targets = _query_named_targets(query_text)
+    except Exception:
+        return False
+    return len([target for target in targets if str(target or "").strip()]) >= 2
+
+
+def _query_is_work_scoped_person_role_request(query_text: str) -> bool:
+    """Recognize a named person's relation to the remembered person's work."""
+    folded = _fold_text(_positive_query_scope(query_text))
+    role_requested = any(
+        marker in folded
+        for marker in ("che ruolo", "ruolo ha", "what role", "role does")
+    )
+    work_scoped = any(
+        marker in folded
+        for marker in (
+            "nel tuo lavoro",
+            "nel mio lavoro",
+            "in your work",
+            "in my work",
+            "nel lavoro",
+        )
+    )
+    if not role_requested or not work_scoped:
+        return False
+    try:
+        targets = _query_named_targets(query_text)
+    except Exception:
+        return False
+    return any(
+        str(target or "").strip()
+        and not _target_looks_like_org_or_project(str(target))
+        for target in targets
+    )
+
+
 def _requested_relations_from_query(query_text: str) -> list[str]:
     lowered = _fold_text(_positive_query_scope(query_text))
     relations: list[str] = []
@@ -1933,6 +1999,8 @@ def _requested_relations_from_query(query_text: str) -> list[str]:
             continue
         if any(alias in lowered for alias in aliases):
             relations.append(relation)
+    if not relations and _query_is_implicit_person_relationship_request(query_text):
+        relations.append("generic")
     return relations
 
 
@@ -2530,6 +2598,7 @@ def _broad_profile_required_slots(query_text: str, aspects: list[str] | None = N
 
 
 _SEMANTIC_SLOT_SECTIONS = {
+    "knowledge": "knowledge",
     "identity": "identity",
     "work_company": "work",
     "project": "work",
@@ -2859,6 +2928,8 @@ def _semantic_slot_from_legacy_slot(
     folded_query = _fold_text(query_text)
     if slot in EXACT_FIELD_SLOT_IDS:
         return slot, ""
+    if slot == "knowledge":
+        return "knowledge", ""
     if slot == "identity":
         return "identity", ""
     if slot == "company_founding":
@@ -2938,6 +3009,7 @@ def _semantic_slot_from_legacy_slot(
 
 def _semantic_required_fields(slot_id: str, subtype: str = "") -> list[str]:
     mapping = {
+        "knowledge": ["subject", "answering_claim"],
         "identity": ["person", "identity_claim"],
         "work_company": ["person", "company_or_organization", "role_or_relation", "timeframe_if_available"],
         "project": ["person", "project_or_workstream", "detail"],
@@ -3055,6 +3127,40 @@ def _build_semantic_slot_contracts_for_query(
     return contracts
 
 
+def _query_requests_document_lookup(query_text: str) -> bool:
+    lowered = _fold_text(query_text)
+    padded = f" {lowered} "
+    explicit_document = any(
+        marker in lowered
+        for marker in (
+            "documento",
+            "documenti",
+            "document",
+            "pdf",
+            "file",
+            "spec",
+            "report",
+            "note",
+            "appunto",
+            "doc ",
+        )
+    ) or " memo " in padded
+    explicit_source_trace = any(
+        marker in lowered
+        for marker in (
+            "quali fonti",
+            "fonti supportano",
+            "fonti dimostrano",
+            "fonti provano",
+            "source trace",
+            "sources support",
+            "sources prove",
+            "sources confirm",
+        )
+    )
+    return bool(explicit_document or explicit_source_trace)
+
+
 def build_query_contract(query_text: str, *, retrieval_mode: str = "balanced") -> dict[str, Any]:
     """Semantic answer contract shared by retrieval, stop policy, and answering."""
     positive_query_text = _positive_query_scope(query_text)
@@ -3062,8 +3168,10 @@ def build_query_contract(query_text: str, *, retrieval_mode: str = "balanced") -
     exact_field_request = extract_exact_user_field_request(positive_query_text)
     aspects = detect_query_aspects(positive_query_text)
     relations = _requested_relations_from_query(positive_query_text)
+    implicit_person_relation_query = _query_is_implicit_person_relationship_request(positive_query_text)
+    work_scoped_person_role_query = _query_is_work_scoped_person_role_request(positive_query_text)
     broad_query = _query_requests_broad_profile_context(positive_query_text)
-    document_query = any(marker in lowered for marker in ("documento", "documenti", "source", "fonte", "fonti", "file"))
+    document_query = _query_requests_document_lookup(positive_query_text)
     public_event_query = any(
         marker in lowered
         for marker in ("evento pubblico", "eventi pubblici", "public event", "public events", "fatti pubblici", "public facts")
@@ -3095,7 +3203,10 @@ def build_query_contract(query_text: str, *, retrieval_mode: str = "balanced") -
     elif temporal_query and not relations:
         query_kind = "temporal"
         answer_style = "timeline" if _is_temporal_inventory_query(positive_query_text) else "exact" if _explicit_temporal_terms(positive_query_text) else "narrative"
-    elif relations and exact_pressure and not narrative_pressure and not detail_pressure:
+    elif work_scoped_person_role_query:
+        query_kind = "exact_relation_fact"
+        answer_style = "exact"
+    elif relations and (exact_pressure or implicit_person_relation_query) and not narrative_pressure and not detail_pressure:
         query_kind = "exact_relation_fact"
         answer_style = "exact"
     elif relations:
@@ -3157,6 +3268,8 @@ def build_query_contract(query_text: str, *, retrieval_mode: str = "balanced") -
         add_required("work_detail")
         add_optional("documents")
         add_optional("history")
+    elif work_scoped_person_role_query:
+        add_required("relationships")
     elif relations:
         add_required("relationships")
         if answer_style == "narrative":
@@ -3171,7 +3284,7 @@ def build_query_contract(query_text: str, *, retrieval_mode: str = "balanced") -
         if temporal_query:
             add_required("history")
     if not required_slots:
-        add_required("identity")
+        add_required("knowledge")
 
     if answer_style == "exact":
         min_landing_count = 1
@@ -3308,6 +3421,22 @@ def _source_surface_noise_only(folded_text: str) -> bool:
     return not any(marker in f" {folded} " for marker in personal_fact_markers)
 
 
+def _knowledge_query_overlap(query_text: str, evidence_text: str) -> tuple[int, int]:
+    stopwords = {
+        "about", "alla", "alle", "also", "anche", "before", "come", "cosa", "does", "dopo",
+        "every", "from", "have", "identify", "into", "must", "nella", "nelle", "prima", "quale",
+        "quali", "should", "that", "the", "this", "what", "when", "where", "which", "with",
+    }
+    query_terms = {
+        term
+        for term in re.findall(r"[a-z0-9]+", _fold_text(query_text))
+        if len(term) >= 3 and term not in stopwords
+    }
+    evidence = _fold_text(evidence_text)
+    hits = sum(1 for term in query_terms if term in evidence)
+    return hits, len(query_terms)
+
+
 def _family_relation_present(folded_text: str, subtype: str = "") -> bool:
     folded = _fold_text(folded_text)
     if subtype == "father":
@@ -3324,6 +3453,7 @@ def _family_relation_present(folded_text: str, subtype: str = "") -> bool:
 def _semantic_slot_evidence_row(
     slot_contract: dict[str, Any],
     *,
+    query_text: str,
     evidence_text: str,
     folded: str,
     coverage_by_slot: dict[str, float],
@@ -3338,7 +3468,13 @@ def _semantic_slot_evidence_row(
     source_noise_only = _source_surface_noise_only(folded)
     exact_field_request = exact_field_request_from_slot_contract(slot_contract)
 
-    if exact_field_request:
+    if slot_id == "knowledge":
+        overlap, term_count = _knowledge_query_overlap(query_text, evidence_text)
+        required_overlap = 1 if term_count <= 2 else 2
+        evidence_found = bool(term_count and overlap >= required_overlap)
+        confidence = min(0.95, overlap / max(1, required_overlap)) if evidence_found else 0.0
+        reason = "query_evidence_overlap" if evidence_found else reason
+    elif exact_field_request:
         exact_hit = text_satisfies_exact_field_request(evidence_text, exact_field_request)
         confidence = 0.9 if exact_hit else 0.0
         evidence_found = bool(exact_hit)
@@ -3529,7 +3665,13 @@ def build_evidence_satisfaction_matrix(
         evidence_found = False
         confidence = float(coverage_by_slot.get(slot_name) or 0.0)
         reason = "coverage_by_slot"
-        if slot_name == "relationships":
+        if slot_name == "knowledge":
+            overlap, term_count = _knowledge_query_overlap(query_text, evidence_text)
+            required_overlap = 1 if term_count <= 2 else 2
+            evidence_found = bool(term_count and overlap >= required_overlap)
+            confidence = min(0.95, overlap / max(1, required_overlap)) if evidence_found else 0.0
+            reason = "query_evidence_overlap"
+        elif slot_name == "relationships":
             evidence_found = bool(relation_evidence_present) if requested_relations else bool(relation_evidence_present or _text_mentions_personal_relationship(folded))
             confidence = max(confidence, 0.72 if evidence_found else 0.0)
             reason = "relation_alias_or_slot_coverage"
@@ -3621,6 +3763,7 @@ def build_evidence_satisfaction_matrix(
     semantic_rows = [
         _semantic_slot_evidence_row(
             dict(slot_contract),
+            query_text=query_text,
             evidence_text=evidence_text,
             folded=folded,
             coverage_by_slot=coverage_by_slot,
@@ -3708,8 +3851,29 @@ def clean_answer_surface_text(value: str | None) -> str:
 def _clean_role_value(value: str) -> str:
     cleaned = _clean_fact_value(value)
     cleaned = re.sub(r"\s+associated with\b.*$", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.split(
+        r"\s+(?:e|and)\s+(?:guido|guida|guides?|leads?|sta costruendo|sta sviluppando|is building|is developing)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
     cleaned = re.split(r",\s+(?:a|an|the)\s+", cleaned, maxsplit=1, flags=re.IGNORECASE)[0].strip()
     cleaned = re.sub(r"^(?:a|an|the|un|una|uno)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+    if any(
+        _fold_text(cleaned).startswith(marker)
+        for marker in (
+            "guido ",
+            "guida ",
+            "sto costruendo ",
+            "sta costruendo ",
+            "sta sviluppando ",
+            "sta lavorando ",
+            "building ",
+            "developing ",
+            "working on ",
+        )
+    ):
+        return ""
     role_translations = {
         "founder and ceo": "fondatore e CEO",
         "founder-operator": "fondatore-operatore",
@@ -3984,9 +4148,23 @@ def extract_grounded_fact_inventory(matches: list[dict[str, Any]]) -> dict[str, 
             role_match = re.search(
                 r"(?:lavora come|lavoro come|works as|i work as)\s+([A-Za-zÀ-ÿ0-9'’ -]+?)(?:[.,;]|$)",
                 sentence,
+                flags=re.IGNORECASE,
             )
             role_priority = 0.86
-            if not role_match:
+            folded_sentence = _fold_text(sentence)
+            describes_communication_style = any(
+                marker in folded_sentence
+                for marker in (
+                    "stile di comunicazione",
+                    "communication style",
+                    "parla in modo",
+                    "scrive in modo",
+                    "si esprime in modo",
+                    "speaks in a",
+                    "writes in a",
+                )
+            )
+            if not role_match and not describes_communication_style:
                 for role_pattern in (
                     r"^(?:Dr\.\s+)?[A-ZÀ-Þ][A-Za-zÀ-ÿ'’.-]+(?:\s+[A-ZÀ-Þ][A-Za-zÀ-ÿ'’.-]+){0,4}\s+is presented as\s+(?:a|an)?\s*([A-Za-zÀ-ÿ0-9'’ ,/-]+?)(?:[.;]|$)",
                     r"^(?:Dr\.\s+)?[A-ZÀ-Þ][A-Za-zÀ-ÿ'’.-]+(?:\s+[A-ZÀ-Þ][A-Za-zÀ-ÿ'’.-]+){0,4}\s+(?:is|è|e)\s+(?:a|an|un|una|uno)?\s*([A-Za-zÀ-ÿ0-9'’ ,/-]+?)(?:\s+(?:who|che)\s+|[.;]|$)",
@@ -3997,18 +4175,19 @@ def extract_grounded_fact_inventory(matches: list[dict[str, Any]]) -> dict[str, 
                         break
             if role_match:
                 role_value = _clean_role_value(role_match.group(1))
-                inventory["role"].append(
-                    _make_fact(
-                        kind="role",
-                        text=f"Lavora come {role_value}.",
-                        node_id=node_id,
-                        raw_score=raw_score,
-                        summary=summary,
-                        priority=role_priority,
-                        value=role_value,
-                        evidence_snippet=sentence,
+                if role_value:
+                    inventory["role"].append(
+                        _make_fact(
+                            kind="role",
+                            text=f"Lavora come {role_value}.",
+                            node_id=node_id,
+                            raw_score=raw_score,
+                            summary=summary,
+                            priority=role_priority,
+                            value=role_value,
+                            evidence_snippet=sentence,
+                        )
                     )
-                )
 
             style_match = re.search(
                 r"(?:stile di comunicazione è|parla in modo|scrive in modo|si esprime in modo)\s+(.+?)(?:[.;]|$)",
@@ -4110,6 +4289,8 @@ def extract_grounded_fact_inventory(matches: list[dict[str, Any]]) -> dict[str, 
                 (r"(?:il\s+)?mio progetto principale\s+(?:e|is)\s+([A-Z][A-Za-z0-9' -]+?)(?:[.;]|$)", 1.0, "primary_project"),
                 (r"(?:guida|is building|is constructing|sta costruendo|sto costruendo|sta buildando|building)\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ0-9'’ -]+?)(?:\s+(?:dentro|inside|within)\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ0-9'’ .-]+?))?(?:[.;]|$)", 1.0, "primary_project"),
                 (r"(?:sta sviluppando|is developing)\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ0-9'’ -]+?)(?:[.;]|$)", 0.74, "secondary_project"),
+                (r"(?:sta lavorando (?:a|su)|is working on)\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ0-9'’ -]+?)(?:[,.;]|$)", 0.86, "secondary_project"),
+                (r"(?:descrive|describes)\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ0-9'’ -]+?)\s+(?:come|as)\s+", 0.82, "secondary_project"),
             ):
                 project_match = re.search(pattern, sentence, flags=re.IGNORECASE)
                 if not project_match:
@@ -4157,6 +4338,23 @@ def _pick_best_fact(facts: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not facts:
         return None
     return max(facts, key=lambda item: (float(item.get("priority") or 0.0), float(item.get("raw_score") or 0.0)))
+
+
+def _is_active_project_query(query_text: str) -> bool:
+    folded = _fold_text(query_text)
+    return any(
+        marker in folded
+        for marker in (
+            "sta lavorando",
+            "stai lavorando",
+            "lavorando a",
+            "lavorando su",
+            "sta sviluppando",
+            "stai sviluppando",
+            "working on",
+            "developing",
+        )
+    )
 
 
 def _descriptor_tokens(facts: list[dict[str, Any]], *, allow: tuple[str, ...]) -> list[str]:
@@ -5291,7 +5489,7 @@ def _is_multi_target_human_query(query_text: str, targets: list[str]) -> bool:
     folded = _fold_text(query_text)
     if len(targets) < 2:
         return False
-    return any(
+    return _query_is_implicit_person_relationship_request(query_text) or any(
         token in folded
         for token in (
             "cosa sai",
@@ -5325,7 +5523,7 @@ def _query_asks_relationship_between_targets(query_text: str, targets: list[str]
     if len([target for target in targets if str(target or "").strip()]) < 2:
         return False
     folded = _fold_text(query_text)
-    return any(
+    return _query_is_implicit_person_relationship_request(query_text) or any(
         marker in folded
         for marker in (
             "rapporto",
@@ -5665,7 +5863,27 @@ def _build_contractual_human_answer(
                 for entry in temporal_entries
                 if requested_terms & set(str(token) for token in list(entry.get("tokens") or []))
             ]
-        for entry in temporal_entries[:3]:
+        temporal_entries = _rank_temporal_entries_for_query(
+            query_text,
+            temporal_entries,
+            requested_terms=requested_terms,
+        )
+        single_event_query = bool(
+            _is_temporal_reference_query(query_text)
+            and not _is_temporal_inventory_query(query_text)
+            and any(
+                token in _fold_text(query_text)
+                for token in (
+                    "quando",
+                    "when",
+                    "iniziato",
+                    "cominciato",
+                    "avviato",
+                    "started",
+                )
+            )
+        )
+        for entry in temporal_entries[: 1 if single_event_query else 3]:
             add_fact(_temporal_entry_to_fact(entry, requested_terms=requested_terms or None, first_person=_prefers_first_person_answer(query_text)))
         if not temporal_entries:
             for fact in sorted(list(inventory.get("history") or []), key=lambda item: (float(item.get("priority") or 0.0), float(item.get("raw_score") or 0.0)), reverse=True)[:2]:
@@ -5755,6 +5973,13 @@ def _query_named_targets(query_text: str) -> list[str]:
         "quali valori",
         "cosa",
         "chi",
+        "dove",
+        "quando",
+        "perche",
+        "quanto",
+        "quanta",
+        "quanti",
+        "quante",
         "quale",
         "quali",
         "mappa",
@@ -5778,6 +6003,10 @@ def _query_named_targets(query_text: str) -> list[str]:
         "what",
         "who",
         "which",
+        "where",
+        "when",
+        "why",
+        "how",
         "map",
         "connect",
         "find",
@@ -5823,6 +6052,10 @@ def _query_named_targets(query_text: str) -> list[str]:
         for match in entity_pattern.finditer(segment):
             candidate = match.group(0).strip(" .,:;?!")
             candidate = re.sub(r"^(?:E|Ed|And|With|Con)\s+", "", candidate, flags=re.IGNORECASE).strip(" .,:;?!")
+            candidate_parts = candidate.split()
+            while len(candidate_parts) > 1 and _fold_text(candidate_parts[0]) in stop_targets:
+                candidate_parts.pop(0)
+            candidate = " ".join(candidate_parts)
             folded = _fold_text(candidate)
             if not candidate or folded in stop_targets:
                 continue
@@ -5896,6 +6129,13 @@ def _mcp_explicit_query_entities(query_text: str) -> list[str]:
         "come",
         "chi",
         "cosa",
+        "dove",
+        "quando",
+        "perche",
+        "quanto",
+        "quanta",
+        "quanti",
+        "quante",
         "dimmi",
         "prepara",
         "spiega",
@@ -5937,6 +6177,10 @@ def _mcp_explicit_query_entities(query_text: str) -> list[str]:
         "what",
         "which",
         "who",
+        "where",
+        "when",
+        "why",
+        "how",
         "tell",
         "prepare",
         "explain",
@@ -5969,6 +6213,10 @@ def _mcp_explicit_query_entities(query_text: str) -> list[str]:
     for fragment in re.split(r"(?<=[.!?;:])\s+|[,/()]+", text):
         for match in entity_pattern.finditer(fragment):
             entity = " ".join(match.group(0).split()).strip(" .,:;?!")
+            entity_parts = entity.split()
+            while len(entity_parts) > 1 and _fold_text(entity_parts[0]) in stop_entities:
+                entity_parts.pop(0)
+            entity = " ".join(entity_parts)
             folded = _fold_text(entity)
             if not folded or folded in stop_entities or folded in seen:
                 continue
@@ -6636,6 +6884,33 @@ def _apply_answer_contract(
 ) -> dict[str, Any]:
     decorated = dict(answer or {})
     answer_text = clean_answer_surface_text(decorated.get("answer_text"))
+    contract_matches = list(matches or [])
+    if str(decorated.get("mode") or "") == "document_packet":
+        snippet_matches: list[dict[str, Any]] = []
+        for index, snippet in enumerate(list(decorated.get("evidence_snippets") or [])):
+            if not isinstance(snippet, dict):
+                continue
+            snippet_text = str(snippet.get("text") or "").strip()
+            if not snippet_text:
+                continue
+            evidence_ids = list(decorated.get("evidence_node_ids") or [])
+            fallback_node_id = str(evidence_ids[0] if evidence_ids else "").strip()
+            node_id = str(snippet.get("node_id") or fallback_node_id).strip()
+            snippet_matches.append(
+                {
+                    "node_id": node_id or f"document_packet_{index}",
+                    "evidence_snippet": snippet_text,
+                    "summary": snippet_text,
+                    "source_type": str(snippet.get("kind") or "document"),
+                    "node": {
+                        "raw_text": snippet_text,
+                        "summary": snippet_text,
+                        "memory_type": "document",
+                    },
+                }
+            )
+        if snippet_matches:
+            contract_matches = [*contract_matches, *snippet_matches]
     if answer_text and _prefers_first_person_answer(query_text):
         answer_text = " ".join(_self_voice_fragment(sentence) for sentence in _sentence_candidates(answer_text)).strip()
     polisher = globals().get("polish_final_answer_surface")
@@ -6643,7 +6918,7 @@ def _apply_answer_contract(
         answer_text = polisher(query_text, answer_text) or answer_text
     if answer_text:
         decorated["answer_text"] = clean_answer_surface_text(answer_text)
-    contract = _answer_adequacy_contract(query_text=query_text, answer_text=answer_text, matches=matches)
+    contract = _answer_adequacy_contract(query_text=query_text, answer_text=answer_text, matches=contract_matches)
     if contract["context_ledger_leak"]:
         requested = contract["requested_objects"] or contract["requested_times"]
         target_text = ", ".join(requested) if requested else "la richiesta"
@@ -6656,7 +6931,7 @@ def _apply_answer_contract(
                 "reasoning_summary": "Answer adequacy blocked a raw context ledger from reaching the human answer surface.",
             }
         )
-        contract = _answer_adequacy_contract(query_text=query_text, answer_text=str(decorated.get("answer_text") or ""), matches=matches)
+        contract = _answer_adequacy_contract(query_text=query_text, answer_text=str(decorated.get("answer_text") or ""), matches=contract_matches)
     if str(decorated.get("document_lookup_state") or "") in {"no_matching_document_packet", "no_matching_document_packet_yet"}:
         decorated["answer_adequacy"] = contract
         if decorated.get("answer_text"):
@@ -6675,7 +6950,7 @@ def _apply_answer_contract(
                 "reasoning_summary": "The query requested a concrete object, but the retrieved evidence did not contain that object.",
             }
         )
-        contract = _answer_adequacy_contract(query_text=query_text, answer_text=str(decorated.get("answer_text") or ""), matches=matches)
+        contract = _answer_adequacy_contract(query_text=query_text, answer_text=str(decorated.get("answer_text") or ""), matches=contract_matches)
     elif not contract["passed"]:
         decorated["answerability_state"] = "partial"
         decorated["insufficient"] = True
@@ -6850,6 +7125,46 @@ def build_direct_fact_answer(
     except Exception:
         identity_nucleus = {}
         fetch_nodes_by_ids = None  # type: ignore[assignment]
+
+    if "projects" in aspects and _is_active_project_query(query_text) and fetch_nodes_by_ids is not None:
+        core_node_ids = [
+            str(item.get("node_id") or "").strip()
+            for item in list(identity_nucleus.get("core_nodes") or [])
+            if isinstance(item, dict) and str(item.get("node_id") or "").strip()
+        ][:24]
+        try:
+            core_nodes = fetch_nodes_by_ids(core_node_ids, include_raw_text=True) if core_node_ids else []
+        except Exception:
+            core_nodes = []
+        project_activity_markers = (
+            "sta sviluppando",
+            "sta lavorando",
+            "is developing",
+            "is working on",
+            " descrive ",
+            " describes ",
+        )
+        project_support_matches: list[dict[str, Any]] = []
+        for node in core_nodes:
+            text = " ".join(
+                str(node.get(key) or "").strip()
+                for key in ("raw_text", "summary")
+                if str(node.get(key) or "").strip()
+            )
+            if not any(marker in f" {_fold_text(text)} " for marker in project_activity_markers):
+                continue
+            node_id = str(node.get("id") or "").strip()
+            project_support_matches.append(
+                {
+                    "node_id": node_id,
+                    "summary": str(node.get("summary") or ""),
+                    "raw_score": float(node.get("memory_confidence") or node.get("derivation_confidence") or 0.0),
+                    "evidence_snippet": str(node.get("raw_text") or node.get("summary") or ""),
+                    "node": dict(node),
+                }
+            )
+        support_inventory = extract_grounded_fact_inventory(project_support_matches)
+        inventory["secondary_project"].extend(list(support_inventory.get("secondary_project") or []))
 
     fallback_fact_specs = {
         "name": (
@@ -7285,7 +7600,7 @@ def build_direct_fact_answer(
             secondary_project = _pick_best_fact(
                 [fact for fact in inventory["secondary_project"] if fact.get("value") != (primary_project or {}).get("value")]
             )
-            add_fact(primary_project or secondary_project)
+            add_fact(secondary_project if _is_active_project_query(query_text) and secondary_project else primary_project or secondary_project)
     if "style" in aspects:
         add_fact(_compound_style_fact(inventory["style"]))
     if "values" in aspects:
@@ -7293,7 +7608,27 @@ def build_direct_fact_answer(
     if "history" in aspects:
         if _is_temporal_reference_query(query_text):
             requested_terms = set(_explicit_temporal_terms(query_text))
-            action_query = False
+            folded_temporal_query = _fold_text(query_text)
+            action_query = any(
+                token in folded_temporal_query
+                for token in (
+                    "quando",
+                    "when",
+                    "iniziato",
+                    "cominciato",
+                    "avviato",
+                    "started",
+                    "cosa hai fatto",
+                    "cosa e successo",
+                    "successo",
+                    "accaduto",
+                    "lavorato",
+                    "lavoravi",
+                    "worked",
+                    "working",
+                    "happened",
+                )
+            )
             temporal_entries = [dict(entry) for entry in list(temporal_inventory.get("entries") or []) if isinstance(entry, dict)]
             if requested_terms:
                 temporal_entries = [
@@ -7301,25 +7636,6 @@ def build_direct_fact_answer(
                     for entry in temporal_entries
                     if requested_terms & set(str(token) for token in list(entry.get("tokens") or []))
                 ]
-                action_query = any(
-                    token in _fold_text(query_text)
-                    for token in (
-                        "cosa hai fatto",
-                        "cosa e successo",
-                        "cosa è successo",
-                        "successo",
-                        "accaduto",
-                        "fatto",
-                        "lavorato",
-                        "lavoravi",
-                        "rilevante",
-                        "work",
-                        "worked",
-                        "working",
-                        "happened",
-                        "relevant",
-                    )
-                )
                 action_tokens = (
                     "lavor",
                     "iniziato",
@@ -7388,11 +7704,13 @@ def build_direct_fact_answer(
                     for fact in history_facts[:history_limit]:
                         add_fact(fact)
             else:
+                temporal_entries = _rank_temporal_entries_for_query(query_text, temporal_entries)
                 if _is_temporal_inventory_query(query_text) and temporal_entries and set(aspects) == {"history"}:
                     temporal_answer = _build_temporal_inventory_direct_answer(query_text, temporal_inventory, matches, aspects)
                     return _apply_answer_contract(query_text, temporal_answer, matches) if temporal_answer else None
                 if temporal_entries:
-                    for entry in temporal_entries[:6 if _is_temporal_inventory_query(query_text) else 3]:
+                    history_limit = 1 if action_query else 6 if _is_temporal_inventory_query(query_text) else 3
+                    for entry in temporal_entries[:history_limit]:
                         add_fact(_temporal_entry_to_fact(entry))
                 else:
                     history_facts = sorted(inventory["history"], key=lambda item: (float(item.get("priority") or 0.0), float(item.get("raw_score") or 0.0)), reverse=True)
@@ -7602,6 +7920,7 @@ def build_context_payload(
     matches = _eligible_answer_matches(matches)
     fragments: list[dict[str, Any]] = []
     structured_sections: dict[str, dict[str, Any]] = {
+        "knowledge": {"key": "knowledge", "title": "Knowledge", "items": [], "evidence_node_ids": [], "confidence": 0.0},
         "identity": {"key": "identity", "title": "Identity", "items": [], "evidence_node_ids": [], "confidence": 0.0},
         "work": {"key": "work", "title": "Work/Projects", "items": [], "evidence_node_ids": [], "confidence": 0.0},
         "relationships": {"key": "relationships", "title": "Relationships", "items": [], "evidence_node_ids": [], "confidence": 0.0},
@@ -7658,7 +7977,7 @@ def build_context_payload(
             return "values"
         if lowered_topic in {"history", "episodic"} or any(token in lowered_text for token in ("nel 20", "nel 19", "in passato", "ha iniziato", "ha lavorato")):
             return "history"
-        return "work"
+        return "knowledge"
 
     def append_section_item(section_key: str, text: str, node_id: str, confidence: float) -> None:
         section = structured_sections[section_key]
@@ -7778,6 +8097,7 @@ def build_context_payload(
 
 
 _MCP_CONTEXT_SECTION_TITLES = {
+    "knowledge": "Knowledge",
     "identity": "Identity",
     "work": "Work And Projects",
     "relationships": "Relationships",
@@ -8160,6 +8480,8 @@ def _mcp_context_section_key(value: Any, text: Any = "") -> str:
         return "identity"
     if seed_folded == "personal_contact":
         return "relationships"
+    if seed_folded in {"knowledge", "fact", "facts", "concept", "framework", "definition", "theory"}:
+        return "knowledge"
     if any(token in seed_folded for token in ("style", "communication", "stile")):
         return "style"
     if any(token in seed_folded for token in ("value", "values", "principle", "principi", "valori")):
@@ -8222,7 +8544,7 @@ def _mcp_context_section_key(value: Any, text: Any = "") -> str:
         return "identity"
     if any(token in folded for token in ("document", "source", "file", "chunk", "anchor")):
         return "documents"
-    return "history"
+    return "knowledge"
 
 
 def _mcp_query_requests_private_data_boundary(query_text: Any, semantic_contract: dict[str, Any] | None = None) -> bool:
@@ -14061,6 +14383,14 @@ def build_mcp_master_judgement(
         and _mcp_master_slot_key(row)
     }
     broad_slot_subsumption = _is_broad_self_query(query_text)
+    deterministic_contract_complete = bool(render_contract.get("deterministic_contract_passed")) and not bool(
+        list(render_contract.get("blocked_reasons") or [])
+    )
+    deterministic_required_sections = {
+        str(section).strip()
+        for section in list(render_contract.get("deterministic_required_sections") or [])
+        if str(section).strip()
+    }
     subsumed_unresolved_goals: list[str] = []
     for index, row in enumerate(rows, start=1):
         mission_id = str(row.get("mission_id") or f"mission_{index}").strip()
@@ -14087,9 +14417,13 @@ def build_mcp_master_judgement(
         subsumed_by_resolved_duplicate = bool(
             (goal_key and goal_key in resolved_goal_keys)
             or (
-                broad_slot_subsumption
+                (broad_slot_subsumption or deterministic_contract_complete)
                 and _mcp_master_slot_key(row)
                 and _mcp_master_slot_key(row) in resolved_slot_keys
+                and (
+                    broad_slot_subsumption
+                    or _mcp_master_slot_key(row) in deterministic_required_sections
+                )
             )
         ) and bool(
             effective_state not in resolved_states
@@ -16197,9 +16531,14 @@ def build_mcp_context_package(
     if "relationships" in required_sections and missing_requested_relations:
         satisfied_sections.discard("relationships")
     unresolved_sections = sorted(section for section in required_sections if section not in satisfied_sections)
+    supplied_semantic_slot_contracts = list((semantic_contract or {}).get("semantic_slot_contracts") or [])
+    if str((semantic_contract or {}).get("schema_version") or "") == "agvm.semantic_query_contract.v2":
+        supplied_semantic_slot_contracts = list(
+            build_query_contract(query_text, retrieval_mode=retrieval_mode).get("semantic_slot_contracts") or []
+        )
     semantic_slot_contracts = [
         dict(item)
-        for item in list((semantic_contract or {}).get("semantic_slot_contracts") or [])
+        for item in supplied_semantic_slot_contracts
         if isinstance(item, dict) and bool(item.get("required"))
     ]
     semantic_satisfied_slot_keys: list[str] = []
@@ -16664,6 +17003,8 @@ def build_mcp_context_package(
         "ledger_row_count": int(compact_mission_evidence_ledger.get("row_count") or 0),
         "master_judgement_id": None,
         "blocked_reasons": list(dict.fromkeys(package_render_blocked_reasons))[:16],
+        "deterministic_contract_passed": bool(contract_passed),
+        "deterministic_required_sections": sorted(required_sections),
         "semantic_discovery_disabled": ledger_renderer_mode,
         "disabled_rescue_functions": (
             [
@@ -17710,6 +18051,16 @@ def _document_packet_segments(document_packets: list[dict[str, Any]] | None) -> 
                 source_node_id=anchor_id,
                 score=float((packet.get("coverage") or {}).get("match_count") or 0.0),
             )
+        full_text = str(packet.get("full_text") or "").strip()
+        if full_text and full_text != anchor_text:
+            add_segment(
+                packet=packet,
+                role="chunk",
+                text=full_text,
+                node_id=anchor_id,
+                source_node_id=anchor_id,
+                score=float(packet.get("query_fit_score") or packet.get("exact_match_score") or 0.0),
+            )
         for fact in list(packet.get("supported_fact_text") or []):
             if not isinstance(fact, dict):
                 continue
@@ -18236,11 +18587,19 @@ def generate_grounded_answer(
 
     best_partial_answer: dict[str, Any] | None = None
     best_partial_context: dict[str, Any] | None = None
+    query_contract = build_query_contract(query_text, retrieval_mode=retrieval_mode)
+    work_answer_requires_broad_synthesis = bool(
+        _query_is_work_or_company(query_text)
+        and (
+            str(query_contract.get("answer_width") or "") == "broad"
+            or str(query_contract.get("query_kind") or "") in {"broad_profile", "profile"}
+        )
+    )
 
     def candidate_final_ready(candidate: dict[str, Any] | None) -> bool:
         if not candidate:
             return False
-        if _query_is_work_or_company(query_text) and len(str(candidate.get("answer_text") or "").strip()) < 180 and len(answer_matches) >= 3:
+        if work_answer_requires_broad_synthesis and len(str(candidate.get("answer_text") or "").strip()) < 180 and len(answer_matches) >= 3:
             return False
         adequacy = dict(candidate.get("answer_adequacy") or {})
         return (
@@ -18327,7 +18686,7 @@ def generate_grounded_answer(
         context = build_context_payload(prioritized_matches, shared_evidence, evidence_reservoir=evidence_reservoir, query_text=query_text)
         direct_text = str(answer.get("answer_text") or "").strip()
         direct_too_thin_for_work = (
-            _query_is_work_or_company(query_text)
+            work_answer_requires_broad_synthesis
             and len(direct_text) < 180
             and len(answer_matches) >= 3
         )

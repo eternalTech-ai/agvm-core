@@ -7,11 +7,12 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from brain_registry import active_brain_summary
 from edition_gate import build_edition_route_report
-from setup_env import managed_env_status, save_managed_env_values
+from setup_env import ProviderKeyTestError, managed_env_status, save_managed_env_values, test_openai_provider_key
 
 
 HostedRegistrySummaryProvider = Callable[[], dict[str, Any]]
@@ -55,6 +56,19 @@ def create_core_runtime_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @router.post("/setup/provider/test")
+    async def setup_provider_key_test(request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001 - return a fixed error without reflecting request content.
+            raise HTTPException(status_code=400, detail=_provider_test_request_error("invalid_json")) from None
+        if not isinstance(payload, dict) or not isinstance(payload.get("api_key"), str):
+            raise HTTPException(status_code=400, detail=_provider_test_request_error("provider_key_required"))
+        try:
+            return await run_in_threadpool(test_openai_provider_key, payload["api_key"])
+        except ProviderKeyTestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.response_detail()) from None
+
     @router.get("/health")
     def health() -> dict[str, Any]:
         summary = active_brain_summary()
@@ -90,6 +104,22 @@ def _hosted_registry_summary(provider: HostedRegistrySummaryProvider | None) -> 
             "schema_version": "agvm.hosted_tenant_registry_summary.v1",
             "validation": {"passed": False, "reason": "hosted_registry_unavailable", "error": str(exc)},
         }
+
+
+def _provider_test_request_error(code: str) -> dict[str, Any]:
+    return {
+        "schema_version": "agvm.provider_key_test.v1",
+        "ok": False,
+        "provider": "openai",
+        "status": "invalid_request",
+        "capability": "model_access",
+        "persisted": False,
+        "error": {
+            "code": code,
+            "message": "Enter a provider key before testing.",
+            "retryable": False,
+        },
+    }
 
 
 def _setup_env_value(name: str, value: str | None) -> str | None:

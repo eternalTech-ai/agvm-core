@@ -20,16 +20,16 @@
   },
   "source": {
     "path": "src/tokens.json",
-    "sha256": "d396127c722df0160e71dd22839fd97449ad8418b55325874cb42d4d290ed2ae"
+    "sha256": "4c02ac821987be2d5cdfb2f94681de052110e2dacc52b0d278826d5875c56419"
   },
   "outputs": [
     {
       "path": "src/generated/tokens.css",
-      "sha256": "5c36e6c2cb15be09f2055ad956e313c515164f9f7f0f80f935b035120ea79f2c"
+      "sha256": "123dc944622faf2554aa13d548b7ca4b2c4a0f6d224e6b6b78bc534acf391be1"
     },
     {
       "path": "src/generated/tokens.ts",
-      "sha256": "58110d799abd115a2fab5d27ca18c6eef611248446b3bb572a7d6ca961c9173b"
+      "sha256": "89eb5e1656085653e64d95a347bd99e0ccf21515a1cf059513355acd5e371409"
     }
   ]
 }

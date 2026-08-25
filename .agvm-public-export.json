@@ -1,11 +1,11 @@
 {
-  "commentable_file_count": 135,
-  "exported_file_count": 150,
+  "commentable_file_count": 138,
+  "exported_file_count": 153,
   "mode": "release",
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v1",
   "source_clean": true,
-  "source_commit": "695c98bbacc4619591b2bf14e8f3ab5c83c8e078",
+  "source_commit": "53db39da17885b8c360c42bbee7bb48a6ca7421f",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 70
 }

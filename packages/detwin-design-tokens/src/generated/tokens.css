@@ -5,18 +5,18 @@
 
 :root {
   --dt-color-dark-line: rgba(255,255,255,.16);
-  --dt-color-graphite: #404040;
-  --dt-color-ink: #1d1d1d;
-  --dt-color-lavender: #ded5ed;
-  --dt-color-line: rgba(29,29,29,.12);
-  --dt-color-line-strong: rgba(29,29,29,.22);
-  --dt-color-mint: #c9f1e8;
-  --dt-color-muted: rgba(29,29,29,.64);
-  --dt-color-muted-dark: rgba(255,255,255,.68);
-  --dt-color-paper: #ececec;
-  --dt-color-teal: #00e9b1;
-  --dt-color-teal-deep: #0e6e5a;
-  --dt-color-violet: #8b55e7;
+  --dt-color-graphite: #080b0d;
+  --dt-color-ink: #080b0d;
+  --dt-color-lavender: #7857e8;
+  --dt-color-line: rgba(8,11,13,.14);
+  --dt-color-line-strong: rgba(8,11,13,.28);
+  --dt-color-mint: #00d8aa;
+  --dt-color-muted: rgba(8,11,13,.66);
+  --dt-color-muted-dark: rgba(255,255,255,.72);
+  --dt-color-paper: #ffffff;
+  --dt-color-teal: #00d8aa;
+  --dt-color-teal-deep: #007f69;
+  --dt-color-violet: #7857e8;
   --dt-color-white: #ffffff;
   --dt-font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --dt-layout-content-max: 1440px;
@@ -86,10 +86,10 @@
   --dt-visual-projection-cloud-runtime-far: #E4DDEE;
   --dt-visual-projection-cloud-runtime-gradient: linear-gradient(135deg, #2C2437 0%, #A568FC 52%, #E4DDEE 100%);
   --dt-visual-projection-cloud-runtime-near: #2C2437;
-  --dt-visual-projection-flat-reference-graphite: #404040;
+  --dt-visual-projection-flat-reference-graphite: #080B0D;
   --dt-visual-projection-flat-reference-ink: #1E1E1E;
-  --dt-visual-projection-flat-reference-paper: #EDEDED;
-  --dt-visual-projection-flat-reference-teal: #00E9B1;
+  --dt-visual-projection-flat-reference-paper: #FFFFFF;
+  --dt-visual-projection-flat-reference-teal: #00D8AA;
   --dt-visual-projection-flat-reference-white: #FFFFFF;
   --dt-visual-projection-local-runtime-active: #20D5A2;
   --dt-visual-projection-local-runtime-far: #D5EBE5;

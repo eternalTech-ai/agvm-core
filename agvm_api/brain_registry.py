@@ -23,6 +23,7 @@ from storage import utc_timestamp
 LOCAL_BRAIN_REGISTRY_SCHEMA_VERSION = "agvm.local_brain_registry.v1"
 LOCAL_BRAIN_RECORD_SCHEMA_VERSION = "agvm.local_brain_record.v1"
 LOCAL_BRAIN_STORAGE_FORMAT_VERSION = "agvm.local_brain_storage.v1"
+IMPORTED_BOOTSTRAP_LIFECYCLE_SCHEMA_VERSION = "agvm.brain_bootstrap_v1.import_lifecycle.v1"
 
 GRAPH_FILENAME = "beta_vector_memory.graph.json"
 GRAPH_VIEW_FILENAME = "beta_vector_memory.graph.view.json"
@@ -216,6 +217,13 @@ def _latest_bootstrap_revision(registry_brain_path: Path) -> tuple[dict[str, Any
     return _json_object_with_error(latest)
 
 
+def _imported_bootstrap_lifecycle(registry_brain_path: Path) -> tuple[dict[str, Any], str | None]:
+    marker_path = registry_brain_path / "brain_bootstrap_v1" / "import_lifecycle.json"
+    if not marker_path.exists():
+        return {}, None
+    return _json_object_with_error(marker_path)
+
+
 def _brain_lifecycle(storage_path: Path, registry_brain_path: Path) -> dict[str, Any]:
     lifecycle: dict[str, Any] = {
         "bootstrap_state": "not_started",
@@ -231,6 +239,14 @@ def _brain_lifecycle(storage_path: Path, registry_brain_path: Path) -> dict[str,
     elif bootstrap:
         lifecycle["bootstrap_state"] = str(bootstrap.get("lifecycle_state") or "error")
         lifecycle["bootstrap_session_id"] = str(bootstrap.get("session_id") or "") or None
+    else:
+        imported_bootstrap, imported_bootstrap_error = _imported_bootstrap_lifecycle(registry_brain_path)
+        if imported_bootstrap_error:
+            errors.append(imported_bootstrap_error)
+            lifecycle["bootstrap_state"] = "error"
+        elif imported_bootstrap:
+            lifecycle["bootstrap_state"] = str(imported_bootstrap.get("lifecycle_state") or "error")
+            lifecycle["bootstrap_session_id"] = str(imported_bootstrap.get("session_id") or "") or None
 
     profile_state, state_error = _json_object_with_error(storage_path / "brain_profile_v1_api" / "state.json")
     runtime_profile, runtime_error = _json_object_with_error(storage_path / "brain_profile_v1.json")
@@ -293,6 +309,31 @@ def _node_count(storage_path: Path) -> int:
     return int(sqlite_count or 0)
 
 
+def _ensure_nonempty_import_bootstrap_lifecycle(
+    *,
+    storage_path: Path,
+    registry_brain_path: Path,
+    brain_id: str,
+) -> None:
+    if _node_count(storage_path) <= 0:
+        return
+    bootstrap, bootstrap_error = _latest_bootstrap_revision(registry_brain_path)
+    marker_path = registry_brain_path / "brain_bootstrap_v1" / "import_lifecycle.json"
+    if bootstrap or bootstrap_error or marker_path.exists():
+        return
+    _atomic_write_json(
+        marker_path,
+        {
+            "schema_version": IMPORTED_BOOTSTRAP_LIFECYCLE_SCHEMA_VERSION,
+            "lifecycle_state": "applied",
+            "session_id": f"archive-import:{brain_id}",
+            "revision": 0,
+            "source": "nonempty_archive_import",
+            "recorded_at": utc_timestamp(),
+        },
+    )
+
+
 def _env_truthy(name: str) -> bool:
     return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -316,7 +357,7 @@ def _storage_quality(storage_path: Path) -> dict[str, Any]:
         "has_atlas": has_atlas,
         "node_count": int(node_count or 0),
         "sqlite_size_bytes": sqlite_size,
-        "safe_for_mcp": bool(has_sqlite and has_index and has_atlas),
+        "safe_for_mcp": bool(has_sqlite and has_index and has_atlas and node_count > 0),
     }
 
 
@@ -439,14 +480,14 @@ def build_local_brain_record(
         "updated_at": utc_timestamp(),
         "is_default": bool(is_default),
         "is_active": bool(is_active),
-        "safe_for_mcp": has_sqlite and has_index and has_atlas,
+        "safe_for_mcp": has_sqlite and has_index and has_atlas and _node_count(storage) > 0,
         "runtime_scope_status": "brain_scoped_runtime_ready_pr12m_b",
         "node_count": _node_count(storage),
         "lifecycle": _brain_lifecycle(storage, registry_brain),
         "sqlite_size_bytes": int(file_status[SQLITE_FILENAME]["size_bytes"]),
         "storage_files": file_status,
         "capabilities": {
-            "retrieve": has_sqlite,
+            "retrieve": has_sqlite and _node_count(storage) > 0,
             "grow": has_sqlite,
             "documents": True,
             "source_packages": True,
@@ -850,6 +891,7 @@ def _brain_export_manifest(record: dict[str, Any], *, export_kind: str) -> dict[
             "source_packages": "source_packages/",
             "maintenance": "maintenance/",
             "mcp_logs": "mcp_logs/",
+            "brain_bootstrap_v1": "brain_bootstrap_v1/",
         },
         "graph_export": _brain_export_graph_summary(record),
         "restore_policy": "imports_as_registry_managed_brain_by_default",
@@ -896,6 +938,11 @@ def export_local_brain(
         file_count += _zip_dir(zip_file, Path(str(record.get("source_package_path") or "")).expanduser(), "source_packages")
         file_count += _zip_dir(zip_file, Path(str(record.get("maintenance_path") or "")).expanduser(), "maintenance")
         file_count += _zip_dir(zip_file, Path(str(record.get("mcp_log_path") or "")).expanduser(), "mcp_logs")
+        file_count += _zip_dir(
+            zip_file,
+            Path(str(record.get("registry_brain_path") or "")).expanduser() / "brain_bootstrap_v1",
+            "brain_bootstrap_v1",
+        )
     return {
         "schema_version": "agvm.local_brain_export_result.v1",
         "action": export_kind,
@@ -956,7 +1003,7 @@ def import_local_brain_archive(
             _safe_rmtree(target_path, required_parent=root)
             brains = [item for item in brains if str(item.get("brain_id") or "") != target_id]
         target_path.mkdir(parents=True, exist_ok=True)
-        for dirname in ("storage", "documents", "source_packages", "maintenance", "mcp_logs"):
+        for dirname in ("storage", "documents", "source_packages", "maintenance", "mcp_logs", "brain_bootstrap_v1"):
             source = temp_dir / dirname
             destination = target_path / ("storage" if dirname == "storage" else dirname)
             if source.exists():
@@ -965,6 +1012,11 @@ def import_local_brain_archive(
                 shutil.copytree(source, destination)
             else:
                 destination.mkdir(parents=True, exist_ok=True)
+        _ensure_nonempty_import_bootstrap_lifecycle(
+            storage_path=target_path / "storage",
+            registry_brain_path=target_path,
+            brain_id=target_id,
+        )
         record = build_local_brain_record(
             brain_id=target_id,
             display_name=str(display_name or manifest.get("display_name") or source_record.get("display_name") or target_id.replace("_", " ").title()),
