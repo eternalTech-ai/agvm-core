@@ -12,4 +12,4 @@ pypdf>=5.0.0,<7.0.0
 Pillow>=10.0.0,<13.0.0
 playwright>=1.45.0,<2.0.0
 pytesseract>=0.3.13,<0.4.0
-pypdfium2>=4.30.0,<5.0.0
+pypdfium2>=5.13.0,<6.0.0
