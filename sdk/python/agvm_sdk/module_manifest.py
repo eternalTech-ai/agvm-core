@@ -314,7 +314,13 @@ def _normalize_legacy_clone_app_manifest(payload: Mapping[str, Any]) -> AgvmModu
         ui=ui,
         capabilities=capabilities,
         mcp_tools=AgvmModuleMcpTools(uses_core_tools=["retrieve_context", "write_memory_preview"]),
-        license=AgvmModuleLicense(plan_required="pro" if edition == "paid" else None),
+        license=AgvmModuleLicense(
+            plan_required=(
+                _optional_text(payload.get("required_plan")) or "pro"
+                if edition == "paid"
+                else None
+            )
+        ),
         safe_fallback_message=_clean_required_text("safe_fallback_message", payload.get("safe_fallback_message")),
         diagnostics=diagnostics,
         module_state=module_state,

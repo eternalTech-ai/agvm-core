@@ -66,6 +66,7 @@ def _service(
     *,
     fail_apply: bool = False,
     question_generator=None,
+    registry_committer=None,
 ) -> tuple[BrainBootstrapV1Service, list[dict]]:
     brain = _brain(tmp_path)
     apply_calls: list[dict] = []
@@ -119,6 +120,7 @@ def _service(
             apply_executor=apply_executor,
             mutation_probe=mutation_probe,
             question_generator=question_generator,
+            registry_committer=registry_committer or (lambda _brain, _session, _root: {}),
         ),
         apply_calls,
     )
@@ -129,7 +131,7 @@ def test_bootstrap_v1_registry_exposes_nine_bounded_core_tools() -> None:
     tools = {tool["name"]: tool for tool in registry["tools"]}
 
     assert registry["registry_validation"]["passed"] is True
-    assert len(registry["tools"]) == 52
+    assert len(registry["tools"]) == 54
     assert set(BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES).issubset(tools)
     for name in BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES:
         tool = tools[name]
@@ -144,6 +146,13 @@ def test_bootstrap_v1_registry_exposes_nine_bounded_core_tools() -> None:
             "backfill",
             "activation",
         ]
+
+    start_properties = tools["brain_bootstrap_start"]["input_schema"]["properties"]
+    assert start_properties["interview_mode"]["enum"] == ["manual", "adaptive_ai"]
+    assert start_properties["interview_mode"]["default"] == "manual"
+    assert start_properties["quality_policy"]["enum"] == ["guided_seed_v1"]
+    assert "null" in start_properties["quality_policy"]["type"]
+    assert "Omit when interview_mode is adaptive_ai" in start_properties["questions"]["description"]
 
     allowlist_path = ROOT / "repo-policy" / "public-core-allowlist.txt"
     if allowlist_path.is_file():
@@ -332,7 +341,7 @@ def test_guided_bootstrap_cannot_apply_without_a_passing_seed_quality_report(tmp
             "answer": "A real but deliberately incomplete seed.",
         },
     )
-    service.execute(
+    preview = service.execute(
         "preview",
         {
             "brain_id": "bootstrap_v1_test_brain",
@@ -351,6 +360,7 @@ def test_guided_bootstrap_cannot_apply_without_a_passing_seed_quality_report(tmp
                 "expected_revision": 3,
                 "idempotency_key": "guided-apply",
                 "confirm_apply": True,
+                "selected_preview_ids": preview["session"]["preview"]["selected_preview_ids"],
             },
         )
     assert apply_calls == []
@@ -459,7 +469,7 @@ def test_guided_bootstrap_apply_rechecks_the_actual_selected_subset(tmp_path: Pa
         },
     )
     revision += 1
-    service.execute(
+    preview = service.execute(
         "preview",
         {
             "session_id": "guided-selected-subset",
@@ -593,7 +603,7 @@ def test_bootstrap_v1_failed_apply_requires_manual_recovery_and_never_auto_reapp
             "answer": "review me",
         },
     )
-    service.execute(
+    preview = service.execute(
         "preview",
         {
             "session_id": "session-recover",
@@ -608,6 +618,7 @@ def test_bootstrap_v1_failed_apply_requires_manual_recovery_and_never_auto_reapp
             "expected_revision": 3,
             "idempotency_key": "apply-r",
             "confirm_apply": True,
+            "selected_preview_ids": preview["session"]["preview"]["selected_preview_ids"],
         },
     )
     assert failed["status"] == "recovery_required"
@@ -624,6 +635,63 @@ def test_bootstrap_v1_failed_apply_requires_manual_recovery_and_never_auto_reapp
     )
     assert recovered["status"] == "recovered"
     assert recovered["session"]["recovery"]["automatic_reapply_allowed"] is False
+    assert len(apply_calls) == 1
+
+
+def test_bootstrap_v1_registry_commit_failure_is_fail_closed_and_idempotently_retryable(tmp_path: Path) -> None:
+    commit_attempts: list[int] = []
+
+    def flaky_registry_committer(_brain, _session, _root):
+        commit_attempts.append(len(commit_attempts) + 1)
+        if len(commit_attempts) == 1:
+            raise OSError("synthetic registry persistence failure")
+        return {"node_count": 1}
+
+    service, apply_calls = _service(tmp_path, registry_committer=flaky_registry_committer)
+    service.execute("start", {"session_id": "session-registry", "idempotency_key": "start-registry"})
+    service.execute(
+        "answer",
+        {
+            "session_id": "session-registry",
+            "expected_revision": 1,
+            "idempotency_key": "answer-registry",
+            "question_id": "q",
+            "answer": "review me",
+        },
+    )
+    preview = service.execute(
+        "preview",
+        {
+            "session_id": "session-registry",
+            "expected_revision": 2,
+            "idempotency_key": "preview-registry",
+        },
+    )
+    apply_payload = {
+        "session_id": "session-registry",
+        "expected_revision": 3,
+        "idempotency_key": "apply-registry",
+        "confirm_apply": True,
+        "selected_preview_ids": preview["session"]["preview"]["selected_preview_ids"],
+    }
+
+    failed = service.execute("apply", apply_payload)
+
+    assert failed["status"] == "recovery_required"
+    assert failed["lifecycle_state"] == "recovery_required"
+    assert failed["session"]["recovery"] == {
+        "state": "registry_commit_failed",
+        "reason": "OSError",
+        "automatic_reapply_allowed": False,
+    }
+    assert len(apply_calls) == 1
+
+    retried = service.execute("apply", apply_payload)
+
+    assert retried["status"] == "applied"
+    assert retried["idempotent_replay"] is True
+    assert retried["lifecycle_state"] == "applied"
+    assert commit_attempts == [1, 2]
     assert len(apply_calls) == 1
 
 
@@ -669,6 +737,7 @@ def test_bootstrap_v1_hard_crash_after_mutation_recovers_without_double_apply(tm
         preview_builder=preview_builder,
         apply_executor=crashing_apply,
         mutation_probe=mutation_probe,
+        registry_committer=lambda _brain, _session, _root: {},
     )
     service.execute("start", {"session_id": "session-hard-crash", "idempotency_key": "start-hard-crash"})
     service.execute(
@@ -681,7 +750,7 @@ def test_bootstrap_v1_hard_crash_after_mutation_recovers_without_double_apply(tm
             "answer": "reviewed",
         },
     )
-    service.execute(
+    preview = service.execute(
         "preview",
         {
             "session_id": "session-hard-crash",
@@ -697,6 +766,7 @@ def test_bootstrap_v1_hard_crash_after_mutation_recovers_without_double_apply(tm
                 "expected_revision": 3,
                 "idempotency_key": "apply-hard-crash",
                 "confirm_apply": True,
+                "selected_preview_ids": preview["session"]["preview"]["selected_preview_ids"],
             },
         )
 
@@ -934,6 +1004,7 @@ def test_bootstrap_v1_real_local_grow_review_writes_only_after_apply(
             "expected_revision": 3,
             "idempotency_key": "integration-apply",
             "confirm_apply": True,
+            "selected_preview_ids": preview["session"]["preview"]["selected_preview_ids"],
         },
     )
     assert applied["status"] == "applied"

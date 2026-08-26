@@ -4108,7 +4108,11 @@ def _source_section_preview_items(
     for index, section in enumerate(sections, start=1):
         section_id = str(section.get("section_id") or section.get("unit_id") or f"source_unit_{index}").strip()
         title = str(section.get("title") or section_id or f"Source unit {index}").strip()
-        text, self_containment = _make_source_unit_text_self_contained(text=str(section.get("text") or ""), title=title)
+        content_title = "" if str(section.get("kind") or "") == "manual_block" else title
+        text, self_containment = _make_source_unit_text_self_contained(
+            text=str(section.get("text") or ""),
+            title=content_title,
+        )
         if len(text) < 16:
             continue
         normalized_key = normalize_preview_text(f"{section_id}:{text[:420]}")
@@ -4129,7 +4133,7 @@ def _source_section_preview_items(
             and not _SOURCE_MOJIBAKE_RE.search(text)
             and not _SOURCE_STRUCTURED_METADATA_CHUNK_RE.search(text)
         )
-        summary_prefix = title if title and title.lower() not in text[:120].lower() else ""
+        summary_prefix = content_title if content_title and content_title.lower() not in text[:120].lower() else ""
         summary = summarize_text(f"{summary_prefix}: {text}" if summary_prefix else text, limit=180)
         output.append(
             {
@@ -4726,12 +4730,13 @@ def _source_section_claim_preview_items(
     for section in [dict(item) for item in list(source_sections or []) if isinstance(item, dict)]:
         section_id = str(section.get("section_id") or section.get("unit_id") or "").strip()
         title = str(section.get("title") or section_id or "Source unit").strip()
+        content_title = "" if str(section.get("kind") or "") == "manual_block" else title
         fact_eligible = bool(section.get("fact_eligible") if section.get("fact_eligible") is not None else True)
         if not fact_eligible:
             continue
         emitted_for_section = 0
         section_text = str(section.get("text") or "")
-        structured_candidates = _source_structured_claim_candidates(text=section_text, title=title)
+        structured_candidates = _source_structured_claim_candidates(text=section_text, title=content_title)
         section_limit = max_claims_per_section
         if structured_candidates:
             section_limit = max(max_claims_per_section, min(8, len(structured_candidates)))
@@ -4740,7 +4745,10 @@ def _source_section_claim_preview_items(
             *[(sentence, False) for sentence in _source_claim_sentence_candidates(section_text)],
         ]
         for sentence, structured_claim in sentence_candidates:
-            claim_text, self_containment = _make_source_unit_text_self_contained(text=sentence, title=title)
+            claim_text, self_containment = _make_source_unit_text_self_contained(
+                text=sentence,
+                title=content_title,
+            )
             if len(claim_text) < (28 if structured_claim else 48):
                 continue
             key = normalize_preview_text(claim_text)
@@ -4751,7 +4759,11 @@ def _source_section_claim_preview_items(
             claim_type = _source_claim_type_for_source_fact(claim_text)
             nucleus_role = _source_claim_nucleus_role(claim_text)
             confidence = 0.88 if nucleus_role else 0.82
-            retrieval_aliases = _source_question_variants_for_claim(claim_text=claim_text, title=title, limit=8)
+            retrieval_aliases = _source_question_variants_for_claim(
+                claim_text=claim_text,
+                title=content_title,
+                limit=8,
+            )
             output.append(
                 {
                     "derivation_role": "claim",
@@ -4784,7 +4796,9 @@ def _source_section_claim_preview_items(
                     },
                     "retrieval_affordance": {
                         "schema_version": "agvm.source_claim_retrieval_affordance.v1",
-                        "question": retrieval_aliases[0] if retrieval_aliases else _source_question_for_claim(claim_text=claim_text, title=title),
+                        "question": retrieval_aliases[0]
+                        if retrieval_aliases
+                        else _source_question_for_claim(claim_text=claim_text, title=content_title),
                         "answer_claim": claim_text,
                         "nucleus_role": nucleus_role,
                         "purpose": "improve_agent_query_landing_for_clean_source_claim",
@@ -4943,23 +4957,31 @@ def _source_section_qa_preview_items(
     for section in [dict(item) for item in list(source_sections or []) if isinstance(item, dict)]:
         section_id = str(section.get("section_id") or section.get("unit_id") or "").strip()
         title = str(section.get("title") or section_id or "Source unit").strip()
+        content_title = "" if str(section.get("kind") or "") == "manual_block" else title
         fact_eligible = bool(section.get("fact_eligible") if section.get("fact_eligible") is not None else True)
         if not fact_eligible:
             continue
         emitted_for_section = 0
         section_text = str(section.get("text") or "")
         sentence_candidates = [
-            *_source_structured_claim_candidates(text=section_text, title=title),
+            *_source_structured_claim_candidates(text=section_text, title=content_title),
             *_source_claim_sentence_candidates(section_text),
         ]
         for sentence in sentence_candidates:
-            claim_text, self_containment = _make_source_unit_text_self_contained(text=sentence, title=title)
+            claim_text, self_containment = _make_source_unit_text_self_contained(
+                text=sentence,
+                title=content_title,
+            )
             if len(claim_text) < 32:
                 continue
             start, end = _span_bounds_in_lower_source(source_text_lower, sentence[: min(len(sentence), 520)])
             claim_type = _source_claim_type_for_source_fact(claim_text)
             confidence = 0.8
-            for question in _source_question_variants_for_claim(claim_text=claim_text, title=title, limit=8):
+            for question in _source_question_variants_for_claim(
+                claim_text=claim_text,
+                title=content_title,
+                limit=8,
+            ):
                 alias_text = f"{question} {claim_text}"
                 qa_text = f"Retrieval question: {question} Answer grounded in source: {claim_text}"
                 key = normalize_preview_text(alias_text)
@@ -5031,13 +5053,17 @@ def _source_section_micro_chunk_preview_items(
     for section in [dict(item) for item in list(source_sections or []) if isinstance(item, dict)]:
         section_id = str(section.get("section_id") or section.get("unit_id") or "").strip()
         title = str(section.get("title") or section_id or "Source unit").strip()
+        content_title = "" if str(section.get("kind") or "") == "manual_block" else title
         fact_eligible = bool(section.get("fact_eligible") if section.get("fact_eligible") is not None else True)
         supporting_eligible = bool(section.get("supporting_evidence_eligible") or False)
         if not fact_eligible and not supporting_eligible:
             continue
         section_text = str(section.get("text") or "")
         for chunk_index, window in enumerate(_source_evidence_window_candidates(section_text, max_windows=max_chunks_per_section), start=1):
-            chunk_text, self_containment = _make_source_unit_text_self_contained(text=window, title=title)
+            chunk_text, self_containment = _make_source_unit_text_self_contained(
+                text=window,
+                title=content_title,
+            )
             if len(chunk_text) < 96:
                 continue
             key = normalize_preview_text(chunk_text)
@@ -5056,7 +5082,10 @@ def _source_section_micro_chunk_preview_items(
                     "derivation_role": "claim",
                     "claim_type": _source_claim_type_for_source_fact(chunk_text),
                     "raw_text": preserve_node_raw_text(chunk_text, limit=1300),
-                    "summary": summarize_text(f"{title}: {chunk_text}", limit=180),
+                    "summary": summarize_text(
+                        f"{content_title}: {chunk_text}" if content_title else chunk_text,
+                        limit=180,
+                    ),
                     "memory_type": "document_chunk" if document_scope else map_runtime_memory_type(None, claim_type=_source_claim_type_for_source_fact(chunk_text)),
                     "confidence": confidence,
                     "memory_confidence": confidence,
@@ -5711,12 +5740,16 @@ def preview_bundle(
 
     for index, item in enumerate(compiled_derived[:derived_limit], start=1):
         raw_text_source = str(item.get("raw_text") or item.get("summary") or "").strip()
-        context_title = str(
-            item.get("source_unit_title")
-            or item.get("title")
-            or source_label
-            or primary_compiled.get("summary")
-            or "Source context"
+        context_title = (
+            ""
+            if str(item.get("source_unit_kind") or "") == "manual_block"
+            else str(
+                item.get("source_unit_title")
+                or item.get("title")
+                or source_label
+                or primary_compiled.get("summary")
+                or "Source context"
+            )
         )
         raw_text_source, derived_self_containment = _make_source_unit_text_self_contained(
             text=raw_text_source,

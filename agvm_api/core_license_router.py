@@ -47,6 +47,16 @@ def create_core_license_router() -> APIRouter:
                 ttl_hours=payload.ttl_hours,
             )
         except LocalEntitlementError as exc:
+            if exc.code == "local_license_signing_secret_missing":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "local_module_setup_required",
+                        "message": "Set up this paid local module from the Detwin account module manager.",
+                        "action": "open_detwin_module_manager",
+                        "action_path": "/account/modules#modules",
+                    },
+                ) from exc
             raise HTTPException(status_code=400, detail=exc.code) from exc
 
     @router.get("/modules/local-license/entitlements")

@@ -7,6 +7,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -25,6 +28,17 @@ from mcp_contracts import (  # noqa: E402
     REQUIRED_MCP_TOOL_NAMES,
 )
 from route_classification import classify_mcp_tool  # noqa: E402
+
+
+def _canonical_file_digest(path: Path) -> str:
+    payload = path.read_bytes()
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        canonical = payload
+    else:
+        canonical = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def test_public_release_excludes_paid_profile_and_geometry_implementations() -> None:
@@ -86,16 +100,27 @@ def test_public_paid_routes_return_cloud_action_contracts() -> None:
 
 def test_public_release_tree_has_no_private_runtime_roots() -> None:
     assert (ROOT / ".agvm-public-export-marker").is_file()
+    assert (ROOT / "agvm_api" / "Dockerfile.core.dockerignore").is_file()
+    assert (ROOT / "agvm_api" / "Dockerfile.dockerignore").is_file()
+    assert not (ROOT / "agvm_api" / ".dockerignore").exists()
     assert not (ROOT / "platform").exists()
     assert not (ROOT / "apps").exists()
     assert not (ROOT / "agvm_cockpit_prototype" / "src" / "new-ui" / "modules").exists()
 
 
+def test_public_core_api_uses_restricted_browser_origin_policy() -> None:
+    app_source = (ROOT / "agvm_api" / "core_api_app.py").read_text(encoding="utf-8")
+    security_source = (ROOT / "agvm_api" / "core_browser_security.py").read_text(encoding="utf-8")
+
+    assert "install_core_browser_security(app)" in app_source
+    assert 'allow_origins=["*"]' not in app_source
+    assert "agvm_core_browser_origin_forbidden" in security_source
+
+
 def test_public_mcp_contract_has_v1_bootstrap_profile_and_free_grow() -> None:
     tool_names = [*GUIDE_MCP_TOOL_NAMES, *REQUIRED_MCP_TOOL_NAMES, *AGENT_MEMORY_MCP_TOOL_NAMES]
 
-    assert len(tool_names) == 52
-    assert len(set(tool_names)) == 52
+    assert len(tool_names) == len(set(tool_names))
     assert {
         "brain_bootstrap_start",
         "brain_bootstrap_status",
@@ -109,6 +134,8 @@ def test_public_mcp_contract_has_v1_bootstrap_profile_and_free_grow() -> None:
         "brain_profile_preview",
         "brain_profile_apply",
         "brain_profile_rollback",
+        "sleep_rollback",
+        "evolve_rollback",
     }.issubset(tool_names)
     for name in tool_names:
         classification = classify_mcp_tool(name)
@@ -144,7 +171,11 @@ def test_public_docs_describe_visibility_without_claiming_authorization() -> Non
     combined = "\n".join((modules, local_mcp, cloud, changelog))
 
     assert "complete current contract catalog" in modules
-    assert "52" in local_mcp
+    documented_count = re.search(r"defines (\d+) tool contracts", local_mcp)
+    assert documented_count is not None
+    assert int(documented_count.group(1)) == len(
+        [*GUIDE_MCP_TOOL_NAMES, *REQUIRED_MCP_TOOL_NAMES, *AGENT_MEMORY_MCP_TOOL_NAMES]
+    )
     assert "brain_bootstrap_*" in local_mcp
     assert "brain_profile_*" in local_mcp
     assert "Grow" in modules and "Core" in modules
@@ -166,6 +197,49 @@ def test_public_ci_contains_release_hygiene_gates() -> None:
         "docker compose up",
     ):
         assert expected in workflow
+    assert "actions/checkout@v4" not in workflow
+    assert "actions/setup-python@v5" not in workflow
+    assert "actions/setup-node@v4" not in workflow
+    assert workflow.count("@sha256:") >= 2
+    assert "run: npm ci" in workflow
+    assert "run: npm run build" in workflow
+    assert workflow.count("working-directory: agvm_cockpit_prototype") >= 2
+
+
+def test_public_vite_config_cannot_reference_private_source_paths() -> None:
+    config = (
+        ROOT / "agvm_cockpit_prototype" / "vite.config.ts"
+    ).read_text(encoding="utf-8")
+
+    for private_path in ("src/new-ui", "apps/", "clone-app", "platform/"):
+        assert private_path not in config
+
+
+def test_public_export_manifest_authenticates_every_release_file() -> None:
+    manifest_name = ".agvm-public-export.json"
+    manifest = json.loads((ROOT / manifest_name).read_text(encoding="utf-8"))
+    artifact = manifest["artifact"]
+    excluded = set(artifact["excluded_paths"])
+    ignored_prefixes = set(artifact["ignored_generated_path_prefixes"])
+    file_hashes = {
+        path.relative_to(ROOT).as_posix(): _canonical_file_digest(path)
+        for path in sorted(item for item in ROOT.rglob("*") if item.is_file())
+        if path.relative_to(ROOT).as_posix() not in excluded
+        and ".git" not in path.relative_to(ROOT).parts
+        and "__pycache__" not in path.relative_to(ROOT).parts
+        and not any(
+            path.relative_to(ROOT).as_posix() == prefix
+            or path.relative_to(ROOT).as_posix().startswith(f"{prefix}/")
+            for prefix in ignored_prefixes
+        )
+    }
+    canonical = "".join(f"{file_hashes[path]}  {path}\n" for path in sorted(file_hashes))
+
+    assert manifest["schema_version"] == "agvm.public_core_export.v2"
+    assert artifact["algorithm"] == "sha256"
+    assert artifact["files"] == file_hashes
+    assert artifact["file_count"] == len(file_hashes)
+    assert artifact["tree_sha256"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def test_public_ui_is_the_rich_local_product_shell() -> None:

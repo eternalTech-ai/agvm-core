@@ -19000,7 +19000,8 @@ def _append_broad_answer_scope_closure(
         )
     else:
         closure = (
-            "Questo e il perimetro che le memorie recuperate permettono di sostenere su Elena: copre identita, "
+            "Questo e il perimetro che le memorie recuperate permettono di sostenere sulla persona richiesta: "
+            "copre identita, "
             "luogo, lavoro, progetto, relazioni nominate, stile, valori e un passaggio professionale precedente. "
             "Il risultato non va considerato una biografia completa: se date, altri passaggi o ulteriori relazioni "
             "non emergono, il riepilogo lascia il limite esplicito e non aggiunge dettagli non verificati. La "

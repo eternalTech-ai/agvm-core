@@ -8,8 +8,10 @@ FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb836
 # shared TypeScript SDK without vendoring contract copies into the cockpit app.
 ARG VITE_API_URL=http://localhost:8010
 ARG VITE_AGVM_UI_SHELL_PROFILE=public_core
+ARG VITE_PLATFORM_URL=https://app.detwin.ai
 ENV VITE_API_URL=${VITE_API_URL} \
-    VITE_AGVM_UI_SHELL_PROFILE=${VITE_AGVM_UI_SHELL_PROFILE}
+    VITE_AGVM_UI_SHELL_PROFILE=${VITE_AGVM_UI_SHELL_PROFILE} \
+    VITE_PLATFORM_URL=${VITE_PLATFORM_URL}
 
 WORKDIR /app/agvm_cockpit_prototype
 COPY packages/detwin-design-tokens /app/packages/detwin-design-tokens

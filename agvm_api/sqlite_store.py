@@ -69,6 +69,9 @@ _RUNTIME_RETENTION_PINNED_EVENT_TYPES = {
 
 GEOMETRY_CALIBRATION_OPERATION_SCHEMA_VERSION = "agvm.geometry_calibration_operation.v1"
 GEOMETRY_CALIBRATION_ROLLBACK_SCHEMA_VERSION = "agvm.geometry_calibration_rollback.v1"
+GEOMETRY_CALIBRATION_PREVIEW_AUTHORITY_SCHEMA_VERSION = "agvm.geometry_calibration_preview_authority.v1"
+_GEOMETRY_CALIBRATION_AUTHORITY_CYCLE_MARKER = "::authority_cycle::"
+_MAINTENANCE_PREVIEW_AUTHORITY_CYCLE_MARKER = "::authority_cycle::"
 _GEOMETRY_NODE_STATE_COLUMNS = (
     "id",
     "x",
@@ -100,6 +103,14 @@ class GeometryCalibrationStoreError(ValueError):
 
 
 class MaintenancePreviewStoreError(ValueError):
+    def __init__(self, code: str, *, status_code: int = 409, context: dict[str, Any] | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+        self.context = dict(context or {})
+
+
+class GrowPreviewBindingStoreError(ValueError):
     def __init__(self, code: str, *, status_code: int = 409, context: dict[str, Any] | None = None) -> None:
         super().__init__(code)
         self.code = code
@@ -668,6 +679,7 @@ def bootstrap_runtime_store() -> None:
                 reason TEXT NOT NULL,
                 kind TEXT,
                 stability REAL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (source_id, target_id),
                 FOREIGN KEY (source_id) REFERENCES nodes_nav(id) ON DELETE CASCADE,
                 FOREIGN KEY (target_id) REFERENCES nodes_nav(id) ON DELETE CASCADE
@@ -680,6 +692,7 @@ def bootstrap_runtime_store() -> None:
                 reason TEXT NOT NULL,
                 kind TEXT,
                 stability REAL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (source_id, target_id),
                 FOREIGN KEY (source_id) REFERENCES nodes_nav(id) ON DELETE CASCADE,
                 FOREIGN KEY (target_id) REFERENCES nodes_nav(id) ON DELETE CASCADE
@@ -814,6 +827,27 @@ def bootstrap_runtime_store() -> None:
                 applied_at TEXT,
                 rolled_back_at TEXT,
                 invalidated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS grow_preview_bindings (
+                token_id TEXT PRIMARY KEY,
+                preview_revision TEXT NOT NULL,
+                brain_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                operation_family TEXT NOT NULL,
+                brain_revision TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL,
+                preview_sha256 TEXT NOT NULL,
+                binding_json TEXT NOT NULL,
+                source_payload_json TEXT NOT NULL,
+                preview_payload_json TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                apply_result_json TEXT NOT NULL DEFAULT '{}',
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                state_updated_at INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS heuristic_calibration_store (
@@ -1084,6 +1118,10 @@ def bootstrap_runtime_store() -> None:
               ON maintenance_runs (mode, applied, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_maintenance_previews_brain_state
               ON maintenance_previews (brain_id, state, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_grow_preview_bindings_source
+              ON grow_preview_bindings (brain_id, operation_family, source_id, issued_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_grow_preview_bindings_brain_state
+              ON grow_preview_bindings (brain_id, state, issued_at DESC);
             CREATE INDEX IF NOT EXISTS idx_heuristic_calibration_store_updated_at
               ON heuristic_calibration_store (updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_heuristic_calibration_events_created_at
@@ -1185,6 +1223,8 @@ def bootstrap_runtime_store() -> None:
             _ensure_column(conn, "node_semantics", "source_unit_formation_strategy", "TEXT")
             _ensure_column(conn, "node_semantics", "retrieval_affordance_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "node_semantics", "retrieval_aliases_json", "TEXT NOT NULL DEFAULT '[]'")
+            _ensure_column(conn, "links", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+            _ensure_column(conn, "highways", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             if hygiene_columns_added or str(os.getenv("AGVM_RECONCILE_NODE_HYGIENE_ON_BOOTSTRAP", "")).strip().lower() in {"1", "true", "yes", "on"}:
                 _reconcile_node_hygiene(conn)
             conn.commit()
@@ -2695,6 +2735,13 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             _json_dump(list(node.get("retrieval_aliases") or [])),
         ),
     )
+_RELATION_STORAGE_FIELDS = frozenset({"target_node_id", "strength", "reason", "kind", "stability"})
+
+
+def _relation_metadata(relation: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in relation.items() if str(key) not in _RELATION_STORAGE_FIELDS}
+
+
 def _set_node_relations(
     conn: sqlite3.Connection,
     node: dict[str, Any],
@@ -2705,8 +2752,8 @@ def _set_node_relations(
     conn.execute("DELETE FROM links WHERE source_id = ?", (source_id,))
     conn.executemany(
         """
-        INSERT INTO links (source_id, target_id, strength, reason, kind, stability)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO links (source_id, target_id, strength, reason, kind, stability, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -2716,6 +2763,7 @@ def _set_node_relations(
                 str(link.get("reason") or ""),
                 link.get("kind"),
                 link.get("stability"),
+                _json_dump(_relation_metadata(link)),
             )
             for link in list(node.get("links") or [])
             if not valid_target_ids or str(link.get("target_node_id") or "") in valid_target_ids
@@ -2724,8 +2772,8 @@ def _set_node_relations(
     conn.execute("DELETE FROM highways WHERE source_id = ?", (source_id,))
     conn.executemany(
         """
-        INSERT INTO highways (source_id, target_id, strength, reason, kind, stability)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO highways (source_id, target_id, strength, reason, kind, stability, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -2735,6 +2783,7 @@ def _set_node_relations(
                 str(link.get("reason") or ""),
                 link.get("kind"),
                 link.get("stability"),
+                _json_dump(_relation_metadata(link)),
             )
             for link in list(node.get("highways") or [])
             if not valid_target_ids or str(link.get("target_node_id") or "") in valid_target_ids
@@ -2777,13 +2826,15 @@ def _fetch_links_map(conn: sqlite3.Connection, node_ids: list[str], table: str) 
         return {}
     placeholders = ",".join("?" for _ in node_ids)
     rows = conn.execute(
-        f"SELECT source_id, target_id, strength, reason, kind, stability FROM {table} WHERE source_id IN ({placeholders})",
+        f"SELECT source_id, target_id, strength, reason, kind, stability, metadata_json FROM {table} WHERE source_id IN ({placeholders})",
         node_ids,
     ).fetchall()
     payload: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
+        metadata = _json_load(row["metadata_json"], {})
         payload[str(row["source_id"])].append(
             {
+                **(metadata if isinstance(metadata, dict) else {}),
                 "target_node_id": str(row["target_id"]),
                 "strength": float(row["strength"]),
                 "reason": str(row["reason"]),
@@ -3042,6 +3093,26 @@ def fetch_graph_snapshot() -> dict[str, Any]:
         return _fetch_graph_snapshot_conn(conn)
 
 
+def _maintenance_canonical_distribution(values: Any, fields: list[str]) -> dict[str, float]:
+    """Return the stable six-decimal equivalence of SQLite read normalization."""
+    source = values if isinstance(values, dict) else {}
+    cleaned: dict[str, float] = {}
+    for field in fields:
+        try:
+            value = float(source.get(field, 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+        cleaned[field] = max(0.0, min(1.0, value)) if math.isfinite(value) else 0.0
+
+    precision = 1_000_000
+    normalized = normalize_scores(cleaned, fields)
+    units = [int(round(float(normalized[field]) * precision)) for field in fields]
+    residual = precision - sum(units)
+    anchor_index = max(range(len(fields)), key=lambda index: (units[index], -index))
+    units[anchor_index] += residual
+    return {field: units[index] / precision for index, field in enumerate(fields)}
+
+
 def maintenance_graph_revision(graph: dict[str, Any]) -> str:
     def canonical(value: Any) -> Any:
         if isinstance(value, float):
@@ -3052,7 +3123,49 @@ def maintenance_graph_revision(graph: dict[str, Any]) -> str:
             return [canonical(item) for item in value]
         return value
 
-    nodes = [canonical(dict(node)) for node in list(graph.get("nodes") or []) if isinstance(node, dict)]
+    def canonical_relation(value: Any) -> dict[str, Any]:
+        relation = value if isinstance(value, dict) else {}
+        metadata = {
+            str(key): canonical(item)
+            for key, item in relation.items()
+            if str(key) not in _RELATION_STORAGE_FIELDS
+        }
+        try:
+            strength = float(relation.get("strength") or 0.0)
+        except (TypeError, ValueError):
+            strength = 0.0
+        metadata.update(
+            {
+                "target_node_id": str(relation.get("target_node_id") or ""),
+                "strength": canonical(strength),
+                "reason": str(relation.get("reason") or ""),
+                "kind": canonical(relation.get("kind")),
+                "stability": canonical(relation.get("stability")),
+            }
+        )
+        return metadata
+
+    def canonical_relations(values: Any) -> list[dict[str, Any]]:
+        relations = [canonical_relation(item) for item in list(values or []) if isinstance(item, dict)]
+        relations.sort(key=lambda item: json.dumps(item, ensure_ascii=True, sort_keys=True, default=str))
+        return relations
+
+    nodes = []
+    for source_node in list(graph.get("nodes") or []):
+        if not isinstance(source_node, dict):
+            continue
+        node = canonical(dict(source_node))
+        node["routing_semantic_scores"] = _maintenance_canonical_distribution(
+            source_node.get("routing_semantic_scores"),
+            ROUTING_FIELDS,
+        )
+        node["routing_facets"] = _maintenance_canonical_distribution(
+            source_node.get("routing_facets"),
+            FACET_FIELDS,
+        )
+        node["links"] = canonical_relations(source_node.get("links"))
+        node["highways"] = canonical_relations(source_node.get("highways"))
+        nodes.append(node)
     nodes.sort(key=lambda node: str(node.get("id") or ""))
     edges = [canonical(dict(edge)) for edge in list(graph.get("edges") or []) if isinstance(edge, dict)]
     edges.sort(key=lambda edge: json.dumps(edge, ensure_ascii=True, sort_keys=True, default=str))
@@ -4460,6 +4573,9 @@ def reset_runtime_store() -> tuple[dict[str, Any], dict[str, Any]]:
         conn.execute(
             "UPDATE maintenance_previews SET state = 'invalidated', invalidated_at = ? WHERE state = 'active'",
             (utc_timestamp(),),
+        )
+        conn.execute(
+            "UPDATE grow_preview_bindings SET state = 'invalidated' WHERE state = 'active'",
         )
         conn.execute("DELETE FROM graph_edges")
         conn.execute("DELETE FROM links")
@@ -6071,6 +6187,316 @@ def fetch_region_summary(region_id: str) -> dict[str, Any] | None:
     return next((item for item in summaries if str(item.get("region_id")) == str(region_id)), None)
 
 
+def _grow_preview_binding_error(
+    code: str,
+    *,
+    status_code: int = 409,
+    **context: Any,
+) -> GrowPreviewBindingStoreError:
+    return GrowPreviewBindingStoreError(code, status_code=status_code, context=context)
+
+
+def _grow_preview_binding_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "binding": dict(_json_load(row["binding_json"], {})),
+        "source_sha256": str(row["source_sha256"]),
+        "preview_sha256": str(row["preview_sha256"]),
+        "source_payload": dict(_json_load(row["source_payload_json"], {})),
+        "preview_payload": dict(_json_load(row["preview_payload_json"], {})),
+        "tool_name": str(row["tool_name"]),
+        "state": str(row["state"]),
+        "state_updated_at": int(row["state_updated_at"]),
+        "apply_result": dict(_json_load(row["apply_result_json"], {})),
+        "created_at": str(row["created_at"]),
+    }
+
+
+def _assert_grow_preview_brain_scope(brain_id: str) -> str:
+    normalized_brain_id = str(brain_id or "").strip()
+    if not normalized_brain_id:
+        raise _grow_preview_binding_error("preview_binding_brain_id_required", status_code=400)
+    active_brain_id = str(current_brain_id() or "").strip()
+    if active_brain_id and active_brain_id != normalized_brain_id:
+        raise _grow_preview_binding_error("preview_binding_brain_mismatch")
+    return normalized_brain_id
+
+
+def current_grow_preview_brain_revision(brain_id: str) -> str:
+    bootstrap_runtime_store()
+    _assert_grow_preview_brain_scope(brain_id)
+    with connect_readonly() as conn:
+        return maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+
+
+def store_grow_preview_binding(*, record: dict[str, Any]) -> dict[str, Any]:
+    bootstrap_runtime_store()
+    binding = dict(record.get("binding") or {})
+    normalized_brain_id = _assert_grow_preview_brain_scope(str(binding.get("brain_id") or ""))
+    token_id = str(binding.get("token_id") or "").strip()
+    preview_revision = str(binding.get("revision") or "").strip()
+    source_id = str(binding.get("source_id") or "").strip()
+    operation_family = str(binding.get("operation_family") or "").strip()
+    brain_revision = str(binding.get("brain_revision") or "").strip()
+    source_sha256 = str(record.get("source_sha256") or "").strip()
+    preview_sha256 = str(record.get("preview_sha256") or "").strip()
+    source_payload = dict(record.get("source_payload") or {})
+    preview_payload = dict(record.get("preview_payload") or {})
+    tool_name = str(record.get("tool_name") or operation_family).strip()
+    try:
+        issued_at = int(binding.get("issued_at"))
+        expires_at = int(binding.get("expires_at"))
+    except (TypeError, ValueError) as exc:
+        raise _grow_preview_binding_error("preview_binding_invalid", status_code=400) from exc
+    if not all(
+        (
+            token_id,
+            preview_revision,
+            source_id,
+            operation_family,
+            brain_revision,
+            source_sha256,
+            preview_sha256,
+            source_payload,
+            preview_payload,
+        )
+    ) or expires_at <= issued_at:
+        raise _grow_preview_binding_error("preview_binding_invalid", status_code=400)
+    if source_sha256 != str(binding.get("source_sha256") or "") or preview_sha256 != str(
+        binding.get("preview_sha256") or ""
+    ):
+        raise _grow_preview_binding_error("preview_binding_invalid", status_code=400)
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != brain_revision:
+            conn.rollback()
+            raise _grow_preview_binding_error(
+                "preview_binding_stale",
+                expected_brain_revision=brain_revision,
+                current_brain_revision=current_revision,
+            )
+        conn.execute(
+            """
+            UPDATE grow_preview_bindings
+            SET state = 'invalidated', state_updated_at = ?
+            WHERE brain_id = ? AND operation_family = ? AND source_id = ? AND state = 'active'
+            """,
+            (issued_at, normalized_brain_id, operation_family, source_id),
+        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO grow_preview_bindings (
+                    token_id, preview_revision, brain_id, source_id, operation_family,
+                    brain_revision, source_sha256, preview_sha256, binding_json,
+                    source_payload_json, preview_payload_json, tool_name, state,
+                    apply_result_json, issued_at, expires_at, state_updated_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', '{}', ?, ?, ?, ?)
+                """,
+                (
+                    token_id,
+                    preview_revision,
+                    normalized_brain_id,
+                    source_id,
+                    operation_family,
+                    brain_revision,
+                    source_sha256,
+                    preview_sha256,
+                    _json_dump(binding),
+                    _json_dump(source_payload),
+                    _json_dump(preview_payload),
+                    tool_name,
+                    issued_at,
+                    expires_at,
+                    issued_at,
+                    utc_timestamp(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            raise _grow_preview_binding_error("preview_binding_token_conflict") from exc
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (token_id,),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise _grow_preview_binding_error("preview_binding_store_unavailable", status_code=503)
+    return _grow_preview_binding_row(row)
+
+
+def fetch_grow_preview_binding(
+    *,
+    brain_id: str,
+    operation_family: str,
+    token_id: str | None = None,
+    source_id: str | None = None,
+) -> dict[str, Any] | None:
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_family = str(operation_family or "").strip()
+    normalized_token = str(token_id or "").strip()
+    normalized_source = str(source_id or "").strip()
+    if not normalized_family:
+        raise _grow_preview_binding_error("preview_binding_operation_required", status_code=400)
+    with connect_readonly() as conn:
+        if normalized_token:
+            row = conn.execute(
+                """
+                SELECT * FROM grow_preview_bindings
+                WHERE token_id = ? AND brain_id = ? AND operation_family = ?
+                """,
+                (normalized_token, normalized_brain_id, normalized_family),
+            ).fetchone()
+        elif normalized_source:
+            row = conn.execute(
+                """
+                SELECT * FROM grow_preview_bindings
+                WHERE brain_id = ? AND operation_family = ? AND source_id = ?
+                ORDER BY issued_at DESC, rowid DESC LIMIT 1
+                """,
+                (normalized_brain_id, normalized_family, normalized_source),
+            ).fetchone()
+        else:
+            return None
+    return _grow_preview_binding_row(row) if row is not None else None
+
+
+def reserve_grow_preview_binding(
+    *,
+    token_id: str | None,
+    brain_id: str,
+    source_id: str,
+    operation_family: str,
+    source_sha256: str,
+    preview_sha256: str,
+    now: int,
+) -> dict[str, Any]:
+    bootstrap_runtime_store()
+    normalized_token = str(token_id or "").strip()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_source_id = str(source_id or "").strip()
+    normalized_family = str(operation_family or "").strip()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_token,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_stale"}
+        record = _grow_preview_binding_row(row)
+        binding = dict(record.get("binding") or {})
+        state = str(record.get("state") or "")
+        if state in {"applying", "consumed"}:
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_replayed"}
+        if state != "active":
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_stale"}
+        if str(binding.get("brain_id") or "") != normalized_brain_id:
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_brain_mismatch"}
+        if str(binding.get("source_id") or "") != normalized_source_id:
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_source_mismatch"}
+        if str(binding.get("operation_family") or "") != normalized_family:
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_operation_mismatch"}
+        if record["source_sha256"] != str(source_sha256 or ""):
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_source_mismatch"}
+        if record["preview_sha256"] != str(preview_sha256 or ""):
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_bundle_mismatch"}
+        if int(now) >= int(binding.get("expires_at") or 0):
+            conn.execute(
+                "UPDATE grow_preview_bindings SET state = 'invalidated', state_updated_at = ? WHERE token_id = ? AND state = 'active'",
+                (int(now), normalized_token),
+            )
+            conn.commit()
+            return {"reserved": False, "reason": "preview_binding_stale"}
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != str(binding.get("brain_revision") or ""):
+            conn.execute(
+                "UPDATE grow_preview_bindings SET state = 'invalidated', state_updated_at = ? WHERE token_id = ? AND state = 'active'",
+                (int(now), normalized_token),
+            )
+            conn.commit()
+            return {"reserved": False, "reason": "preview_binding_stale"}
+        updated = conn.execute(
+            "UPDATE grow_preview_bindings SET state = 'applying', state_updated_at = ? WHERE token_id = ? AND state = 'active'",
+            (int(now), normalized_token),
+        )
+        if updated.rowcount != 1:
+            conn.rollback()
+            return {"reserved": False, "reason": "preview_binding_replayed"}
+        conn.commit()
+    return {"reserved": True}
+
+
+def finish_grow_preview_binding(
+    *,
+    token_id: str | None,
+    brain_id: str,
+    state: str,
+    now: int,
+    apply_result: dict[str, Any],
+) -> dict[str, Any]:
+    bootstrap_runtime_store()
+    normalized_token = str(token_id or "").strip()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_state = str(state or "").strip()
+    if normalized_state not in {"consumed", "failed"}:
+        raise _grow_preview_binding_error("preview_binding_finish_state_invalid", status_code=500)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_token,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            raise _grow_preview_binding_error("preview_binding_stale")
+        record = _grow_preview_binding_row(row)
+        binding = dict(record.get("binding") or {})
+        if str(binding.get("brain_id") or "") != normalized_brain_id:
+            conn.rollback()
+            raise _grow_preview_binding_error("preview_binding_brain_mismatch")
+        if record["state"] == normalized_state:
+            conn.rollback()
+            return record
+        if record["state"] != "applying":
+            conn.rollback()
+            raise _grow_preview_binding_error("preview_binding_replayed")
+        conn.execute(
+            """
+            UPDATE grow_preview_bindings
+            SET state = ?, state_updated_at = ?, apply_result_json = ?
+            WHERE token_id = ? AND state = 'applying'
+            """,
+            (normalized_state, int(now), _json_dump(dict(apply_result or {})), normalized_token),
+        )
+        conn.execute(
+            """
+            UPDATE grow_preview_bindings
+            SET state = 'invalidated', state_updated_at = ?
+            WHERE brain_id = ? AND state = 'active' AND token_id <> ?
+            """,
+            (int(now), normalized_brain_id, normalized_token),
+        )
+        finalized = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_token,),
+        ).fetchone()
+        conn.commit()
+    if finalized is None:
+        raise _grow_preview_binding_error("preview_binding_store_unavailable", status_code=503)
+    return _grow_preview_binding_row(finalized)
+
+
 def _maintenance_preview_error(
     code: str,
     *,
@@ -6102,6 +6528,67 @@ def _maintenance_preview_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _resolve_maintenance_preview_authority_conn(
+    conn: sqlite3.Connection,
+    *,
+    brain_id: str,
+    mode: str,
+    deterministic_preview_signature: str,
+) -> dict[str, Any]:
+    cycle_prefix = f"{deterministic_preview_signature}{_MAINTENANCE_PREVIEW_AUTHORITY_CYCLE_MARKER}"
+    rows = conn.execute(
+        """
+        SELECT preview_signature, state
+        FROM maintenance_previews
+        WHERE brain_id = ?
+          AND mode = ?
+          AND (preview_signature = ? OR substr(preview_signature, 1, ?) = ?)
+        """,
+        (brain_id, mode, deterministic_preview_signature, len(cycle_prefix), cycle_prefix),
+    ).fetchall()
+    cycles: dict[int, sqlite3.Row] = {}
+    for row in rows:
+        signature = str(row["preview_signature"])
+        if signature == deterministic_preview_signature:
+            cycles[1] = row
+            continue
+        suffix = signature[len(cycle_prefix) :]
+        if suffix.isdigit() and int(suffix) >= 2:
+            cycles[int(suffix)] = row
+
+    predecessor_signature = None
+    predecessor_state = None
+    if not cycles:
+        authority_cycle = 1
+        authority_signature = deterministic_preview_signature
+    else:
+        latest_cycle = max(cycles)
+        latest_row = cycles[latest_cycle]
+        latest_state = str(latest_row["state"])
+        if latest_state == "active":
+            authority_cycle = latest_cycle
+            authority_signature = str(latest_row["preview_signature"])
+            prior_cycles = [cycle for cycle in cycles if cycle < latest_cycle]
+            if prior_cycles:
+                predecessor_row = cycles[max(prior_cycles)]
+                predecessor_signature = str(predecessor_row["preview_signature"])
+                predecessor_state = str(predecessor_row["state"])
+        else:
+            authority_cycle = latest_cycle + 1
+            authority_signature = f"{cycle_prefix}{authority_cycle}"
+            predecessor_signature = str(latest_row["preview_signature"])
+            predecessor_state = latest_state
+
+    return {
+        "signature_id": authority_signature,
+        "deterministic_preview_signature": deterministic_preview_signature,
+        "authority_cycle": authority_cycle,
+        "predecessor_signature": predecessor_signature,
+        "predecessor_state": predecessor_state,
+        "anti_replay_tombstone_preserved": predecessor_state in {"rolled_back", "invalidated"},
+    }
+
+
 def store_maintenance_preview(
     *,
     brain_id: str,
@@ -6125,28 +6612,9 @@ def store_maintenance_preview(
         "candidate_revision": candidate_revision,
         "proposal_hash": proposal_hash,
     }
-    preview_signature = "maintenance_preview::" + hashlib.sha256(
+    deterministic_preview_signature = "maintenance_preview::" + hashlib.sha256(
         json.dumps(signature_seed, ensure_ascii=True, sort_keys=True).encode("utf-8")
     ).hexdigest()[:24]
-    authority = {
-        "schema_version": "agvm.maintenance_reviewed_preview.v1",
-        "signature_id": preview_signature,
-        "brain_id": normalized_brain_id,
-        "mode": normalized_mode,
-        "brain_revision": brain_revision,
-        "candidate_revision": candidate_revision,
-        "proposal_hash": proposal_hash,
-        "proposal_ids": proposal_ids,
-        "persisted": True,
-        "state": "active",
-    }
-    stored_report = dict(report)
-    transaction = dict(stored_report.get("maintenance_transaction") or {})
-    transaction["preview_signature"] = authority
-    stored_report["maintenance_transaction"] = transaction
-    guard = dict(stored_report.get("apply_policy_guard") or {})
-    guard["reviewed_preview_authority"] = authority
-    stored_report["apply_policy_guard"] = guard
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -6158,6 +6626,31 @@ def store_maintenance_preview(
                 expected_brain_revision=brain_revision,
                 current_brain_revision=current_revision,
             )
+        authority = {
+            "schema_version": "agvm.maintenance_reviewed_preview.v1",
+            **_resolve_maintenance_preview_authority_conn(
+                conn,
+                brain_id=normalized_brain_id,
+                mode=normalized_mode,
+                deterministic_preview_signature=deterministic_preview_signature,
+            ),
+            "brain_id": normalized_brain_id,
+            "mode": normalized_mode,
+            "brain_revision": brain_revision,
+            "candidate_revision": candidate_revision,
+            "proposal_hash": proposal_hash,
+            "proposal_ids": proposal_ids,
+            "persisted": True,
+            "state": "active",
+        }
+        preview_signature = str(authority["signature_id"])
+        stored_report = dict(report)
+        transaction = dict(stored_report.get("maintenance_transaction") or {})
+        transaction["preview_signature"] = authority
+        stored_report["maintenance_transaction"] = transaction
+        guard = dict(stored_report.get("apply_policy_guard") or {})
+        guard["reviewed_preview_authority"] = authority
+        stored_report["apply_policy_guard"] = guard
         conn.execute(
             """
             INSERT INTO maintenance_previews (
@@ -6237,11 +6730,16 @@ def apply_maintenance_preview(
                 selected_proposal_ids=selected_ids,
             )
         guard = dict(preview["report"].get("apply_policy_guard") or {})
-        if not bool(guard.get("guard_passed")):
+        substantive_blocked_reasons = [
+            str(reason)
+            for reason in list(guard.get("blocked_reasons") or [])
+            if str(reason) and str(reason) != "preview_only"
+        ]
+        if not bool(guard.get("guard_passed")) or substantive_blocked_reasons:
             conn.rollback()
             raise _maintenance_preview_error(
                 "maintenance_preview_safety_guard_failed",
-                blocked_reasons=list(guard.get("blocked_reasons") or []),
+                blocked_reasons=substantive_blocked_reasons or ["maintenance_preview_guard_not_passed"],
             )
         current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
         if preview["state"] == "applied":

@@ -168,6 +168,13 @@ def ensure_local_module_entitled(module_id: str) -> None:
     status = _module_status(module_id)
     if bool(status.get("granted")):
         return
+    manifest = _module_gate_manifest(module_id, status=status)
+    required_plan = str(
+        manifest.get("required_plan")
+        or dict(manifest.get("license") or {}).get("plan_required")
+        or ""
+    ).strip() or None
+    message = str(manifest.get("safe_fallback_message") or "").strip() or "This module is not available."
     raise HTTPException(
         status_code=402,
         detail={
@@ -177,10 +184,26 @@ def ensure_local_module_entitled(module_id: str) -> None:
             "license_state": status.get("license_state"),
             "reason": status.get("reason"),
             "plan": status.get("plan"),
+            "required_plan": required_plan,
             "lease_present": bool(status.get("lease_present")),
-            "message": "This AGVM Pro module requires a valid local lease from the Detwin platform.",
+            "message": message,
         },
     )
+
+
+def _module_gate_manifest(module_id: str, *, status: dict[str, Any]) -> dict[str, Any]:
+    if module_id == MAINTAIN_MODULE_ID:
+        return build_local_module_manifest(MAINTAIN_MANIFEST)
+    if module_id == CLONE_MODULE_ID:
+        try:
+            from agvm_clone_app.api import build_clone_app_module_manifest
+        except ImportError:
+            return {}
+        return build_clone_app_module_manifest(
+            license_state=_manifest_license_state(str(status.get("license_state") or "missing")),
+            backend_status="healthy",
+        ).as_dict()
+    return {}
 
 
 def _module_status(module_id: str) -> dict[str, Any]:
