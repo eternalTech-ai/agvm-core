@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The export provenance manifest contains only deterministic SHA-256 file hashes."
+paths = ['''(^|/)\.agvm-public-export\.json$''']

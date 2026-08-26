@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -43,6 +44,7 @@ from schemas import (
 
 
 _BRAIN_ENSURE_LOCK = threading.Lock()
+_BRAIN_SYNC_SNAPSHOT_LOCK = threading.Lock()
 
 
 def create_core_brain_router() -> APIRouter:
@@ -67,10 +69,10 @@ def create_core_brain_router() -> APIRouter:
         return active_brain()
 
     @router.get("/memory/brains/{brain_id}/sync-snapshot")
-    def brain_sync_snapshot(brain_id: str, max_nodes: int = 5000) -> dict[str, Any]:
+    def brain_sync_snapshot(brain_id: str, max_nodes: int = 250000) -> dict[str, Any]:
         """Project one real local brain into the bounded Cloud sync contract."""
 
-        if max_nodes < 1 or max_nodes > 5000:
+        if max_nodes < 1 or max_nodes > 250000:
             raise HTTPException(status_code=422, detail="brain_sync_snapshot_max_nodes_out_of_bounds")
         try:
             brain = resolve_brain_scope(brain_id=brain_id, require_explicit=True)
@@ -398,16 +400,6 @@ def _brain_sync_snapshot_payload(
     lifecycle = dict(brain.get("lifecycle") or {})
     profile_revision = int(lifecycle.get("profile_revision") or 0)
     bootstrap_session_id = str(lifecycle.get("bootstrap_session_id") or "").strip()
-    revision = max(1, profile_revision)
-    history = [
-        {
-            "revision": revision,
-            "profile_state": str(lifecycle.get("profile_state") or "not_reported"),
-            "benchmark_state": str(lifecycle.get("benchmark_state") or "not_reported"),
-            "bootstrap_state": str(lifecycle.get("bootstrap_state") or "not_started"),
-            "bootstrap_session_id": bootstrap_session_id or None,
-        }
-    ]
     exposed_sources = (
         list(materialized_sources)
         if isinstance(materialized_sources, list)
@@ -418,8 +410,39 @@ def _brain_sync_snapshot_payload(
         if isinstance(materialized_profile, dict)
         else profile
     )
+    materialized_revision = (
+        int(materialized_revisions.get("current_revision") or 0)
+        if isinstance(materialized_revisions, dict)
+        else 0
+    )
+    revision = _brain_sync_source_revision(
+        storage_path=storage_path,
+        content={
+            "nodes": sorted(graph_nodes, key=lambda item: str(item.get("id") or "")),
+            "edges": sorted(
+                [dict(item) for item in list(graph.get("edges") or []) if isinstance(item, dict)],
+                key=lambda item: (
+                    str(item.get("source") or item.get("source_id") or item.get("source_node_id") or ""),
+                    str(item.get("target") or item.get("target_id") or item.get("target_node_id") or ""),
+                    str(item.get("id") or ""),
+                ),
+            ),
+            "sources": exposed_sources,
+            "profile": exposed_profile,
+        },
+        minimum_revision=max(1, profile_revision, materialized_revision),
+    )
+    history = [
+        {
+            "revision": revision,
+            "profile_state": str(lifecycle.get("profile_state") or "not_reported"),
+            "benchmark_state": str(lifecycle.get("benchmark_state") or "not_reported"),
+            "bootstrap_state": str(lifecycle.get("bootstrap_state") or "not_started"),
+            "bootstrap_session_id": bootstrap_session_id or None,
+        }
+    ]
     exposed_revisions = (
-        dict(materialized_revisions)
+        {**dict(materialized_revisions), "current_revision": revision}
         if isinstance(materialized_revisions, dict)
         else {"current_revision": revision, "history": history}
     )
@@ -444,6 +467,51 @@ def _brain_sync_snapshot_payload(
             "revisions": exposed_revisions,
         },
     }
+
+
+def _brain_sync_source_revision(
+    *,
+    storage_path: Path,
+    content: dict[str, Any],
+    minimum_revision: int,
+) -> int:
+    content_sha256 = hashlib.sha256(
+        json.dumps(
+            content,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    state_path = storage_path / "brain_sync_source_revision.json"
+    with _BRAIN_SYNC_SNAPSHOT_LOCK:
+        previous = _read_json_object(state_path)
+        previous_revision = int(previous.get("source_revision") or 0)
+        if (
+            previous_revision >= minimum_revision
+            and str(previous.get("content_sha256") or "") == content_sha256
+        ):
+            return previous_revision
+        revision = max(minimum_revision, previous_revision + 1)
+        state = {
+            "schema_version": "agvm.local_brain_sync_source_revision.v1",
+            "content_sha256": content_sha256,
+            "source_revision": revision,
+        }
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            delete=False,
+            dir=state_path.parent,
+            prefix=f".{state_path.name}.",
+            suffix=".tmp",
+        ) as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(state_path)
+        return revision
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

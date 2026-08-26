@@ -839,9 +839,17 @@ class McpMaintenanceRequest(BaseModel):
 
 
 class McpMaintenanceApplyRequest(McpMaintenanceRequest):
-    proposal_ids: list[str] = Field(default_factory=list)
+    proposal_ids: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("selected_proposal_ids", "proposal_ids"),
+        serialization_alias="selected_proposal_ids",
+    )
     preview_signature: str | None = Field(default=None, min_length=1)
     confirm_apply: bool = False
+
+    @property
+    def selected_proposal_ids(self) -> list[str]:
+        return self.proposal_ids
 
     @field_validator("preview_signature")
     @classmethod
@@ -873,11 +881,12 @@ class McpBrainHealthRequest(BaseModel):
 
 class McpMatrixCalibrationRequest(BaseModel):
     brain_id: str | None = None
+    focus_node_id: str | None = None
     max_nodes_considered: int = Field(default=4000, ge=50, le=4000)
     max_position_updates: int = Field(default=1600, ge=1, le=2000)
     include_recommendations: bool = True
 
-    @field_validator("brain_id")
+    @field_validator("brain_id", "focus_node_id")
     @classmethod
     def trim_optional_mcp_matrix_calibration_id(cls, value: str | None) -> str | None:
         if value is None:
@@ -890,6 +899,15 @@ class McpMatrixCalibrationApplyRequest(McpMatrixCalibrationRequest):
     confirm_apply: bool = False
     rollback_consent: bool = False
     preview_signature: str | None = None
+    proposal_ids: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("selected_proposal_ids", "proposal_ids"),
+        serialization_alias="selected_proposal_ids",
+    )
+
+    @property
+    def selected_proposal_ids(self) -> list[str]:
+        return self.proposal_ids
 
     @field_validator("preview_signature")
     @classmethod

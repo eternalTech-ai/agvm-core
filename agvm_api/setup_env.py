@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import socket
 import tempfile
 import urllib.error
@@ -27,6 +28,8 @@ MANAGED_ENV_SCHEMA_VERSION = "agvm.setup_env.v1"
 PROVIDER_KEY_TEST_SCHEMA_VERSION = "agvm.provider_key_test.v1"
 PROVIDER_KEY_TEST_TIMEOUT_SECONDS = 5.0
 PROVIDER_KEY_TEST_TIMEOUT_MAX_SECONDS = 8.0
+GROW_PREVIEW_BINDING_SECRET_ENV = "AGVM_GROW_PREVIEW_BINDING_SECRET"
+GROW_PREVIEW_BINDING_SECRET_MIN_BYTES = 32
 
 MANAGED_ENV_KEYS = {
     "AGVM_DEFAULT_BRAIN_ID",
@@ -41,6 +44,7 @@ MANAGED_ENV_KEYS = {
     "AGVM_CLONE_APP_SPEAKER_MODEL",
     "AGVM_CLONE_APP_PREFETCH_MODEL",
     "AGVM_CLONE_APP_TEACH_MODEL",
+    GROW_PREVIEW_BINDING_SECRET_ENV,
     "OPENAI_API_KEY",
 }
 
@@ -81,8 +85,44 @@ def managed_env_path() -> Path:
 
 def load_managed_env_into_process(*, override: bool = True) -> None:
     path = managed_env_path()
+    explicit_grow_secret = str(os.getenv(GROW_PREVIEW_BINDING_SECRET_ENV) or "").strip()
     if load_dotenv and path.exists():
         load_dotenv(path, override=override)
+    if explicit_grow_secret:
+        os.environ[GROW_PREVIEW_BINDING_SECRET_ENV] = explicit_grow_secret
+    ensure_grow_preview_binding_secret()
+
+
+def ensure_grow_preview_binding_secret() -> dict[str, Any]:
+    configured = str(os.getenv(GROW_PREVIEW_BINDING_SECRET_ENV) or "").strip()
+    if configured:
+        _validate_grow_preview_binding_secret(configured)
+        return {
+            "configured": True,
+            "generated": False,
+            "source": "process_or_managed_env",
+        }
+
+    managed_secret = str(
+        read_managed_env_values().get(GROW_PREVIEW_BINDING_SECRET_ENV) or ""
+    ).strip()
+    if managed_secret:
+        _validate_grow_preview_binding_secret(managed_secret)
+        os.environ[GROW_PREVIEW_BINDING_SECRET_ENV] = managed_secret
+        return {
+            "configured": True,
+            "generated": False,
+            "source": "managed_runtime_env",
+        }
+
+    generated = secrets.token_urlsafe(48)
+    _validate_grow_preview_binding_secret(generated)
+    save_managed_env_values({GROW_PREVIEW_BINDING_SECRET_ENV: generated})
+    return {
+        "configured": True,
+        "generated": True,
+        "source": "managed_runtime_env",
+    }
 
 
 def read_managed_env_values() -> dict[str, str]:
@@ -309,6 +349,11 @@ def _quote_env_value(value: str) -> str:
         escaped = text.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return text
+
+
+def _validate_grow_preview_binding_secret(value: str) -> None:
+    if len(str(value).encode("utf-8")) < GROW_PREVIEW_BINDING_SECRET_MIN_BYTES:
+        raise ValueError("AGVM_GROW_PREVIEW_BINDING_SECRET_must_be_at_least_32_bytes")
 
 
 def _mask_secret(value: str) -> str:

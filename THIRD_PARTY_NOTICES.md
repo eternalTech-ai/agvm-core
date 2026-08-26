@@ -15,8 +15,8 @@ Do not treat this notice inventory as approved independently of the technical re
 
 ## Summary
 
-- Total dependencies: `203`
-- Python dependencies: `10`
+- Total dependencies: `204`
+- Python dependencies: `11`
 - NPM dependencies: `193`
 - Dependencies requiring manual legal review: `0`
 - Main AGVM Core license placeholder still present: `false`
@@ -30,6 +30,7 @@ Do not treat this notice inventory as approved independently of the technical re
 | ISC | 10 |
 | BSD-3-Clause | 7 |
 | AGPL-3.0-only | 1 |
+| Apache-2.0 OR BSD-3-Clause | 1 |
 | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | 1 |
 | CC-BY-4.0 | 1 |
 | MIT-CMU | 1 |
@@ -42,8 +43,9 @@ No dependency is currently marked for manual review by the generator.
 
 | Ecosystem | Package | Version / Specifier | License | Review |
 | --- | --- | --- | --- | --- |
+| python | `cryptography` | `cryptography==50.0.0` | Apache-2.0 OR BSD-3-Clause | standard |
 | python | `fastapi` | `fastapi==0.133.0` | MIT | standard |
-| python | `Pillow` | `Pillow>=10.0.0,<13.0.0` | MIT-CMU | standard |
+| python | `pillow` | `Pillow>=10.0.0,<13.0.0` | MIT-CMU | standard |
 | python | `playwright` | `playwright>=1.45.0,<2.0.0` | Apache-2.0 | standard |
 | python | `pydantic` | `pydantic==2.11.9` | MIT | standard |
 | python | `pypdf` | `pypdf>=5.0.0,<7.0.0` | BSD-3-Clause | standard |

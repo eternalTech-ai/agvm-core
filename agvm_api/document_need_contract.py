@@ -213,7 +213,6 @@ _NORMAL_CONTEXT_MARKERS = (
     "values",
     "famiglia",
     "family",
-    "simone",
 )
 
 _FIRST_OR_SECOND_PERSON_MARKERS = (

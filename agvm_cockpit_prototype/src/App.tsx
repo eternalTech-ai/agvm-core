@@ -40,8 +40,9 @@ import {
   Sun,
   TerminalSquare,
   UploadCloud,
+  X,
 } from "lucide-react";
-import { OrbitControls } from "@react-three/drei";
+import { Html, OrbitControls } from "@react-three/drei";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Quaternion, Vector3, type Group } from "three";
@@ -64,6 +65,13 @@ type BrainSummary = {
   is_active?: boolean;
   node_count?: number;
   safe_for_mcp?: boolean;
+  migration_source?: string | null;
+  lifecycle?: {
+    bootstrap_state?: string | null;
+    bootstrap_session_id?: string | null;
+    profile_state?: string | null;
+    benchmark_state?: string | null;
+  } | null;
 };
 
 type BrainRegistry = {
@@ -115,6 +123,7 @@ type McpRegistry = {
 };
 
 type RouteId =
+  | "brain_center"
   | "context"
   | "results"
   | "brain_explorer"
@@ -146,9 +155,16 @@ type BrainPoint3d = {
 };
 
 const apiBaseUrl = String(import.meta.env.VITE_API_URL || "http://localhost:8010").replace(/\/$/, "");
-const cloudUrl = String(import.meta.env.VITE_DETWIN_CLOUD_URL || "https://app.detwin.ai").replace(/\/$/, "");
+const cloudUrl = String(
+  import.meta.env.VITE_PLATFORM_URL
+  || import.meta.env.VITE_DETWIN_CLOUD_URL
+  || "https://app.detwin.ai",
+).replace(/\/$/, "");
+const connectedClientDeviceTokenKey = "agvm.platform.connected_client.device_token.v1";
+const connectedClientPlatformOriginKey = "agvm.platform.connected_client.platform_origin.v1";
 
 const routes: Array<{ id: RouteId; label: string; shortLabel?: string; eyebrow: string; icon: LucideIcon }> = [
+  { id: "brain_center", label: "Brain Center", eyebrow: "Registry", icon: Brain },
   { id: "context", label: "Context", eyebrow: "Core", icon: Search },
   { id: "results", label: "Results", eyebrow: "Core", icon: BarChart3 },
   { id: "brain_explorer", label: "Brain Explorer", shortLabel: "Explorer", eyebrow: "Core", icon: Brain },
@@ -189,22 +205,23 @@ export function CockpitApp() {
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
-  const [query, setQuery] = useState("What changed in this brain recently?");
+  const [query, setQuery] = useState("");
+  const [includeAnswerDemo, setIncludeAnswerDemo] = useState(false);
+  const [retrievalLimit, setRetrievalLimit] = useState(24);
   const [theme, setTheme] = useState<ThemeMode>(() => readTheme());
   const [sourceKind, setSourceKind] = useState<GrowSourceKind>("manual_text");
-  const [sourceLabel, setSourceLabel] = useState("Local Core source");
+  const [sourceLabel, setSourceLabel] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceFileName, setSourceFileName] = useState("");
-  const [sourceText, setSourceText] = useState(
-    "Capture the product-readiness decision: AGVM Core stays local and free, while advanced modules run in Detwin Cloud.",
-  );
-  const [newBrainDisplayName, setNewBrainDisplayName] = useState("Personal Memory");
-  const [newBrainId, setNewBrainId] = useState("personal_memory");
-  const [importBrainDisplayName, setImportBrainDisplayName] = useState("Imported Memory");
-  const [importBrainId, setImportBrainId] = useState("imported_memory");
+  const [sourceText, setSourceText] = useState("");
+  const [newBrainDisplayName, setNewBrainDisplayName] = useState("");
+  const [newBrainId, setNewBrainId] = useState("");
+  const [importBrainDisplayName, setImportBrainDisplayName] = useState("");
+  const [importBrainId, setImportBrainId] = useState("");
   const [toolName, setToolName] = useState("retrieve_context");
   const [rawPayload, setRawPayload] = useState("{\n  \"query_text\": \"What should AGVM retrieve from this brain?\"\n}");
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [bootstrapSession, setBootstrapSession] = useState<Record<string, unknown> | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -240,11 +257,20 @@ export function CockpitApp() {
     registry?.active_brain_id || health?.active_brain_id || brains.find((brain) => brain.is_active)?.brain_id || brains[0]?.brain_id || "",
   );
   const activeBrain = brains.find((brain) => brainId(brain) === activeBrainId) || brains[0] || null;
+  const bootstrapReady = isBootstrapReady(activeBrain);
   const nodes = graph?.graph?.nodes || [];
   const toolOptions = useMemo(() => (mcpRegistry?.tools || []).filter((tool) => tool.endpoint_path).slice(0, 80), [mcpRegistry]);
   const selectedTool = toolOptions.find((tool) => tool.name === toolName) || toolOptions[0] || null;
   const routeModel = routes.find((item) => item.id === route) || routes[0];
-  const activity = activityFor(busyAction, route);
+  const activity = activityFor(busyAction, route, result);
+
+  useEffect(() => {
+    if (loading || !activeBrainId || bootstrapReady || route === "brain_center") return;
+    if (!window.location.hash || route === "context" || route === "grow") {
+      setRoute("brain_center");
+      window.location.hash = "brain_center";
+    }
+  }, [activeBrainId, bootstrapReady, loading, route]);
 
   useEffect(() => {
     if (selectedTool && selectedTool.name !== toolName) setToolName(selectedTool.name);
@@ -254,10 +280,13 @@ export function CockpitApp() {
     setBusyAction(action);
     setLastError(null);
     try {
-      setResult(await executor());
+      const response = await executor();
+      setResult(response);
+      return response;
     } catch (error: unknown) {
       setLastError(errorMessage(error));
       setResult(null);
+      return null;
     } finally {
       setBusyAction(null);
     }
@@ -266,7 +295,7 @@ export function CockpitApp() {
   function createLocalBrain(displayName = newBrainDisplayName, requestedBrainId = newBrainId) {
     const cleanDisplayName = displayName.trim() || "Personal Memory";
     const brain_id = normalizeBrainId(requestedBrainId || cleanDisplayName);
-    runAction("create-brain", async () => {
+    return runAction("create-brain", async () => {
       const payload = {
         brain_id,
         display_name: cleanDisplayName,
@@ -274,32 +303,19 @@ export function CockpitApp() {
         make_active: true,
         make_default: true,
       };
-      const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/brains/create", "/memory/brains/create", payload);
+      const response = await writeApi<Record<string, unknown>>("/mcp/brains/create", payload);
       await refresh();
+      setBootstrapSession(null);
+      setRoute("brain_center");
+      window.location.hash = "brain_center";
       return response;
     });
   }
 
   function bootstrapRegistry() {
-    runAction("bootstrap-brain-registry", async () => {
-      const brain_id = normalizeBrainId(newBrainId || newBrainDisplayName);
-      const response = await writeApiWithFallback<Record<string, unknown>>(
-        "/mcp/brains/ensure",
-        "/memory/brains/bootstrap",
-        {
-          brain_id,
-          default_brain_id: brain_id,
-          display_name: newBrainDisplayName.trim() || "Personal Memory",
-          description: "Bootstrapped from the AGVM Core UI.",
-          purpose: "local_core",
-          activation_policy: "make_default",
-          create_if_missing: true,
-          force_rescan: true,
-          legacy_data_dirs: [],
-        },
-      );
+    runAction("refresh-brain-registry", async () => {
       await refresh();
-      return response;
+      return { status: "ok", operation: "brain_registry_refresh", mutation: "none" };
     });
   }
 
@@ -322,12 +338,8 @@ export function CockpitApp() {
   function exportActiveBrain() {
     runAction("export-brain", async () => {
       if (!activeBrainId) throw new Error("Select or create a local brain before export.");
-      return writeApiWithFallback<Record<string, unknown>>("/mcp/brains/export", "/memory/brains/export", { brain_id: activeBrainId });
+      return writeApi<Record<string, unknown>>("/mcp/brains/export", { brain_id: activeBrainId });
     });
-  }
-
-  function createDemoBrain() {
-    createLocalBrain("Core Product Demo Brain", "core_product_demo_brain");
   }
 
   async function loadGrowSourceFile(file: File | null) {
@@ -347,6 +359,92 @@ export function CockpitApp() {
         "For binary PDF/DOCX/image sources, run the same Grow source preview contract through Cloud AGVM or provide extracted text here for Local Core preview.",
       ].join("\n"),
     );
+  }
+
+  async function runBootstrapCommand(operation: string, payload: Record<string, unknown>) {
+    const response = await runAction(`bootstrap-${operation}`, async () => {
+      const next = await writeApi<Record<string, unknown>>(`/mcp/brain-bootstrap-${operation.replace(/_/g, "-")}`, {
+        brain_id: activeBrainId || undefined,
+        ...payload,
+      });
+      const session = objectAt(next, "session");
+      if (session) setBootstrapSession(session);
+      if (operation === "apply") await refresh();
+      return next;
+    });
+    return response;
+  }
+
+  async function applyGrowPreview(selectedPreviewIds: string[]) {
+    const data = resultData(result);
+    const investigation = objectAt(data, "source_investigation");
+    const investigationId = String(investigation?.investigation_id || "").trim();
+    if (!investigationId) {
+      setLastError("Run a Grow preview before applying reviewed candidates.");
+      return null;
+    }
+    return runAction("grow-apply", async () => {
+      const response = await writeApi<Record<string, unknown>>("/mcp/grow-source-apply", {
+        brain_id: activeBrainId || undefined,
+        investigation_id: investigationId,
+        source_investigation: investigation || undefined,
+        source_formation_contract: objectAt(data, "source_formation_contract") || undefined,
+        preview_bundle: objectAt(data, "preview_bundle") || undefined,
+        selected_preview_ids: selectedPreviewIds,
+        approved_preview_ids: selectedPreviewIds,
+        learning_mode: "strict_review",
+        confirm_apply: true,
+      });
+      await refresh();
+      return response;
+    });
+  }
+
+  async function retrieveContext() {
+    return runAction("retrieve", async () => {
+      const first = await writeApi<Record<string, unknown>>("/mcp/retrieve-context", {
+        brain_id: activeBrainId || undefined,
+        query_text: query,
+        retrieval_mode: "balanced",
+        context_package_mode: "mcp_operational",
+        document_text_policy: "refs_only",
+        max_matches: retrievalLimit,
+        include_answer_demo: includeAnswerDemo,
+        include_raw_text: false,
+        complete_paths: true,
+      });
+      setResult(first);
+      let latest = first;
+      const searchId = contextSearchId(first);
+      for (let attempt = 0; searchId && !contextResultIsTerminal(latest) && attempt < 8; attempt += 1) {
+        await waitFor(350 + attempt * 150);
+        try {
+          latest = await writeApi<Record<string, unknown>>("/mcp/inspect-context-package", { search_id: searchId });
+          setResult(latest);
+        } catch {
+          // The first package remains usable while background materialization catches up.
+        }
+      }
+      if (searchId) {
+        try {
+          const trace = await readApi<Record<string, unknown>>(
+            withQuery(`/memory/get-trace/${encodeURIComponent(searchId)}`, { brain_id: activeBrainId || undefined }),
+          );
+          latest = {
+            ...latest,
+            ui_trace: {
+              landing_metadata: arrayAt(trace, "landing_metadata"),
+              context_waves: arrayAt(trace, "context_waves"),
+              worker_stop_reasons: objectAt(trace, "worker_stop_reasons") || {},
+            },
+          };
+          setResult(latest);
+        } catch {
+          // The structured context remains valid when optional trace enrichment is unavailable.
+        }
+      }
+      return latest;
+    });
   }
 
   return (
@@ -377,8 +475,15 @@ export function CockpitApp() {
             onRefresh={refresh}
             onSelect={(brain) =>
               runAction("select-brain", async () => {
-                const response = await writeApiWithFallback<Record<string, unknown>>("/mcp/select-brain", "/memory/brains/select", { brain_id: brain, make_default: false });
+                const response = await writeApi<Record<string, unknown>>("/mcp/select-brain", { brain_id: brain, make_default: false });
                 await refresh();
+                setBootstrapSession(null);
+                setResult(null);
+                const selected = brains.find((item) => brainId(item) === brain) || null;
+                if (!isBootstrapReady(selected)) {
+                  setRoute("brain_center");
+                  window.location.hash = "brain_center";
+                }
                 return response;
               })
             }
@@ -444,40 +549,52 @@ export function CockpitApp() {
 
         <main className="agvm-product-main">
           <section className="agvm-product-content">
-          {route !== "context" && route !== "brain_explorer" ? (
+          {route !== "brain_center" && route !== "context" && route !== "brain_explorer" ? (
             <header className="workspace-head agvm-product-page-header">
               <div><span>{routeModel.eyebrow.toUpperCase()}</span><h1>{headlineForRoute(route, activeBrain)}</h1><p>{descriptionForRoute(route)}</p></div>
               <div className="workspace-actions">
-                {!activeBrainId ? <button className="primary" disabled={busyAction === "create-brain"} onClick={createDemoBrain} type="button"><Brain size={16} />Create starter brain</button> : null}
                 <a className="secondary" href={`${cloudUrl}/modules`}><Cloud size={16} />Use Detwin Cloud</a>
               </div>
             </header>
           ) : null}
           {lastError ? <Notice tone="blocked" title="Local request did not complete" detail={lastError} /> : null}
-          {!activeBrainId && route !== "context" ? <BrainBootstrapNotice busyAction={busyAction} onBootstrap={bootstrapRegistry} onCreateDemo={createDemoBrain} /> : null}
+          {!activeBrainId && route !== "context" && route !== "brain_center" ? <BrainBootstrapNotice busyAction={busyAction} onBootstrap={bootstrapRegistry} /> : null}
 
+          {route === "brain_center" ? (
+            <BrainCenterRoute
+              activeBrain={activeBrain}
+              activeBrainId={activeBrainId}
+              bootstrapReady={bootstrapReady}
+              busyAction={busyAction}
+              nodes={nodes}
+              onCommand={runBootstrapCommand}
+              onOpenContext={() => {
+                setRoute("context");
+                window.location.hash = "context";
+              }}
+              session={bootstrapSession}
+            />
+          ) : null}
           {route === "brain_explorer" ? <BrainRoute activeBrain={activeBrain} activeBrainId={activeBrainId} activity={activity} graph={graph} nodes={nodes} /> : null}
           {route === "context" ? (
             <ContextRoute
               activeBrainId={activeBrainId}
               activity={activity}
+              bootstrapReady={bootstrapReady}
               busy={busyAction === "retrieve"}
+              includeAnswerDemo={includeAnswerDemo}
               nodes={nodes}
               query={query}
+              retrievalLimit={retrievalLimit}
               result={result}
+              setIncludeAnswerDemo={setIncludeAnswerDemo}
               setQuery={setQuery}
-              onRun={() =>
-                runAction("retrieve", () =>
-                  writeApi<Record<string, unknown>>("/memory/query", {
-                    brain_id: activeBrainId || undefined,
-                    query_text: query,
-                    retrieval_mode: "balanced",
-                    max_matches: 10,
-                    include_answer_demo: true,
-                    include_raw_text: false,
-                  }),
-                )
-              }
+              setRetrievalLimit={setRetrievalLimit}
+              onOpenBootstrap={() => {
+                setRoute("brain_center");
+                window.location.hash = "brain_center";
+              }}
+              onRun={() => void retrieveContext()}
             />
           ) : null}
           {route === "results" ? <ResultsRoute nodes={nodes} result={result} /> : null}
@@ -485,7 +602,8 @@ export function CockpitApp() {
             <GrowRoute
               activeBrainId={activeBrainId}
               activity={activity}
-              busy={busyAction === "grow"}
+              bootstrapReady={bootstrapReady}
+              busy={busyAction === "grow" || busyAction === "grow-apply"}
               nodes={nodes}
               sourceFileName={sourceFileName}
               sourceKind={sourceKind}
@@ -498,6 +616,11 @@ export function CockpitApp() {
               setSourceUrl={setSourceUrl}
               setSourceText={setSourceText}
               onFileChange={(file) => void loadGrowSourceFile(file)}
+              onApply={applyGrowPreview}
+              onOpenBootstrap={() => {
+                setRoute("brain_center");
+                window.location.hash = "brain_center";
+              }}
               onRun={() =>
                 runAction("grow", () =>
                   writeApi<Record<string, unknown>>("/mcp/grow-source-preview", {
@@ -558,10 +681,200 @@ export function CockpitApp() {
             />
           ) : null}
           {route === "bench" ? <BenchRoute activeBrainId={activeBrainId} graph={graph} health={health} /> : null}
-          {route === "brain_sync" ? <BrainSyncRoute activeBrain={activeBrain} activeBrainId={activeBrainId} /> : null}
+          {route === "brain_sync" ? <BrainSyncRoute activeBrain={activeBrain} activeBrainId={activeBrainId} nodes={nodes} onRefresh={refresh} /> : null}
           {route === "settings" ? <SettingsRoute activeBrainId={activeBrainId} health={health} mcpRegistry={mcpRegistry} setTheme={setTheme} theme={theme} /> : null}
           </section>
         </main>
+      </div>
+    </section>
+  );
+}
+
+function BrainCenterRoute({
+  activeBrain,
+  activeBrainId,
+  bootstrapReady,
+  busyAction,
+  nodes,
+  onCommand,
+  onOpenContext,
+  session,
+}: {
+  activeBrain: BrainSummary | null;
+  activeBrainId: string;
+  bootstrapReady: boolean;
+  busyAction: string | null;
+  nodes: GraphNode[];
+  onCommand: (operation: string, payload: Record<string, unknown>) => Promise<Record<string, unknown> | null | undefined>;
+  onOpenContext: () => void;
+  session: Record<string, unknown> | null;
+}) {
+  const [goal, setGoal] = useState("");
+  const [interviewMode, setInterviewMode] = useState<"adaptive_ai" | "manual">("adaptive_ai");
+  const [manualQuestions, setManualQuestions] = useState("");
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [sourceText, setSourceText] = useState("");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const requestedStatus = useRef("");
+  const state = bootstrapSessionState(session);
+  const questions = arrayAt(session, "questions").map((item) => String(item || "")).filter(Boolean);
+  const candidates = bootstrapCandidates(session);
+  const sessionId = String(session?.session_id || activeBrain?.lifecycle?.bootstrap_session_id || "").trim();
+  const revision = Number(session?.revision || 0);
+  const busy = Boolean(busyAction?.startsWith("bootstrap-"));
+
+  useEffect(() => {
+    if (session || !sessionId || requestedStatus.current === sessionId) return;
+    requestedStatus.current = sessionId;
+    void onCommand("status", { session_id: sessionId });
+  }, [onCommand, session, sessionId]);
+
+  useEffect(() => {
+    if (!candidates.length) return;
+    const ids = candidates.map((candidate) => candidate.id);
+    setSelectedIds((current) => current.length ? current.filter((id) => ids.includes(id)) : ids);
+  }, [candidates.map((candidate) => candidate.id).join("|")]);
+
+  if (!activeBrainId || !activeBrain) {
+    return (
+      <section className="brain-center-onboarding">
+        <div className="brain-center-copy">
+          <PanelEyebrow icon={Brain} label="Brain Center" />
+          <h1>Create your first brain</h1>
+          <p>Use Manage in the top bar to name a local brain or import a reviewed archive. Nothing is uploaded.</p>
+        </div>
+        <BrainCanvas activeBrainId="" activity={activityFor(null, "brain_center")} nodes={[]} />
+      </section>
+    );
+  }
+
+  if (bootstrapReady || state === "applied") {
+    return (
+      <section className="brain-center-onboarding brain-born">
+        <div className="brain-center-copy">
+          <PanelEyebrow icon={CheckCircle2} label="Brain ready" />
+          <h1>{brainName(activeBrain)}</h1>
+          <p>{nodes.length} reviewed memories are active. Context, Grow, Explorer and MCP retrieval are unlocked.</p>
+          <button className="primary" onClick={onOpenContext} type="button"><Search size={16} />Open Context</button>
+        </div>
+        <BrainCanvas activeBrainId={activeBrainId} activity={activityFor(null, "brain_center")} nodes={nodes} />
+      </section>
+    );
+  }
+
+  return (
+    <section className="bootstrap-workspace">
+      <header className="bootstrap-hero">
+        <div>
+          <PanelEyebrow icon={Sparkles} label="Required Brain Bootstrap" />
+          <h1>{state === "applied" ? "Your brain is alive" : `Build ${brainName(activeBrain)}`}</h1>
+          <p>Define the mission, answer a domain-specific interview, add trusted material, review every memory and apply once.</p>
+        </div>
+        <div className="bootstrap-progress" aria-label="Bootstrap progress">
+          {["Purpose", "Interview", "Foundations", "Review", "Activate"].map((label, index) => (
+            <span className={bootstrapStepState(state, index)} key={label}><b>{index + 1}</b>{label}</span>
+          ))}
+        </div>
+      </header>
+
+      <div className="bootstrap-layout">
+        <div className="bootstrap-form-stack">
+          {!session ? (
+            <section className="command-surface bootstrap-panel">
+              <PanelEyebrow icon={Brain} label="Purpose" />
+              <h2>What should this brain understand?</h2>
+              <textarea aria-label="Brain purpose" onChange={(event) => setGoal(event.target.value)} placeholder="Describe the work, users, trusted sources and decisions this brain should support." value={goal} />
+              <div className="theme-toggle bootstrap-mode" role="group" aria-label="Interview mode">
+                <button className={interviewMode === "adaptive_ai" ? "active" : ""} onClick={() => setInterviewMode("adaptive_ai")} type="button"><Sparkles size={16} />AI interview</button>
+                <button className={interviewMode === "manual" ? "active" : ""} onClick={() => setInterviewMode("manual")} type="button"><ClipboardCheck size={16} />Manual questions</button>
+              </div>
+              {interviewMode === "manual" ? (
+                <label className="bootstrap-question-authoring">
+                  Interview questions
+                  <textarea aria-label="Manual interview questions" onChange={(event) => setManualQuestions(event.target.value)} placeholder="One question per line. Add as many as this brain needs; six answered dimensions are the minimum quality gate." value={manualQuestions} />
+                </label>
+              ) : <p className="fine-print">A configured local provider creates a bounded interview from this purpose. The question count adapts to domain complexity.</p>}
+              <button
+                className="primary wide"
+                disabled={busy || !goal.trim() || (interviewMode === "manual" && manualQuestionList(manualQuestions).length < 6)}
+                onClick={() => void onCommand("start", {
+                  idempotency_key: `bootstrap-start-${activeBrainId}`,
+                  goal: goal.trim(),
+                  interview_mode: interviewMode,
+                  quality_policy: "guided_seed_v1",
+                  questions: interviewMode === "manual" ? manualQuestionList(manualQuestions) : undefined,
+                })}
+                type="button"
+              >
+                {busy ? <RefreshCw size={17} /> : <ArrowRight size={17} />}
+                Start Brain Bootstrap
+              </button>
+            </section>
+          ) : null}
+
+          {session && state !== "applied" ? (
+            <section className="command-surface bootstrap-panel">
+              <PanelEyebrow icon={MessageSquareText} label="Human review interview" />
+              <div className="bootstrap-panel-heading"><h2>Answer the questions that shape this brain</h2><strong>{arrayAt(session, "answers").length} / {questions.length}</strong></div>
+              <div className="bootstrap-question-list">
+                {questions.map((question, index) => {
+                  const questionId = bootstrapQuestionId(question, index);
+                  const saved = arrayAt(session, "answers").some((item) => objectAtValue(item, "question_id") === questionId);
+                  return (
+                    <article className={saved ? "saved" : ""} key={questionId}>
+                      <span>{String(index + 1).padStart(2, "0")}</span>
+                      <label>
+                        <strong>{question}</strong>
+                        <textarea aria-label={`Answer ${index + 1}`} disabled={saved} onChange={(event) => setAnswers((current) => ({ ...current, [questionId]: event.target.value }))} placeholder="Write a concrete, reviewable answer." value={answers[questionId] || ""} />
+                      </label>
+                      <button className="secondary" disabled={busy || saved || !String(answers[questionId] || "").trim()} onClick={() => void onCommand("answer", { session_id: sessionId, expected_revision: revision, idempotency_key: `bootstrap-answer-${sessionId}-${questionId}`, question_id: questionId, answer: String(answers[questionId] || "").trim() })} type="button">
+                        {saved ? <CheckCircle2 size={15} /> : <ArrowRight size={15} />}{saved ? "Saved" : "Save answer"}
+                      </button>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          ) : null}
+
+          {session && state !== "applied" ? (
+            <section className="command-surface bootstrap-panel">
+              <PanelEyebrow icon={Database} label="Trusted foundations" />
+              <h2>Add reviewed material</h2>
+              <textarea aria-label="Bootstrap source material" onChange={(event) => setSourceText(event.target.value)} placeholder="Paste specifications, decisions, operating rules or other trusted source material. At least 240 characters are required by the quality gate." value={sourceText} />
+              <button className="secondary wide" disabled={busy || sourceText.trim().length < 240} onClick={() => void onCommand("add_source", { session_id: sessionId, expected_revision: revision, idempotency_key: `bootstrap-source-${sessionId}-${revision}`, source_id: `bootstrap-source-${revision}`, source_label: "Brain Bootstrap reviewed material", source_kind: "manual_text", source_text: sourceText.trim(), source_trust: "user_asserted" })} type="button"><PlusCircle size={16} />Add reviewed source</button>
+              <button className="primary wide" disabled={busy || arrayAt(session, "answers").length < Number(objectAt(session, "quality_requirements")?.minimum_answer_count || 6) || !arrayAt(session, "sources").length} onClick={() => void onCommand("preview", { session_id: sessionId, expected_revision: revision, idempotency_key: `bootstrap-preview-${sessionId}-${revision}`, capability: "grow_review" })} type="button"><GitBranch size={16} />Build memory preview</button>
+            </section>
+          ) : null}
+
+          {candidates.length ? (
+            <section className="command-surface bootstrap-panel bootstrap-review-panel">
+              <PanelEyebrow icon={ClipboardCheck} label="Review memories" />
+              <div className="bootstrap-panel-heading"><h2>Approve the exact memories to activate</h2><strong>{selectedIds.length} / {candidates.length}</strong></div>
+              <div className="bootstrap-candidate-list">
+                {candidates.map((candidate, index) => (
+                  <label className={selectedIds.includes(candidate.id) ? "selected" : ""} key={candidate.id}>
+                    <input checked={selectedIds.includes(candidate.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, candidate.id])] : current.filter((id) => id !== candidate.id))} type="checkbox" />
+                    <span>{String(index + 1).padStart(2, "0")}</span>
+                    <div><strong>{candidate.title}</strong><p>{candidate.detail}</p></div>
+                  </label>
+                ))}
+              </div>
+              <button className="primary wide" disabled={busy || selectedIds.length < 12} onClick={() => void onCommand("apply", { session_id: sessionId, expected_revision: revision, idempotency_key: `bootstrap-apply-${sessionId}`, selected_preview_ids: selectedIds, confirm_apply: true })} type="button"><Sparkles size={17} />Activate reviewed brain</button>
+              <p className="fine-print">The guided seed requires 12-30 distinct, grounded memories. Only checked candidates cross the write boundary.</p>
+            </section>
+          ) : null}
+        </div>
+
+        <aside className="bootstrap-visual">
+          <BrainCanvas activeBrainId={activeBrainId} activity={{ active: busy, detail: busy ? "forming reviewed memory" : state.replace(/_/g, " "), label: state === "applied" ? "Brain born" : "Bootstrap live", phase: busy ? "growing" : "idle" }} nodes={nodes} />
+          <div className="bootstrap-quality-grid">
+            <Receipt title="Answers" detail={String(arrayAt(session, "answers").length)} tone={arrayAt(session, "answers").length ? "ready" : "pending"} />
+            <Receipt title="Sources" detail={String(arrayAt(session, "sources").length)} tone={arrayAt(session, "sources").length ? "ready" : "pending"} />
+            <Receipt title="Candidates" detail={String(candidates.length)} tone={candidates.length >= 12 ? "active" : "pending"} />
+            <Receipt title="Write state" detail={state === "applied" ? "activated" : "review gated"} tone={state === "applied" ? "ready" : "pending"} />
+          </div>
+        </aside>
       </div>
     </section>
   );
@@ -613,43 +926,78 @@ function BrainRoute({
 function ContextRoute({
   activeBrainId,
   activity,
+  bootstrapReady,
   busy,
+  includeAnswerDemo,
   nodes,
+  onOpenBootstrap,
   onRun,
   query,
+  retrievalLimit,
   result,
+  setIncludeAnswerDemo,
   setQuery,
+  setRetrievalLimit,
 }: {
   activeBrainId: string;
   activity: BrainActivity;
+  bootstrapReady: boolean;
   busy: boolean;
+  includeAnswerDemo: boolean;
   nodes: GraphNode[];
+  onOpenBootstrap: () => void;
   onRun: () => void;
   query: string;
+  retrievalLimit: number;
   result: Record<string, unknown> | null;
+  setIncludeAnswerDemo: (value: boolean) => void;
   setQuery: (value: string) => void;
+  setRetrievalLimit: (value: number) => void;
 }) {
+  const canRetrieve = Boolean(activeBrainId && bootstrapReady);
   return (
     <section className="context-core-workspace">
       <div className="context-command-bar">
         <Search size={17} />
         <input aria-label="Context query" onChange={(event) => setQuery(event.target.value)} placeholder="Ask the brain for context..." value={query} />
-        <button className="secondary" disabled={!activeBrainId} type="button">
-          <Brain size={16} />{activeBrainId ? "Active brain" : "Choose brain"}
-        </button>
-        <button className="primary" disabled={busy || !activeBrainId || !query.trim()} onClick={onRun} type="button">
+        <button className="primary" disabled={busy || !canRetrieve || !query.trim()} onClick={onRun} type="button">
           {busy ? <RefreshCw size={17} /> : <Play size={17} />}
-          {activeBrainId ? "Run retrieval" : "Create, import or select a brain"}
+          Run Context
         </button>
       </div>
+      <div className="context-search-controls" aria-label="Context search controls">
+        <div className="context-depth" role="group" aria-label="Search depth">
+          {[
+            { label: "Focus", value: 12 },
+            { label: "Balanced", value: 24 },
+            { label: "Deep", value: 48 },
+            { label: "Forensic", value: 64 },
+          ].map((option) => (
+            <button aria-pressed={retrievalLimit === option.value} key={option.value} onClick={() => setRetrievalLimit(option.value)} type="button">
+              <strong>{option.label}</strong><span>{option.value} max</span>
+            </button>
+          ))}
+        </div>
+        <div className="context-output-mode" role="group" aria-label="Context output">
+          <button aria-pressed={!includeAnswerDemo} onClick={() => setIncludeAnswerDemo(false)} type="button"><Database size={15} />Context only</button>
+          <button aria-pressed={includeAnswerDemo} onClick={() => setIncludeAnswerDemo(true)} type="button"><MessageSquareText size={15} />Draft answer</button>
+        </div>
+      </div>
+      {!canRetrieve ? (
+        <Notice
+          detail={activeBrainId ? "Complete the reviewed Bootstrap before retrieval. The first applied memories make this brain usable." : "Create or import a brain, then complete its reviewed Bootstrap."}
+          title="Brain Bootstrap required"
+          tone="pending"
+        />
+      ) : null}
+      {!canRetrieve ? <button className="primary context-bootstrap-action" onClick={onOpenBootstrap} type="button"><Sparkles size={16} />Open Brain Bootstrap</button> : null}
       <div className="context-live-layout">
         <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
         <aside className="context-insight-rail">
           <PanelEyebrow icon={Search} label="Search status" />
-          <strong>{busy ? "Retrieval active" : result ? "Result ready" : "Awaiting mission"}</strong>
+          <strong>{busy ? "Retrieval active" : result ? resultStatusLabel(result) : canRetrieve ? "Ready for a question" : "Bootstrap required"}</strong>
           <div className="context-progress" aria-label="Context progress"><i style={{ width: busy ? "58%" : result ? "100%" : "0%" }} /></div>
           <ResultPanel emptyTitle={activeBrainId ? "No evidence yet" : "Select or create a brain first"} result={result} />
-          <article className="context-transparency"><span>Transparency</span><strong>See what the brain relied on</strong><p>Every returned memory and source remains inspectable in the local result receipt.</p></article>
         </aside>
       </div>
     </section>
@@ -659,9 +1007,12 @@ function ContextRoute({
 function GrowRoute({
   activeBrainId,
   activity,
+  bootstrapReady,
   busy,
   nodes,
+  onApply,
   onFileChange,
+  onOpenBootstrap,
   onRun,
   result,
   setSourceKind,
@@ -676,9 +1027,12 @@ function GrowRoute({
 }: {
   activeBrainId: string;
   activity: BrainActivity;
+  bootstrapReady: boolean;
   busy: boolean;
   nodes: GraphNode[];
+  onApply: (selectedPreviewIds: string[]) => Promise<Record<string, unknown> | null | undefined>;
   onFileChange: (file: File | null) => void;
+  onOpenBootstrap: () => void;
   onRun: () => void;
   result: Record<string, unknown> | null;
   setSourceKind: (value: GrowSourceKind) => void;
@@ -695,6 +1049,19 @@ function GrowRoute({
   const sourceReady = requiresUrl ? sourceUrl.trim().length > 0 : sourceText.trim().length > 0;
   const preview = growPreviewSummary(result);
   const previewReady = preview.sourceUnits !== "0" || preview.candidates !== "0";
+  if (!activeBrainId || !bootstrapReady) {
+    return (
+      <section className="bootstrap-gate-surface">
+        <div>
+          <PanelEyebrow icon={Lock} label="Grow locked" />
+          <h2>Bootstrap this brain before adding new memory.</h2>
+          <p>Grow extends a reviewed brain. Complete the initial interview, foundations and memory review first.</p>
+          <button className="primary" onClick={onOpenBootstrap} type="button"><Sparkles size={16} />Open Brain Bootstrap</button>
+        </div>
+        <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
+      </section>
+    );
+  }
   return (
     <div className="grow-product">
       <section className="grow-overview" aria-label="Grow operation status">
@@ -808,7 +1175,7 @@ function GrowRoute({
           </section>
           <div className="live-result-stack">
             <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
-            <GrowResultPanel emptyTitle={activeBrainId ? "Grow preview has not run" : "Create a brain before growing memory"} result={result} />
+            <GrowResultPanel busy={busy} emptyTitle="Grow preview has not run" onApply={onApply} result={result} />
           </div>
         </div>
       </div>
@@ -945,20 +1312,357 @@ function CloudMaintainRoute() {
   );
 }
 
-function BrainSyncRoute({ activeBrain, activeBrainId }: { activeBrain: BrainSummary | null; activeBrainId: string }) {
+type BrainSyncDirection = "local_to_cloud" | "cloud_to_local";
+type BrainSyncPhase = "idle" | "connecting" | "preflight" | "review" | "applying" | "checking" | "complete" | "error";
+type BrainSyncAccount = { actorId: string; organizationId: string; workspaceId: string };
+
+function BrainSyncRoute({
+  activeBrain,
+  activeBrainId,
+  nodes,
+  onRefresh,
+}: {
+  activeBrain: BrainSummary | null;
+  activeBrainId: string;
+  nodes: GraphNode[];
+  onRefresh: () => Promise<void>;
+}) {
+  const [direction, setDirection] = useState<BrainSyncDirection>("local_to_cloud");
+  const [phase, setPhase] = useState<BrainSyncPhase>("idle");
+  const [account, setAccount] = useState<BrainSyncAccount | null>(null);
+  const [cloudBrains, setCloudBrains] = useState<Record<string, unknown>[]>([]);
+  const [cloudBrainId, setCloudBrainId] = useState("");
+  const [targetLocalId, setTargetLocalId] = useState("");
+  const [targetDisplayName, setTargetDisplayName] = useState("");
+  const [overwriteExisting, setOverwriteExisting] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
+  const [operation, setOperation] = useState<Record<string, unknown> | null>(null);
+  const [restore, setRestore] = useState<Record<string, unknown> | null>(null);
+  const [localSnapshot, setLocalSnapshot] = useState<Record<string, unknown> | null>(null);
+  const [receipt, setReceipt] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState("");
+  const bootstrapReady = isBootstrapReady(activeBrain) && (activeBrain?.node_count || nodes.length) > 0;
+  const connected = Boolean(connectedClientTokenForPlatform(brainSyncPlatformOrigin()));
+  const operationId = String(operation?.preview_operation_id || "");
+  const operationAuthority = String(operation?.operation_authority || "");
+  const binding = objectAt(operation, "binding");
+  const materializationReceipt = findNestedText(operation, "materialization_receipt_sha256");
+  const activationReceipt = findNestedText(operation, "activation_receipt_sha256");
+  const operationState = String(operation?.state || operation?.status || "").toLowerCase();
+  const terminal = ["acknowledged", "complete", "completed", "ready", "synced"].includes(operationState)
+    || findNestedValue(operation, "sync_claim_allowed") === true;
+  const estimatedCredits = findNestedNumber(operation, "estimated_credit_units", "estimated_credits", "reserved_units");
+  const sourceNodeCount = Number(localSnapshot?.node_count || activeBrain?.node_count || nodes.length || 0);
+  const sourceEdgeCount = Number(localSnapshot?.edge_count || 0);
+  const sourceRevision = Number(localSnapshot?.source_revision || binding?.source_revision || 0);
+
+  useEffect(() => {
+    const baseId = normalizeBrainId(activeBrainId || "restored_cloud_memory");
+    setTargetLocalId(`${baseId}_cloud_copy`);
+    setTargetDisplayName(`${activeBrain ? brainName(activeBrain) : "Cloud memory"} local copy`);
+  }, [activeBrain, activeBrainId]);
+
+  useEffect(() => {
+    const handoff = new URLSearchParams(window.location.search).get("agvm_connected_client_handoff")?.trim() || "";
+    if (!handoff) return;
+    setPhase("connecting");
+    exchangeConnectedClientHandoff(handoff)
+      .then(() => {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("agvm_connected_client_handoff");
+        window.history.replaceState({}, "", url.toString());
+        setPhase("idle");
+      })
+      .catch((caught) => {
+        setError(syncErrorMessage(caught));
+        setPhase("error");
+      });
+  }, []);
+
+  const resetDirection = (next: BrainSyncDirection) => {
+    setDirection(next);
+    setPhase("idle");
+    setOperation(null);
+    setRestore(null);
+    setReceipt(null);
+    setConfirmed(false);
+    setError("");
+  };
+
+  const loadCloudContext = async () => {
+    if (!connectedClientTokenForPlatform(brainSyncPlatformOrigin())) {
+      window.location.assign(connectedClientLoginUrl());
+      return null;
+    }
+    const [profile, summary, registry] = await Promise.all([
+      platformJson<Record<string, unknown>>("/v1/account/me"),
+      platformJson<Record<string, unknown>>("/v1/account/brain-sync/summary"),
+      platformJson<Record<string, unknown>>("/v1/account/hosted-mcp/brains"),
+    ]);
+    const nextAccount = brainSyncAccount(profile, summary);
+    const hosted = arrayAt(registry, "brains").filter(isRecord);
+    setAccount(nextAccount);
+    setCloudBrains(hosted);
+    setCloudBrainId((current) => current || String(registry.active_brain_id || hosted[0]?.brain_id || hosted[0]?.id || ""));
+    return { account: nextAccount, cloudBrainId: String(registry.active_brain_id || hosted[0]?.brain_id || hosted[0]?.id || ""), cloudBrains: hosted };
+  };
+
+  const previewSync = async () => {
+    setPhase("preflight");
+    setConfirmed(false);
+    setError("");
+    try {
+      const cloud = account ? { account, cloudBrainId, cloudBrains } : await loadCloudContext();
+      if (!cloud) return;
+      if (direction === "local_to_cloud") {
+        if (!bootstrapReady || !activeBrainId) throw new Error("Complete Brain Bootstrap before syncing this local brain.");
+        const source = await readApi<Record<string, unknown>>(`/memory/brains/${encodeURIComponent(activeBrainId)}/sync-snapshot?max_nodes=250000`);
+        if (Number(source.node_count || 0) < 1) throw new Error("This brain has no reviewed memory to synchronize.");
+        if (source.truncated === true) throw new Error("The snapshot exceeds the browser transfer boundary and was not uploaded.");
+        const snapshot = objectAt(source, "snapshot");
+        if (!snapshot) throw new Error("The local runtime did not return a complete graph snapshot.");
+        const hash = snapshotHash(snapshot);
+        const destinationBrainId = cloudBrainIdFor(activeBrainId);
+        const existingDestination = cloud.cloudBrains.find((brain) => String(brain.brain_id || brain.id || "") === destinationBrainId);
+        const expectedDestinationRevision = Number(existingDestination?.materialized_revision || existingDestination?.current_revision || existingDestination?.revision || existingDestination?.bootstrap_revision || 0);
+        const result = await platformJson<Record<string, unknown>>("/memory/brains/sync/lifecycle/preview", {
+          method: "POST",
+          body: JSON.stringify({
+            scope: { organization_id: cloud.account.organizationId, workspace_id: cloud.account.workspaceId },
+            direction: "local_to_cloud",
+            source_brain_id: activeBrainId,
+            destination_brain_id: destinationBrainId,
+            source_revision: Number(source.source_revision || 1),
+            expected_destination_revision: expectedDestinationRevision,
+            preview_idempotency_key: durableOperationKey(`brain-sync-preview:${activeBrainId}:${source.source_revision || 1}:${hash}:${expectedDestinationRevision}`),
+            preview_ttl_seconds: 900,
+            local_export: { ...source, snapshot },
+            destination_display_name: `${String(source.display_name || (activeBrain ? brainName(activeBrain) : activeBrainId))} Cloud copy`,
+            privacy_scope: "workspace_private",
+          }),
+        });
+        setLocalSnapshot(source);
+        setOperation(result);
+        setReceipt(lastSyncReceipt(result));
+      } else {
+        const sourceCloudId = cloudBrainId || cloud.cloudBrainId;
+        if (!sourceCloudId) throw new Error("Choose a Cloud brain to restore.");
+        if (!targetLocalId.trim() || !targetDisplayName.trim()) throw new Error("Choose the new local brain ID and display name.");
+        let result = await platformJson<Record<string, unknown>>("/v1/account/brain-sync/restore-bundle", {
+          method: "POST",
+          body: JSON.stringify({
+            cloud_brain_id: sourceCloudId,
+            target_local_brain_id: targetLocalId.trim(),
+            target_display_name: targetDisplayName.trim(),
+            overwrite_existing: overwriteExisting,
+          }),
+        });
+        const envelope = objectAt(result, "bundle");
+        const bundleId = String(envelope?.bundle_id || "");
+        if (bundleId && !objectAt(envelope, "bundle")) {
+          result = { ...result, ...(await platformJson<Record<string, unknown>>(`/v1/account/brain-sync/bundles/${encodeURIComponent(bundleId)}`)) };
+        }
+        const completeEnvelope = objectAt(result, "bundle");
+        const restoreBundle = objectAt(completeEnvelope, "bundle");
+        if (!restoreBundle) throw new Error("Detwin did not return a complete signed restore bundle.");
+        const localPreflight = await writeApi<Record<string, unknown>>("/memory/brains/sync/preflight-restore", {
+          schema_version: "agvm.core.brain_sync.preflight_restore_request.v1",
+          bundle: restoreBundle,
+        });
+        setRestore({ ...result, local_preflight: localPreflight });
+        setReceipt(objectAt(result, "receipt"));
+      }
+      setPhase("review");
+    } catch (caught) {
+      setError(syncErrorMessage(caught));
+      setPhase("error");
+    }
+  };
+
+  const applyReviewedSync = async () => {
+    if (!confirmed) return;
+    setPhase("applying");
+    setError("");
+    try {
+      if (direction === "local_to_cloud") {
+        if (!account || !operationId || !binding?.bundle_sha256 || !binding?.policy_sha256) {
+          throw new Error("Run a fresh preflight before applying this Cloud copy.");
+        }
+        const result = await platformJson<Record<string, unknown>>(`/memory/brains/sync/lifecycle/${encodeURIComponent(operationId)}/apply`, {
+          method: "POST",
+          headers: syncAuthorityHeaders(operationAuthority),
+          body: JSON.stringify({
+            scope: { organization_id: account.organizationId, workspace_id: account.workspaceId },
+            idempotency_key: durableOperationKey(`brain-sync-apply:${operationId}`),
+            consent: {
+              preview_operation_id: operationId,
+              actor_id: account.actorId,
+              bundle_sha256: binding.bundle_sha256,
+              policy_sha256: binding.policy_sha256,
+              granted: true,
+            },
+          }),
+        });
+        setOperation(result);
+        setReceipt(lastSyncReceipt(result));
+        setPhase(isTerminalSync(result) ? "complete" : "checking");
+      } else {
+        const restoreEnvelope = objectAt(restore, "bundle");
+        const bundle = objectAt(restoreEnvelope, "bundle");
+        const applyContract = objectAt(restore, "local_apply_contract");
+        const restoreReceiptId = String(applyContract?.restore_receipt_id || receipt?.receipt_id || receipt?.id || "");
+        if (!bundle || !restoreReceiptId) throw new Error("The signed restore bundle is incomplete. Run a fresh preview.");
+        const bundleIdempotencyKey = String(bundle.idempotency_key || "");
+        if (!bundleIdempotencyKey) throw new Error("The signed restore bundle is missing its idempotency binding. Run a fresh preview.");
+        const localPreflight = objectAt(restore, "local_preflight");
+        const destinationState = objectAt(localPreflight, "destination_state");
+        const expectedDestinationStateSha256 = String(destinationState?.state_sha256 || "");
+        if (!expectedDestinationStateSha256) throw new Error("The local destination was not bound during preflight. Run a fresh preview.");
+        const localReceipt = await writeApi<Record<string, unknown>>("/memory/brains/sync/apply-restore", {
+          schema_version: "agvm.core.brain_sync.apply_restore_request.v1",
+          bundle,
+          expected_destination_state_sha256: expectedDestinationStateSha256,
+          idempotency_key: bundleIdempotencyKey,
+          overwrite_existing_confirmed: overwriteExisting,
+          select_after_restore: false,
+        });
+        const acknowledged = await platformJson<Record<string, unknown>>("/v1/account/brain-sync/restore-application", {
+          method: "POST",
+          body: JSON.stringify({ restore_receipt_id: restoreReceiptId, local_apply_receipt: localReceipt }),
+        });
+        setReceipt(acknowledged);
+        await onRefresh();
+        setPhase("complete");
+      }
+    } catch (caught) {
+      setError(syncErrorMessage(caught));
+      setPhase("error");
+    }
+  };
+
+  const advanceCloudLifecycle = async () => {
+    if (!account || !operationId) return;
+    setPhase("checking");
+    setError("");
+    try {
+      let result: Record<string, unknown>;
+      if (materializationReceipt && !activationReceipt) {
+        result = await platformJson<Record<string, unknown>>(`/memory/brains/sync/lifecycle/${encodeURIComponent(operationId)}/activation-review`, {
+          method: "POST",
+          headers: syncAuthorityHeaders(operationAuthority),
+          body: JSON.stringify({
+            scope: { organization_id: account.organizationId, workspace_id: account.workspaceId },
+            actor_id: account.actorId,
+            bundle_sha256: binding?.bundle_sha256,
+            materialization_receipt_sha256: materializationReceipt,
+            approved: true,
+            note: "Approved from Local AGVM after verified materialization.",
+          }),
+        });
+      } else if (activationReceipt) {
+        result = await platformJson<Record<string, unknown>>(`/memory/brains/sync/lifecycle/${encodeURIComponent(operationId)}/acknowledge`, {
+          method: "POST",
+          headers: syncAuthorityHeaders(operationAuthority),
+          body: JSON.stringify({
+            scope: { organization_id: account.organizationId, workspace_id: account.workspaceId },
+            actor_id: account.actorId,
+            activation_receipt_sha256: activationReceipt,
+            acknowledged: true,
+          }),
+        });
+      } else {
+        result = await platformJson<Record<string, unknown>>(`/memory/brains/sync/lifecycle/${encodeURIComponent(operationId)}`, {
+          headers: syncAuthorityHeaders(operationAuthority),
+        });
+      }
+      setOperation(result);
+      setReceipt(lastSyncReceipt(result));
+      setPhase(isTerminalSync(result) ? "complete" : "checking");
+    } catch (caught) {
+      setError(syncErrorMessage(caught));
+      setPhase("error");
+    }
+  };
+
+  if (!bootstrapReady && direction === "local_to_cloud") {
+    return (
+      <div className="brain-sync-route">
+        <section className="brain-sync-intro">
+          <div><PanelEyebrow icon={CloudUpload} label="Explicit Brain Sync" /><h2>Start locally or restore an existing Cloud brain.</h2><p>A reviewed local brain is required only for upload. Cloud restore remains available on a new installation.</p></div>
+          <div className="brain-sync-direction" role="group" aria-label="Brain Sync direction">
+            <button className="active" onClick={() => resetDirection("local_to_cloud")} type="button"><CloudUpload size={16} />Local to Cloud</button>
+            <button onClick={() => resetDirection("cloud_to_local")} type="button"><Download size={16} />Cloud to device</button>
+          </div>
+        </section>
+        <Notice tone="pending" title="Local upload needs Brain Bootstrap" detail="Create and activate reviewed memories, or choose Cloud to device to restore an existing Cloud brain into this installation." />
+      </div>
+    );
+  }
+
+  const stage = phase === "complete" ? 6 : phase === "checking" ? 5 : phase === "applying" ? 4 : phase === "review" ? 3 : phase === "preflight" || phase === "connecting" ? 2 : 1;
+  const nextLabel = materializationReceipt && !activationReceipt
+    ? "Activate verified Cloud brain"
+    : activationReceipt
+      ? "Record final receipt"
+      : "Check original operation";
+
   return (
-    <div className="operation-grid">
-      <section className="command-surface">
-        <PanelEyebrow icon={CloudUpload} label="Explicit Brain Sync" />
-        <h2>{activeBrain ? brainName(activeBrain) : "Select a local brain first."}</h2>
-        <p>Local brains remain on this device until an explicit Detwin Cloud sync handoff is opened.</p>
-        <MetricGrid metrics={[{ label: "Brain id", value: activeBrainId || "not selected" }, { label: "Local state", value: activeBrain ? "available" : "required" }, { label: "Automatic upload", value: "off" }, { label: "Cloud account", value: "optional" }]} />
+    <div className="brain-sync-route">
+      <section className="brain-sync-intro">
+        <div><PanelEyebrow icon={CloudUpload} label="Explicit Brain Sync" /><h2>Move a reviewed snapshot, never a live hidden stream.</h2><p>Local and Cloud remain separate until preflight, destination review and explicit confirmation are complete.</p></div>
+        <div className="brain-sync-direction" role="group" aria-label="Brain Sync direction">
+          <button className={direction === "local_to_cloud" ? "active" : ""} onClick={() => resetDirection("local_to_cloud")} type="button"><CloudUpload size={16} />Local to Cloud</button>
+          <button className={direction === "cloud_to_local" ? "active" : ""} onClick={() => resetDirection("cloud_to_local")} type="button"><Download size={16} />Cloud to device</button>
+        </div>
       </section>
-      <aside className="proof-panel">
-        <Receipt title="Local by default" detail="No brain archive is transmitted by this standalone UI." tone="ready" />
-        <Receipt title="Explicit handoff" detail="Cloud sync starts only after opening Detwin and authorizing the account workflow there." tone="active" />
-        <a className="secondary link-button" href={`${cloudUrl}/brains`}><CloudUpload size={16} />Open Brain Sync</a>
-      </aside>
+
+      <ol className="brain-sync-steps" aria-label="Brain Sync progress">
+        {["Eligibility", "Preflight", "Review", direction === "local_to_cloud" ? "Upload" : "Restore", "Validate", "Receipt"].map((label, index) => <li className={stage > index ? "active" : ""} key={label}><span>{index + 1}</span>{label}</li>)}
+      </ol>
+
+      <section className="brain-sync-workspace">
+        <div className="brain-sync-visual">
+          <BrainCanvas activeBrainId={activeBrainId} activity={{ active: ["preflight", "applying", "checking"].includes(phase), detail: phase.replace(/_/g, " "), label: direction === "local_to_cloud" ? "Cloud snapshot" : "Local restore", phase: phase === "preflight" ? "retrieving" : phase === "applying" || phase === "checking" ? "growing" : "idle" }} nodes={nodes} />
+          <MetricGrid metrics={[
+            { label: "Local brain", value: activeBrain ? brainName(activeBrain) : activeBrainId },
+            { label: "Nodes", value: String(sourceNodeCount) },
+            { label: "Edges", value: sourceEdgeCount ? String(sourceEdgeCount) : "measured at preflight" },
+            { label: "Revision", value: sourceRevision ? String(sourceRevision) : "measured at preflight" },
+          ]} />
+        </div>
+
+        <aside className="brain-sync-control" aria-live="polite">
+          <div className="brain-sync-control-head"><ShieldCheck size={20} /><div><span>{connected ? "Detwin connected" : "Account connection"}</span><h3>{phase === "review" ? "Review before apply" : phase === "complete" ? "Sync receipt ready" : "Prepare verified snapshot"}</h3></div></div>
+
+          {direction === "cloud_to_local" ? (
+            <div className="brain-sync-fields">
+              <label><span>Cloud brain</span><select value={cloudBrainId} onChange={(event) => setCloudBrainId(event.target.value)}><option value="">Connect to load Cloud brains</option>{cloudBrains.map((brain) => { const id = String(brain.brain_id || brain.id || ""); return <option key={id} value={id}>{String(brain.display_name || brain.name || id)}</option>; })}</select></label>
+              <label><span>New local brain ID</span><input value={targetLocalId} onChange={(event) => setTargetLocalId(event.target.value)} /></label>
+              <label><span>Display name</span><input value={targetDisplayName} onChange={(event) => setTargetDisplayName(event.target.value)} /></label>
+              <label className="brain-sync-check"><input checked={overwriteExisting} onChange={(event) => setOverwriteExisting(event.target.checked)} type="checkbox" /><span>Replace an existing local brain only after validation and explicit Apply.</span></label>
+            </div>
+          ) : null}
+
+          {phase === "review" ? (
+            <div className="brain-sync-review">
+              <MetricGrid metrics={[
+                { label: "Direction", value: direction === "local_to_cloud" ? "Local to Cloud" : "Cloud to device" },
+                { label: "Destination", value: direction === "local_to_cloud" ? String(binding?.destination_brain_id || "new Cloud brain") : targetLocalId },
+                { label: "Snapshot", value: `${sourceNodeCount} nodes` },
+                { label: "Cost", value: estimatedCredits === null ? "Platform preflight" : `${estimatedCredits} credits` },
+              ]} />
+              <label className="brain-sync-check"><input checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} type="checkbox" /><span>I reviewed the source, destination, scope and reported cost. Apply this exact snapshot.</span></label>
+              <button className="primary brain-sync-primary" disabled={!confirmed} onClick={() => void applyReviewedSync()} type="button">{direction === "local_to_cloud" ? "Confirm upload and validate" : "Download, validate and restore"}<ArrowRight size={16} /></button>
+            </div>
+          ) : null}
+
+          {["connecting", "preflight", "applying"].includes(phase) ? <Notice tone="pending" title="Operation in progress" detail={phase === "connecting" ? "Completing the secure Detwin account handoff." : phase === "preflight" ? "Measuring the real graph and requesting an authoritative preflight." : "Applying only the reviewed snapshot and preserving its receipt."} /> : null}
+          {phase === "checking" ? <div className="brain-sync-review"><Receipt title="Original operation recorded" detail="Continue this operation; do not start a duplicate transfer." tone="active" /><button className="primary brain-sync-primary" onClick={() => void advanceCloudLifecycle()} type="button">{nextLabel}<RefreshCw size={16} /></button></div> : null}
+          {phase === "complete" ? <div className="brain-sync-review"><Receipt title="Verified transfer complete" detail={String(receipt?.receipt_id || receipt?.operation_id || receipt?.status || "The final receipt was acknowledged.")} tone="ready" /><button className="secondary" onClick={() => resetDirection(direction)} type="button"><RefreshCw size={16} />Start another snapshot</button></div> : null}
+          {phase === "error" ? <div className="brain-sync-review"><Notice tone="blocked" title="Brain Sync needs attention" detail={error} /><button className="secondary" onClick={() => void previewSync()} type="button"><RefreshCw size={16} />Run a fresh preflight</button></div> : null}
+          {phase === "idle" ? <button className="primary brain-sync-primary" onClick={() => void previewSync()} type="button">{connected ? direction === "local_to_cloud" ? "Preview Cloud sync" : "Preview Cloud restore" : "Connect Detwin and continue"}<ArrowRight size={16} /></button> : null}
+        </aside>
+      </section>
     </div>
   );
 }
@@ -1062,6 +1766,7 @@ function BrainCanvas({
   variant?: "stage" | "compact";
 }) {
   const [density, setDensity] = useState<"focus" | "balanced" | "detailed" | "full">("balanced");
+  const [selectedPoint, setSelectedPoint] = useState<BrainPoint3d | null>(null);
   const nodeLimit = density === "focus" ? 30 : density === "balanced" ? 90 : density === "detailed" ? 240 : nodes.length;
   const visibleNodes = nodes.slice(0, nodeLimit);
   const liveGraph = Boolean(activeBrainId && nodes.length);
@@ -1075,7 +1780,7 @@ function BrainCanvas({
         <directionalLight color="#f7fffb" intensity={1.2} position={[3.2, 4.5, 5]} />
         <pointLight color="#00e9b1" intensity={2.4} position={[-2.6, 1.8, 2.4]} />
         <pointLight color="#8b55e7" intensity={1.25} position={[2.8, -1.2, 2.2]} />
-        <BrainThreeScene activity={activity} points={points} variant={variant} />
+        <BrainThreeScene activity={activity} onSelectPoint={setSelectedPoint} points={points} variant={variant} />
         <OrbitControls
           autoRotate
           autoRotateSpeed={activity.active ? 1.2 : 0.38}
@@ -1113,16 +1818,26 @@ function BrainCanvas({
         <span>Graph nodes</span>
         <strong>{liveGraph ? `${visibleNodes.length} rendered` : "0 - no synthetic data"}</strong>
       </div>
+      {selectedPoint ? (
+        <aside className="brain-node-inspector" aria-live="polite">
+          <button aria-label="Close node details" className="icon-button" onClick={() => setSelectedPoint(null)} title="Close node details" type="button"><X size={15} /></button>
+          <span>{selectedPoint.memoryType}</span>
+          <strong>{selectedPoint.label}</strong>
+          <code>{selectedPoint.id}</code>
+        </aside>
+      ) : null}
     </section>
   );
 }
 
 function BrainThreeScene({
   activity,
+  onSelectPoint,
   points,
   variant,
 }: {
   activity: BrainActivity;
+  onSelectPoint: (point: BrainPoint3d) => void;
   points: BrainPoint3d[];
   variant: "stage" | "compact";
 }) {
@@ -1165,13 +1880,13 @@ function BrainThreeScene({
       ) : null}
 
       {points.map((point, index) => (
-        <MemoryNodeMesh active={active} key={`${point.id}-${index}`} point={point} pulseOffset={index * 0.137} />
+        <MemoryNodeMesh active={active} key={`${point.id}-${index}`} onSelect={onSelectPoint} point={point} pulseOffset={index * 0.137} />
       ))}
     </group>
   );
 }
 
-function MemoryNodeMesh({ active, point, pulseOffset }: { active: boolean; point: BrainPoint3d; pulseOffset: number }) {
+function MemoryNodeMesh({ active, onSelect, point, pulseOffset }: { active: boolean; onSelect: (point: BrainPoint3d) => void; point: BrainPoint3d; pulseOffset: number }) {
   const meshRef = useRef<Group>(null);
   useFrame(({ clock }) => {
     if (!meshRef.current) return;
@@ -1179,7 +1894,13 @@ function MemoryNodeMesh({ active, point, pulseOffset }: { active: boolean; point
     meshRef.current.scale.setScalar(pulse);
   });
   return (
-    <group ref={meshRef} position={point.position}>
+    <group
+      onClick={() => onSelect(point)}
+      onPointerOut={() => { document.body.style.cursor = ""; }}
+      onPointerOver={() => { document.body.style.cursor = "pointer"; }}
+      ref={meshRef}
+      position={point.position}
+    >
       <mesh>
         <sphereGeometry args={[point.size, 16, 10]} />
         <meshStandardMaterial color={point.color} emissive={point.color} emissiveIntensity={active ? 0.55 : 0.24} roughness={0.48} />
@@ -1188,6 +1909,18 @@ function MemoryNodeMesh({ active, point, pulseOffset }: { active: boolean; point
         <sphereGeometry args={[point.size, 12, 8]} />
         <meshBasicMaterial color={point.color} opacity={0.11} transparent />
       </mesh>
+      <Html center distanceFactor={7} zIndexRange={[12, 0]}>
+        <button
+          aria-label={`Open memory node ${point.label}`}
+          className="brain-node-hitbox"
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect(point);
+          }}
+          title={point.label}
+          type="button"
+        />
+      </Html>
     </group>
   );
 }
@@ -1267,14 +2000,14 @@ function BrainSelector({
         <div className="brain-menu-panel">
           <fieldset>
             <legend>Create local brain</legend>
-            <input aria-label="New brain display name" onChange={(event) => setNewBrainDisplayName(event.target.value)} value={newBrainDisplayName} />
-            <input aria-label="New brain id" onChange={(event) => setNewBrainId(event.target.value)} value={newBrainId} />
-            <button disabled={busy} onClick={onCreateBrain} type="button"><PlusCircle size={15} />Create and select</button>
+            <input aria-label="New brain display name" onChange={(event) => setNewBrainDisplayName(event.target.value)} placeholder="My product brain" value={newBrainDisplayName} />
+            <input aria-label="New brain id" onChange={(event) => setNewBrainId(event.target.value)} placeholder="Optional technical id" value={newBrainId} />
+            <button disabled={busy || !newBrainDisplayName.trim()} onClick={onCreateBrain} type="button"><PlusCircle size={15} />Create and select</button>
           </fieldset>
           <fieldset>
             <legend>Import brain archive</legend>
-            <input aria-label="Imported brain display name" onChange={(event) => setImportBrainDisplayName(event.target.value)} value={importBrainDisplayName} />
-            <input aria-label="Imported brain id" onChange={(event) => setImportBrainId(event.target.value)} value={importBrainId} />
+            <input aria-label="Imported brain display name" onChange={(event) => setImportBrainDisplayName(event.target.value)} placeholder="Name shown after import" value={importBrainDisplayName} />
+            <input aria-label="Imported brain id" onChange={(event) => setImportBrainId(event.target.value)} placeholder="Optional technical id" value={importBrainId} />
             <label className="file-action">
               <FileUp size={15} />
               Import .zip
@@ -1282,7 +2015,7 @@ function BrainSelector({
             </label>
           </fieldset>
           <div className="brain-menu-actions">
-            <button disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={15} />Scan local brains</button>
+            <button disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={15} />Refresh brain list</button>
             <button disabled={busy || !activeBrainId} onClick={onExportBrain} type="button"><Download size={15} />Export active</button>
             <button disabled={busy} onClick={onRefresh} type="button"><RefreshCw size={15} />Refresh</button>
             <a href="#brain_explorer"><Brain size={15} />Open Brain Explorer</a>
@@ -1293,17 +2026,16 @@ function BrainSelector({
   );
 }
 
-function BrainBootstrapNotice({ busyAction, onBootstrap, onCreateDemo }: { busyAction: string | null; onBootstrap: () => void; onCreateDemo: () => void }) {
+function BrainBootstrapNotice({ busyAction, onBootstrap }: { busyAction: string | null; onBootstrap: () => void }) {
   const busy = Boolean(busyAction);
   return (
     <article className="bootstrap-notice">
       <Brain size={22} />
       <div>
         <strong>Create or import a local brain to start.</strong>
-        <p>Context, Grow and MCP are brain-scoped. Scan discovers existing local brains; Create starter brain creates an empty brain ready for your first Grow.</p>
+        <p>Context, Grow and MCP are brain-scoped. Use Manage in the top bar to name a new brain or import a reviewed archive.</p>
       </div>
-      <button className="primary" disabled={busy} onClick={onCreateDemo} type="button"><PlusCircle size={16} />Create starter brain</button>
-      <button className="secondary" disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={16} />Scan local brains</button>
+      <button className="secondary" disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={16} />Refresh brain list</button>
     </article>
   );
 }
@@ -1368,25 +2100,105 @@ function Receipt({ detail, title, tone }: { detail: string; title: string; tone:
 }
 
 function ResultPanel({ emptyTitle, result }: { emptyTitle: string; result: Record<string, unknown> | null }) {
+  const contextPackage = resultContextPackage(result);
+  const sections = resultSectionSummaries(contextPackage);
+  const evidence = resultEvidenceSummaries(contextPackage);
+  const paths = resultPathSummaries(result);
+  const answer = resultAnswer(result);
+  const searchId = String(result?.search_id || "").trim();
   return (
     <section className="result-panel">
-      <PanelEyebrow icon={MessageSquareText} label="Receipt" />
+      <PanelEyebrow icon={MessageSquareText} label={contextPackage ? "Context package" : "Operation receipt"} />
       {result ? (
-        <pre>{JSON.stringify(result, null, 2)}</pre>
+        <div className="structured-result">
+          <div className="structured-result-head">
+            <div><span>Status</span><strong>{resultStatusLabel(result)}</strong></div>
+            {searchId ? <div><span>Search</span><strong>{searchId.slice(0, 8)}</strong></div> : null}
+            <div><span>Evidence</span><strong>{evidence.length}</strong></div>
+            {paths.length ? <div><span>Paths</span><strong>{paths.length}</strong></div> : null}
+          </div>
+          {answer ? <article className="result-answer"><span>Draft answer</span><p>{answer}</p></article> : null}
+          {sections.length ? (
+            <div className="result-sections">
+              {sections.map((section) => (
+                <article key={section.key}>
+                  <div><strong>{section.title}</strong><span>{section.confidence}</span></div>
+                  <ul>{section.items.map((item, index) => <li key={`${section.key}-${index}`}>{item}</li>)}</ul>
+                </article>
+              ))}
+            </div>
+          ) : null}
+          {paths.length ? (
+            <div className="result-path-list">
+              <span className="result-subhead">Search paths</span>
+              {paths.map((path, index) => (
+                <article key={path.id || `path-${index + 1}`}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <div><strong>{path.title}</strong><p>{path.detail}</p></div>
+                  <em>{path.status}</em>
+                </article>
+              ))}
+            </div>
+          ) : null}
+          {evidence.length ? (
+            <div className="result-evidence-list">
+              {evidence.map((item, index) => (
+                <details key={item.id || `${item.title}-${index}`}>
+                  <summary><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.title}</strong><em>{item.score}</em></summary>
+                  <p>{item.summary}</p>
+                  <div className="evidence-meta"><span>{item.lane}</span>{item.id ? <code>{item.id}</code> : null}</div>
+                  {item.hydration ? <code className="hydration-recipe">Hydrate with {item.hydration}</code> : null}
+                </details>
+              ))}
+            </div>
+          ) : null}
+          {!sections.length && !evidence.length && !answer ? <OperationSummary result={result} /> : null}
+          <details className="raw-receipt">
+            <summary>Technical receipt</summary>
+            <pre>{JSON.stringify(result, null, 2)}</pre>
+          </details>
+        </div>
       ) : (
         <div className="empty-result">
           <Network size={26} />
           <strong>{emptyTitle}</strong>
-          <span>The next successful local call will render the exact JSON receipt here.</span>
+          <span>A successful call will show readable context, evidence and a collapsible technical receipt here.</span>
         </div>
       )}
     </section>
   );
 }
 
-function GrowResultPanel({ emptyTitle, result }: { emptyTitle: string; result: Record<string, unknown> | null }) {
+function OperationSummary({ result }: { result: Record<string, unknown> }) {
+  const data = resultData(result) || result;
+  const rows = Object.entries(data)
+    .filter(([, value]) => typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+    .slice(0, 8);
+  return rows.length ? (
+    <dl className="operation-summary">
+      {rows.map(([key, value]) => <div key={key}><dt>{key.replace(/_/g, " ")}</dt><dd>{String(value)}</dd></div>)}
+    </dl>
+  ) : <p className="fine-print">The operation completed. Open the technical receipt for its exact contract.</p>;
+}
+
+function GrowResultPanel({
+  busy,
+  emptyTitle,
+  onApply,
+  result,
+}: {
+  busy: boolean;
+  emptyTitle: string;
+  onApply: (selectedPreviewIds: string[]) => Promise<Record<string, unknown> | null | undefined>;
+  result: Record<string, unknown> | null;
+}) {
   const summary = growPreviewSummary(result);
   const candidates = growCandidateSummaries(result);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const candidateKey = candidates.map((candidate) => candidate.id).join("|");
+  useEffect(() => {
+    setSelectedIds(candidates.map((candidate) => candidate.id).filter(Boolean));
+  }, [candidateKey]);
   return (
     <section className="result-panel grow-result-panel">
       <PanelEyebrow icon={GitBranch} label="Grow preview" />
@@ -1395,18 +2207,20 @@ function GrowResultPanel({ emptyTitle, result }: { emptyTitle: string; result: R
           <div className="grow-result-kpis">
             <Receipt title="Source units" detail={summary.sourceUnits} tone={summary.sourceUnits === "0" ? "pending" : "ready"} />
             <Receipt title="Candidate nodes" detail={summary.candidates} tone={summary.candidates === "0" ? "pending" : "active"} />
+            {summary.applyState === "applied" ? <Receipt title="Graph delta" detail={`+${summary.graphDelta} nodes`} tone="ready" /> : null}
             <Receipt title="Write state" detail={summary.applyState} tone={summary.applyState === "review needed" ? "pending" : "ready"} />
           </div>
           {candidates.length ? (
             <div className="grow-candidate-list">
               {candidates.map((candidate, index) => (
-                <article key={`${candidate.title}-${index}`}>
+                <label className={selectedIds.includes(candidate.id) ? "selected" : ""} key={candidate.id || `${candidate.title}-${index}`}>
+                  <input checked={selectedIds.includes(candidate.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, candidate.id])] : current.filter((id) => id !== candidate.id))} type="checkbox" />
                   <span>{String(index + 1).padStart(2, "0")}</span>
                   <div>
                     <strong>{candidate.title}</strong>
                     <p>{candidate.detail}</p>
                   </div>
-                </article>
+                </label>
               ))}
             </div>
           ) : (
@@ -1414,8 +2228,14 @@ function GrowResultPanel({ emptyTitle, result }: { emptyTitle: string; result: R
               <Network size={22} />
               <strong>No candidate list returned yet</strong>
               <span>Run a source preview with enough source material to inspect proposed memory nodes before apply.</span>
-            </div>
+              </div>
           )}
+          {candidates.length && summary.applyState !== "applied" ? (
+            <button className="primary wide" disabled={busy || !selectedIds.length} onClick={() => void onApply(selectedIds)} type="button">
+              {busy ? <RefreshCw size={16} /> : <CheckCircle2 size={16} />}
+              Apply {selectedIds.length} reviewed {selectedIds.length === 1 ? "memory" : "memories"}
+            </button>
+          ) : null}
           <details className="raw-receipt">
             <summary>Open exact receipt</summary>
             <pre>{JSON.stringify(result, null, 2)}</pre>
@@ -1438,14 +2258,6 @@ async function readApi<T>(path: string): Promise<T> {
 
 async function writeApi<T>(path: string, body: Record<string, unknown>): Promise<T> {
   return requestApi<T>(path, { method: "POST", body: JSON.stringify(compact(body)) });
-}
-
-async function writeApiWithFallback<T>(primaryPath: string, fallbackPath: string, body: Record<string, unknown>): Promise<T> {
-  try {
-    return await writeApi<T>(primaryPath, body);
-  } catch {
-    return writeApi<T>(fallbackPath, body);
-  }
 }
 
 async function uploadApi<T>(path: string, body: FormData): Promise<T> {
@@ -1474,6 +2286,223 @@ async function requestApi<T>(path: string, init: RequestInit, jsonBody = true): 
   }
 }
 
+function brainSyncPlatformOrigin() {
+  const configuredOrigin = configuredBrainSyncPlatformOrigin();
+  const explicit = new URLSearchParams(window.location.search).get("platform_url")?.trim() || "";
+  if (!explicit) return configuredOrigin;
+  try {
+    const candidateOrigin = new URL(explicit).origin;
+    return candidateOrigin === configuredOrigin ? candidateOrigin : configuredOrigin;
+  } catch {
+    return configuredOrigin;
+  }
+}
+
+function configuredBrainSyncPlatformOrigin() {
+  try {
+    return new URL(cloudUrl).origin;
+  } catch {
+    return "https://app.detwin.ai";
+  }
+}
+
+function connectedClientTokenForPlatform(platformOrigin: string) {
+  const deviceToken = readLocalValue(connectedClientDeviceTokenKey);
+  if (!deviceToken) return "";
+  const boundOrigin = readLocalValue(connectedClientPlatformOriginKey);
+  if (boundOrigin && boundOrigin !== platformOrigin) return "";
+  return platformOrigin === configuredBrainSyncPlatformOrigin() ? deviceToken : "";
+}
+
+async function platformJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 120000);
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "application/json");
+  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const platformOrigin = brainSyncPlatformOrigin();
+  const deviceToken = connectedClientTokenForPlatform(platformOrigin);
+  if (deviceToken) headers.set("X-AGVM-Device-Token", deviceToken);
+  try {
+    const response = await fetch(`${platformOrigin}${path.startsWith("/") ? path : `/${path}`}`, {
+      ...init,
+      credentials: "include",
+      headers,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let payload: unknown = {};
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = { detail: text };
+      }
+    }
+    if (!response.ok) throw new Error(responseDetail(payload) || `Detwin returned HTTP ${response.status}.`);
+    return payload as T;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function connectedClientLoginUrl() {
+  const deviceId = readOrCreateLocalValue("agvm.platform.connected_client.device_id.v1", "local-agvm");
+  const fingerprint = readOrCreateLocalValue("agvm.platform.connected_client.fingerprint.v1", "sha256");
+  const returnUrl = new URL(window.location.href);
+  returnUrl.searchParams.delete("agvm_connected_client_handoff");
+  returnUrl.searchParams.set("route", "brain_sync");
+  returnUrl.hash = "brain_sync";
+  const query = new URLSearchParams({
+    device_label: "Local AGVM",
+    intent: "deep_link",
+    local_device_id: deviceId,
+    machine_fingerprint_hash: fingerprint,
+    next: "/account/brains/sync",
+    return_url: returnUrl.toString(),
+    source: "local_agvm",
+  });
+  return `${brainSyncPlatformOrigin()}/auth/login?${query.toString()}`;
+}
+
+async function exchangeConnectedClientHandoff(handoffToken: string) {
+  const deviceId = readOrCreateLocalValue("agvm.platform.connected_client.device_id.v1", "local-agvm");
+  const fingerprint = readOrCreateLocalValue("agvm.platform.connected_client.fingerprint.v1", "sha256");
+  const response = await fetch(`${brainSyncPlatformOrigin()}/v1/account/connected-client/handoff/exchange`, {
+    method: "POST",
+    credentials: "omit",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_kind: "local_agvm",
+      handoff_token: handoffToken,
+      local_device_id: deviceId,
+      machine_fingerprint_hash: fingerprint,
+      return_origin: window.location.origin,
+    }),
+  });
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) throw new Error(responseDetail(payload) || `Detwin handoff returned HTTP ${response.status}.`);
+  const deviceToken = String(payload.device_token || "").trim();
+  if (!deviceToken) throw new Error("Detwin did not return a connected-device credential.");
+  window.localStorage.setItem(connectedClientDeviceTokenKey, deviceToken);
+  window.localStorage.setItem(connectedClientPlatformOriginKey, brainSyncPlatformOrigin());
+}
+
+function readLocalValue(key: string) {
+  try {
+    return String(window.localStorage.getItem(key) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function readOrCreateLocalValue(key: string, prefix: string) {
+  const existing = readLocalValue(key);
+  if (existing) return existing;
+  const random = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID().replaceAll("-", "")
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+  const value = `${prefix}:${random}`;
+  window.localStorage.setItem(key, value);
+  return value;
+}
+
+function durableOperationKey(scope: string) {
+  const key = `agvm.operation.${scope}`;
+  const existing = window.sessionStorage.getItem(key);
+  if (existing) return existing;
+  const random = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const value = `${scope}:${random}`.replace(/[^A-Za-z0-9:_.=-]/g, "_").slice(0, 128);
+  window.sessionStorage.setItem(key, value);
+  return value;
+}
+
+function brainSyncAccount(profile: Record<string, unknown>, summary: Record<string, unknown>): BrainSyncAccount {
+  const organizationId = String(findNestedValue(summary, "organization_id") || findNestedValue(profile, "organization_id") || "");
+  const workspaceId = String(findNestedValue(summary, "workspace_id") || findNestedValue(profile, "workspace_id") || "");
+  const actorId = String(findNestedValue(profile, "user_id") || findNestedValue(profile, "actor_id") || findNestedValue(profile, "id") || "");
+  if (!organizationId || !workspaceId || !actorId) throw new Error("Detwin did not return the active organization, workspace and user required for Brain Sync.");
+  return { actorId, organizationId, workspaceId };
+}
+
+function findNestedValue(source: unknown, key: string): unknown {
+  if (Array.isArray(source)) {
+    for (const item of source) {
+      const value = findNestedValue(item, key);
+      if (value !== undefined && value !== null && value !== "") return value;
+    }
+    return undefined;
+  }
+  if (!isRecord(source)) return undefined;
+  if (source[key] !== undefined && source[key] !== null && source[key] !== "") return source[key];
+  for (const value of Object.values(source)) {
+    const nested = findNestedValue(value, key);
+    if (nested !== undefined && nested !== null && nested !== "") return nested;
+  }
+  return undefined;
+}
+
+function findNestedText(source: unknown, key: string) {
+  return String(findNestedValue(source, key) || "").trim();
+}
+
+function findNestedNumber(source: unknown, ...keys: string[]) {
+  for (const key of keys) {
+    const value = findNestedValue(source, key);
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function snapshotHash(snapshot: Record<string, unknown>) {
+  const text = JSON.stringify(snapshot);
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function cloudBrainIdFor(localBrainId: string) {
+  const base = localBrainId.trim().toLowerCase().replace(/[^a-z0-9_.=-]+/g, "_").replace(/^[^a-z0-9]+/, "").replace(/_+/g, "_").slice(0, 96) || "local_brain";
+  return `cloud_${base}`.slice(0, 120);
+}
+
+function syncAuthorityHeaders(authority: string): HeadersInit | undefined {
+  const value = authority.trim();
+  return value ? { "X-AGVM-Brain-Sync-Operation-Authority": value } : undefined;
+}
+
+function lastSyncReceipt(operation: Record<string, unknown>) {
+  const direct = objectAt(operation, "receipt");
+  if (direct) return direct;
+  const receipts = arrayAt(operation, "receipts").filter(isRecord);
+  return receipts.length ? receipts[receipts.length - 1] : null;
+}
+
+function isTerminalSync(operation: Record<string, unknown>) {
+  const state = String(operation.state || operation.status || "").toLowerCase();
+  return ["acknowledged", "complete", "completed", "ready", "synced"].includes(state)
+    || findNestedValue(operation, "sync_claim_allowed") === true;
+}
+
+function syncErrorMessage(error: unknown) {
+  const raw = errorMessage(error);
+  const normalized = raw.toLowerCase();
+  if (normalized.includes("auth") || normalized.includes("session") || normalized.includes("device")) return "Reconnect Detwin and run a new preflight. No snapshot was applied.";
+  if (normalized.includes("credit") || normalized.includes("quota") || normalized.includes("insufficient")) return "The current credit allowance cannot cover this operation. Nothing was applied.";
+  if (normalized.includes("revision") || normalized.includes("stale")) return "The source changed after preflight. Run a new preflight against the current revision.";
+  if (normalized.includes("authority")) return "The verified sync operation expired. Run a new preflight before applying.";
+  return raw.replace(/brain_sync_/gi, "").replace(/_/g, " ");
+}
+
 function routeFromLocation(): RouteId {
   const raw = window.location.hash.replace(/^#/, "") || new URLSearchParams(window.location.search).get("route") || "context";
   return routes.some((item) => item.id === raw) ? (raw as RouteId) : "context";
@@ -1488,7 +2517,7 @@ function readTheme(): ThemeMode {
   }
 }
 
-function activityFor(busyAction: string | null, route: RouteId): BrainActivity {
+function activityFor(busyAction: string | null, route: RouteId, result: Record<string, unknown> | null = null): BrainActivity {
   if (busyAction === "retrieve") {
     return { active: true, detail: "path corridor resolving", label: "Retrieval running", phase: "retrieving" };
   }
@@ -1501,14 +2530,25 @@ function activityFor(busyAction: string | null, route: RouteId): BrainActivity {
   if (busyAction === "health") {
     return { active: true, detail: "health proof scanning", label: "Brain health", phase: "health" };
   }
-  if (route === "context") return { active: false, detail: "ready for retrieval", label: "Context path", phase: "idle" };
-  if (route === "grow") return { active: false, detail: "preview required", label: "Growth path", phase: "idle" };
+  if (route === "context") {
+    const evidenceCount = resultEvidenceSummaries(resultContextPackage(result)).length;
+    return evidenceCount
+      ? { active: false, detail: `${evidenceCount} evidence ready`, label: "Context complete", phase: "idle" }
+      : { active: false, detail: "ready for retrieval", label: "Context path", phase: "idle" };
+  }
+  if (route === "grow") {
+    const preview = growPreviewSummary(result);
+    return preview.applyState === "applied"
+      ? { active: false, detail: `${preview.graphDelta} persisted nodes`, label: "Growth applied", phase: "idle" }
+      : { active: false, detail: "preview required", label: "Growth path", phase: "idle" };
+  }
   if (route === "mcp") return { active: false, detail: "raw catalog ready", label: "MCP path", phase: "idle" };
   if (route === "health") return { active: false, detail: "proof idle", label: "Health path", phase: "idle" };
   return { active: false, detail: "radial memory map", label: "Shape lock", phase: "idle" };
 }
 
 function headlineForRoute(route: RouteId, activeBrain: BrainSummary | null) {
+  if (route === "brain_center") return activeBrain ? brainName(activeBrain) : "Create your first brain.";
   if (route === "context") return "Retrieve from local memory.";
   if (route === "results") return "Inspect bounded Local Core results.";
   if (route === "brain_explorer") return activeBrain ? brainName(activeBrain) : "Explore a real local brain.";
@@ -1523,6 +2563,7 @@ function headlineForRoute(route: RouteId, activeBrain: BrainSummary | null) {
 }
 
 function descriptionForRoute(route: RouteId) {
+  if (route === "brain_center") return "Create, select and complete the reviewed Bootstrap that unlocks a local brain.";
   if (route === "context") return "Ask the selected local brain for a context package and inspect the receipt returned by the local API.";
   if (route === "results") return "Review the latest local operation response without creating a cloud history dependency.";
   if (route === "brain_explorer") return "Inspect the same real-node-only Brain Core projection used throughout Local AGVM.";
@@ -1666,7 +2707,8 @@ function growPreviewSummary(result: Record<string, unknown> | null) {
     (previewBundle?.primary_node_preview ? "1" : "0");
   const applyContract = objectAt(data, "source_formation_contract") || objectAt(data, "apply_contract") || objectAt(previewBundle, "apply_contract");
   const applyState = result?.status === "applied" ? "applied" : applyContract ? "review needed" : "preview first";
-  return { applyState, candidates, sourceUnits };
+  const graphDelta = numberString(completeness?.persisted_node_count) || (applyState === "applied" ? candidates : "0");
+  return { applyState, candidates, graphDelta, sourceUnits };
 }
 
 function growCandidateSummaries(result: Record<string, unknown> | null) {
@@ -1676,14 +2718,16 @@ function growCandidateSummaries(result: Record<string, unknown> | null) {
   const candidates = rawCandidates
     .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
     .filter((item): item is Record<string, unknown> => Boolean(item))
-    .slice(0, 8)
-    .map((item) => ({
+    .slice(0, 64)
+    .map((item, index) => ({
+      id: String(item.preview_id || item.candidate_id || item.node_id || item.id || `candidate-${index + 1}`),
       title: String(item.summary || item.title || item.label || item.node_id || "Candidate memory node"),
       detail: String(item.memory_type || item.source_label || item.confidence || item.rationale || "Review this candidate before any apply step."),
     }));
   if (!candidates.length && previewBundle?.primary_node_preview && typeof previewBundle.primary_node_preview === "object") {
     const primary = previewBundle.primary_node_preview as Record<string, unknown>;
     candidates.push({
+      id: String(primary.preview_id || primary.candidate_id || primary.node_id || primary.id || "primary-candidate"),
       title: String(primary.summary || primary.title || "Primary candidate memory node"),
       detail: String(primary.memory_type || primary.rationale || "Primary preview returned by the local Grow contract."),
     });
@@ -1698,16 +2742,190 @@ function resultData(result: Record<string, unknown> | null) {
   return data || result;
 }
 
+function isBootstrapReady(brain: BrainSummary | null) {
+  if (!brain) return false;
+  if (String(brain.lifecycle?.bootstrap_state || "").toLowerCase() === "applied") return true;
+  const source = String(brain.migration_source || "").toLowerCase();
+  const reviewedImport = ["import", "migrat", "restore", "sync"].some((marker) => source.includes(marker));
+  return reviewedImport && Number(brain.node_count || 0) > 0 && brain.safe_for_mcp !== false;
+}
+
+function bootstrapSessionState(session: Record<string, unknown> | null) {
+  if (!session) return "not_started";
+  return String(session.lifecycle_state || session.state || session.status || "in_progress").toLowerCase();
+}
+
+function bootstrapCandidates(session: Record<string, unknown> | null) {
+  const previewEnvelope = objectAt(session, "preview");
+  const preview = objectAt(session, "preview_bundle") || objectAt(previewEnvelope, "preview_bundle") || previewEnvelope;
+  const raw = [
+    ...arrayAt(session, "review_candidates"),
+    ...arrayAt(session, "candidates"),
+    ...arrayAt(preview, "derived_nodes"),
+    ...arrayAt(preview, "candidate_nodes"),
+  ];
+  const seen = new Set<string>();
+  return raw.flatMap((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    const id = String(row.preview_id || row.candidate_id || row.node_id || row.id || `candidate-${index + 1}`);
+    if (seen.has(id)) return [];
+    seen.add(id);
+    return [{
+      id,
+      title: String(row.summary || row.title || row.label || "Candidate memory"),
+      detail: String(row.content || row.detail || row.rationale || row.memory_type || "Reviewed Bootstrap memory"),
+    }];
+  });
+}
+
+function bootstrapStepState(state: string, index: number) {
+  const rank: Record<string, number> = {
+    not_started: 0,
+    purpose_ready: 1,
+    interview_ready: 1,
+    interviewing: 1,
+    answers_ready: 2,
+    sources_ready: 3,
+    preview_ready: 4,
+    review_ready: 4,
+    applied: 5,
+  };
+  const current = rank[state] ?? (state.includes("preview") ? 4 : state.includes("source") ? 3 : state.includes("answer") ? 2 : 1);
+  return index < current ? "done" : index === current ? "active" : "pending";
+}
+
+function manualQuestionList(value: string) {
+  return value.split(/\r?\n/).map((question) => question.trim()).filter(Boolean);
+}
+
+function bootstrapQuestionId(question: string, index: number) {
+  return `q${index + 1}-${question.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 42)}`;
+}
+
+function objectAtValue(source: unknown, key: string) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return "";
+  return String((source as Record<string, unknown>)[key] || "");
+}
+
+function resultContextPackage(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  if (!data) return null;
+  return objectAt(data, "context_package") || (String(data.schema_version || "").includes("context_package") ? data : null);
+}
+
+function resultSectionSummaries(contextPackage: Record<string, unknown> | null) {
+  const rows = arrayAt(contextPackage, "structured_sections").length
+    ? arrayAt(contextPackage, "structured_sections")
+    : arrayAt(contextPackage, "sections");
+  return rows.flatMap((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    const items = arrayAt(row, "items").map((value) => String(value || "").trim()).filter(Boolean);
+    if (!items.length) return [];
+    const confidence = typeof row.confidence === "number" ? `${Math.round(row.confidence * 100)}%` : "";
+    return [{ key: String(row.key || `section-${index + 1}`), title: String(row.title || row.key || "Context"), items, confidence }];
+  });
+}
+
+function resultEvidenceSummaries(contextPackage: Record<string, unknown> | null) {
+  return arrayAt(contextPackage, "evidence").flatMap((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    const inspect = objectAt(row, "inspect");
+    const score = typeof row.score === "number" ? `${Math.round(row.score * 100)}%` : "";
+    const summary = String(row.summary || row.content || "Open the technical receipt for this evidence contract.");
+    return [{
+      id: String(row.node_id || row.document_id || row.id || ""),
+      lane: String(row.lane || row.type || "memory"),
+      title: summary,
+      summary: String(row.content || row.source_excerpt || summary),
+      score,
+      hydration: String(inspect?.tool_name || inspect?.endpoint || ""),
+    }];
+  });
+}
+
+function resultPathSummaries(result: Record<string, unknown> | null) {
+  const trace = objectAt(result, "ui_trace");
+  return arrayAt(trace, "landing_metadata").flatMap((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    const studied = Number(row.studied_node_count || 0);
+    const hydrated = Number(row.hydrated_node_count || 0);
+    const routeEvents = Number(row.route_trace_count || 0);
+    return [{
+      id: String(row.landing_id || row.branch_id || `path-${index + 1}`),
+      title: String(row.query_text || row.goal || row.label || `Search path ${index + 1}`),
+      detail: `${studied} studied / ${hydrated} hydrated / ${routeEvents} route events`,
+      status: pathStatusLabel(row),
+    }];
+  });
+}
+
+function pathStatusLabel(path: Record<string, unknown>) {
+  const stopReason = String(path.stop_reason || "").trim().toLowerCase();
+  if (stopReason === "budget_exhausted" && Number(path.hydrated_node_count || 0) > 0) return "completed at budget";
+  return String(path.status || path.route_state || stopReason || "complete").replace(/_/g, " ");
+}
+
+function resultAnswer(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const materialization = objectAt(data, "answer_demo_materialization") || objectAt(data, "answer_demo");
+  const contextPackage = resultContextPackage(result);
+  return String(
+    materialization?.answer_markdown || materialization?.answer || materialization?.text ||
+    contextPackage?.answer_markdown || contextPackage?.answer || "",
+  ).trim();
+}
+
+function contextSearchId(result: Record<string, unknown>) {
+  const data = resultData(result) || result;
+  const payload = objectAt(data, "result");
+  const contextPackage = objectAt(data, "context_package");
+  const delivery = objectAt(data, "mcp_delivery_contract");
+  const completion = objectAt(delivery, "completion_contract");
+  const inspection = objectAt(completion, "inspection");
+  const argumentsPayload = objectAt(inspection, "arguments");
+  return String(
+    data.search_id || payload?.search_id || contextPackage?.search_id || argumentsPayload?.search_id || "",
+  ).trim();
+}
+
+function contextResultIsTerminal(result: Record<string, unknown>) {
+  const data = resultData(result) || result;
+  const payload = objectAt(data, "result");
+  const delivery = objectAt(data, "mcp_delivery_contract");
+  const terminal = data.result_ready_terminal ?? payload?.result_ready_terminal ?? delivery?.terminal_for_client;
+  const pending = data.final_materialization_pending ?? payload?.final_materialization_pending ?? delivery?.final_materialization_pending;
+  return terminal === true && pending !== true;
+}
+
+function waitFor(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function resultStatusLabel(result: Record<string, unknown>) {
+  const data = resultData(result) || result;
+  const delivery = objectAt(data, "mcp_delivery_contract");
+  const lifecycle = objectAt(data, "run_lifecycle_contract");
+  const state = String(delivery?.client_payload_state || lifecycle?.terminal_state || data.status || result.status || "complete");
+  if (state === "partial_context" || state === "background_running") return "Context ready, refining";
+  if (state === "complete_context" || state === "contract_satisfied" || state === "sealed") return "Complete context";
+  if (state === "applied") return "Applied";
+  return state.replace(/_/g, " ");
+}
+
 function objectAt(source: unknown, key: string): Record<string, unknown> | null {
   if (!source || typeof source !== "object" || Array.isArray(source)) return null;
   const value = (source as Record<string, unknown>)[key];
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
-function arrayAt(source: unknown, key: string): unknown[] | null {
-  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+function arrayAt(source: unknown, key: string): unknown[] {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return [];
   const value = (source as Record<string, unknown>)[key];
-  return Array.isArray(value) ? value : null;
+  return Array.isArray(value) ? value : [];
 }
 
 function arrayLength(value: unknown) {

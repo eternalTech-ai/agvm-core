@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import unicodedata
 import uuid
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from brain_registry import BrainRegistryError, brain_root_path, resolve_brain_scope
+from brain_registry import BrainRegistryError, brain_root_path, refresh_local_brain_record, resolve_brain_scope
 from derivation import _source_grounding_assessment, persist_selection, preview_bundle, resolve_persist_selection
 from retrieval import build_index
 from runtime_scope import use_runtime_brain
@@ -66,6 +67,7 @@ class BrainBootstrapV1Service:
         apply_executor: Callable[[dict[str, Any], dict[str, Any], list[str]], dict[str, Any]] | None = None,
         mutation_probe: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
         question_generator: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        registry_committer: Callable[[dict[str, Any], dict[str, Any], Path], dict[str, Any]] | None = None,
     ) -> None:
         self._brain_resolver = brain_resolver
         self._brain_root_resolver = brain_root_resolver
@@ -73,6 +75,7 @@ class BrainBootstrapV1Service:
         self._apply_executor = apply_executor or _apply_manual_grow_preview
         self._mutation_probe = mutation_probe or _probe_manual_grow_mutation
         self._question_generator = question_generator or _generate_adaptive_interview
+        self._registry_committer = registry_committer or _commit_bootstrap_registry
 
     def execute(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         if operation not in OPERATIONS:
@@ -199,6 +202,14 @@ class BrainBootstrapV1Service:
             history = store.load_history(session_id)
             replay = store.find_idempotent(history, operation=operation, idempotency_key=key, request_digest=digest)
             if replay:
+                reconciled = self._reconcile_applied_registry_replay(
+                    operation=operation,
+                    brain_record=brain_record,
+                    store=store,
+                    replay=replay,
+                )
+                if reconciled is not None:
+                    return reconciled
                 return bootstrap_response(
                     operation=operation,
                     status=_operation_status(operation, replay),
@@ -249,7 +260,13 @@ class BrainBootstrapV1Service:
                             },
                         }
                     )
-                    return self._append_response(store, recovered, operation, key, digest, status="applied")
+                    recovered = self._append(store, recovered, operation, key, digest)
+                    return self._commit_applied_registry(
+                        operation=operation,
+                        brain_record=brain_record,
+                        store=store,
+                        applied=recovered,
+                    )
                 recovered = copy.deepcopy(current)
                 recovered["lifecycle_state"] = "review_required"
                 recovered["recovery"] = {
@@ -369,7 +386,7 @@ class BrainBootstrapV1Service:
         if not preview:
             raise BootstrapV1Error("bootstrap_preview_required_before_apply", status_code=409)
         available = [str(value) for value in list(preview.get("selected_preview_ids") or []) if str(value)]
-        selected = [str(value) for value in list(payload.get("selected_preview_ids") or available) if str(value)]
+        selected = [str(value) for value in list(payload.get("selected_preview_ids") or []) if str(value)]
         if not selected or len(selected) != len(set(selected)) or not set(selected).issubset(set(available)):
             raise BootstrapV1Error("bootstrap_selected_preview_ids_invalid", status_code=422)
         if str(current.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
@@ -420,7 +437,12 @@ class BrainBootstrapV1Service:
                     }
                 )
                 applied = store.append(applied, expected_revision=int(pending["revision"]))
-                return bootstrap_response(operation="apply", status="applied", brain_id=store.brain_id, session=applied)
+                return self._commit_applied_registry(
+                    operation="apply",
+                    brain_record=brain_record,
+                    store=store,
+                    applied=applied,
+                )
             failed = copy.deepcopy(pending)
             failed.update(
                 {
@@ -461,7 +483,86 @@ class BrainBootstrapV1Service:
             }
         )
         applied = store.append(applied, expected_revision=int(pending["revision"]))
-        return bootstrap_response(operation="apply", status="applied", brain_id=store.brain_id, session=applied)
+        return self._commit_applied_registry(
+            operation="apply",
+            brain_record=brain_record,
+            store=store,
+            applied=applied,
+        )
+
+    def _reconcile_applied_registry_replay(
+        self,
+        *,
+        operation: str,
+        brain_record: dict[str, Any],
+        store: BootstrapSessionStore,
+        replay: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        lifecycle_state = str(replay.get("lifecycle_state") or "")
+        recovery_state = str(dict(replay.get("recovery") or {}).get("state") or "")
+        if lifecycle_state == "recovery_required" and recovery_state == "registry_commit_failed":
+            applied = copy.deepcopy(replay)
+            applied.update(
+                {
+                    "lifecycle_state": "applied",
+                    "applied_at": str(replay.get("applied_at") or _utc_now()),
+                    "recovery": {
+                        "state": "registry_commit_retry",
+                        "automatic_reapply_allowed": False,
+                    },
+                }
+            )
+            applied = store.append(applied, expected_revision=int(replay["revision"]))
+        elif lifecycle_state == "applied":
+            applied = replay
+        else:
+            return None
+        return self._commit_applied_registry(
+            operation=operation,
+            brain_record=brain_record,
+            store=store,
+            applied=applied,
+            replayed=True,
+        )
+
+    def _commit_applied_registry(
+        self,
+        *,
+        operation: str,
+        brain_record: dict[str, Any],
+        store: BootstrapSessionStore,
+        applied: dict[str, Any],
+        replayed: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            self._registry_committer(brain_record, applied, self._brain_root_resolver())
+        except Exception as exc:
+            failed = copy.deepcopy(applied)
+            failed.update(
+                {
+                    "lifecycle_state": "recovery_required",
+                    "recovery": {
+                        "state": "registry_commit_failed",
+                        "reason": type(exc).__name__,
+                        "automatic_reapply_allowed": False,
+                    },
+                }
+            )
+            failed = store.append(failed, expected_revision=int(applied["revision"]))
+            return bootstrap_response(
+                operation=operation,
+                status="recovery_required",
+                brain_id=store.brain_id,
+                session=failed,
+                replayed=replayed,
+            )
+        return bootstrap_response(
+            operation=operation,
+            status="applied",
+            brain_id=store.brain_id,
+            session=applied,
+            replayed=replayed,
+        )
 
     def _simple_transition(
         self,
@@ -514,11 +615,30 @@ class BrainBootstrapV1Service:
         return BootstrapSessionStore(brain_record, brain_root=self._brain_root_resolver())
 
 
+def _commit_bootstrap_registry(
+    brain_record: dict[str, Any],
+    applied_session: dict[str, Any],
+    brain_root: Path,
+) -> dict[str, Any]:
+    apply_result = dict(applied_session.get("apply_result") or {})
+    persisted_node_ids = {
+        str(value)
+        for value in list(apply_result.get("persisted_node_ids") or [])
+        if str(value).strip()
+    }
+    return refresh_local_brain_record(
+        str(brain_record.get("brain_id") or ""),
+        brain_root=brain_root,
+        minimum_node_count=max(1, len(persisted_node_ids)),
+        expected_bootstrap_state="applied",
+        expected_bootstrap_session_id=str(applied_session.get("session_id") or ""),
+    )
+
+
 def _generate_adaptive_interview(goal: str, brain_record: dict[str, Any]) -> dict[str, Any]:
-    from hosted_credential_context import resolved_openai_api_key
     from llm import compiler_model, structured_json
 
-    api_key = resolved_openai_api_key()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise BootstrapV1Error("bootstrap_question_generation_unavailable", status_code=503)
     schema = {
@@ -619,31 +739,28 @@ def _build_manual_grow_preview(session: dict[str, Any], brain_record: dict[str, 
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
-        bundle = preview_bundle(
-            raw_text,
-            "text",
-            graph,
-            build_index(list(graph.get("nodes") or [])),
-            fetch_atlas(),
-            source_label="Brain Bootstrap V1 reviewed material",
-            source_type="manual_bootstrap",
-            source_trust="user_asserted",
-            learning_mode="strict_review",
-            source_purpose="bootstrap_seed",
-            operator_instruction=(
-                "Create atomic, provenance-preserving bootstrap candidates without writing memory. "
-                "Every reviewable memory must be one complete, self-contained, informative sentence with explicit "
-                "context and terminal punctuation; titles, labels, fragments, and semantic duplicates are not "
-                "reviewable memories. "
-                f"When the reviewed material supports it, target {requirements['target_candidate_count']} distinct memories "
-                f"and never exceed {requirements['maximum_candidate_count']}; do not invent content to meet the target."
-            ),
-            source_context={
-                "bootstrap_quality_policy": str(session.get("quality_policy") or "legacy"),
-                "candidate_target": requirements["target_candidate_count"],
-                "candidate_maximum": requirements["maximum_candidate_count"],
-            },
-        )
+        if str(session.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
+            bundle = _build_guided_seed_bundle(
+                session=session,
+                raw_text=raw_text,
+                graph=graph,
+                index=build_index(list(graph.get("nodes") or [])),
+                atlas=fetch_atlas(),
+                requirements=requirements,
+            )
+        else:
+            bundle = preview_bundle(
+                raw_text,
+                "text",
+                graph,
+                build_index(list(graph.get("nodes") or [])),
+                fetch_atlas(),
+                source_label="Brain Bootstrap V1 reviewed material",
+                source_type="manual_bootstrap",
+                source_trust="user_asserted",
+                learning_mode="strict_review",
+                source_purpose="bootstrap_seed",
+            )
     screening: dict[str, Any] | None = None
     if str(session.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
         selected, screening = _screen_seed_candidates(session=session, bundle=bundle)
@@ -659,6 +776,125 @@ def _build_manual_grow_preview(session: dict[str, Any], brain_record: dict[str, 
         "quality": quality,
         "mutates_brain": False,
     }
+
+
+def _build_guided_seed_bundle(
+    *,
+    session: dict[str, Any],
+    raw_text: str,
+    graph: dict[str, Any],
+    index: dict[str, Any],
+    atlas: dict[str, Any],
+    requirements: dict[str, int],
+) -> dict[str, Any]:
+    statements = _reviewed_atomic_seed_statements(session)
+    candidates: list[dict[str, Any]] = []
+    for position, statement in enumerate(statements[: requirements["maximum_candidate_count"]], start=1):
+        atom_bundle = preview_bundle(
+            statement,
+            "text",
+            graph,
+            index,
+            atlas,
+            source_label="Brain Bootstrap V1 reviewed material",
+            source_type="manual_bootstrap",
+            source_trust="user_asserted",
+            learning_mode="strict_review",
+            source_purpose="bootstrap_seed",
+            operator_instruction="Preserve this reviewed atomic memory exactly; do not expand or invent content.",
+            source_context={
+                "bootstrap_quality_policy": GUIDED_SEED_QUALITY_POLICY,
+                "candidate_target": requirements["target_candidate_count"],
+                "candidate_maximum": requirements["maximum_candidate_count"],
+                "atomic_seed_position": position,
+            },
+        )
+        candidate = dict(atom_bundle.get("primary_node_preview") or {})
+        if not candidate:
+            continue
+        preview_id = f"bootstrap_seed_{position:03d}"
+        candidate.update(
+            {
+                "id": preview_id,
+                "preview_id": preview_id,
+                "preview_kind": "derived",
+                "derivation_role": "reviewed_atomic_seed",
+                "raw_text": statement,
+                "summary": statement,
+                "selected_by_default": True,
+                "source_label": "Brain Bootstrap V1 reviewed material",
+                "source_type": "manual_bootstrap",
+                "source_trust": "user_asserted",
+            }
+        )
+        candidate.pop("summary_full", None)
+        provenance = dict(candidate.get("provenance") or {})
+        provenance.update(
+            {
+                "mode": "agvm_brain_bootstrap_reviewed_atomic_seed",
+                "source_label": "Brain Bootstrap V1 reviewed material",
+                "source_type": "manual_bootstrap",
+                "source_trust": "user_asserted",
+            }
+        )
+        candidate["provenance"] = provenance
+        candidates.append(candidate)
+    return {
+        "schema_version": "agvm.preview_bundle.v1",
+        "input_mode": "text",
+        "source_label": "Brain Bootstrap V1 reviewed material",
+        "source_type": "manual_bootstrap",
+        "source_trust": "user_asserted",
+        "raw_text": raw_text,
+        "primary_node_preview": {},
+        "derived_nodes": candidates,
+        "warnings": [],
+        "preview_quality_contract": {
+            "schema_version": "agvm.preview_quality_contract.v1",
+            "apply_safe": True,
+            "blocking_reasons": [],
+            "rows": [],
+            "source_scope": True,
+        },
+    }
+
+
+def _reviewed_atomic_seed_statements(session: dict[str, Any]) -> list[str]:
+    source_chunks = [
+        str(item.get("source_text") or "").strip()
+        for item in list(session.get("sources") or [])
+        if isinstance(item, dict) and str(item.get("source_text") or "").strip()
+    ]
+    answer_chunks = [
+        str(item.get("answer") or "").strip()
+        for item in list(session.get("answers") or [])
+        if isinstance(item, dict) and str(item.get("answer") or "").strip()
+    ]
+    raw_candidates: list[str] = []
+    for chunk in [*source_chunks, *answer_chunks]:
+        raw_candidates.extend(
+            part.strip()
+            for part in re.split(r"(?<=[.!?\u3002\uff01\uff1f])\s+|[\r\n]+", chunk)
+            if part.strip()
+        )
+    statements: list[str] = []
+    semantic_rows: list[tuple[str, set[str]]] = []
+    for value in raw_candidates:
+        statement = " ".join(value.split()).strip()
+        if statement and statement[-1] not in ".!?\u3002\uff01\uff1f":
+            statement = f"{statement}."
+        shape = _seed_candidate_shape(statement)
+        if not (shape["complete_sentence"] and shape["informative"] and shape["atomic"]):
+            continue
+        semantic_text, semantic_tokens = _seed_candidate_semantic_form(statement)
+        if any(
+            _seed_candidates_are_duplicates(semantic_text, semantic_tokens, prior_text, prior_tokens)
+            for prior_text, prior_tokens in semantic_rows
+        ):
+            continue
+        semantic_rows.append((semantic_text, semantic_tokens))
+        statements.append(statement)
+    return statements
 
 
 def _bootstrap_seed_quality(
@@ -982,7 +1218,7 @@ def _bootstrap_reviewed_material(session: dict[str, Any]) -> str:
 def _apply_manual_grow_preview(
     preview: dict[str, Any], brain_record: dict[str, Any], selected_ids: list[str]
 ) -> dict[str, Any]:
-    bundle = dict(preview.get("preview_bundle") or {})
+    bundle = _bootstrap_persist_bundle(preview)
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
@@ -1017,7 +1253,7 @@ def _build_mutation_receipt(
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
-    bundle = dict(preview.get("preview_bundle") or {})
+    bundle = _bootstrap_persist_bundle(preview)
     effective_selected_ids, learning_policy = resolve_persist_selection(
         bundle,
         selected_ids,
@@ -1061,6 +1297,19 @@ def _build_mutation_receipt(
         ),
         "witnesses": witnesses,
     }
+
+
+def _bootstrap_persist_bundle(preview: dict[str, Any]) -> dict[str, Any]:
+    bundle = copy.deepcopy(dict(preview.get("preview_bundle") or {}))
+    primary = dict(bundle.get("primary_node_preview") or {})
+    if not str(primary.get("id") or primary.get("preview_id") or "").strip():
+        primary = {
+            "id": "bootstrap_primary_not_selected",
+            "preview_id": "bootstrap_primary_not_selected",
+            "selected_by_default": False,
+        }
+    bundle["primary_node_preview"] = primary
+    return bundle
 
 
 def _probe_manual_grow_mutation(brain_record: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any]:

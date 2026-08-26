@@ -91,8 +91,10 @@ REQUIRED_MCP_TOOL_NAMES = [
     "matrix_calibration_apply",
     "sleep_preview",
     "sleep_apply",
+    "sleep_rollback",
     "evolve_preview",
     "evolve_apply",
+    "evolve_rollback",
     "list_open_questions",
     "list_hypotheses",
     "list_contradictions",
@@ -147,8 +149,10 @@ PR12J_D_IMPLEMENTED_TOOL_NAMES = {
     "matrix_calibration_apply",
     "sleep_preview",
     "sleep_apply",
+    "sleep_rollback",
     "evolve_preview",
     "evolve_apply",
+    "evolve_rollback",
     "list_open_questions",
     "list_hypotheses",
     "list_contradictions",
@@ -497,19 +501,34 @@ def _write_output_schema(*, commit: bool = False) -> dict[str, Any]:
 
 def _maintenance_input_schema(*, apply: bool = False) -> dict[str, Any]:
     properties = {
+        "brain_id": {
+            **_string("Explicit brain id returned by list_brains or ensure_brain."),
+            "minLength": 1,
+        },
         "focus_node_id": _string("Optional focus node id for local maintenance.", nullable=True),
         "mode": _string("Optional maintenance mode override. Named tools already imply this: sleep_preview/sleep_apply use sleep, evolve_preview/evolve_apply use evolve.", enum=["sleep", "evolve"]),
         "dry_run": _boolean("Preview only; true by default for preview tools.", default=True),
         "max_nodes_considered": _integer("Maintenance node budget. Default MCP preview is 20 for fast local-client inspection; request 80+ for a deeper maintenance preview.", minimum=10, maximum=500, default=20),
     }
     if apply:
-        properties["proposal_ids"] = _array("Review-approved maintenance proposal ids.", item_type="string")
+        properties["preview_signature"] = {
+            **_string("Exact preview signature returned by the matching maintenance preview."),
+            "minLength": 1,
+        }
+        properties["selected_proposal_ids"] = {
+            **_array("Complete set of review-approved maintenance proposal ids returned by the matching preview.", item_type="string"),
+            "minItems": 1,
+            "uniqueItems": True,
+        }
         properties["confirm_apply"] = _boolean("Explicit apply confirmation.", default=False)
-    required = ["confirm_apply"] if apply else []
+    required = ["brain_id", "preview_signature", "selected_proposal_ids", "confirm_apply"] if apply else []
     return _schema_object(
         properties=properties,
         required=required,
-        description="Maintenance MCP input contract. For preview tools, pass brain_id and optionally max_nodes_considered; the tool name selects sleep or evolve.",
+        description=(
+            "Maintenance MCP input contract. Preview exposes brain_id, focus_node_id and max_nodes_considered; "
+            "the tool name selects sleep or evolve. Apply must be bound to the exact preview and its complete reviewed proposal selection."
+        ),
     )
 
 
@@ -534,6 +553,43 @@ def _maintenance_output_schema(*, apply: bool = False) -> dict[str, Any]:
         properties["rollback_snapshot"] = _object("Rollback snapshot metadata created before apply.")
         properties["before_after_audit"] = _object("Before/candidate/applied graph audit.")
     return _schema_object(properties=properties, required=["schema_version", "tool_name", "status", "maintenance_report", "memory_operation_lifecycle_contract"], description="Maintenance MCP output contract.")
+
+
+def _maintenance_rollback_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "brain_id": {
+                **_string("Explicit brain id returned by list_brains or ensure_brain."),
+                "minLength": 1,
+            },
+            "preview_signature": {
+                **_string("Exact signature of the applied Sleep/Evolve preview to restore."),
+                "minLength": 1,
+            },
+            "confirm_rollback": _boolean("Explicit rollback confirmation.", default=False),
+        },
+        required=["brain_id", "preview_signature", "confirm_rollback"],
+        description="Revision-safe Sleep/Evolve rollback bound to one applied persistent preview.",
+    )
+
+
+def _maintenance_rollback_output_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "schema_version": _string("Maintenance rollback output schema version."),
+            "brain_id": _string("Brain restored by the rollback."),
+            "tool_name": _string("Canonical Sleep/Evolve rollback tool name."),
+            "mode": _string("Maintenance mode restored by this rollback.", enum=["sleep", "evolve"]),
+            "preview_signature": _string("Applied persistent preview restored by this rollback."),
+            "status": _string("Rollback state.", enum=["rolled_back", "already_rolled_back", "blocked", "failed"]),
+            "rollback_result": _object("Atomic SQLite rollback result, restored revision and idempotency proof."),
+            "mutation_surface": _object("Revision-safe graph restoration evidence."),
+            "maintenance_latency_profile": _object("Rollback execution latency."),
+            "error": _object("Structured rollback error when blocked."),
+        },
+        required=["schema_version", "brain_id", "tool_name", "mode", "preview_signature", "status", "rollback_result"],
+        description="Sleep/Evolve rollback MCP output contract.",
+    )
 
 
 def _brain_health_input_schema() -> dict[str, Any]:
@@ -580,11 +636,16 @@ def _brain_health_output_schema() -> dict[str, Any]:
 def _matrix_calibration_input_schema() -> dict[str, Any]:
     return _schema_object(
         properties={
+            "brain_id": {
+                **_string("Explicit brain id returned by list_brains or ensure_brain."),
+                "minLength": 1,
+            },
+            "focus_node_id": _string("Optional focus node id for geometry inspection.", nullable=True),
             "max_nodes_considered": _integer("Geometry calibration node budget.", minimum=50, maximum=4000, default=4000),
             "max_position_updates": _integer("Maximum preview-only position deltas to include.", minimum=1, maximum=2000, default=1600),
             "include_recommendations": _boolean("Include bounded calibration recommendations.", default=True),
         },
-        description="Non-mutating matrix calibration preview request.",
+        description="Non-mutating Geometry/Matrix calibration preview request with explicit brain, optional focus and bounded node/update limits.",
     )
 
 
@@ -594,9 +655,24 @@ def _matrix_calibration_apply_input_schema() -> dict[str, Any]:
         **dict(schema.get("properties") or {}),
         "confirm_apply": _boolean("Explicit matrix apply confirmation.", default=False),
         "rollback_consent": _boolean("Confirms rollback snapshot creation and guarded coordinate mutation.", default=False),
-        "preview_signature": _string("Exact plan_signature returned by matrix_calibration_preview."),
+        "preview_signature": {
+            **_string("Exact plan_signature returned by the matching Geometry/Matrix calibration preview."),
+            "minLength": 1,
+        },
+        "selected_proposal_ids": {
+            **_array("Complete set of reviewed calibration proposal ids returned by the matching preview.", item_type="string"),
+            "minItems": 1,
+            "uniqueItems": True,
+        },
     }
-    schema["description"] = "Guarded matrix calibration apply request."
+    schema["required"] = [
+        "brain_id",
+        "preview_signature",
+        "selected_proposal_ids",
+        "confirm_apply",
+        "rollback_consent",
+    ]
+    schema["description"] = "Guarded Geometry/Matrix calibration apply request bound to an exact reviewed preview and rollback consent."
     return schema
 
 
@@ -835,7 +911,20 @@ def _brain_bootstrap_v1_input_schema(operation: str) -> dict[str, Any]:
         properties.update(
             {
                 "goal": _string("Bounded bootstrap goal.", nullable=True),
-                "questions": _array("Optional manual interview questions.", item_type="string"),
+                "interview_mode": _string(
+                    "Interview planning mode. adaptive_ai generates a bounded provider-backed interview; manual uses caller-supplied questions.",
+                    enum=["manual", "adaptive_ai"],
+                    default="manual",
+                ),
+                "quality_policy": _string(
+                    "Optional reviewed-seed quality gate. guided_seed_v1 requires enough answers, trusted source material and 12-30 grounded atomic candidates before apply.",
+                    enum=["guided_seed_v1"],
+                    nullable=True,
+                ),
+                "questions": _array(
+                    "Optional manual interview questions. Omit when interview_mode is adaptive_ai.",
+                    item_type="string",
+                ),
             }
         )
         required = ["idempotency_key"]
@@ -870,7 +959,7 @@ def _brain_bootstrap_v1_input_schema(operation: str) -> dict[str, Any]:
                 "selected_preview_ids": _array("Reviewed Grow candidate ids to apply.", item_type="string"),
             }
         )
-        required.append("confirm_apply")
+        required.extend(["confirm_apply", "selected_preview_ids"])
     return _schema_object(
         properties=properties,
         required=required,
@@ -1477,7 +1566,7 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
             input_schema=_matrix_calibration_input_schema(),
             output_schema=_matrix_calibration_output_schema(),
             candidate_backend_routes=["POST /memory/mcp/matrix-calibration-preview", "GET /memory/geometry-calibration"],
-            mutation_policy="read_only",
+            mutation_policy="preview_only",
         )
     )
 
@@ -1515,7 +1604,7 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
                     + _advanced_module_visibility_note()
                     if not apply_tool
                     else (
-                        f"Apply reviewed {mode} maintenance proposals. Requires proposal_ids from {mode}_preview and confirm_apply=true."
+                        f"Apply reviewed {mode} maintenance proposals. Requires preview_signature and selected_proposal_ids from {mode}_preview, plus confirm_apply=true."
                         + _advanced_module_visibility_note()
                     )
                 ),
@@ -1533,6 +1622,29 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
                     "POST /memory/evolve",
                 ],
                 mutation_policy="explicit_apply" if apply_tool else "preview_only",
+            )
+        )
+
+    for name, title, mode in [
+        ("sleep_rollback", "Sleep Rollback", "sleep"),
+        ("evolve_rollback", "Evolve Rollback", "evolve"),
+    ]:
+        contracts.append(
+            _tool_contract(
+                name=name,
+                title=title,
+                description=(
+                    f"Atomically restore the exact persistent graph revision captured by one applied {mode} preview. "
+                    "Requires its preview_signature and confirm_rollback=true."
+                    + _advanced_module_visibility_note()
+                ),
+                category="maintenance",
+                planned_slice="PR-12J-D",
+                default_output_package="rollback_result",
+                input_schema=_maintenance_rollback_input_schema(),
+                output_schema=_maintenance_rollback_output_schema(),
+                candidate_backend_routes=[f"POST /memory/mcp/{mode}-rollback"],
+                mutation_policy="explicit_apply",
             )
         )
 

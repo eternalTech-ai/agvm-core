@@ -58,11 +58,17 @@ AGVM_DEFAULT_BRAIN_ID=default_brain
 AGVM_MCP_BRAIN_POLICY=ai_create_if_missing
 AGVM_MCP_READ_ONLY=false
 AGVM_MCP_MODULE_VISIBILITY_POLICY=block_unlicensed
+AGVM_GROW_PREVIEW_BINDING_SECRET=
 ```
 
-Provider keys can also be saved through the UI setup flow when the backend
-supports managed environment storage. Raw provider keys must not be written to
-browser localStorage.
+The public Docker UI reports provider readiness but does not persist a raw key.
+Set provider keys in `.env` and restart the API container. Raw provider keys
+must not be written to browser localStorage.
+
+When `AGVM_GROW_PREVIEW_BINDING_SECRET` is empty, first-run setup generates a
+random key and stores it in the local API data volume. Set an explicit value of
+at least 32 bytes only when the runtime must share that key across managed
+instances; never commit it.
 
 ## Data Location
 
@@ -73,6 +79,10 @@ Docker volumes hold local runtime data:
 
 Removing those volumes removes local AGVM state. Export or back up local brains
 before deleting volumes.
+
+The published Compose stack binds API and UI to loopback by default. It is a
+same-machine product; exposing it to a network requires a reviewed reverse proxy,
+authentication and TLS configuration that are outside this quickstart.
 
 ## First MCP Check
 

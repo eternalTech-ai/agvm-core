@@ -1,15 +1,15 @@
 {
   "api_base_url": "http://127.0.0.1:8010",
-  "brain_policy": "fixed",
-  "active_brain_id": "example_local_brain",
-  "default_brain_id": "example_local_brain",
+  "brain_policy": "ai_create_if_missing",
+  "active_brain_id": null,
+  "default_brain_id": null,
   "brain_id_hint": null,
   "brain_display_name": null,
   "brain_purpose": null,
-  "tenant_id": "local_tenant",
-  "organization_id": "local_org",
-  "user_id": "local_user",
-  "environment_id": "local_self_hosted_dev",
+  "tenant_id": null,
+  "organization_id": null,
+  "user_id": null,
+  "environment_id": null,
   "request_timeout_seconds": 180,
   "hosted_mcp_base_url": "https://mcp.detwin.ai",
   "tool_permissions": {
@@ -41,7 +41,7 @@
     "visibility_policy": "block_unlicensed",
     "status_source": "local_license_supervisor",
     "license_state_path": null,
-    "public_core_behavior": "All 52 registry tools remain visible. Core tools execute locally. Module-required paid tools execute only through Detwin Hosted MCP when AGVM_HOSTED_MCP_API_KEY is set; otherwise they return a structured account and billing recovery contract."
+    "public_core_behavior": "All 54 registry tools remain visible. Core tools execute locally. Module-required paid tools execute only through Detwin Hosted MCP when AGVM_HOSTED_MCP_API_KEY is set; otherwise they return a structured account and billing recovery contract."
   },
   "permission_profiles": {
     "read_only_recall": {

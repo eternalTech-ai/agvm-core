@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from fastapi import APIRouter, HTTPException, Request
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from brain_registry import (
     BrainRegistryError,
@@ -44,10 +47,17 @@ from sqlite_store import fetch_graph_snapshot, replace_runtime_graph
 
 
 BRAIN_SYNC_APPLY_RESTORE_PATH = "/memory/brains/sync/apply-restore"
+BRAIN_SYNC_PREFLIGHT_RESTORE_PATH = "/memory/brains/sync/preflight-restore"
 BRAIN_SYNC_RESTORE_STATUS_PATH = "/memory/brains/sync/restore-status"
 BRAIN_SYNC_ROLLBACK_RESTORE_PATH = "/memory/brains/sync/rollback-restore"
 BRAIN_SYNC_APPLY_RESTORE_REQUEST_SCHEMA_VERSION = (
     "agvm.core.brain_sync.apply_restore_request.v1"
+)
+BRAIN_SYNC_PREFLIGHT_RESTORE_REQUEST_SCHEMA_VERSION = (
+    "agvm.core.brain_sync.preflight_restore_request.v1"
+)
+BRAIN_SYNC_PREFLIGHT_RESTORE_RESPONSE_SCHEMA_VERSION = (
+    "agvm.core.brain_sync.preflight_restore_response.v1"
 )
 BRAIN_SYNC_ROLLBACK_RESTORE_REQUEST_SCHEMA_VERSION = (
     "agvm.core.brain_sync.rollback_restore_request.v1"
@@ -72,6 +82,10 @@ _BRAIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _RESTORE_TRANSACTION_ID_PATTERN = re.compile(r"^restore_tx_[0-9a-f]{64}$")
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RESTORE_LOCK = threading.RLock()
+_BRAIN_SYNC_SIGNATURE_CONTEXT = b"agvm.detwin.brain_sync.bundle.v2\x00"
+_DEFAULT_PLATFORM_BRAIN_SYNC_SIGNING_KEYS = {
+    "agvm-memory-authority-v1": "QiziW2OJWVECJ5dPr--Qzt8pSFFI53Kg3A4UulT6erA",
+}
 _FORBIDDEN_SECRET_KEYS = frozenset(
     {
         "access_token",
@@ -96,6 +110,22 @@ _FORBIDDEN_SECRET_KEY_FORMS = _FORBIDDEN_SECRET_KEYS | frozenset(
 
 def create_brain_sync_restore_router() -> APIRouter:
     router = APIRouter(tags=["agvm-core-brain-sync"])
+
+    @router.post(BRAIN_SYNC_PREFLIGHT_RESTORE_PATH)
+    async def preflight_restore_bundle(request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="brain_sync_restore_request_json_invalid",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="brain_sync_restore_request_object_required",
+            )
+        return preflight_validated_restore_bundle(payload)
 
     @router.post(BRAIN_SYNC_APPLY_RESTORE_PATH)
     async def apply_restore_bundle(request: Request) -> dict[str, Any]:
@@ -157,6 +187,35 @@ def create_brain_sync_restore_router() -> APIRouter:
         return rollback_applied_restore(payload)
 
     return router
+
+
+def preflight_validated_restore_bundle(request_payload: dict[str, Any]) -> dict[str, Any]:
+    if (
+        request_payload.get("schema_version")
+        != BRAIN_SYNC_PREFLIGHT_RESTORE_REQUEST_SCHEMA_VERSION
+        or set(request_payload) != {"schema_version", "bundle"}
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="brain_sync_restore_preflight_request_invalid",
+        )
+    validation = _validate_restore_bundle(
+        _required_object(request_payload.get("bundle"), "bundle")
+    )
+    root = brain_root_path().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    destination_brain_id = str(dict(validation["destination"])["brain_id"])
+    with _exclusive_restore_lock(root):
+        destination_state = _destination_state_binding(
+            root=root,
+            destination_brain_id=destination_brain_id,
+        )
+    return {
+        "schema_version": BRAIN_SYNC_PREFLIGHT_RESTORE_RESPONSE_SCHEMA_VERSION,
+        "status": "ready",
+        "bundle_sha256": validation["bundle_sha256"],
+        "destination_state": destination_state,
+    }
 
 
 def read_restore_status(
@@ -262,10 +321,27 @@ def apply_validated_restore_bundle(request_payload: dict[str, Any]) -> dict[str,
             status_code=422,
             detail="brain_sync_restore_request_schema_invalid",
         )
-    if request_payload.get("overwrite_existing_confirmed") is not True:
+    allowed_fields = {
+        "schema_version",
+        "idempotency_key",
+        "expected_destination_state_sha256",
+        "overwrite_existing_confirmed",
+        "select_after_restore",
+        "bundle",
+    }
+    if set(request_payload) - allowed_fields:
         raise HTTPException(
-            status_code=409,
-            detail="brain_sync_restore_overwrite_confirmation_required",
+            status_code=422,
+            detail="brain_sync_restore_request_fields_invalid",
+        )
+    overwrite_existing_confirmed = request_payload.get(
+        "overwrite_existing_confirmed",
+        False,
+    )
+    if not isinstance(overwrite_existing_confirmed, bool):
+        raise HTTPException(
+            status_code=422,
+            detail="brain_sync_restore_overwrite_confirmation_invalid",
         )
     select_after_restore = request_payload.get("select_after_restore", False)
     if not isinstance(select_after_restore, bool):
@@ -275,6 +351,11 @@ def apply_validated_restore_bundle(request_payload: dict[str, Any]) -> dict[str,
         )
     bundle = _required_object(request_payload.get("bundle"), "bundle")
     validation = _validate_restore_bundle(bundle)
+    if overwrite_existing_confirmed is not validation["overwrite_existing_authorized"]:
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_overwrite_policy_mismatch",
+        )
     requested_idempotency_key = _required_text(
         request_payload.get("idempotency_key"),
         "idempotency_key",
@@ -287,6 +368,15 @@ def apply_validated_restore_bundle(request_payload: dict[str, Any]) -> dict[str,
             status_code=409,
             detail="brain_sync_restore_idempotency_key_mismatch",
         )
+    expected_destination_state_sha256 = _required_text(
+        request_payload.get("expected_destination_state_sha256"),
+        "expected_destination_state_sha256",
+    )
+    if not _SHA256_PATTERN.fullmatch(expected_destination_state_sha256):
+        raise HTTPException(
+            status_code=422,
+            detail="brain_sync_restore_expected_destination_state_sha256_invalid",
+        )
 
     root = brain_root_path().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -295,6 +385,8 @@ def apply_validated_restore_bundle(request_payload: dict[str, Any]) -> dict[str,
             root=root,
             bundle=bundle,
             validation=validation,
+            expected_destination_state_sha256=expected_destination_state_sha256,
+            overwrite_existing_confirmed=overwrite_existing_confirmed,
             select_after_restore=select_after_restore,
         )
 
@@ -304,6 +396,8 @@ def _apply_restore_under_lock(
     root: Path,
     bundle: dict[str, Any],
     validation: dict[str, Any],
+    expected_destination_state_sha256: str,
+    overwrite_existing_confirmed: bool,
     select_after_restore: bool,
 ) -> dict[str, Any]:
     destination = dict(validation["destination"])
@@ -338,7 +432,9 @@ def _apply_restore_under_lock(
         "bundle_sha256": validation["bundle_sha256"],
         "content_sha256": validation["content_sha256"],
         "brain_id": destination_brain_id,
+        "overwrite_existing_confirmed": overwrite_existing_confirmed,
         "select_after_restore": select_after_restore,
+        "expected_destination_state_sha256": expected_destination_state_sha256,
     }
     request_fingerprint = _sha256(_canonical_json_bytes(fingerprint_body))
     existing_idempotency = _read_json_object(idempotency_path)
@@ -426,6 +522,16 @@ def _apply_restore_under_lock(
         None,
     )
     if existing_record:
+        if not validation["overwrite_existing_authorized"]:
+            raise HTTPException(
+                status_code=409,
+                detail="brain_sync_restore_existing_destination_not_authorized",
+            )
+        if not overwrite_existing_confirmed:
+            raise HTTPException(
+                status_code=409,
+                detail="brain_sync_restore_overwrite_confirmation_required",
+            )
         if str(existing_record.get("storage_layout") or "") != "registry_managed":
             raise HTTPException(
                 status_code=409,
@@ -445,6 +551,20 @@ def _apply_restore_under_lock(
             detail="brain_sync_restore_unregistered_destination_exists",
         )
 
+    destination_state = _destination_state_binding(
+        root=root,
+        destination_brain_id=destination_brain_id,
+        registry=registry,
+    )
+    if not hmac.compare_digest(
+        str(destination_state["state_sha256"]),
+        expected_destination_state_sha256,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_destination_changed_since_preflight",
+        )
+
     if stage_path.exists():
         _safe_remove_tree(stage_path, required_parent=state_root / "staging")
     if backup_path.exists():
@@ -456,6 +576,7 @@ def _apply_restore_under_lock(
     receipt = _build_restore_receipt(
         validation=validation,
         receipt_id=receipt_id,
+        overwrite_existing_confirmed=overwrite_existing_confirmed,
         created=existing_record is None,
         overwritten=existing_record is not None,
         selected=bool(select_after_restore or (existing_record or {}).get("is_active")),
@@ -1192,6 +1313,18 @@ def _validate_restore_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     consent = _required_object(bundle.get("consent"), "bundle_consent")
     if consent.get("sync_to_cloud") is not True:
         raise HTTPException(status_code=403, detail="brain_sync_restore_consent_required")
+    constraints = _required_object(
+        bundle.get("transfer_constraints"),
+        "bundle_transfer_constraints",
+    )
+    if set(constraints) != {"overwrite_existing"} or not isinstance(
+        constraints.get("overwrite_existing"),
+        bool,
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="brain_sync_restore_overwrite_policy_invalid",
+        )
     payload = _required_object(bundle.get("payload"), "bundle_payload")
     if _contains_forbidden_secret(payload):
         raise HTTPException(status_code=422, detail="brain_sync_restore_bundle_contains_secret")
@@ -1229,13 +1362,36 @@ def _validate_restore_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     bundle_body.pop("signature", None)
     checksum = _sha256(_canonical_json_bytes(bundle_body))
     signature = _required_object(bundle.get("signature"), "bundle_signature")
-    if (
-        not hmac.compare_digest(str(bundle.get("checksum") or ""), checksum)
-        or signature.get("alg") != "sha256-canonical-json"
-        or not hmac.compare_digest(str(signature.get("value") or ""), checksum)
-        or signature.get("covered_fields") != "all fields except checksum/signature"
-    ):
+    if not hmac.compare_digest(str(bundle.get("checksum") or ""), checksum):
         raise HTTPException(status_code=409, detail="brain_sync_restore_bundle_checksum_invalid")
+    if (
+        signature.get("alg") != "ed25519"
+        or signature.get("covered_fields") != "all fields except checksum/signature"
+        or signature.get("security_property") != "authenticated_origin"
+        or signature.get("context")
+        != _BRAIN_SYNC_SIGNATURE_CONTEXT.rstrip(b"\x00").decode("ascii")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_bundle_authenticated_signature_required",
+        )
+    key_id = _required_text(signature.get("key_id"), "bundle_signature_key_id")
+    trusted_key = _trusted_restore_signing_keys().get(key_id)
+    if trusted_key is None:
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_bundle_signature_key_untrusted",
+        )
+    try:
+        Ed25519PublicKey.from_public_bytes(trusted_key).verify(
+            _decode_base64url_signature(signature.get("value")),
+            _BRAIN_SYNC_SIGNATURE_CONTEXT + _canonical_json_bytes(bundle_body),
+        )
+    except InvalidSignature as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_bundle_signature_invalid",
+        ) from exc
     return {
         "tenant": tenant,
         "source": source,
@@ -1244,6 +1400,7 @@ def _validate_restore_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         "bundle_sha256": _sha256(_canonical_json_bytes(bundle)),
         "content_sha256": _sha256(_canonical_json_bytes(payload)),
         "revision": target_revision,
+        "overwrite_existing_authorized": constraints["overwrite_existing"] is True,
         "node_count": actual_counts["node_count"],
         "edge_count": actual_counts["edge_count"],
         "snapshot": {
@@ -1254,6 +1411,113 @@ def _validate_restore_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             "revisions": revisions,
         },
     }
+
+
+def _destination_state_binding(
+    *,
+    root: Path,
+    destination_brain_id: str,
+    registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current_registry = registry or load_local_brain_registry(brain_root=root)
+    record = next(
+        (
+            dict(item)
+            for item in list(current_registry.get("brains") or [])
+            if isinstance(item, dict)
+            and str(item.get("brain_id") or "") == destination_brain_id
+        ),
+        None,
+    )
+    destination_path = (root / destination_brain_id).resolve()
+    _require_within_root(destination_path, root)
+    registered = record is not None
+    exists = destination_path.is_dir()
+    destination_sha256 = _directory_sha256(destination_path) if exists else None
+    body = {
+        "brain_id": destination_brain_id,
+        "registered": registered,
+        "exists": exists,
+        "registry_record": record,
+        "destination_sha256": destination_sha256,
+    }
+    return {
+        **body,
+        "state_sha256": _sha256(_canonical_json_bytes(body)),
+    }
+
+
+def _trusted_restore_signing_keys() -> dict[str, bytes]:
+    configured = dict(_DEFAULT_PLATFORM_BRAIN_SYNC_SIGNING_KEYS)
+    raw_json = str(
+        os.getenv("AGVM_PLATFORM_BRAIN_SYNC_TRUSTED_PUBLIC_KEYS_JSON") or ""
+    ).strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="brain_sync_restore_trusted_signing_keys_invalid",
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise HTTPException(
+                status_code=500,
+                detail="brain_sync_restore_trusted_signing_keys_invalid",
+            )
+        configured.update({str(key): str(value) for key, value in parsed.items()})
+    single_key = str(
+        os.getenv("AGVM_PLATFORM_BRAIN_SYNC_TRUSTED_PUBLIC_KEY") or ""
+    ).strip()
+    if single_key:
+        key_id = str(
+            os.getenv("AGVM_PLATFORM_BRAIN_SYNC_TRUSTED_KEY_ID")
+            or "agvm-platform-brain-sync-v1"
+        ).strip()
+        configured[key_id] = single_key
+    return {
+        key_id: _decode_base64url_key(value)
+        for key_id, value in configured.items()
+    }
+
+
+def _decode_base64url_key(value: Any) -> bytes:
+    text = str(value or "").strip()
+    try:
+        decoded = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="brain_sync_restore_trusted_signing_keys_invalid",
+        ) from exc
+    if len(decoded) != 32:
+        raise HTTPException(
+            status_code=500,
+            detail="brain_sync_restore_trusted_signing_keys_invalid",
+        )
+    return decoded
+
+
+def _decode_base64url_signature(value: Any) -> bytes:
+    text = str(value or "").strip()
+    if not text or not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_bundle_signature_invalid",
+        )
+    try:
+        decoded = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_bundle_signature_invalid",
+        ) from exc
+    if len(decoded) != 64:
+        raise HTTPException(
+            status_code=409,
+            detail="brain_sync_restore_bundle_signature_invalid",
+        )
+    return decoded
 
 
 def _validate_snapshot_references(
@@ -1389,6 +1653,7 @@ def _build_restore_receipt(
     *,
     validation: dict[str, Any],
     receipt_id: str,
+    overwrite_existing_confirmed: bool,
     created: bool,
     overwritten: bool,
     selected: bool,
@@ -1408,7 +1673,7 @@ def _build_restore_receipt(
         "node_count": validation["node_count"],
         "edge_count": validation["edge_count"],
         "revision": validation["revision"],
-        "overwrite_existing_confirmed": True,
+        "overwrite_existing_confirmed": overwrite_existing_confirmed,
         "created": created,
         "overwritten": overwritten,
         "selected": selected,

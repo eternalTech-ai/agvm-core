@@ -94,6 +94,7 @@ def test_ocm7_clone_app_manifest_requires_valid_signed_module_token(monkeypatch)
     token = create_signed_module_lease(
         license_key="agvm-dev-pro-clone",
         module_ids=["agvm_clone_app"],
+        plan="pro_plus",
         signing_secret=SECRET,
     )
     monkeypatch.setenv("AGVM_MODULE_TOKEN", token)

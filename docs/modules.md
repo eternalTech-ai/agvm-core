@@ -67,7 +67,8 @@ readiness server-side.
 The target release model is:
 
 1. the user logs into Detwin;
-2. the platform decides whether the account has AGVM Pro;
+2. the platform validates the required plan (`pro` for Maintain or `pro_plus`
+   for Clone Chat and Teach);
 3. Cloud AGVM checks provider, brain, entitlement and credits;
 4. the cloud module action runs only after quota preflight;
 5. the platform records a usage event and receipt.

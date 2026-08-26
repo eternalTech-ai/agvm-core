@@ -30,6 +30,11 @@ Desktop clients should run the bridge from the AGVM Core checkout:
 python -m agvm_mcp_server
 ```
 
+The bridge reads its process environment or `AGVM_MCP_CONFIG`; it does not load
+the repository `.env` file by itself. Put the variables below in the desktop
+client's MCP configuration, export them in the launching shell, or point
+`AGVM_MCP_CONFIG` at a JSON file derived from `agvm_mcp_server/config.example.json`.
+
 Minimum environment:
 
 ```bash
@@ -63,7 +68,7 @@ Ask the client to call `get_agvm_usage_guide` and then list the AGVM tools it
 can see. If the tool is missing, check the process working directory, Python
 environment and `AGVM_API_BASE_URL`.
 
-The current V1 contract registry defines 52 tool contracts. `tools/list` is the
+The current V1 contract registry defines 54 tool contracts. `tools/list` is the
 runtime authority because client permission policy can expose a filtered set. Grow,
 brain registry, retrieval, write-preview/commit and local graph inspection
 tools are Core tools. The registry also includes nine bounded

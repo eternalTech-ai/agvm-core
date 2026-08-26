@@ -7385,6 +7385,20 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
             ("schema_version", "passed", "state", "status", "reason", "reason_codes", "missing_reasons"),
             list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
         ),
+        "payload_truth_contract": _selected_public_metadata(
+            output.get("payload_truth_contract"),
+            (
+                "schema_version",
+                "status",
+                "tool_name",
+                "primary_mcp_payload",
+                "documents",
+                "answer_demo",
+                "support_alignment",
+                "missing_reasons",
+            ),
+            list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
+        ),
         "budget": _selected_public_metadata(
             output.get("budget"),
             (
@@ -7420,7 +7434,18 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
         "completion_contract": completion,
         "run_lifecycle_contract": _selected_public_metadata(
             output.get("run_lifecycle_contract"),
-            ("schema_version", "state", "status", "terminal", "terminal_state", "final_materialization_pending", "result_ready_terminal"),
+            (
+                "schema_version",
+                "state",
+                "status",
+                "terminal",
+                "terminal_state",
+                "final_materialization_pending",
+                "result_ready_terminal",
+                "provider_degraded",
+                "ai_required",
+                "ai_material",
+            ),
         ),
         "runtime_state_contract": _selected_public_metadata(
             output.get("runtime_state_contract"),

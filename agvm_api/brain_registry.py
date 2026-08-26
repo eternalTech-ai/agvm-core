@@ -756,6 +756,56 @@ def refresh_local_brain_registry(*, brain_root: Path | None = None) -> dict[str,
     return _finalize_registry(registry, brain_root=root)
 
 
+def refresh_local_brain_record(
+    brain_id: str,
+    *,
+    brain_root: Path | None = None,
+    minimum_node_count: int = 0,
+    expected_bootstrap_state: str | None = None,
+    expected_bootstrap_session_id: str | None = None,
+) -> dict[str, Any]:
+    target = str(brain_id or "").strip()
+    if not target:
+        raise BrainRegistryError("brain_id_required")
+    root = (brain_root or brain_root_path()).resolve()
+    with _REGISTRY_WRITE_LOCK:
+        registry = load_local_brain_registry(brain_root=root)
+        brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
+        target_index = next(
+            (index for index, item in enumerate(brains) if str(item.get("brain_id") or "") == target),
+            None,
+        )
+        if target_index is None:
+            raise BrainRegistryError(f"unknown_brain_id:{target}")
+        previous = brains[target_index]
+        refreshed = build_local_brain_record(
+            brain_id=target,
+            display_name=str(previous.get("display_name") or target),
+            storage_path=Path(str(previous.get("storage_path") or root / target / "storage")).expanduser(),
+            registry_brain_path=Path(str(previous.get("registry_brain_path") or root / target)).expanduser(),
+            is_default=bool(previous.get("is_default")),
+            is_active=bool(previous.get("is_active")),
+            migration_source=str(previous.get("migration_source") or "existing_registry"),
+            storage_layout=str(previous.get("storage_layout") or "registry_managed"),
+            migration_status=str(previous.get("migration_status") or "registry_refreshed_pr12m_e"),
+            previous=previous,
+        )
+        if int(refreshed.get("node_count") or 0) < max(0, int(minimum_node_count)):
+            raise BrainRegistryError("brain_registry_refresh_node_count_not_persisted")
+        lifecycle = dict(refreshed.get("lifecycle") or {})
+        if expected_bootstrap_state is not None and lifecycle.get("bootstrap_state") != expected_bootstrap_state:
+            raise BrainRegistryError("brain_registry_refresh_bootstrap_state_mismatch")
+        if (
+            expected_bootstrap_session_id is not None
+            and lifecycle.get("bootstrap_session_id") != expected_bootstrap_session_id
+        ):
+            raise BrainRegistryError("brain_registry_refresh_bootstrap_session_mismatch")
+        brains[target_index] = refreshed
+        registry["brains"] = brains
+        _finalize_registry(registry, brain_root=root)
+        return dict(refreshed)
+
+
 def create_local_brain(
     *,
     display_name: str,
@@ -1153,14 +1203,16 @@ def resolve_brain_scope(
     brain_root: Path | None = None,
     require_explicit: bool = False,
 ) -> dict[str, Any]:
-    registry = load_local_brain_registry(brain_root=brain_root)
+    root = (brain_root or brain_root_path()).resolve()
+    registry = load_local_brain_registry(brain_root=root)
     brains = [dict(item) for item in list(registry.get("brains") or []) if isinstance(item, dict)]
     by_id = {str(item.get("brain_id") or ""): item for item in brains}
     requested = str(brain_id or "").strip()
     if requested:
         if requested not in by_id:
             raise BrainRegistryError(f"unknown_brain_id:{requested}")
-        return by_id[requested]
+        resolved_record = by_id[requested]
+        return _reconcile_resolved_brain_record(resolved_record, brain_root=root)
     if require_explicit:
         raise BrainRegistryError("brain_id_required")
     validation = dict(registry.get("validation") or {})
@@ -1169,7 +1221,22 @@ def resolve_brain_scope(
     resolved = active_id or default_id
     if not bool(validation.get("safe_default_configured")) or resolved not in by_id:
         raise BrainRegistryError("ambiguous_brain_scope_without_safe_default")
-    return by_id[resolved]
+    return _reconcile_resolved_brain_record(by_id[resolved], brain_root=root)
+
+
+def _reconcile_resolved_brain_record(
+    record: dict[str, Any],
+    *,
+    brain_root: Path,
+) -> dict[str, Any]:
+    brain_id = str(record.get("brain_id") or "").strip()
+    if not brain_id:
+        raise BrainRegistryError("brain_id_required")
+    storage = Path(str(record.get("storage_path") or brain_root / brain_id / "storage")).expanduser()
+    persisted_node_count = int(record.get("node_count") or 0)
+    if _node_count(storage) == persisted_node_count:
+        return record
+    return refresh_local_brain_record(brain_id, brain_root=brain_root)
 
 
 def active_brain_summary(*, brain_root: Path | None = None) -> dict[str, Any]:

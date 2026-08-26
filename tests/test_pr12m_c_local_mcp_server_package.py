@@ -32,6 +32,12 @@ from agvm_mcp_server.server import (  # noqa: E402
     run_stdio,
 )
 from mcp_contracts import AGENT_MEMORY_MCP_TOOL_NAMES, GUIDE_MCP_TOOL_NAMES, REQUIRED_MCP_TOOL_NAMES, build_mcp_contract_registry  # noqa: E402
+from schemas import (  # noqa: E402
+    McpMaintenanceApplyRequest,
+    McpMaintenanceRequest,
+    McpMatrixCalibrationApplyRequest,
+    McpMatrixCalibrationRequest,
+)
 
 
 REPORT = ROOT / "docs" / "AGVM_PROGRESS.md"
@@ -204,6 +210,77 @@ def test_pr12m_c_tools_list_is_mcp_protocol_registry_projection_with_brain_scope
     retrieve_context = next(tool for tool in tools if tool["name"] == "retrieve_context")
     assert "Query guidance:" in retrieve_context["description"]
     assert "query_text" in retrieve_context["description"]
+
+
+def test_pr12m_c_maintenance_tools_list_matches_runtime_request_models() -> None:
+    http_server, _handler, base_url = _stub_api()
+    try:
+        server = AgvmMcpServer(
+            AgvmMcpConfig(api_base_url=base_url, active_brain_id="alpha_brain", default_brain_id="alpha_brain")
+        )
+        response = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    finally:
+        _shutdown(http_server)
+
+    assert response is not None
+    tools = {tool["name"]: tool["inputSchema"] for tool in response["result"]["tools"]}
+    preview_fields = {"brain_id", "focus_node_id", "max_nodes_considered"}
+    maintenance_apply_fields = {
+        "brain_id",
+        "preview_signature",
+        "selected_proposal_ids",
+        "confirm_apply",
+    }
+    geometry_apply_fields = maintenance_apply_fields | {"rollback_consent"}
+
+    maintenance_preview_model_fields = set(McpMaintenanceRequest.model_json_schema()["properties"])
+    maintenance_apply_model_fields = set(McpMaintenanceApplyRequest.model_json_schema()["properties"])
+    geometry_preview_model_fields = set(McpMatrixCalibrationRequest.model_json_schema()["properties"])
+    geometry_apply_model_fields = set(McpMatrixCalibrationApplyRequest.model_json_schema()["properties"])
+
+    for tool_name in ("sleep_preview", "evolve_preview"):
+        assert preview_fields <= set(tools[tool_name]["properties"])
+        assert preview_fields <= maintenance_preview_model_fields
+
+    for tool_name in ("sleep_apply", "evolve_apply"):
+        assert maintenance_apply_fields <= set(tools[tool_name]["properties"])
+        assert set(tools[tool_name]["required"]) == maintenance_apply_fields
+        assert maintenance_apply_fields <= maintenance_apply_model_fields
+        assert "proposal_ids" not in tools[tool_name]["properties"]
+
+    for tool_name in ("geometry_calibration_preview", "matrix_calibration_preview"):
+        assert preview_fields <= set(tools[tool_name]["properties"])
+        assert preview_fields <= geometry_preview_model_fields
+
+    for tool_name in ("geometry_calibration_apply", "matrix_calibration_apply"):
+        assert geometry_apply_fields <= set(tools[tool_name]["properties"])
+        assert set(tools[tool_name]["required"]) == geometry_apply_fields
+        assert geometry_apply_fields <= geometry_apply_model_fields
+        assert "proposal_ids" not in tools[tool_name]["properties"]
+
+    assert tools["geometry_calibration_preview"] == tools["matrix_calibration_preview"]
+    assert tools["geometry_calibration_apply"] == tools["matrix_calibration_apply"]
+
+
+def test_pr12m_c_runtime_models_accept_legacy_proposal_ids_but_serialize_canonical_name() -> None:
+    maintenance = McpMaintenanceApplyRequest(
+        brain_id="alpha_brain",
+        preview_signature="maintenance-preview-signature",
+        proposal_ids=["sleep-proposal-1"],
+        confirm_apply=True,
+    )
+    geometry = McpMatrixCalibrationApplyRequest(
+        brain_id="alpha_brain",
+        preview_signature="geometry-preview-signature",
+        proposal_ids=["geometry-proposal-1"],
+        confirm_apply=True,
+        rollback_consent=True,
+    )
+
+    assert maintenance.selected_proposal_ids == ["sleep-proposal-1"]
+    assert geometry.selected_proposal_ids == ["geometry-proposal-1"]
+    assert maintenance.model_dump(by_alias=True)["selected_proposal_ids"] == ["sleep-proposal-1"]
+    assert geometry.model_dump(by_alias=True)["selected_proposal_ids"] == ["geometry-proposal-1"]
 
 
 def test_pr12m_c_tools_call_injects_brain_id_and_mcp_header() -> None:
@@ -610,11 +687,13 @@ def test_pr12m_c_stdio_lists_and_cloud_blocks_canonical_geometry_tools() -> None
             "params": {
                 "name": "geometry_calibration_apply",
                 "arguments": {
+                    "brain_id": "alpha_brain",
                     "max_nodes_considered": 50,
                     "max_position_updates": 10,
                     "confirm_apply": True,
                     "rollback_consent": True,
                     "preview_signature": "geometry-preview::test",
+                    "selected_proposal_ids": ["geometry-proposal::test"],
                 },
             },
         },
@@ -647,7 +726,7 @@ def test_pr12m_c_stdio_lists_and_cloud_blocks_canonical_geometry_tools() -> None
     responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
     listed_names = [tool["name"] for tool in responses[0]["result"]["tools"]]
     assert exit_code == 0
-    assert len(listed_names) == 52
+    assert len(listed_names) == len(GUIDE_MCP_TOOL_NAMES) + len(REQUIRED_MCP_TOOL_NAMES) + len(AGENT_MEMORY_MCP_TOOL_NAMES)
     assert {
         "geometry_calibration_preview",
         "geometry_calibration_apply",
@@ -930,7 +1009,8 @@ def test_pr12m_c_config_manifest_and_docs_close_slice() -> None:
 
     loaded = load_config(CONFIG_EXAMPLE)
     assert loaded.api_base_url == "http://127.0.0.1:8010"
-    assert loaded.selected_brain_id == "example_local_brain"
+    assert loaded.brain_policy == "ai_create_if_missing"
+    assert loaded.selected_brain_id is None
     assert "registry_write" in loaded.tool_permissions.allowed_permission_families
     assert "preview_only" in loaded.tool_permissions.allowed_permission_families
     assert "destructive" in loaded.tool_permissions.blocked_permission_families

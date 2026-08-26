@@ -34,16 +34,14 @@ Detwin Cloud provides the account and authorization boundary for:
 Hosted mode must be tenant-scoped and server-authorized. A hosted token must not
 grant access to another user's brain, module entitlement or usage records.
 
-## Detwin Pro
+## Detwin Pro And Pro Plus
 
-Detwin Pro unlocks advanced
-modules in Detwin Cloud while keeping the local Core repository free of paid
-module source:
+Paid Detwin plans unlock advanced Cloud modules while keeping the local Core
+repository free of paid module source. The current capability boundary is:
 
-- Clone Chat and Teach in Cloud AGVM;
-- Maintain Health, Sleep, Evolve and Matrix in Cloud AGVM;
-- Hosted MCP for account-scoped cloud brains;
-- metered Cloud AGVM actions and receipts.
+- Detwin Pro: Maintain Health, Sleep, Evolve and Geometry Calibration, Hosted
+  MCP for account-scoped cloud brains, and metered Cloud AGVM actions;
+- Detwin Pro Plus: every Pro capability plus Clone Chat and Teach.
 
 Local AGVM does not download Clone, Teach or Maintain runtime source. Grow is a
 free Core capability. The local MCP bridge nevertheless exposes the public
