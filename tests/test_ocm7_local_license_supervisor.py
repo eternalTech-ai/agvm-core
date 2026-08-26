@@ -76,6 +76,30 @@ def test_ocm7_core_license_router_exposes_activation_without_docker_socket(monke
     assert "docker.sock" not in (API_DIR / "core_api_app.py").read_text(encoding="utf-8")
 
 
+def test_ocm7_public_core_routes_missing_verifier_to_account_module_setup(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("AGVM_LOCAL_LICENSE_SIGNING_SECRET", raising=False)
+    monkeypatch.delenv("AGVM_MODULE_LICENSE_SIGNING_SECRET", raising=False)
+    monkeypatch.delenv("AGVM_ALLOW_DEV_LICENSE_FIXTURE", raising=False)
+    monkeypatch.setenv("AGVM_ALLOW_SETUP_WITHOUT_PROVIDER", "true")
+
+    core_api_app = importlib.reload(sys.modules["core_api_app"]) if "core_api_app" in sys.modules else importlib.import_module("core_api_app")
+    client = TestClient(core_api_app.app)
+
+    response = client.post(
+        "/modules/local-license/activate",
+        json={"lease_token": "account-issued-lease"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "local_module_setup_required",
+        "message": "Set up this paid local module from the Detwin account module manager.",
+        "action": "open_detwin_module_manager",
+        "action_path": "/account/modules#modules",
+    }
+
+
 def test_ocm7_clone_app_manifest_requires_valid_signed_module_token(monkeypatch) -> None:
     if PUBLIC_EXPORT and not CLONE_APP_BACKEND_DIR.exists():
         pytest.skip("Private Clone App runtime source is not part of the public Core export.")

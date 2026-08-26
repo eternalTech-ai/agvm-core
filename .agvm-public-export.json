@@ -54,7 +54,7 @@
       "agvm_api/core_brain_router.py": "c13288012fef0513877f7ad1d30fbe85477c61b3718d0555f6440560c18f4046",
       "agvm_api/core_browser_security.py": "c1dd15fc70e0d1ff9351595fb2822b35fd72998865b202457979b78f137d7be8",
       "agvm_api/core_graph_router.py": "09a6f6490323b31807ab3d9789c0cf0cc70dfb96f0a106e8ad31b227a1f8ee41",
-      "agvm_api/core_license_router.py": "2afceaafd088d686924738e30f317220a6f96b93bf7761b5b8a6159f2fedb32b",
+      "agvm_api/core_license_router.py": "fb497161f0d982a70d2aab39fab21337fecf04d772ebf7ff56d7a5e99638dabb",
       "agvm_api/core_mcp_contract_router.py": "3bee47e4e965d3d03a31a87ec10ce6391810b076481730c8df573257c4e7cdcf",
       "agvm_api/core_mcp_matrix_router.py": "44c19d7091a91e12f98a2f8543c9e92352b12bce7f4683e65f555ed9ef1f1c67",
       "agvm_api/core_mcp_ops_router.py": "acf912968cdedc6c7cfc1f911b899cbd6cffd21984dbdc42556451151a70d9ed",
@@ -161,7 +161,7 @@
       "tests/test_brain_profile_v1.py": "0c8fe864512c4b84a5bf6812cff68d2a6f9be89add3e70f58e1cca168611c434",
       "tests/test_ocm1_open_core_classification.py": "6584196fb061c89cad67fee189badef018579d4584f9784a9d6963b17d0cacc1",
       "tests/test_ocm3_core_ui_shell_boundary.py": "298bb96710e1dfd35a879cc3862adc0a9e132c52a8d34a7f84bfd0ff56b158a2",
-      "tests/test_ocm7_local_license_supervisor.py": "f8842be9252dc1b1bdb368d9e51db44058841b9a55367e1f7d46a5bf5d105a23",
+      "tests/test_ocm7_local_license_supervisor.py": "64e9cddff1a1bdb3db13a0392fca1eeaac2f97d97008f7618bc5b83611f548a0",
       "tests/test_pr12m_c_local_mcp_server_package.py": "2f9d1c966e0d9b49e218642ebec52005f60e98c67ce7556c2da439db72190b6b",
       "tests/test_public_release_contract.py": "8743c0d78b9066e43f5add7ed16f0ebf2249fc3f90632c9459d599008aa4a993",
       "tests/test_setup_env_runtime.py": "034adb64cbd8ece75b62f1515f52e56b7f89824436ec8da1361c32f171d044ad"
@@ -176,7 +176,7 @@
       "agvm_cockpit_prototype/vite.config.d.ts",
       "agvm_cockpit_prototype/vite.config.js"
     ],
-    "tree_sha256": "708e789f032bcc249b3ec7173cc30748c9c4efb68f55a33fd370d8fa12c3f7ed"
+    "tree_sha256": "a5ff7ff190f1c4260882cdbf3511bfc01dfba5454e3347b329e1ba06b10acca9"
   },
   "commentable_file_count": 141,
   "exported_file_count": 156,
@@ -184,7 +184,7 @@
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v2",
   "source_clean": true,
-  "source_commit": "a7c8baf7d990b1a9e189ed631e504a334a8c25d3",
+  "source_commit": "6d17bbac6e247b555dfeec2ff35f238c5af239dc",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 70
 }
