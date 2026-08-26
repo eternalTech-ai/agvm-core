@@ -252,6 +252,11 @@ def _record_tool_call(result: LocalMcpClientProbeResult, name: str, exchange: Js
         matrix["maintenance_latency_profile"] = dict(payload.get("maintenance_latency_profile") or {})
     if isinstance(payload.get("source_latency_profile"), dict):
         matrix["source_latency_profile"] = dict(payload.get("source_latency_profile") or {})
+    if payload.get("reason"):
+        matrix["blocked_reason"] = str(payload.get("reason"))
+    action_contract = dict(dict(payload.get("data") or {}).get("action_contract") or {})
+    if action_contract:
+        matrix["action_contract"] = action_contract
     result.call_matrix[name] = matrix
     _record_exchange(result, exchange)
     return payload
@@ -278,6 +283,33 @@ def _validate_tool_payload(
         allowed.add("blocked")
     if status not in allowed:
         result.failures.append(f"{tool_name}:unexpected_status:{status}")
+
+
+def _validate_hosted_mcp_action_contract(
+    result: LocalMcpClientProbeResult,
+    tool_name: str,
+    payload: dict[str, Any],
+) -> None:
+    reason = str(payload.get("reason") or "")
+    data = dict(payload.get("data") or {})
+    action = dict(data.get("action_contract") or {})
+    if reason != "detwin_cloud_auth_required":
+        result.failures.append(f"{tool_name}:unexpected_local_paid_reason:{reason}")
+    expected = {
+        "schema_version": "agvm.local_mcp_paid_tool_action.v1",
+        "action": "use_detwin_cloud_for_advanced_tool",
+        "tool_name": tool_name,
+        "execution_surface": "hosted_mcp",
+        "credential_environment_variable": "AGVM_HOSTED_MCP_API_KEY",
+    }
+    for field_name, expected_value in expected.items():
+        if action.get(field_name) != expected_value:
+            result.failures.append(
+                f"{tool_name}:invalid_hosted_action_contract:{field_name}:{action.get(field_name)}"
+            )
+    for field_name in ("requires_account", "requires_credits", "requires_cloud_handoff"):
+        if action.get(field_name) is not True:
+            result.failures.append(f"{tool_name}:invalid_hosted_action_contract:{field_name}")
 
 
 def run_local_mcp_client_probe(
@@ -401,23 +433,11 @@ def run_local_mcp_client_probe(
 
             matrix_calibration = client.call_tool("geometry_calibration_preview", {"max_nodes_considered": 4000})
             matrix_payload = _record_tool_call(result, "geometry_calibration_preview", matrix_calibration)
-            _validate_tool_payload(
-                result,
-                "geometry_calibration_preview",
-                matrix_payload,
-                required_field="brain_geometry_calibration",
-                allow_blocked=False,
-            )
-            matrix_safety = dict(matrix_payload.get("safety_contract") or {})
-            if matrix_safety.get("non_mutating") is not True or matrix_safety.get("hidden_mutation_allowed") is not False:
-                result.failures.append(f"matrix_calibration_safety_contract_missing:{matrix_safety}")
+            _validate_hosted_mcp_action_contract(result, "geometry_calibration_preview", matrix_payload)
 
             sleep_preview = client.call_tool("sleep_preview", {"mode": "sleep", "dry_run": True, "max_nodes_considered": 20})
             sleep_payload = _record_tool_call(result, "sleep_preview", sleep_preview)
-            _validate_tool_payload(result, "sleep_preview", sleep_payload, required_field="maintenance_report", allow_blocked=True)
-            sleep_profile = dict(sleep_payload.get("maintenance_latency_profile") or {})
-            if sleep_profile.get("mode") not in {"fast_preview", "fast_scan"} or sleep_profile.get("fast_preview") is not True:
-                result.failures.append(f"sleep_preview_fast_profile_missing:{sleep_profile}")
+            _validate_hosted_mcp_action_contract(result, "sleep_preview", sleep_payload)
     except Exception as exc:  # noqa: BLE001
         result.failures.append(f"stdio_probe_exception:{type(exc).__name__}:{str(exc)[:500]}")
 
@@ -456,10 +476,10 @@ def _probe_read_only_gate(
             ]
             blocked = client.call_tool("write_memory_commit", {"text": "this must be blocked"})
             reason = _tool_error_reason(blocked)
-            passed = "write_memory_commit" not in tool_names and reason == "mutation_tool_blocked_by_read_only_local_mcp_config"
+            passed = "write_memory_commit" in tool_names and reason == "mutation_tool_blocked_by_read_only_local_mcp_config"
             return {
                 "passed": passed,
-                "write_memory_commit_hidden": "write_memory_commit" not in tool_names,
+                "write_memory_commit_discoverable": "write_memory_commit" in tool_names,
                 "blocked_reason": reason,
                 "is_error": bool(((blocked.response.get("result") or {}) if isinstance(blocked.response, dict) else {}).get("isError")),
             }

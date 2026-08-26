@@ -20,6 +20,7 @@ services:
       AGVM_RETRIEVAL_MODEL: ${AGVM_RETRIEVAL_MODEL:-gpt-4o-mini}
       AGVM_ANSWER_MODEL: ${AGVM_ANSWER_MODEL:-gpt-4o-mini}
       AGVM_SLEEP_MODEL: ${AGVM_SLEEP_MODEL:-gpt-4o-mini}
+      AGVM_GROW_PREVIEW_BINDING_SECRET: ${AGVM_GROW_PREVIEW_BINDING_SECRET:-}
       AGVM_LOCAL_LICENSE_SIGNING_SECRET: ${AGVM_LOCAL_LICENSE_SIGNING_SECRET:-}
       AGVM_ALLOW_DEV_LICENSE_FIXTURE: ${AGVM_ALLOW_DEV_LICENSE_FIXTURE:-false}
     ports:
@@ -45,6 +46,7 @@ services:
       args:
         VITE_API_URL: ${VITE_API_URL:-http://localhost:${AGVM_API_PORT:-8010}}
         VITE_AGVM_UI_SHELL_PROFILE: public_core
+        VITE_PLATFORM_URL: ${VITE_PLATFORM_URL:-https://app.detwin.ai}
     depends_on:
       agvm_core_api:
         condition: service_healthy
@@ -69,13 +71,16 @@ services:
       - mcp
     environment:
       AGVM_API_BASE_URL: http://agvm_core_api:8010
-      AGVM_MCP_BRAIN_POLICY: ${AGVM_MCP_BRAIN_POLICY:-fixed}
-      AGVM_MCP_BRAIN_ID: ${AGVM_MCP_BRAIN_ID:-default_brain}
+      AGVM_MCP_BRAIN_POLICY: ${AGVM_MCP_BRAIN_POLICY:-ai_create_if_missing}
+      AGVM_MCP_BRAIN_ID: ${AGVM_MCP_BRAIN_ID:-}
       AGVM_MCP_BRAIN_ID_HINT: ${AGVM_MCP_BRAIN_ID_HINT:-}
-      AGVM_MCP_BRAIN_DISPLAY_NAME: ${AGVM_MCP_BRAIN_DISPLAY_NAME:-Codex Project Memory}
+      AGVM_MCP_BRAIN_DISPLAY_NAME: ${AGVM_MCP_BRAIN_DISPLAY_NAME:-AI Client Memory}
       AGVM_MCP_BRAIN_PURPOSE: ${AGVM_MCP_BRAIN_PURPOSE:-Persistent MCP memory for this AI client.}
       AGVM_MCP_READ_ONLY: ${AGVM_MCP_READ_ONLY:-false}
       AGVM_MCP_TIMEOUT_SECONDS: ${AGVM_MCP_TIMEOUT_SECONDS:-180}
+      AGVM_MCP_MODULE_VISIBILITY_POLICY: ${AGVM_MCP_MODULE_VISIBILITY_POLICY:-block_unlicensed}
+      AGVM_HOSTED_MCP_URL: ${AGVM_HOSTED_MCP_URL:-https://mcp.detwin.ai}
+      AGVM_HOSTED_MCP_API_KEY: ${AGVM_HOSTED_MCP_API_KEY:-}
     depends_on:
       agvm_core_api:
         condition: service_healthy

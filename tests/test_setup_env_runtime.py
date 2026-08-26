@@ -67,6 +67,83 @@ def test_managed_env_save_persists_allowed_keys_and_updates_process_env(
     assert status["llm"]["clone_app"]["teach_model"] == "clone-teach-model"
 
 
+def test_fresh_setup_generates_and_reuses_private_grow_preview_binding_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("AGVM_GROW_PREVIEW_BINDING_SECRET", raising=False)
+
+    first = setup_env.ensure_grow_preview_binding_secret()
+    generated = os.environ["AGVM_GROW_PREVIEW_BINDING_SECRET"]
+    managed_file = tmp_path / "agvm_runtime.env"
+
+    assert first == {
+        "configured": True,
+        "generated": True,
+        "source": "managed_runtime_env",
+    }
+    assert len(generated.encode("utf-8")) >= 32
+    assert generated in managed_file.read_text(encoding="utf-8")
+
+    monkeypatch.delenv("AGVM_GROW_PREVIEW_BINDING_SECRET", raising=False)
+    second = setup_env.ensure_grow_preview_binding_secret()
+
+    assert second["generated"] is False
+    assert os.environ["AGVM_GROW_PREVIEW_BINDING_SECRET"] == generated
+
+
+def test_explicit_grow_preview_binding_secret_wins_over_managed_value(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    managed = "managed-grow-preview-binding-secret-value"
+    explicit = "explicit-grow-preview-binding-secret-value"
+    (tmp_path / "agvm_runtime.env").write_text(
+        f"AGVM_GROW_PREVIEW_BINDING_SECRET={managed}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGVM_GROW_PREVIEW_BINDING_SECRET", explicit)
+
+    setup_env.load_managed_env_into_process(override=True)
+
+    assert os.environ["AGVM_GROW_PREVIEW_BINDING_SECRET"] == explicit
+
+
+def test_explicit_grow_preview_binding_secret_rejects_short_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGVM_GROW_PREVIEW_BINDING_SECRET", "too-short")
+
+    with pytest.raises(
+        ValueError,
+        match="AGVM_GROW_PREVIEW_BINDING_SECRET_must_be_at_least_32_bytes",
+    ):
+        setup_env.load_managed_env_into_process(override=True)
+
+    assert not (tmp_path / "agvm_runtime.env").exists()
+
+
+def test_grow_preview_binding_secret_is_forwarded_without_a_compose_default() -> None:
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    core_compose_path = ROOT / "docker-compose.core.yml"
+    core_compose = (core_compose_path if core_compose_path.exists() else ROOT / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "AGVM_GROW_PREVIEW_BINDING_SECRET=\n" in env_example
+    expected = "AGVM_GROW_PREVIEW_BINDING_SECRET: ${AGVM_GROW_PREVIEW_BINDING_SECRET:-}"
+    assert expected in compose
+    assert expected in core_compose
+
+
 def test_managed_env_save_creates_backup_without_overwriting_host_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

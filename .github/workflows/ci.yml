@@ -15,15 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           cache: npm
@@ -38,6 +38,7 @@ jobs:
         run: |
           python -m py_compile \
             agvm_api/core_api_app.py \
+            agvm_api/core_browser_security.py \
             agvm_api/core_runtime_router.py \
             agvm_api/core_brain_router.py \
             agvm_api/core_mcp_contract_router.py \
@@ -106,7 +107,7 @@ jobs:
         run: |
           docker run --rm \
             -v "$PWD:/repo:ro" \
-            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
             git /repo --redact --exit-code=1 --log-opts=--all
 
       - name: Scan committed content with TruffleHog
@@ -115,7 +116,7 @@ jobs:
           git archive HEAD | tar -x -C "$RUNNER_TEMP/trufflehog-tree"
           if ! docker run --rm \
             -v "$RUNNER_TEMP/trufflehog-tree:/src:ro" \
-            trufflesecurity/trufflehog:3.95.6 \
+            trufflesecurity/trufflehog:3.95.6@sha256:96f8429082cb2d4ae73b1096dcdb2f5aa139881d97042b0c5e5fa226a392e056 \
             filesystem /src --json --no-update --fail \
             >"$RUNNER_TEMP/trufflehog.jsonl"; then
             echo "TruffleHog detected secret material; output is withheld from CI logs." >&2

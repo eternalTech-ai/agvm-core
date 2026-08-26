@@ -21,7 +21,7 @@ benchmark artifacts are not included.
 - a brain registry and scoped runtime storage;
 - public MCP contracts for local AI clients;
 - a Docker-based API and UI package;
-- setup surfaces for provider keys and MCP client configuration;
+- setup surfaces for MCP client configuration;
 - explicit local brain bootstrap, create/import and switching workflows;
 - Retrieve, Health, Bench and MCP Raw Console surfaces when the public core API
   exports their backing endpoints.
@@ -47,8 +47,8 @@ Then open:
 - API health: `http://localhost:8010/health`
 - API docs: `http://localhost:8010/docs`
 
-Set `OPENAI_API_KEY` in `.env` or through the UI setup flow when provider-backed
-operations are needed. The browser UI must not store raw provider keys in
+Set `OPENAI_API_KEY` in `.env` before starting Docker when provider-backed
+operations are needed. The browser UI never stores raw provider keys in
 localStorage; keys belong in backend-managed environment storage or an OS secret
 manager.
 

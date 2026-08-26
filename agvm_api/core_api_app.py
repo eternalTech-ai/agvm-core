@@ -5,12 +5,12 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 from brain_bootstrap_v1 import create_brain_bootstrap_v1_router
 from brain_profile_v1_api import create_brain_profile_v1_router
 from brain_sync_restore_materializer import create_brain_sync_restore_router
 from config import APP_NAME, APP_VERSION
+from core_browser_security import install_core_browser_security
 from core_brain_router import create_core_brain_router
 from core_graph_router import create_core_graph_router
 from core_license_router import create_core_license_router
@@ -24,13 +24,7 @@ from edition_gate import install_edition_route_gate, read_edition_settings
 
 def create_core_app() -> FastAPI:
     app = FastAPI(title=f"{APP_NAME} Core", version=APP_VERSION)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    install_core_browser_security(app)
     app.include_router(
         create_core_runtime_router(
             app_name=APP_NAME,

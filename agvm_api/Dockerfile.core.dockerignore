@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
+.git/
+tmp*/
+tmp_*
+logs/
+brains/
+agvm_api/data/
+agvm_api/data_*/
+apps/agvm_clone_app/
+apps/agvm_clone_app/**
+agvm_cockpit_prototype_plan/
+playwright-report/
+test-results/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.err
+*.out
