@@ -98,6 +98,55 @@ def test_public_paid_routes_return_cloud_action_contracts() -> None:
         assert action["local_execution_available"] is False, path
 
 
+def test_public_local_core_discovery_is_maintain_handoff_only() -> None:
+    from core_api_app import create_core_app
+
+    payload = TestClient(create_core_app()).get("/mcp/contracts").json()
+    tools = {str(tool["name"]): tool for tool in payload["tools"]}
+    cloud_handoff_tools = {
+        "brain_profile_preview",
+        "brain_profile_apply",
+        "brain_profile_rollback",
+        "geometry_calibration_preview",
+        "geometry_calibration_apply",
+        "geometry_calibration_rollback",
+        "matrix_calibration_preview",
+        "matrix_calibration_apply",
+        "matrix_calibration_rollback",
+        "sleep_preview",
+        "sleep_apply",
+        "sleep_rollback",
+        "evolve_preview",
+        "evolve_apply",
+        "evolve_rollback",
+    }
+
+    assert payload["registry_validation"]["passed"] is True
+    assert cloud_handoff_tools.issubset(tools)
+    for name in sorted(cloud_handoff_tools):
+        registration = tools[name]["tool_registration"]
+        assert registration["required_module_id"] == "agvm_maintain_studio"
+        assert registration["entitlement_required"] is True
+        assert registration["current_runtime_binding"] == "hosted_cloud_handoff"
+        assert registration["local_execution_available"] is False
+
+
+def test_public_local_core_compatibility_route_cannot_apply(monkeypatch) -> None:
+    import core_maintenance_runtime
+
+    monkeypatch.setattr(core_maintenance_runtime, "ensure_local_module_entitled", lambda module_id: None)
+    app = FastAPI()
+    app.include_router(core_maintenance_runtime.create_core_maintenance_cloud_handoff_router())
+    client = TestClient(app)
+    payload = client.post("/mcp/matrix-calibration-apply", json={"confirm_apply": True}).json()
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "detwin_cloud_execution_required"
+    assert payload["action_contract"]["requires_entitlement"] is True
+    assert payload["action_contract"]["local_execution_available"] is False
+    assert payload["mutation_surface"]["graph_mutation"] == "none"
+
+
 def test_public_release_tree_has_no_private_runtime_roots() -> None:
     assert (ROOT / ".agvm-public-export-marker").is_file()
     assert (ROOT / "agvm_api" / "Dockerfile.core.dockerignore").is_file()
@@ -168,8 +217,6 @@ def test_public_docs_describe_visibility_without_claiming_authorization() -> Non
     local_mcp = (ROOT / "docs" / "local-mcp.md").read_text(encoding="utf-8")
     cloud = (ROOT / "docs" / "cloud-and-pro.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    combined = "\n".join((modules, local_mcp, cloud, changelog))
-
     assert "complete current contract catalog" in modules
     documented_count = re.search(r"defines (\d+) tool contracts", local_mcp)
     assert documented_count is not None
@@ -213,6 +260,11 @@ def test_public_vite_config_cannot_reference_private_source_paths() -> None:
 
     for private_path in ("src/new-ui", "apps/", "clone-app", "platform/"):
         assert private_path not in config
+
+    node_config = json.loads(
+        (ROOT / "agvm_cockpit_prototype" / "tsconfig.node.json").read_text(encoding="utf-8")
+    )
+    assert node_config["compilerOptions"]["noEmit"] is True
 
 
 def test_public_export_manifest_authenticates_every_release_file() -> None:

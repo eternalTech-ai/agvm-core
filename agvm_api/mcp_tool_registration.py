@@ -27,12 +27,68 @@ BRAIN_BOOTSTRAP_V1_CLOUD_CAPABILITIES = ["ai_research", "fitting", "backfill", "
 BRAIN_PROFILE_V1_TOOL_PREFIX = "brain_profile_"
 BRAIN_PROFILE_V1_CLOUD_CAPABILITIES = ["fitting", "backfill", "activation"]
 
+LOCAL_CORE_MAINTAIN_PREVIEW_TOOL_NAMES = frozenset(
+    {
+        "geometry_calibration_preview",
+        "matrix_calibration_preview",
+        "sleep_preview",
+        "evolve_preview",
+    }
+)
+LOCAL_CORE_MAINTAIN_MUTATION_TOOL_NAMES = frozenset(
+    {
+        "geometry_calibration_apply",
+        "geometry_calibration_rollback",
+        "matrix_calibration_apply",
+        "matrix_calibration_rollback",
+        "sleep_apply",
+        "sleep_rollback",
+        "evolve_apply",
+        "evolve_rollback",
+        "calibrate_brain_apply",
+        "calibrate_brain_rollback",
+    }
+)
+LOCAL_CORE_MAINTAIN_CLOUD_HANDOFF_TOOL_NAMES = frozenset(
+    set(LOCAL_CORE_MAINTAIN_PREVIEW_TOOL_NAMES)
+    | set(LOCAL_CORE_MAINTAIN_MUTATION_TOOL_NAMES)
+)
+
 
 def required_module_id_for_tool_name(tool_name: str) -> str | None:
     clean = str(tool_name or "").strip()
-    if clean.startswith(("matrix_calibration_", "geometry_calibration_", "sleep_", "evolve_")) or clean in MAINTAIN_LIST_TOOL_NAMES:
+    if clean.startswith(
+        (
+            "calibrate_brain_",
+            "matrix_calibration_",
+            "geometry_calibration_",
+            "sleep_",
+            "evolve_",
+        )
+    ) or clean in MAINTAIN_LIST_TOOL_NAMES:
         return MAINTAIN_MODULE_ID
     return None
+
+
+def local_core_tool_is_discoverable(tool_name: str) -> bool:
+    """Return whether Local Core may advertise a canonical tool contract."""
+
+    return bool(str(tool_name or "").strip())
+
+
+def mark_local_core_cloud_handoff_registration(registration: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a paid Maintain preview as a non-executing Hosted MCP handoff."""
+
+    projected = dict(registration)
+    projected.update(
+        {
+            "current_runtime_binding": "hosted_cloud_handoff",
+            "execution_surface_policy": "hosted_mcp_only",
+            "local_execution_available": False,
+            "cloud_execution_required": True,
+        }
+    )
+    return projected
 
 
 def build_mcp_tool_registration(
@@ -136,7 +192,10 @@ def build_mcp_module_tool_registration_summary(tools: list[Mapping[str, Any]]) -
             "required_module_field": "tool_registration.required_module_id",
             "entitlement_required_field": "tool_registration.entitlement_required",
             "hosted_gateway_filter": "active module_access entitlement required when required_module_id is set",
-            "local_gateway_filter": "permission families still apply; local module lease filtering is a later supervisor slice",
+            "local_gateway_filter": (
+                "Local Core publishes Maintain contracts as non-executing Cloud handoffs; module entitlement "
+                "gates Hosted MCP and no paid mutation can execute against the local graph."
+            ),
         },
     }
 

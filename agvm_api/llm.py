@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
 import time
@@ -107,10 +108,25 @@ def _ensure_openai_strict_schema(schema: Any) -> Any:
 
 def llm_enabled() -> bool:
     flag = os.getenv("AGVM_LLM_ENABLED", "").strip().lower()
-    key = os.getenv("OPENAI_API_KEY", "").strip()
     if flag in {"0", "false", "no", "off"}:
         return False
-    return bool(key)
+    try:
+        from hosted_credential_context import openai_provider_configured
+
+        return bool(openai_provider_configured())
+    except ImportError:
+        return bool(str(os.getenv("OPENAI_API_KEY") or "").strip())
+
+
+def _resolved_provider_api_key() -> str:
+    """Resolve a request-scoped hosted credential before the local env key."""
+
+    try:
+        from hosted_credential_context import resolved_openai_api_key
+
+        return str(resolved_openai_api_key() or "").strip()
+    except ImportError:
+        return str(os.getenv("OPENAI_API_KEY") or "").strip()
 
 
 def llm_model() -> str:
@@ -241,12 +257,13 @@ def structured_json(
     role: str = "compiler",
     max_output_tokens: int | None = None,
     api_key_override: str | None = None,
+    execution_metadata: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     resolved_model = model or llm_model()
     resolved_api_key = (
         str(api_key_override or "").strip()
         if api_key_override is not None
-        else os.getenv("OPENAI_API_KEY", "").strip()
+        else _resolved_provider_api_key()
     )
     provider_disabled = os.getenv("AGVM_LLM_ENABLED", "").strip().lower() in {
         "0",
@@ -282,10 +299,16 @@ def structured_json(
     if max_output_tokens is not None:
         request_body["max_output_tokens"] = max(16, int(max_output_tokens))
 
+    endpoint = str(
+        os.getenv("AGVM_OPENAI_RESPONSES_URL")
+        or os.getenv("OPENAI_RESPONSES_URL")
+        or "https://api.openai.com/v1/responses"
+    ).strip()
+    request_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
     req = urllib.request.Request(
-        url="https://api.openai.com/v1/responses",
+        url=endpoint,
         method="POST",
-        data=json.dumps(request_body).encode("utf-8"),
+        data=request_bytes,
         headers={
             "Authorization": f"Bearer {resolved_api_key}",
             "Content-Type": "application/json",
@@ -308,7 +331,8 @@ def structured_json(
     try:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                response_bytes = response.read()
+                payload = json.loads(response_bytes.decode("utf-8"))
         finally:
             semaphore.release()
     except urllib.error.HTTPError as exc:
@@ -328,6 +352,42 @@ def structured_json(
 
     try:
         parsed = json.loads(text)
+        if execution_metadata is not None:
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+            output_details = (
+                usage.get("output_tokens_details")
+                if isinstance(usage.get("output_tokens_details"), dict)
+                else {}
+            )
+            def usage_count(value: Any) -> int:
+                try:
+                    return max(0, int(value or 0))
+                except (TypeError, ValueError):
+                    return 0
+
+            execution_metadata.clear()
+            execution_metadata.update(
+                {
+                    "schema_version": "agvm.ai_execution_attestation.v2",
+                    "status": "completed",
+                    "provider_executed": True,
+                    "provider": "openai_compatible",
+                    "endpoint_origin": endpoint.split("/v1/", 1)[0],
+                    "response_id": str(payload.get("id") or payload.get("response_id") or "")[:256],
+                    "model": str(payload.get("model") or resolved_model)[:256],
+                    "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+                    "output_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "usage": {
+                        "input_tokens": usage_count(usage.get("input_tokens")),
+                        "output_tokens": usage_count(usage.get("output_tokens")),
+                        "reasoning_tokens": usage_count(
+                            output_details.get("reasoning_tokens")
+                            or usage.get("reasoning_tokens")
+                        ),
+                        "total_tokens": usage_count(usage.get("total_tokens")),
+                    },
+                }
+            )
         record_llm_result(role, path="llm", error=None, model=resolved_model, timeout_seconds=timeout)
         return parsed, None
     except json.JSONDecodeError:

@@ -361,6 +361,54 @@ def _storage_quality(storage_path: Path) -> dict[str, Any]:
     }
 
 
+def _looks_like_foreign_runtime_path(raw_path: str) -> bool:
+    normalized = str(raw_path or "").strip()
+    if not normalized:
+        return False
+    if os.name == "nt":
+        return normalized.startswith("/app/") or normalized.startswith("/home/")
+    return bool(re.search(r"(?:^|[/\\])[a-zA-Z]:[\\/]", normalized))
+
+
+def _portable_registered_storage_path(
+    record: dict[str, Any] | None,
+    *,
+    brain_root: Path,
+    brain_id: str,
+) -> Path:
+    payload = dict(record or {})
+    registry_brain = (brain_root / _safe_id(brain_id)).resolve()
+    managed_storage = registry_brain / "storage"
+    in_place_storage = registry_brain
+    raw = str(payload.get("storage_path") or "").strip()
+    raw_path = Path(raw).expanduser() if raw else None
+    local_candidates = (managed_storage, in_place_storage)
+    for candidate in local_candidates:
+        if any((candidate / filename).is_file() for filename in (SQLITE_FILENAME, GRAPH_FILENAME, INDEX_FILENAME, ATLAS_FILENAME)):
+            if raw_path is None or not raw_path.exists() or _looks_like_foreign_runtime_path(raw):
+                return candidate.resolve()
+    if raw_path is not None and raw_path.exists() and not _looks_like_foreign_runtime_path(raw):
+        return raw_path.resolve()
+    if managed_storage.exists() or str(payload.get("storage_layout") or "") == "registry_managed":
+        return managed_storage.resolve()
+    return raw_path.resolve() if raw_path is not None else managed_storage.resolve()
+
+
+def _portable_registered_brain_path(
+    record: dict[str, Any] | None,
+    *,
+    brain_root: Path,
+    brain_id: str,
+) -> Path:
+    payload = dict(record or {})
+    managed_path = (brain_root / _safe_id(brain_id)).resolve()
+    raw = str(payload.get("registry_brain_path") or "").strip()
+    raw_path = Path(raw).expanduser() if raw else None
+    if managed_path.exists() or raw_path is None or not raw_path.exists() or _looks_like_foreign_runtime_path(raw):
+        return managed_path
+    return raw_path.resolve()
+
+
 def _prefer_previous_storage(previous: dict[str, Any] | None, discovered_storage: Path) -> Path | None:
     if not previous:
         return None
@@ -634,13 +682,14 @@ def bootstrap_local_brain_registry(
         )
     for brain_id, previous in previous_by_id.items():
         if brain_id not in seen_ids and str(previous.get("storage_path") or "").strip():
-            storage_path = Path(str(previous["storage_path"])).expanduser().resolve()
+            storage_path = _portable_registered_storage_path(previous, brain_root=root, brain_id=brain_id)
+            registry_brain_path = _portable_registered_brain_path(previous, brain_root=root, brain_id=brain_id)
             brain_records.append(
                 build_local_brain_record(
                     brain_id=brain_id,
                     display_name=str(previous.get("display_name") or brain_id),
                     storage_path=storage_path,
-                    registry_brain_path=Path(str(previous.get("registry_brain_path") or root / brain_id)).expanduser(),
+                    registry_brain_path=registry_brain_path,
                     is_default=False,
                     is_active=False,
                     migration_source=str(previous.get("migration_source") or "existing_registry"),
@@ -738,12 +787,14 @@ def refresh_local_brain_registry(*, brain_root: Path | None = None) -> dict[str,
         brain_id = str(previous.get("brain_id") or "").strip()
         if not brain_id:
             continue
+        storage_path = _portable_registered_storage_path(previous, brain_root=root, brain_id=brain_id)
+        registry_brain_path = _portable_registered_brain_path(previous, brain_root=root, brain_id=brain_id)
         refreshed.append(
             build_local_brain_record(
                 brain_id=brain_id,
                 display_name=str(previous.get("display_name") or brain_id),
-                storage_path=Path(str(previous.get("storage_path") or root / brain_id / "storage")).expanduser(),
-                registry_brain_path=Path(str(previous.get("registry_brain_path") or root / brain_id)).expanduser(),
+                storage_path=storage_path,
+                registry_brain_path=registry_brain_path,
                 is_default=bool(previous.get("is_default")),
                 is_active=bool(previous.get("is_active")),
                 migration_source=str(previous.get("migration_source") or "existing_registry"),
@@ -778,11 +829,13 @@ def refresh_local_brain_record(
         if target_index is None:
             raise BrainRegistryError(f"unknown_brain_id:{target}")
         previous = brains[target_index]
+        storage_path = _portable_registered_storage_path(previous, brain_root=root, brain_id=target)
+        registry_brain_path = _portable_registered_brain_path(previous, brain_root=root, brain_id=target)
         refreshed = build_local_brain_record(
             brain_id=target,
             display_name=str(previous.get("display_name") or target),
-            storage_path=Path(str(previous.get("storage_path") or root / target / "storage")).expanduser(),
-            registry_brain_path=Path(str(previous.get("registry_brain_path") or root / target)).expanduser(),
+            storage_path=storage_path,
+            registry_brain_path=registry_brain_path,
             is_default=bool(previous.get("is_default")),
             is_active=bool(previous.get("is_active")),
             migration_source=str(previous.get("migration_source") or "existing_registry"),
@@ -1232,9 +1285,10 @@ def _reconcile_resolved_brain_record(
     brain_id = str(record.get("brain_id") or "").strip()
     if not brain_id:
         raise BrainRegistryError("brain_id_required")
-    storage = Path(str(record.get("storage_path") or brain_root / brain_id / "storage")).expanduser()
+    storage = _portable_registered_storage_path(record, brain_root=brain_root, brain_id=brain_id)
     persisted_node_count = int(record.get("node_count") or 0)
-    if _node_count(storage) == persisted_node_count:
+    recorded_storage = Path(str(record.get("storage_path") or brain_root / brain_id / "storage")).expanduser()
+    if storage == recorded_storage and _node_count(storage) == persisted_node_count:
         return record
     return refresh_local_brain_record(brain_id, brain_root=brain_root)
 

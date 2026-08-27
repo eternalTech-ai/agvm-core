@@ -11,10 +11,12 @@ import json
 import math
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
+from brain_feedback_ledger import build_brain_feedback_ledger
 from config import APP_NAME, APP_VERSION
 from geometry_calibration import expected_brain_geometry_profile
+from health_ai_diagnosis import build_health_ai_readonly_diagnosis
 from storage import utc_timestamp
 
 
@@ -1936,6 +1938,9 @@ def build_brain_health_report(
     brain_id: str | None = None,
     identity_nucleus: dict[str, Any] | None = None,
     recent_search_sessions: list[dict[str, Any]] | None = None,
+    recent_search_events: list[dict[str, Any]] | None = None,
+    recent_feedback_events: list[dict[str, Any]] | None = None,
+    recent_corrections: list[dict[str, Any]] | None = None,
     recent_maintenance_runs: list[dict[str, Any]] | None = None,
     recent_memory_learning_events: list[dict[str, Any]] | None = None,
     metamemory: dict[str, Any] | None = None,
@@ -1945,8 +1950,9 @@ def build_brain_health_report(
     source_manifest_snapshot: dict[str, Any] | None = None,
     latest_benchmark_verdict: dict[str, Any] | None = None,
     explicit_reset_approval: bool = False,
-    target_min_nodes: int = 2000,
+    target_min_nodes: int = 0,
     target_max_nodes: int = 4000,
+    health_ai_diagnoser: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     nodes = [dict(node) for node in _as_list(graph.get("nodes")) if isinstance(node, dict)]
@@ -1959,6 +1965,14 @@ def build_brain_health_report(
     document_retrievability = _analyze_document_retrievability(nodes)
     radial_distribution = _analyze_radial_distribution(nodes)
     recent_session_rows = [dict(item) for item in _as_list(recent_search_sessions) if isinstance(item, dict)]
+    feedback_ledger = build_brain_feedback_ledger(
+        brain_id=brain_id,
+        search_sessions=recent_session_rows,
+        search_events=recent_search_events,
+        feedback_events=recent_feedback_events,
+        corrections=recent_corrections,
+        learning_events=recent_memory_learning_events,
+    )
     recent_failures = _analyze_recent_retrieval_failures(recent_session_rows)
     metamemory_health = _analyze_metamemory(
         metamemory=metamemory,
@@ -1981,10 +1995,6 @@ def build_brain_health_report(
     metamemory_health["spatial_prior_resolution"] = spatial_prior_resolution
     reason_codes: list[str] = []
     node_count = len(nodes)
-    if node_count < target_min_nodes:
-        reason_codes.append("grow_repair:node_count_below_validation_target")
-    if node_count > target_max_nodes:
-        reason_codes.append("sleep_preview:node_count_above_validation_target_review_duplicates")
     if float(node_atomicity["score"]) < 0.96:
         reason_codes.append("grow_repair:node_atomicity_fragments")
     if float(identity_explicitness["score"]) < 0.72:
@@ -2014,12 +2024,9 @@ def build_brain_health_report(
     if metamemory_health.get("metamemory_spatial_brief_runtime_present") and not bool(spatial_readiness.get("certifiable")):
         reason_codes.append("matrix_calibration_preview:metamemory_spatial_brief_incomplete")
     if (
-        node_count < target_min_nodes
-        and (
-            float(node_atomicity["score"]) < 0.94
-            or float(source_coverage["score"]) < 0.65
-            or float(document_retrievability["score"]) < 0.65
-        )
+        float(node_atomicity["score"]) < 0.94
+        and float(source_coverage["score"]) < 0.65
+        and float(document_retrievability["score"]) < 0.65
     ):
         reason_codes.append("rebuild_required:source_replay_cleaner_than_local_repair")
     if (
@@ -2040,6 +2047,7 @@ def build_brain_health_report(
         "recent_retrieval_failures": recent_failures,
         "retrieval_learning_rollup": retrieval_learning_rollup,
         "metacognitive_observations": metacognitive_observations,
+        "brain_feedback_ledger": dict(feedback_ledger.get("health_rollup") or {}),
         "metamemory": metamemory_health,
     }
     score_keys = [
@@ -2142,7 +2150,7 @@ def build_brain_health_report(
     )
     latency_ms = round((time.perf_counter() - started) * 1000.0, 3)
     brain_sanity_snapshot["health_latency_ms"] = latency_ms
-    return {
+    report = {
         "schema_version": BRAIN_HEALTH_SCHEMA_VERSION,
         "service": APP_NAME,
         "version": APP_VERSION,
@@ -2165,6 +2173,10 @@ def build_brain_health_report(
             "retrieval_learning_repeated_families": list(retrieval_learning_rollup["repeated_signal_families"]),
             "metacognitive_observation_count": metacognitive_observations["observation_count"],
             "metacognitive_repeated_kinds": list(metacognitive_observations["repeated_observation_kinds"]),
+            "feedback_signal_count": int(feedback_ledger.get("signal_count") or 0),
+            "explicit_feedback_signal_count": int(
+                dict(feedback_ledger.get("health_rollup") or {}).get("explicit_signal_count") or 0
+            ),
             "health_is_non_mutating": True,
             "validation_rebuild_gate_status": validation_brain_rebuild_gate["status"],
             "validation_node_quality_green": validation_brain_rebuild_gate["node_quality_gate"]["green"],
@@ -2173,6 +2185,7 @@ def build_brain_health_report(
             ],
         },
         "checks": checks,
+        "brain_feedback_ledger": feedback_ledger,
         "actions": actions,
         "brain_sanity_snapshot": brain_sanity_snapshot,
         "health_alerts": health_alerts,
@@ -2188,6 +2201,8 @@ def build_brain_health_report(
         "safety_contract": {
             "non_mutating": True,
             "hidden_mutation_allowed": False,
+            "deterministic_health_is_authoritative": True,
+            "ai_diagnosis_may_override_health": False,
             "sleep_evolve_apply_requires_explicit_acceptance": True,
             "matrix_updates_require_preview_apply_rollback": True,
             "direct_db_repair_is_product_invalid": True,
@@ -2198,6 +2213,14 @@ def build_brain_health_report(
             "reason": "brain_health_is_a_diagnostic_gate_not_full_mcp_product_benchmark",
         },
     }
+    ai_diagnosis = build_health_ai_readonly_diagnosis(
+        deterministic_health=report,
+        feedback_ledger=feedback_ledger,
+        diagnoser=health_ai_diagnoser,
+    )
+    report["health_ai_diagnosis"] = ai_diagnosis
+    report["health_ai_attestation"] = dict(ai_diagnosis.get("attestation") or {})
+    return report
 
 
 def build_mcp_brain_health_output(report: dict[str, Any]) -> dict[str, Any]:
@@ -2215,6 +2238,9 @@ def build_mcp_brain_health_output(report: dict[str, Any]) -> dict[str, Any]:
         "actions": list(report.get("actions") or []),
         "retrieval_learning_rollup": dict(dict(report.get("checks") or {}).get("retrieval_learning_rollup") or {}),
         "metacognitive_observation_rollup": dict(dict(report.get("checks") or {}).get("metacognitive_observations") or {}),
+        "brain_feedback_ledger": dict(report.get("brain_feedback_ledger") or {}),
+        "health_ai_diagnosis": dict(report.get("health_ai_diagnosis") or {}),
+        "health_ai_attestation": dict(report.get("health_ai_attestation") or {}),
         "brain_sanity_snapshot": dict(report.get("brain_sanity_snapshot") or {}),
         "health_alerts": list(report.get("health_alerts") or []),
         "alert_summary": dict(report.get("alert_summary") or {}),

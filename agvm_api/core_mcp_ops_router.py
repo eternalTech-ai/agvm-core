@@ -4,22 +4,34 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from datetime import datetime, timezone
 import hashlib
 import json
+import sqlite3
 import threading
-from typing import Any, Protocol
 import time
 import uuid
+from copy import deepcopy
+from datetime import datetime, timezone
+from typing import Any, Protocol
 
-from fastapi import APIRouter, HTTPException
-
+from ai_modules_v2 import (
+    AiModuleContractError,
+)
 from brain_registry import BrainRegistryError, resolve_brain_scope
-from derivation import persist_selection, preview_bundle
-from local_module_manifest_router import MAINTAIN_MODULE_ID, ensure_local_module_entitled
+from derivation import persist_selection
+from fastapi import APIRouter, HTTPException
+from grow_engine import GrowEngine
+from local_module_manifest_router import (
+    MAINTAIN_MODULE_ID,
+    ensure_local_module_entitled,
+)
 from retrieval import build_index
 from runtime_scope import use_runtime_brain
+from source_investigation import (
+    build_source_compiler_handoff_proof,
+    build_source_formation_contract,
+    build_source_investigation_package,
+)
 from schemas import (
     McpClarificationRequest,
     McpGrowApplyRequest,
@@ -32,16 +44,20 @@ from schemas import (
     McpWriteMemoryPreviewRequest,
 )
 from sqlite_store import (
+    GrowPreviewBindingStoreError,
+    apply_local_grow_v2_preview_transaction,
     bootstrap_runtime_store,
     fetch_atlas,
     fetch_graph_snapshot,
-    replace_runtime_graph,
+    fetch_local_grow_v2_preview,
+    maintenance_graph_revision,
+    store_local_grow_v2_preview,
     store_maintenance_run,
 )
 
-
 _GROW_PREVIEW_RUNS: dict[str, dict[str, Any]] = {}
 _GROW_PREVIEW_APPLY_LOCK = threading.RLock()
+_GROW_ENGINE = GrowEngine()
 
 
 class MaintenanceMutationRuntime(Protocol):
@@ -286,6 +302,26 @@ def _grow_contract_fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _grow_apply_material(
+    *,
+    investigation_id: str,
+    brain_id: str,
+    preview_fingerprint: str,
+    selected_preview_ids: list[str],
+    payload: McpGrowApplyRequest,
+) -> dict[str, Any]:
+    return {
+        "investigation_id": investigation_id,
+        "brain_id": brain_id,
+        "preview_fingerprint": preview_fingerprint,
+        "selected_preview_ids": sorted(selected_preview_ids),
+        "learning_mode": payload.learning_mode,
+        "clarification_answers": payload.clarification_answers,
+        "approved_preview_ids": sorted(_normalized_grow_ids(payload.approved_preview_ids)),
+        "question_limit": payload.question_limit,
+    }
+
+
 def _grow_apply_fingerprint(
     *,
     investigation_id: str,
@@ -295,16 +331,13 @@ def _grow_apply_fingerprint(
     payload: McpGrowApplyRequest,
 ) -> str:
     return _grow_contract_fingerprint(
-        {
-            "investigation_id": investigation_id,
-            "brain_id": brain_id,
-            "preview_fingerprint": preview_fingerprint,
-            "selected_preview_ids": sorted(selected_preview_ids),
-            "learning_mode": payload.learning_mode,
-            "clarification_answers": payload.clarification_answers,
-            "approved_preview_ids": sorted(_normalized_grow_ids(payload.approved_preview_ids)),
-            "question_limit": payload.question_limit,
-        }
+        _grow_apply_material(
+            investigation_id=investigation_id,
+            brain_id=brain_id,
+            preview_fingerprint=preview_fingerprint,
+            selected_preview_ids=selected_preview_ids,
+            payload=payload,
+        )
     )
 
 
@@ -340,6 +373,76 @@ def _grow_idempotent_replay(
     return McpGrowToolExecutionResponse(**response_payload)
 
 
+def _grow_response_from_durable_apply(
+    tool_name: str,
+    stored: dict[str, Any],
+    apply_result: dict[str, Any],
+    *,
+    started: float,
+) -> McpGrowToolExecutionResponse:
+    signed_receipt = dict(apply_result.get("signed_apply_receipt") or {})
+    receipt_id = str(signed_receipt.get("receipt_id") or "")
+    idempotent_replay = bool(apply_result.get("idempotent_replay"))
+    source_investigation = {
+        **dict(stored.get("source_investigation") or {}),
+        "investigation_id": str(stored.get("investigation_id") or ""),
+        "status": "applied",
+        "applied_at": signed_receipt.get("applied_at"),
+    }
+    source_formation_contract = {
+        **dict(stored.get("source_formation_contract") or {}),
+        "state": "applied",
+        "mutates_memory": True,
+    }
+    persisted_node_ids = _normalized_grow_ids(apply_result.get("persisted_node_ids") or [])
+    selected_preview_ids = _normalized_grow_ids(apply_result.get("selected_preview_ids") or [])
+    return McpGrowToolExecutionResponse(
+        schema_version="agvm.mcp_grow_tool_output.v1",
+        brain_id=str(stored.get("brain_id") or ""),
+        tool_name=tool_name,
+        status="applied",
+        source_investigation=source_investigation,
+        source_formation_contract=source_formation_contract,
+        memory_operation_lifecycle_contract={
+            "schema_version": "agvm.memory_operation_lifecycle_contract.v2",
+            "operation": "grow",
+            "phase": "applied",
+            "confirm_apply": True,
+            "partial_merge_allowed": False,
+            "receipt_id": receipt_id,
+            "receipt_signature": signed_receipt.get("signature"),
+            "idempotent_replay": idempotent_replay,
+        },
+        preview_bundle=deepcopy(dict(stored.get("preview_bundle") or {})),
+        ai_execution_attestation=deepcopy(dict(stored.get("ai_execution_attestation") or {})),
+        investigation_session=deepcopy(dict(stored.get("investigation_session") or {})),
+        persist_result={
+            "schema_version": "agvm.core_grow_persist_result.v2",
+            "persisted_node_ids": persisted_node_ids,
+            "persisted_edge_count": int(apply_result.get("persisted_edge_count") or 0),
+            "merged_into_existing_ids": _normalized_grow_ids(
+                apply_result.get("merged_into_existing_ids") or []
+            ),
+            "selected_preview_ids": selected_preview_ids,
+            "idempotent_replay": idempotent_replay,
+            "receipt_id": receipt_id,
+            "signed_apply_receipt": signed_receipt,
+            "before_brain_revision": apply_result.get("before_brain_revision"),
+            "after_brain_revision": apply_result.get("after_brain_revision"),
+        },
+        learning_policy=dict(apply_result.get("learning_policy") or {}),
+        completeness={
+            "applied": True,
+            "persisted_node_count": len(persisted_node_ids),
+            "persisted_edge_count": int(apply_result.get("persisted_edge_count") or 0),
+            "idempotent_replay": idempotent_replay,
+            "source_unit_count": len(list(source_investigation.get("source_units") or [])),
+        },
+        mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
+        budget={"credits_required": 0, "runtime": "local_core"},
+    )
+
+
 def _local_core_source_unit(payload: McpGrowSourceRequest, investigation_id: str) -> dict[str, Any]:
     raw_text = str(payload.raw_input or "").strip()
     source_unit_id = f"src_{investigation_id.removeprefix('mcp-grow-')}"
@@ -356,6 +459,49 @@ def _local_core_source_unit(payload: McpGrowSourceRequest, investigation_id: str
         "fact_eligible": True,
         "status": "available",
     }
+
+
+def _grow_source_package(payload: McpGrowSourceRequest, brain_id: str) -> dict[str, Any]:
+    package = build_source_investigation_package(
+        payload.raw_input,
+        source_label=payload.source_label,
+        source_uri=payload.source_uri,
+        user_instruction=payload.user_instruction,
+        input_kind=payload.input_kind,
+        options=payload.options.model_dump(mode="python"),
+    )
+    package["brain_id"] = brain_id
+    return package
+
+
+def _source_sections_for_grow(package: dict[str, Any]) -> list[dict[str, Any]]:
+    handoff = dict(package.get("compiler_handoff") or {})
+    structured = [dict(item) for item in list(handoff.get("structured_sections") or []) if isinstance(item, dict)]
+    if structured:
+        return structured
+    return [
+        {
+            "section_id": str(unit.get("unit_id") or ""),
+            "unit_id": str(unit.get("unit_id") or ""),
+            "title": str(unit.get("title") or unit.get("unit_id") or "Source unit"),
+            "kind": str(unit.get("kind") or "source_unit"),
+            "text": str(unit.get("raw_text") or unit.get("text") or ""),
+            "source_uri": unit.get("source_uri"),
+            "source_unit_role": unit.get("source_unit_role"),
+            "promotion_role": unit.get("promotion_role"),
+            "fact_eligible": bool(unit.get("fact_eligible", True)),
+        }
+        for unit in list(package.get("source_units") or [])
+        if isinstance(unit, dict) and str(unit.get("unit_id") or "").strip()
+    ]
+
+
+def _input_mode_for_grow(payload: McpGrowSourceRequest, package: dict[str, Any]) -> str:
+    handoff = dict(package.get("compiler_handoff") or {})
+    recommended = str(handoff.get("recommended_input_mode") or "").strip().lower()
+    if recommended in {"auto", "manual", "document"}:
+        return recommended
+    return _input_mode(payload)
 
 
 def _bind_preview_bundle_to_source_unit(bundle: dict[str, Any], source_unit: dict[str, Any]) -> dict[str, Any]:
@@ -390,35 +536,18 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
     started = time.perf_counter()
     brain_record = _resolve_bootstrap_ready_brain_record(payload.brain_id)
     brain_id = _brain_record_id(brain_record)
-    investigation_id = f"mcp-grow-{uuid.uuid4()}"
-    source_unit = _local_core_source_unit(payload, investigation_id)
+    source_package = _grow_source_package(payload, brain_id)
+    investigation_id = str(source_package.get("investigation_id") or f"mcp-grow-{uuid.uuid4()}")
+    source_package["investigation_id"] = investigation_id
+    source_units = [dict(unit) for unit in list(source_package.get("source_units") or []) if isinstance(unit, dict)]
+    if not source_units:
+        source_units = [_local_core_source_unit(payload, investigation_id)]
+        source_package["source_units"] = source_units
+    source_unit = source_units[0]
     if not payload.run_preview:
-        source_investigation = {
-            "schema_version": "agvm.source_investigation_package.v1",
-            "investigation_id": investigation_id,
-            "brain_id": brain_id,
-            "status": "preview_ready",
-            "source_request": {
-                "brain_id": brain_id,
-                "source_label": payload.source_label,
-                "source_uri": payload.source_uri,
-                "input_kind": payload.input_kind,
-                "run_preview": False,
-            },
-            "source_detection": {
-                "source_kind": str(payload.input_kind or "auto"),
-                "confidence": source_unit.get("confidence"),
-            },
-            "source_units": [source_unit],
-            "compiler_handoff": {
-                "preview_eligible": True,
-                "recommended_input_mode": _input_mode(payload),
-                "recommended_learning_mode": "guided_learning" if payload.options.pause_on_questions else "strict_review",
-            },
-            "compiler_handoff_proof": {"proof_passed": True},
-            "budgets": {"max_units": payload.options.max_units},
-            "budget_usage": {"source_units": 1},
-        }
+        source_investigation = source_package
+        compiler_handoff_proof = build_source_compiler_handoff_proof(source_package)
+        source_investigation["compiler_handoff_proof"] = compiler_handoff_proof
         source_formation_contract = {
             "schema_version": "agvm.core_source_formation_contract.v1",
             "mode": "local_core_source_unit_proof",
@@ -473,14 +602,14 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
                 "phase": "source_unit_proof",
                 "next_action": "call grow_source_preview with run_preview=true before apply",
             },
-            compiler_handoff_proof={"proof_passed": True},
+            compiler_handoff_proof=compiler_handoff_proof,
             completeness={
                 "preview_generated": False,
                 "preview_present": False,
                 "preview_node_count": 0,
                 "selected_preview_count": 0,
                 "source_status": "source_units_ready",
-                "source_unit_count": 1,
+                "source_unit_count": len(source_units),
             },
             mcp_latency_profile=latency_profile,
             budget={"credits_required": 0, "runtime": "local_core"},
@@ -489,41 +618,50 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
     with use_runtime_brain(brain_record):
         bootstrap_runtime_store()
         graph = fetch_graph_snapshot()
+        preview_brain_revision = maintenance_graph_revision(graph)
         index_payload = build_index(list(graph.get("nodes") or []))
         atlas_payload = fetch_atlas()
         options = payload.options
-        bundle = preview_bundle(
-            payload.raw_input,
-            _input_mode(payload),
-            graph,
-            index_payload,
-            atlas_payload,
-            source_label=payload.source_label,
-            source_type=_source_type(payload),
-            source_trust=str(options.source_trust or "unknown"),
-            learning_mode="guided_learning" if options.pause_on_questions else "strict_review",
-            question_limit=options.question_limit,
-            source_investigation_id=investigation_id,
-            source_purpose=payload.user_instruction,
-            operator_instruction=payload.user_instruction,
-            compiler_timeout_seconds=options.compiler_preview_timeout_seconds,
-        )
-    bundle = _bind_preview_bundle_to_source_unit(bundle, source_unit)
+        try:
+            engine_result = _GROW_ENGINE.preview(
+                raw_input=payload.raw_input,
+                input_mode=_input_mode_for_grow(payload, source_package),
+                graph=graph,
+                index_payload=index_payload,
+                atlas_payload=atlas_payload,
+                source_label=payload.source_label,
+                source_uri=payload.source_uri,
+                source_type=_source_type(payload),
+                source_trust=str(options.source_trust or "unknown"),
+                learning_mode="guided_learning" if options.pause_on_questions else "strict_review",
+                question_limit=options.question_limit,
+                source_investigation_id=investigation_id,
+                source_purpose=payload.user_instruction,
+                operator_instruction=payload.user_instruction,
+                source_sections=_source_sections_for_grow(source_package),
+                source_unit_formation=dict(source_package.get("source_unit_formation") or {}),
+                source_context=source_package,
+                clarification_answers=options.clarification_answers,
+                compiler_timeout_seconds=options.compiler_preview_timeout_seconds,
+            )
+            bundle = dict(engine_result["preview_bundle"])
+            attestation = dict(engine_result["ai_execution_attestation"])
+            clarification_questions = list(engine_result["clarification_questions"])
+        except (ValueError, AiModuleContractError) as exc:
+            reason = str(getattr(exc, "code", "") or exc or "grow_ai_unavailable")
+            if not reason.startswith("grow_ai_") and not reason.startswith("ai_execution_"):
+                reason = f"grow_ai_unavailable:{reason}"
+            return _grow_blocked(tool_name, brain_id, reason, started)
+    if len(source_units) == 1:
+        bundle = _bind_preview_bundle_to_source_unit(bundle, source_unit)
     selected_preview_ids = _selected_preview_ids(bundle, [])
-    source_investigation = {
-        "schema_version": "agvm.mcp_source_investigation.v1",
-        "investigation_id": investigation_id,
-        "brain_id": brain_id,
-        "source_label": payload.source_label,
-        "source_uri": payload.source_uri,
-        "input_kind": payload.input_kind,
-        "created_at": _utc_now(),
-        "status": "preview_ready",
-        "source_units": [source_unit],
-    }
+    compiler_handoff_proof = build_source_compiler_handoff_proof(source_package, bundle)
+    source_package["compiler_handoff_proof"] = compiler_handoff_proof
+    source_investigation = source_package
     source_formation_contract = {
-        "schema_version": "agvm.core_source_formation_contract.v1",
-        "mode": "local_core_preview",
+        **build_source_formation_contract(source_package, bundle),
+        "schema_version": "agvm.core_source_formation_contract.v2",
+        "mode": "shared_ai_grow_preview",
         "mutates_memory": False,
         "apply_requires_confirm_apply": True,
         "state": "preview_ready",
@@ -533,25 +671,51 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
             "preview_required": True,
             "explicit_confirm_apply_required": True,
             "apply_without_preview_allowed": False,
-            "can_apply_now": bool(selected_preview_ids),
-            "blocked_reasons": [] if selected_preview_ids else ["preview_bundle_missing"],
+            "can_apply_now": bool(selected_preview_ids) and not clarification_questions,
+            "blocked_reasons": (
+                ["clarification_required"]
+                if clarification_questions
+                else [] if selected_preview_ids else ["preview_bundle_missing"]
+            ),
             "selected_preview_ids": selected_preview_ids,
         },
     }
+    with use_runtime_brain(brain_record):
+        try:
+            persisted_preview = store_local_grow_v2_preview(
+                brain_id=brain_id,
+                investigation_id=investigation_id,
+                tool_name=tool_name,
+                source_investigation=source_investigation,
+                source_formation_contract=source_formation_contract,
+                preview_bundle=bundle,
+                ai_execution_attestation=attestation,
+                investigation_session=dict(engine_result["investigation_session"]),
+                expected_brain_revision=preview_brain_revision,
+            )
+        except (GrowPreviewBindingStoreError, AiModuleContractError) as exc:
+            reason = str(getattr(exc, "code", "") or exc or "grow_v2_preview_persistence_failed")
+            return _grow_blocked(tool_name, brain_id, reason, started)
+    # Expose the canonical attestation bound to the durable preview. Status reads
+    # this same representation, so both surfaces remain byte-for-byte equivalent.
+    attestation = deepcopy(dict(persisted_preview["ai_execution_attestation"]))
     _GROW_PREVIEW_RUNS[investigation_id] = {
         "brain_id": brain_id,
-        "status": "preview_ready",
+        "status": "asking_clarification" if clarification_questions else "preview_ready",
         "source_investigation": source_investigation,
         "source_formation_contract": source_formation_contract,
-        "preview_bundle": bundle,
-        "preview_fingerprint": _grow_contract_fingerprint(bundle),
+        "preview_bundle": deepcopy(bundle),
+        "preview_fingerprint": persisted_preview["preview_sha256"],
+        "ai_execution_attestation": deepcopy(attestation),
+        "attestation_fingerprint": persisted_preview["attestation_sha256"],
+        "investigation_session": deepcopy(dict(engine_result["investigation_session"])),
         "apply_receipt": None,
     }
     return McpGrowToolExecutionResponse(
         schema_version="agvm.mcp_grow_tool_output.v1",
         brain_id=brain_id,
         tool_name=tool_name,
-        status="preview_ready",
+        status="asking_clarification" if clarification_questions else "preview_ready",
         source_investigation=source_investigation,
         source_formation_contract=source_formation_contract,
         memory_operation_lifecycle_contract={
@@ -561,15 +725,20 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
             "next_action": "call grow_source_apply with confirm_apply=true and selected_preview_ids",
         },
         preview_bundle=bundle,
+        clarification_questions=clarification_questions,
+        compiler_handoff_proof=compiler_handoff_proof,
+        ai_execution_attestation=attestation,
+        investigation_session=dict(engine_result["investigation_session"]),
         cognitive_write_plan=dict(bundle.get("cognitive_write_plan") or {}),
         learning_policy=dict(bundle.get("learning_policy") or {}),
         write_trace=dict(bundle.get("write_trace") or {}),
         completeness={
             "preview_generated": True,
+            "ai_execution_attested": True,
             "preview_node_count": len(selected_preview_ids),
             "selected_preview_count": len(selected_preview_ids),
             "source_status": "source_units_ready",
-            "source_unit_count": 1,
+            "source_unit_count": len(source_units),
         },
         mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
         budget={"credits_required": 0, "runtime": "local_core"},
@@ -591,17 +760,43 @@ def _grow_source_apply_locked(tool_name: str, payload: McpGrowApplyRequest) -> M
     investigation_id = request_investigation_id or embedded_investigation_id
     if not investigation_id:
         return _grow_blocked(tool_name, payload.brain_id, "server_preview_investigation_required", started)
-    stored = dict(_GROW_PREVIEW_RUNS.get(investigation_id) or {})
+    requested_brain_id = str(payload.brain_id or investigation.get("brain_id") or "").strip() or None
+    brain_record = _resolve_brain_record(requested_brain_id)
+    resolved_brain_id = _brain_record_id(brain_record)
+    try:
+        with use_runtime_brain(brain_record):
+            stored = fetch_local_grow_v2_preview(
+                brain_id=resolved_brain_id,
+                investigation_id=investigation_id,
+            )
+    except (GrowPreviewBindingStoreError, AiModuleContractError, sqlite3.DatabaseError) as exc:
+        reason = str(getattr(exc, "code", "") or exc or "server_preview_invalid")
+        return _grow_blocked(tool_name, resolved_brain_id, reason, started)
     if not stored:
-        return _grow_blocked(tool_name, payload.brain_id, "server_preview_not_found", started)
+        return _grow_blocked(tool_name, resolved_brain_id, "server_preview_not_found", started)
     bundle = deepcopy(dict(stored.get("preview_bundle") or {}))
     stored_brain_id = str(stored.get("brain_id") or "").strip()
-    requested_brain_id = str(payload.brain_id or investigation.get("brain_id") or "").strip()
-    if requested_brain_id and requested_brain_id != stored_brain_id:
-        return _grow_blocked(tool_name, requested_brain_id, "server_preview_brain_mismatch", started)
+    if resolved_brain_id != stored_brain_id:
+        return _grow_blocked(tool_name, resolved_brain_id, "server_preview_brain_mismatch", started)
     brain_id = stored_brain_id or None
     if not bundle:
         return _grow_blocked(tool_name, brain_id, "server_preview_bundle_required", started)
+    stored_apply_contract = dict(
+        dict(stored.get("source_formation_contract") or {}).get("apply_contract") or {}
+    )
+    if stored_apply_contract and not bool(stored_apply_contract.get("can_apply_now")):
+        blocked_reasons = [
+            str(item)
+            for item in list(stored_apply_contract.get("blocked_reasons") or [])
+            if str(item).strip()
+        ]
+        return _grow_blocked(
+            tool_name,
+            brain_id,
+            blocked_reasons[0] if blocked_reasons else "preview_not_apply_ready",
+            started,
+            preview_bundle=bundle,
+        )
     preview_fingerprint = str(stored.get("preview_fingerprint") or _grow_contract_fingerprint(bundle))
     if payload.preview_bundle is not None and _grow_contract_fingerprint(payload.preview_bundle) != preview_fingerprint:
         return _grow_blocked(tool_name, brain_id, "server_preview_bundle_mismatch", started, preview_bundle=bundle)
@@ -625,6 +820,13 @@ def _grow_source_apply_locked(tool_name: str, payload: McpGrowApplyRequest) -> M
     selected_ids = _selected_preview_ids(bundle, requested_ids)
     if not selected_ids:
         return _grow_blocked(tool_name, brain_id, "selected_preview_ids_required", started, preview_bundle=bundle)
+    apply_material = _grow_apply_material(
+        investigation_id=investigation_id,
+        brain_id=stored_brain_id,
+        preview_fingerprint=preview_fingerprint,
+        selected_preview_ids=selected_ids,
+        payload=payload,
+    )
     apply_fingerprint = _grow_apply_fingerprint(
         investigation_id=investigation_id,
         brain_id=stored_brain_id,
@@ -632,27 +834,10 @@ def _grow_source_apply_locked(tool_name: str, payload: McpGrowApplyRequest) -> M
         selected_preview_ids=selected_ids,
         payload=payload,
     )
-    receipt = dict(stored.get("apply_receipt") or {})
-    if receipt:
-        replay = _grow_idempotent_replay(
-            tool_name,
-            receipt,
-            apply_fingerprint=apply_fingerprint,
-            started=started,
-        )
-        if replay is not None:
-            return replay
-        return _grow_blocked(tool_name, brain_id, "apply_receipt_mismatch", started, preview_bundle=bundle)
-    if str(stored.get("status") or "") == "applied":
-        return _grow_blocked(tool_name, brain_id, "exact_apply_receipt_required", started, preview_bundle=bundle)
-    brain_record = _resolve_bootstrap_ready_brain_record(brain_id)
-    resolved_brain_id = _brain_record_id(brain_record)
-    working_bundle = deepcopy(bundle)
-    with use_runtime_brain(brain_record):
-        bootstrap_runtime_store()
-        graph = fetch_graph_snapshot()
+
+    def mutate_graph(graph: dict[str, Any], stored_bundle: dict[str, Any]) -> dict[str, Any]:
         updated_graph, persisted_ids, persisted_edge_count, merged_ids, learning_policy = persist_selection(
-            working_bundle,
+            stored_bundle,
             selected_ids,
             graph,
             build_index(list(graph.get("nodes") or [])),
@@ -661,146 +846,120 @@ def _grow_source_apply_locked(tool_name: str, payload: McpGrowApplyRequest) -> M
             approved_preview_ids=payload.approved_preview_ids,
             question_limit=payload.question_limit,
         )
-        persisted_ids = _normalized_grow_ids(persisted_ids)
-        if not persisted_ids:
-            return _grow_blocked(tool_name, resolved_brain_id, "zero_persisted_nodes", started, preview_bundle=bundle)
-        before_node_ids = {
-            str(dict(node).get("id") or "").strip()
-            for node in list(graph.get("nodes") or [])
-            if str(dict(node).get("id") or "").strip()
-        }
-        updated_node_ids = {
-            str(dict(node).get("id") or "").strip()
-            for node in list(updated_graph.get("nodes") or [])
-            if str(dict(node).get("id") or "").strip()
-        }
-        if any(node_id in before_node_ids or node_id not in updated_node_ids for node_id in persisted_ids):
-            return _grow_blocked(tool_name, resolved_brain_id, "persisted_node_proof_invalid", started, preview_bundle=bundle)
-        committed_graph = replace_runtime_graph(updated_graph)
-        committed_node_ids = {
-            str(dict(node).get("id") or "").strip()
-            for node in list(dict(committed_graph or {}).get("nodes") or [])
-            if str(dict(node).get("id") or "").strip()
-        }
-        if len(committed_node_ids) <= len(before_node_ids) or any(node_id not in committed_node_ids for node_id in persisted_ids):
-            return _grow_blocked(tool_name, resolved_brain_id, "persistence_mutation_not_verified", started, preview_bundle=bundle)
-    applied_at = _utc_now()
-    source_investigation = {
-        **dict(stored.get("source_investigation") or {}),
-        "investigation_id": investigation_id,
-        "status": "applied",
-        "applied_at": applied_at,
-    }
-    source_formation_contract = {
-        **dict(stored.get("source_formation_contract") or {}),
-        "state": "applied",
-        "mutates_memory": True,
-    }
-    receipt_id = f"grow_apply_{_grow_contract_fingerprint({'apply': apply_fingerprint, 'persisted': persisted_ids})[:24]}"
-    response = McpGrowToolExecutionResponse(
-        schema_version="agvm.mcp_grow_tool_output.v1",
-        brain_id=resolved_brain_id,
-        tool_name=tool_name,
-        status="applied",
-        source_investigation=source_investigation,
-        source_formation_contract=source_formation_contract,
-        memory_operation_lifecycle_contract={
-            "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
-            "operation": "grow",
-            "phase": "applied",
-            "confirm_apply": True,
-            "partial_merge_allowed": False,
-            "receipt_id": receipt_id,
-            "idempotent_replay": False,
-        },
-        preview_bundle=bundle,
-        persist_result={
-            "schema_version": "agvm.core_grow_persist_result.v1",
+        return {
+            "updated_graph": updated_graph,
             "persisted_node_ids": persisted_ids,
             "persisted_edge_count": persisted_edge_count,
             "merged_into_existing_ids": merged_ids,
-            "selected_preview_ids": selected_ids,
-            "idempotent_replay": False,
-            "receipt_id": receipt_id,
-        },
-        learning_policy=learning_policy,
-        completeness={
-            "applied": True,
-            "persisted_node_count": len(persisted_ids),
-            "persisted_edge_count": persisted_edge_count,
-            "idempotent_replay": False,
-            "source_unit_count": len(list(dict(stored.get("source_investigation") or {}).get("source_units") or [])),
-        },
-        mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
-        budget={"credits_required": 0, "runtime": "local_core"},
-    )
-    receipt = {
-        "schema_version": "agvm.core_grow_apply_receipt.v1",
-        "receipt_id": receipt_id,
-        "investigation_id": investigation_id,
-        "brain_id": resolved_brain_id,
-        "preview_fingerprint": preview_fingerprint,
-        "apply_fingerprint": apply_fingerprint,
-        "selected_preview_ids": selected_ids,
-        "persisted_node_ids": persisted_ids,
-        "applied_at": applied_at,
-        "response": response.model_dump(exclude_none=True),
-    }
-    stored.update(
-        {
-            "brain_id": resolved_brain_id,
-            "status": "applied",
-            "source_investigation": source_investigation,
-            "source_formation_contract": source_formation_contract,
-            "preview_bundle": deepcopy(bundle),
-            "preview_fingerprint": preview_fingerprint,
-            "persist_result": deepcopy(response.persist_result),
-            "apply_receipt": receipt,
+            "learning_policy": learning_policy,
         }
+
+    try:
+        with use_runtime_brain(brain_record):
+            apply_result = apply_local_grow_v2_preview_transaction(
+                brain_id=resolved_brain_id,
+                investigation_id=investigation_id,
+                selected_preview_ids=selected_ids,
+                apply_fingerprint=apply_fingerprint,
+                apply_material=apply_material,
+                preview_sha256=preview_fingerprint,
+                attestation_sha256=str(stored.get("attestation_sha256") or ""),
+                mutate_graph=mutate_graph,
+            )
+    except (GrowPreviewBindingStoreError, AiModuleContractError, sqlite3.DatabaseError) as exc:
+        reason = (
+            "grow_v2_apply_transaction_failed"
+            if isinstance(exc, sqlite3.DatabaseError)
+            else str(getattr(exc, "code", "") or exc or "grow_v2_apply_failed")
+        )
+        return _grow_blocked(tool_name, resolved_brain_id, reason, started, preview_bundle=bundle)
+    response = _grow_response_from_durable_apply(
+        tool_name,
+        stored,
+        apply_result,
+        started=started,
     )
-    _GROW_PREVIEW_RUNS[investigation_id] = stored
+    _GROW_PREVIEW_RUNS[investigation_id] = {
+        **deepcopy(stored),
+        "status": "applied",
+        "persist_result": deepcopy(response.persist_result),
+        "apply_receipt": deepcopy(dict(apply_result.get("signed_apply_receipt") or {})),
+    }
     return response
 
 
 def _grow_source_status(tool_name: str, payload: McpGrowApplyRequest) -> McpGrowToolExecutionResponse:
+    started = time.perf_counter()
     investigation = dict(payload.source_investigation or {})
     investigation_id = str(payload.investigation_id or investigation.get("investigation_id") or "").strip()
-    stored = dict(_GROW_PREVIEW_RUNS.get(investigation_id) or {}) if investigation_id else {}
+    requested_brain_id = str(payload.brain_id or investigation.get("brain_id") or "").strip() or None
+    stored: dict[str, Any] = {}
+    if investigation_id:
+        brain_record = _resolve_brain_record(requested_brain_id)
+        resolved_brain_id = _brain_record_id(brain_record)
+        try:
+            with use_runtime_brain(brain_record):
+                stored = dict(
+                    fetch_local_grow_v2_preview(
+                        brain_id=resolved_brain_id,
+                        investigation_id=investigation_id,
+                    )
+                    or {}
+                )
+        except (GrowPreviewBindingStoreError, AiModuleContractError) as exc:
+            reason = str(getattr(exc, "code", "") or exc or "server_preview_invalid")
+            return _grow_blocked(tool_name, resolved_brain_id, reason, started)
+        if not stored:
+            cached = dict(_GROW_PREVIEW_RUNS.get(investigation_id) or {})
+            cached_brain_id = str(cached.get("brain_id") or "").strip()
+            if cached_brain_id and cached_brain_id != resolved_brain_id:
+                cached = {}
+            if cached and not cached.get("preview_bundle"):
+                stored = cached
     if not stored:
-        return McpGrowToolExecutionResponse(
-            schema_version="agvm.mcp_grow_tool_output.v1",
-            brain_id=payload.brain_id,
-            tool_name=tool_name,
-            status="blocked",
-            source_investigation={"investigation_id": investigation_id, "status": "not_found"},
-            memory_operation_lifecycle_contract={"blocked_reason": "investigation_not_found"},
-            budget={"credits_required": 0, "runtime": "local_core"},
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "source_investigation_not_found",
+                "message": "No Grow source investigation exists for this brain.",
+                "brain_id": requested_brain_id,
+            },
         )
-    if str(stored.get("status") or "") == "applied":
-        receipt = dict(stored.get("apply_receipt") or {})
-        response_payload = deepcopy(dict(receipt.get("response") or {}))
-        if response_payload:
-            response_payload["tool_name"] = tool_name
-            return McpGrowToolExecutionResponse(**response_payload)
-        return McpGrowToolExecutionResponse(
-            schema_version="agvm.mcp_grow_tool_output.v1",
-            brain_id=str(stored.get("brain_id") or ""),
-            tool_name=tool_name,
-            status="blocked",
-            source_investigation=dict(stored.get("source_investigation") or {}),
-            source_formation_contract=dict(stored.get("source_formation_contract") or {}),
-            preview_bundle=deepcopy(stored.get("preview_bundle")),
-            memory_operation_lifecycle_contract={"blocked_reason": "exact_apply_receipt_required"},
-            budget={"credits_required": 0, "runtime": "local_core"},
+    if str(stored.get("state") or "") == "consumed":
+        return _grow_response_from_durable_apply(
+            tool_name,
+            stored,
+            {**dict(stored.get("apply_result") or {}), "idempotent_replay": True},
+            started=started,
         )
+    if stored.get("state") and str(stored.get("state")) != "active":
+        return _grow_blocked(
+            tool_name,
+            str(stored.get("brain_id") or "") or None,
+            "server_preview_stale",
+            started,
+            preview_bundle=deepcopy(dict(stored.get("preview_bundle") or {})),
+        )
+    preview_status = (
+        "asking_clarification"
+        if not bool(
+            dict(dict(stored.get("source_formation_contract") or {}).get("apply_contract") or {}).get(
+                "can_apply_now",
+                True,
+            )
+        )
+        else "preview_ready"
+    )
     return McpGrowToolExecutionResponse(
         schema_version="agvm.mcp_grow_tool_output.v1",
         brain_id=str(stored.get("brain_id") or ""),
         tool_name=tool_name,
-        status="preview_ready",
+        status=preview_status,
         source_investigation=dict(stored.get("source_investigation") or {}),
         source_formation_contract=dict(stored.get("source_formation_contract") or {}),
         preview_bundle=deepcopy(stored.get("preview_bundle")),
+        ai_execution_attestation=deepcopy(dict(stored.get("ai_execution_attestation") or {})),
+        investigation_session=deepcopy(dict(stored.get("investigation_session") or {})),
         memory_operation_lifecycle_contract={
             "phase": "preview" if stored.get("preview_bundle") else "source_unit_proof",
             "next_action": "apply with confirm_apply=true" if stored.get("preview_bundle") else "run full preview before apply",
@@ -810,121 +969,52 @@ def _grow_source_status(tool_name: str, payload: McpGrowApplyRequest) -> McpGrow
 
 
 def _write_memory_preview(tool_name: str, payload: McpWriteMemoryPreviewRequest) -> McpGrowToolExecutionResponse:
-    started = time.perf_counter()
-    brain_record = _resolve_brain_record(payload.brain_id)
-    brain_id = _brain_record_id(brain_record)
-    with use_runtime_brain(brain_record):
-        bootstrap_runtime_store()
-        graph = fetch_graph_snapshot()
-        bundle = preview_bundle(
-            payload.text,
-            payload.input_mode,
-            graph,
-            build_index(list(graph.get("nodes") or [])),
-            fetch_atlas(),
-            source_label=payload.source_label,
-            source_type=payload.source_type or "self_memory",
-            source_trust=str(payload.source_trust or "user_asserted"),
-            learning_mode=payload.learning_mode,
-            question_limit=payload.question_limit,
-        )
-    return McpGrowToolExecutionResponse(
-        schema_version="agvm.mcp_grow_tool_output.v1",
-        brain_id=brain_id,
-        tool_name=tool_name,
-        status="preview_ready",
-        preview_bundle=bundle,
-        cognitive_write_plan=dict(bundle.get("cognitive_write_plan") or {}),
-        learning_policy=dict(bundle.get("learning_policy") or {}),
-        write_trace=dict(bundle.get("write_trace") or {}),
-        memory_operation_lifecycle_contract={
-            "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
-            "operation": "write_memory",
-            "phase": "preview",
-            "mutates_memory": False,
-            "next_action": "call write_memory_commit with preview_bundle as bundle and confirm_apply=true",
+    source_type = str(payload.source_type or "self_memory").strip()
+    treat_as = source_type if source_type in {
+        "self_memory",
+        "project_workspace",
+        "public_dossier",
+        "reference_library",
+        "technical_document",
+    } else "self_memory"
+    request = McpGrowSourceRequest(
+        brain_id=payload.brain_id,
+        raw_input=payload.text,
+        input_kind="manual_text" if payload.input_mode == "auto" else "mixed_bundle",
+        source_label=payload.source_label,
+        options={
+            "treat_as": treat_as,
+            "source_trust": str(payload.source_trust or "user_asserted"),
+            "pause_on_questions": payload.learning_mode == "guided_learning",
+            "question_limit": payload.question_limit,
         },
-        completeness={
-            "preview_generated": True,
-            "selected_preview_count": len(_selected_preview_ids(bundle, [])),
-        },
-        mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
-        budget={"credits_required": 0, "runtime": "local_core"},
+        run_preview=True,
     )
+    return _grow_source_preview(tool_name, request)
 
 
 def _write_memory_commit(tool_name: str, payload: McpWriteMemoryCommitRequest) -> McpGrowToolExecutionResponse:
     started = time.perf_counter()
-    bundle = payload.bundle
     brain_id = str(payload.brain_id or "").strip() or None
-    if bundle is None and payload.text:
-        preview = _write_memory_preview(
-            "write_memory_preview",
-            McpWriteMemoryPreviewRequest(
-                brain_id=brain_id,
-                text=payload.text,
-                input_mode=payload.input_mode,
-                source_label=payload.source_label,
-                source_type=payload.source_type,
-                source_trust=payload.source_trust,
-                learning_mode=payload.learning_mode,
-                question_limit=payload.question_limit,
-            ),
-        )
-        bundle = dict(preview.preview_bundle or {})
-        brain_id = preview.brain_id
-    if not bundle:
-        return _grow_blocked(tool_name, brain_id, "preview_bundle_or_text_required", started)
-    if not payload.confirm_apply:
-        return _grow_blocked(tool_name, brain_id, "confirm_apply_required", started, preview_bundle=bundle)
-    brain_record = _resolve_brain_record(brain_id)
-    resolved_brain_id = _brain_record_id(brain_record)
-    with use_runtime_brain(brain_record):
-        bootstrap_runtime_store()
-        graph = fetch_graph_snapshot()
-        selected_ids = _selected_preview_ids(bundle, payload.selected_preview_ids)
-        updated_graph, persisted_ids, persisted_edge_count, merged_ids, learning_policy = persist_selection(
-            bundle,
-            selected_ids,
-            graph,
-            build_index(list(graph.get("nodes") or [])),
-            learning_mode=payload.learning_mode,
-            clarification_answers=payload.clarification_answers,
-            approved_preview_ids=payload.approved_preview_ids,
-            question_limit=payload.question_limit,
-        )
-        replace_runtime_graph(updated_graph)
-    idempotent_replay = bool(selected_ids and not persisted_ids and merged_ids and persisted_edge_count == 0)
-    return McpGrowToolExecutionResponse(
-        schema_version="agvm.mcp_grow_tool_output.v1",
-        brain_id=resolved_brain_id,
-        tool_name=tool_name,
-        status="applied",
-        preview_bundle=bundle,
-        persist_result={
-            "schema_version": "agvm.core_write_persist_result.v1",
-            "persisted_node_ids": persisted_ids,
-            "persisted_edge_count": persisted_edge_count,
-            "merged_into_existing_ids": merged_ids,
-            "selected_preview_ids": selected_ids,
-            "idempotent_replay": idempotent_replay,
-        },
-        learning_policy=learning_policy,
-        memory_operation_lifecycle_contract={
-            "schema_version": "agvm.memory_operation_lifecycle_contract.v1",
+    response = _grow_blocked(tool_name, brain_id, "server_issued_grow_apply_required", started)
+    response.memory_operation_lifecycle_contract.update(
+        {
+            "schema_version": "agvm.memory_operation_lifecycle_contract.v2",
             "operation": "write_memory",
-            "phase": "applied",
-            "confirm_apply": True,
-            "partial_merge_allowed": False,
-        },
-        completeness={
-            "applied": True,
-            "persisted_node_count": len(persisted_ids),
-            "idempotent_replay": idempotent_replay,
-        },
-        mcp_latency_profile={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
-        budget={"credits_required": 0, "runtime": "local_core"},
+            "phase": "blocked",
+            "mutates_memory": False,
+            "legacy_alias": True,
+            "next_action": (
+                "call write_memory_preview or grow_source_preview, then apply the returned "
+                "server-issued investigation with grow_source_apply"
+            ),
+        }
     )
+    response.next_action = (
+        "use grow_source_apply with the server-issued investigation_id, exact selected_preview_ids, "
+        "and confirm_apply=true"
+    )
+    return response
 
 
 def _ask_memory_clarification(tool_name: str, payload: McpClarificationRequest) -> McpGrowToolExecutionResponse:

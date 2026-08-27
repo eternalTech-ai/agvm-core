@@ -72,21 +72,23 @@ MAINTAIN_MANIFEST = LocalModuleManifestDefinition(
     path="/maintain",
     nav_group="operate",
     required_capability="maintain_studio",
-    description="Preview-first Sleep, Evolve and Matrix maintenance.",
-    capabilities=("maintain_studio", "sleep_preview", "evolve_preview", "matrix_calibration", "preview_first_apply"),
+    description="Read-only Sleep, Evolve and Calibrate preview with a reviewed handoff to Detwin Cloud.",
+    capabilities=("maintain_studio", "sleep_preview", "evolve_preview", "matrix_calibration", "cloud_handoff"),
     uses_core_tools=(
+        "brain_profile_preview",
+        "geometry_calibration_preview",
         "matrix_calibration_preview",
-        "matrix_calibration_apply",
         "sleep_preview",
-        "sleep_apply",
         "evolve_preview",
-        "evolve_apply",
         "list_open_questions",
         "list_hypotheses",
         "list_contradictions",
         "list_memory_os_processes",
     ),
-    fallback_message="Maintain Studio is locked. Sign in or activate a Pro local lease before opening this module.",
+    fallback_message=(
+        "Maintain is Cloud-backed. Sign in with an entitled Detwin account to inspect the local preview "
+        "and continue with Hosted MCP."
+    ),
 )
 
 
@@ -148,6 +150,13 @@ def build_local_module_manifest(definition: LocalModuleManifestDefinition) -> di
         "safe_fallback_message": definition.fallback_message,
         "diagnostics": {
             "runtime": "local_core_manifest_projection",
+            "runtime_execution_boundary": (
+                "local_read_only_preview_handoff_to_hosted_mcp"
+                if definition.module_id == MAINTAIN_MODULE_ID
+                else "local_core"
+            ),
+            "local_graph_mutation_allowed": definition.module_id != MAINTAIN_MODULE_ID,
+            "entitlement_bypass_allowed": False,
             "entitlement_reason": status.get("reason"),
             "entitlement_module_state": status.get("module_state"),
             "local_license_present": bool(status.get("lease_present")),

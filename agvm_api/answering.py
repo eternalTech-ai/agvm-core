@@ -10679,6 +10679,18 @@ def _mcp_path_route_events_for_path(
         if probe_ids and str(step.get("probe_id") or "").strip() not in probe_ids:
             continue
         event = dict(step.get("route_decision") or {})
+        if not event and any(
+            key in step
+            for key in (
+                "move_type",
+                "travel_performed",
+                "destination_reached",
+                "studied_node_ids",
+                "hydrated_node_ids",
+                "yielded_match_ids",
+            )
+        ):
+            event = dict(step)
         if event:
             events.append({**event, "probe_id": str(step.get("probe_id") or "").strip() or None, "event_source": "retrieve_step"})
     return events[:32], list(dict.fromkeys(branch_ids))
@@ -11181,7 +11193,8 @@ def build_path_corridor_package(
             if len(intermediate_nodes) >= max_intermediate_nodes:
                 break
         backfill_limit = max(0, max_intermediate_nodes - len(intermediate_nodes))
-        if backfill_limit:
+        route_material_was_retrieved = any(node_id in entries_by_node_id for node_id in node_reason_by_id)
+        if backfill_limit and route_material_was_retrieved:
             intermediate_nodes.extend(
                 _mcp_path_required_section_backfill_nodes(
                     query_text=query_text,
@@ -11389,6 +11402,13 @@ def _mcp_path_discovery_entries(path_corridors: dict[str, Any] | None) -> list[d
     for path in list((path_corridors or {}).get("paths") or []):
         if not isinstance(path, dict):
             continue
+        lifecycle_state = str(path.get("lifecycle_state") or "").strip()
+        if lifecycle_state == "pending" and not any(
+            isinstance(event, dict) for event in list(path.get("route_events") or [])
+        ):
+            # Keep planned corridors in the path ledger, but do not present
+            # reservoir backfill as a discovery before traversal starts.
+            continue
         from_label = str(path.get("from_label") or path.get("from_landing_id") or "Landing").strip()
         to_label = str(path.get("to_label") or path.get("to_landing_id") or "Landing").strip()
         route_kind = str(path.get("route_kind") or "landing_origin_corridor").strip()
@@ -11418,7 +11438,7 @@ def _mcp_path_discovery_entries(path_corridors: dict[str, Any] | None) -> list[d
                     "trace_label": trace_label,
                     "route_kind": route_kind,
                     "changed_context_package": bool(path.get("changed_context_package")),
-                    "lifecycle_state": str(path.get("lifecycle_state") or ""),
+                    "lifecycle_state": lifecycle_state,
                 }
             )
             if len(entries) >= 12:
