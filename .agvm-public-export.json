@@ -195,7 +195,7 @@
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v2",
   "source_clean": true,
-  "source_commit": "78490434c53dace28214fe39f532224d19c1ccca",
+  "source_commit": "bcde71f652e7233da1ba010694ee59d69a0dfb6a",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 79
 }
