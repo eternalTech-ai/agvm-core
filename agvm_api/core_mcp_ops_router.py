@@ -27,11 +27,125 @@ from local_module_manifest_router import (
 )
 from retrieval import build_index
 from runtime_scope import use_runtime_brain
-from source_investigation import (
-    build_source_compiler_handoff_proof,
-    build_source_formation_contract,
-    build_source_investigation_package,
-)
+try:
+    from source_investigation import (
+        build_source_compiler_handoff_proof,
+        build_source_formation_contract,
+        build_source_investigation_package,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "source_investigation":
+        raise
+
+    def build_source_investigation_package(
+        raw_input: str,
+        *,
+        source_label: str | None = None,
+        source_uri: str | None = None,
+        user_instruction: str | None = None,
+        input_kind: str = "auto",
+        options: dict[str, Any] | None = None,
+        investigation_id: str | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the public Core source envelope without private extraction."""
+        del options
+        text = str(raw_input or "").strip()
+        source_kind = str(input_kind or "auto").strip().lower() or "auto"
+        resolved_investigation_id = str(investigation_id or f"mcp-grow-{uuid.uuid4()}")
+        unit_id = f"src_{hashlib.sha256(f'{resolved_investigation_id}:{text}'.encode()).hexdigest()[:16]}"
+        title = str(source_label or source_uri or "Local Grow source").strip()
+        source_unit = {
+            "unit_id": unit_id,
+            "kind": "manual_block" if source_kind == "manual_text" else "external_reference",
+            "title": title,
+            "source_uri": source_uri,
+            "source_type": source_kind,
+            "raw_text": text,
+            "char_count": len(text),
+            "token_estimate": max(1, (len(text) + 3) // 4) if text else 0,
+            "confidence": 0.96 if source_kind == "manual_text" else 0.74,
+            "promotion_role": "primary_evidence" if text else "supporting_evidence",
+            "fact_eligible": bool(text),
+            "status": "available" if text or source_uri else "empty",
+        }
+        section = {
+            "section_id": unit_id,
+            "unit_id": unit_id,
+            "title": title,
+            "kind": source_unit["kind"],
+            "text": text,
+            "source_uri": source_uri,
+            "source_type": source_kind,
+            "promotion_role": source_unit["promotion_role"],
+            "fact_eligible": source_unit["fact_eligible"],
+        }
+        compiler_handoff = {
+            "schema_version": "agvm.compiler_handoff.v1",
+            "recommended_input_mode": "manual" if source_kind == "manual_text" else "auto",
+            "recommended_source_type": source_kind,
+            "structured_sections": [section],
+            "provenance_map": {unit_id: {"source_uri": source_uri, "source_label": title}},
+            "mega_text": text,
+        }
+        return {
+            "schema_version": "agvm.source_investigation.v1",
+            "investigation_id": resolved_investigation_id,
+            "created_at": str(created_at or datetime.now(timezone.utc).isoformat()),
+            "status": "ready" if text or source_uri else "empty",
+            "source_label": title,
+            "source_uri": source_uri,
+            "source_type": source_kind,
+            "user_instruction": user_instruction,
+            "source_units": [source_unit],
+            "source_unit_formation": {
+                "schema_version": "agvm.source_unit_formation.v1",
+                "unit_ids": [unit_id],
+                "source_unit_count": 1,
+            },
+            "compiler_handoff": compiler_handoff,
+            "runtime": {
+                "kind": "public_core",
+                "rich_extraction_available": False,
+            },
+        }
+
+    def build_source_compiler_handoff_proof(
+        source_package: dict[str, Any],
+        preview_bundle: Any | None = None,
+    ) -> dict[str, Any]:
+        source_units = [
+            dict(item)
+            for item in list(source_package.get("source_units") or [])
+            if isinstance(item, dict)
+        ]
+        return {
+            "schema_version": "agvm.compiler_handoff_proof.v1",
+            "investigation_id": str(source_package.get("investigation_id") or ""),
+            "source_unit_count": len(source_units),
+            "has_preview": bool(preview_bundle),
+            "ready": bool(source_units),
+            "problems": [] if source_units else ["no_source_units"],
+        }
+
+    def build_source_formation_contract(
+        source_package: dict[str, Any],
+        preview_bundle: Any | None = None,
+        persist_result: Any | None = None,
+    ) -> dict[str, Any]:
+        del persist_result
+        source_units = [
+            dict(item)
+            for item in list(source_package.get("source_units") or [])
+            if isinstance(item, dict)
+        ]
+        return {
+            "schema_version": "agvm.core_source_formation_contract.v1",
+            "investigation_id": str(source_package.get("investigation_id") or ""),
+            "source_unit_count": len(source_units),
+            "preview_present": bool(preview_bundle),
+            "state": "preview_ready" if preview_bundle else "handoff_ready",
+        }
 from schemas import (
     McpClarificationRequest,
     McpGrowApplyRequest,
