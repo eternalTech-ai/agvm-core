@@ -3861,11 +3861,14 @@ def llm_source_unit_semantic_compile(
     source_investigation_id: str | None = None,
     candidate_target: int | None = None,
     timeout_seconds: float | None = None,
+    api_key_override: str | None = None,
+    model_override: str | None = None,
+    execution_metadata: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     sections = _compact_source_sections_for_semantic_compiler(source_sections)
     if not sections:
         return [], None, "no_source_sections"
-    if not llm_enabled():
+    if api_key_override is None and not llm_enabled():
         return [], None, "llm_disabled"
 
     metamemory = build_metamemory_package("compiler")
@@ -3977,7 +3980,7 @@ def llm_source_unit_semantic_compile(
         f"Traced source units:\n{json.dumps(sections, ensure_ascii=False, sort_keys=True)}"
     )
     payload, error = structured_json(
-        model=compiler_model(),
+        model=model_override or compiler_model(),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         schema_name="agvm_source_unit_semantic_compiler",
@@ -3985,6 +3988,8 @@ def llm_source_unit_semantic_compile(
         timeout=max(1.0, min(float(timeout_seconds or 45.0), 120.0)),
         role="compiler",
         max_output_tokens=16000,
+        api_key_override=api_key_override,
+        execution_metadata=execution_metadata,
     )
     if not payload:
         return [], payload, error
@@ -5786,6 +5791,9 @@ def preview_bundle(
                 source_investigation_id=source_investigation_id,
                 candidate_target=semantic_candidate_target,
                 timeout_seconds=max(12.0, min(float(compiler_timeout_seconds or 45.0), 120.0)),
+                api_key_override=compiler_api_key_override,
+                model_override=compiler_model_override,
+                execution_metadata=compiler_execution_metadata,
             )
             compiled_derived, source_semantic_added = _append_source_section_preview_items(compiled_derived, source_semantic_items)
             if source_semantic_added:
@@ -5854,6 +5862,9 @@ def preview_bundle(
                 source_investigation_id=source_investigation_id,
                 candidate_target=min(32, max(8, len(missing_sections) * 2)),
                 timeout_seconds=max(12.0, min(float(compiler_timeout_seconds or 45.0), 120.0)),
+                api_key_override=compiler_api_key_override,
+                model_override=compiler_model_override,
+                execution_metadata=compiler_execution_metadata,
             )
             if repair_error:
                 source_semantic_error = repair_error
