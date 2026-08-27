@@ -15,7 +15,7 @@
       ".github/ISSUE_TEMPLATE/feature_request.yml": "0e2385da1246b2a3f08b81ce38f0e7d6bce98fa549f44302ac2f34d20d1e1c54",
       ".github/dependabot.yml": "d856231b2865f84124c99ccc802ae7ec1fa7049f011e319d649fc1da6398d510",
       ".github/pull_request_template.md": "ae713e531e753efab163cdfcd1deac87141e590be424f93c29c6971c8da98026",
-      ".github/workflows/ci.yml": "6c85f257681f1ddceced02a639009abb2db9a190faedbf5dcf34b76c8c457454",
+      ".github/workflows/ci.yml": "51bab718f1cc08b8b7eab20195f779db5ae1e40ced1ef40ebcd71377f82af39b",
       ".gitignore": "94583d28b52a2967f3853b6d6a3a2f9c439a62e54f7b5e2e72ab1e1c7e2e3720",
       ".gitleaks.toml": "5a54775734990fd4d14a316e429e8750314b2bac4d31d879489f7cc1ad525d5d",
       "CHANGELOG.md": "d74afb17a2eb05fb8c2a884eabcca8c15e5a92d30e87265deb39baf0e001108a",
@@ -187,7 +187,7 @@
       "agvm_cockpit_prototype/vite.config.d.ts",
       "agvm_cockpit_prototype/vite.config.js"
     ],
-    "tree_sha256": "e78a976943afe67489cce550ad6e36a6a9140d76a6451790bdc8a149668fe1bb"
+    "tree_sha256": "ec8fbd61ef563884cbdc9deab2f0abc068aeafdacbfe2f4ab48690bd24b73503"
   },
   "commentable_file_count": 152,
   "exported_file_count": 167,
@@ -195,7 +195,7 @@
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v2",
   "source_clean": true,
-  "source_commit": "97181714dfe50db3ab2e55de01e95b00693ae3f7",
+  "source_commit": "6ca74d67b04078eedf714af0858a696fa63b7919",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 79
 }
