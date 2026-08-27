@@ -27,7 +27,7 @@
       "LICENSES/Apache-2.0.txt": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
       "NOTICE": "66ffa6754c65bf3bc0fad46d302f52525a2c6a09d7ae76091a962225e02d7a50",
       "README.md": "8eb2d076ebeba879a1111cd8fdb13f464954647d14ebaf3ca2a0a873a465e4ce",
-      "REUSE.toml": "ede2b092c1c2d122d4eb53d99488ffa1654f9879f3c0dccf3250119575c57933",
+      "REUSE.toml": "53fd883c3b2bf0cab9088411e8c7ae90bea92312b68facef08deb72ea3ecb3a7",
       "SECURITY.md": "9d45758f8bfffbcf7dd82fcc2736bffb519f9eb4fc789d4fb2071645910d78d8",
       "SUPPORT.md": "9d68b3ea63835ed7228062a572533b86e917a54833b2374f205590fc0f430cef",
       "THIRD_PARTY_NOTICES.md": "1b314185ddbd571a86253c0f881468b8260f286677839e3f52c48520428f1438",
@@ -187,7 +187,7 @@
       "agvm_cockpit_prototype/vite.config.d.ts",
       "agvm_cockpit_prototype/vite.config.js"
     ],
-    "tree_sha256": "236bcd25512f3dce0fab548063eaf44796d12d80baf9027d861bd2e935076590"
+    "tree_sha256": "8ef6a443a526c33af520bfea932ca172e7fe51df2d6771344ad013d8172aa125"
   },
   "commentable_file_count": 152,
   "exported_file_count": 167,
@@ -195,7 +195,7 @@
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v2",
   "source_clean": true,
-  "source_commit": "a1a30a7bec11516745564becc765f17f45a59b3b",
+  "source_commit": "200ea2c3dae04b9a9c45193e1f372df309b4264a",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 79
 }
