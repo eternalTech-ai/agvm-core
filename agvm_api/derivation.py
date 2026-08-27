@@ -4021,6 +4021,10 @@ def llm_source_unit_semantic_compile(
         if not section:
             continue
         claim_text = preserve_node_raw_text(_strip_generated_source_unit_prefix(str(item.get("raw_text") or item.get("summary") or "").strip()), limit=900)
+        claim_text, _ = _make_source_unit_text_self_contained(
+            text=claim_text,
+            title=str(section.get("title") or source_label or source_unit_id),
+        )
         if len(claim_text) < 36:
             continue
         if crosses_atomic_categories(claim_text):
@@ -4263,7 +4267,7 @@ _CONTEXT_DEPENDENT_SOURCE_START_RE = re.compile(
     r"^\s*(?:"
     r"it|this|that|these|those|he|she|they|his|her|their|"
     r"esso|essa|questo|questa|questi|queste|lui|lei|loro|suo|sua|suoi|sue|"
-    r"the\s+(?:monument|company|project|document|release|source|site|profile|page|team|work)"
+    r"the\s+(?:monument|company|project|program|initiative|platform|document|release|source|site|profile|page|team|work)"
     r")\b",
     re.IGNORECASE,
 )
@@ -4343,13 +4347,16 @@ _SOURCE_CLAIM_ACTION_RE = re.compile(
     r"is|are|was|were|announces?|announced|acquires?|acquired|founds?|founded|"
     r"has|have|lists?|listed|employs?|employed|"
     r"provides?|provided|develops?|developed|specializes?|specialised|specialized|"
+    r"reduces?|reduced|decreases?|decreased|increases?|increased|improves?|improved|"
+    r"links?|linked|collaborates?|collaborated|coordinates?|coordinated|"
     r"focuses?|focused|integrates?|integrated|supports?|supported|creates?|created|"
     r"builds?|building|built|designs?|designed|helps?|helped|connects?|connected|"
     r"shapes?|shaped|believes?|believed|wants?|wanted|am|"
     r"manages?|managed|leads?|led|serves?|served|operates?|operated|"
     r"e|era|sono|annuncia|annunciato|acquisisce|acquisito|fonda|fondato|"
     r"sviluppa|sviluppato|fornisce|specializza|integra|supporta|gestisce|"
-    r"costruisce|costruito|progetta|progettato|crede|vuole|collega"
+    r"costruisce|costruito|progetta|progettato|crede|vuole|collega|collegato|"
+    r"riduce|ridotto|aumenta|aumentato|migliora|migliorato|coordina|coordinato"
     r")\b",
     re.IGNORECASE,
 )
