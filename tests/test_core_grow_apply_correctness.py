@@ -197,7 +197,11 @@ def _apply(
 
 
 @pytest.fixture(autouse=True)
-def _clear_process_cache() -> None:
+def _clear_process_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "AGVM_GROW_PREVIEW_BINDING_SECRET",
+        "test-only-grow-receipt-secret-32-bytes-minimum",
+    )
     grow_router._GROW_PREVIEW_RUNS.clear()
     yield
     grow_router._GROW_PREVIEW_RUNS.clear()
@@ -235,7 +239,8 @@ def test_preview_status_and_apply_survive_process_cache_loss_and_replay_once(
     assert status.ai_execution_attestation["provider"] == "openai_compatible"
     assert applied.status == "applied"
     assert applied.persist_result["idempotent_replay"] is False
-    assert applied.persist_result["signed_apply_receipt"]["signature"].startswith("sha256:")
+    assert applied.persist_result["signed_apply_receipt"]["signature"].startswith("hmac-sha256:")
+    assert applied.persist_result["signed_apply_receipt"]["signature_algorithm"] == "HMAC-SHA256"
     assert replay.status == "applied"
     assert replay.persist_result["idempotent_replay"] is True
     assert replay.persist_result["receipt_id"] == applied.persist_result["receipt_id"]
@@ -411,7 +416,7 @@ def test_persisted_receipt_tamper_is_detected_after_cache_loss(
             ("grow-investigation-1",),
         ).fetchone()
         apply_result = json.loads(str(row["apply_result_json"]))
-        apply_result["signed_apply_receipt"]["signature"] = "sha256:" + "0" * 64
+        apply_result["signed_apply_receipt"]["signature"] = "hmac-sha256:" + "0" * 64
         conn.execute(
             "UPDATE grow_preview_bindings SET apply_result_json = ? WHERE token_id = ?",
             (json.dumps(apply_result), "grow-investigation-1"),
@@ -429,6 +434,49 @@ def test_persisted_receipt_tamper_is_detected_after_cache_loss(
     assert status.memory_operation_lifecycle_contract["blocked_reason"] == (
         "grow_v2_apply_receipt_integrity_invalid"
     )
+
+
+def test_legacy_checksum_receipt_survives_upgrade_without_duplicate_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    brain = _brain(tmp_path, "brain-legacy-receipt")
+    _patch_brain_resolution(monkeypatch, {brain["brain_id"]: brain}, active_brain_id=brain["brain_id"])
+    _store_preview(brain)
+    calls = _patch_persist_selection(monkeypatch)
+    assert _apply(brain["brain_id"]).status == "applied"
+
+    with use_runtime_brain(brain), sqlite_store.connect() as conn:
+        row = conn.execute(
+            "SELECT apply_result_json FROM grow_preview_bindings WHERE token_id = ?",
+            ("grow-investigation-1",),
+        ).fetchone()
+        apply_result = json.loads(str(row["apply_result_json"]))
+        receipt = apply_result["signed_apply_receipt"]
+        receipt["signature_algorithm"] = "SHA-256"
+        receipt.pop("signature_key_id", None)
+        receipt["signature"] = sqlite_store._legacy_local_grow_v2_receipt_checksum(receipt)
+        conn.execute(
+            "UPDATE grow_preview_bindings SET apply_result_json = ? WHERE token_id = ?",
+            (json.dumps(apply_result), "grow-investigation-1"),
+        )
+        conn.commit()
+
+    grow_router._GROW_PREVIEW_RUNS.clear()
+    status = grow_router._grow_source_status(
+        "grow_source_status",
+        grow_router.McpGrowApplyRequest(
+            brain_id=brain["brain_id"],
+            investigation_id="grow-investigation-1",
+        ),
+    )
+    replay = _apply(brain["brain_id"])
+
+    assert status.status == "applied"
+    assert status.persist_result["signed_apply_receipt"]["authenticity"] == "legacy_checksum_only"
+    assert status.persist_result["signed_apply_receipt"]["authenticated_signature"] is False
+    assert replay.persist_result["idempotent_replay"] is True
+    assert calls == {"persist": 1}
 
 
 def test_graph_and_receipt_roll_back_together_when_receipt_write_fails(
@@ -505,3 +553,54 @@ def test_provider_failure_never_persists_preview_or_exposes_apply(
             (sqlite_store.LOCAL_GROW_V2_OPERATION_FAMILY,),
         ).fetchone()[0]
     assert persisted_count == 0
+
+
+@pytest.mark.parametrize("input_kind", ["url", "auto"])
+def test_unfetched_url_stops_before_provider_and_preserves_source_package(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    input_kind: str,
+) -> None:
+    brain = _brain(tmp_path, "brain-url-without-evidence")
+    _patch_brain_resolution(monkeypatch, {brain["brain_id"]: brain}, active_brain_id=brain["brain_id"])
+
+    class ProviderMustNotRun:
+        def preview(self, **_: Any) -> dict[str, Any]:
+            raise AssertionError("provider must not run without acquired source evidence")
+
+    monkeypatch.setattr(
+        grow_router,
+        "build_source_investigation_package",
+        lambda *_args, **_kwargs: {
+            "schema_version": "agvm.source_investigation.v1",
+            "investigation_id": "url-evidence-preflight",
+            "status": "rich_extraction_required",
+            "source_units": [
+                {
+                    "unit_id": "url-reference",
+                    "raw_text": "",
+                    "source_uri": "https://example.com/product-spec",
+                    "fact_eligible": False,
+                    "status": "rich_extraction_required",
+                }
+            ],
+            "compiler_handoff": {"ready": False, "structured_sections": []},
+        },
+    )
+    monkeypatch.setattr(grow_router, "_GROW_ENGINE", ProviderMustNotRun())
+    result = grow_router._grow_source_preview(
+        "grow_source_preview",
+        grow_router.McpGrowSourceRequest(
+            brain_id=brain["brain_id"],
+            raw_input="https://example.com/product-spec",
+            source_uri="https://example.com/product-spec",
+            input_kind=input_kind,
+            run_preview=True,
+        ),
+    )
+
+    assert result.status == "blocked"
+    assert result.memory_operation_lifecycle_contract["blocked_reason"] == "rich_extraction_required"
+    assert result.source_investigation["status"] == "rich_extraction_required"
+    assert result.source_formation_contract["state"] == "blocked"
+    assert result.preview_bundle is None

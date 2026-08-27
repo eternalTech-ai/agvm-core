@@ -23,6 +23,10 @@ FRAMEWORK_ROUTE_PATHS = {
 INTERNAL_SERVICE_ROUTE_PATHS = {
     "/internal/hosted-memory/capabilities",
 }
+PUBLIC_CORE_BRAIN_ROUTE_PATHS = {
+    "/memory/brains/active",
+    "/memory/brains/{brain_id}/sync-snapshot",
+}
 INTERNAL_SERVICE_ROUTE_PREFIXES = (
     "/memory/brains/",
 )
@@ -115,6 +119,14 @@ def route_decision(path: str, settings: EditionSettings) -> RuntimeRouteDecision
         )
     if normalized in FRAMEWORK_ROUTE_PATHS:
         return RuntimeRouteDecision(True, "framework", "fastapi", normalized, "framework route")
+    if normalized in PUBLIC_CORE_BRAIN_ROUTE_PATHS:
+        return RuntimeRouteDecision(
+            True,
+            "core",
+            "agvm_core",
+            normalized,
+            "public core local brain route",
+        )
     if normalized in INTERNAL_SERVICE_ROUTE_PATHS:
         return RuntimeRouteDecision(
             settings.edition in {"cloud", "pro", "dev"},
