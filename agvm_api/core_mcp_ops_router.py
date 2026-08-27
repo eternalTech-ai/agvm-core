@@ -52,8 +52,21 @@ except ModuleNotFoundError as exc:
         del options
         text = str(raw_input or "").strip()
         source_kind = str(input_kind or "auto").strip().lower() or "auto"
+        supplied_uri = str(source_uri or "").strip()
+        supplied_uri_is_web = supplied_uri.lower().startswith(("http://", "https://"))
+        raw_starts_with_web_uri = text.lower().startswith(("http://", "https://"))
+        external_source = source_kind in {"url", "website"} or (
+            source_kind == "auto" and (supplied_uri_is_web or raw_starts_with_web_uri)
+        )
+        evidence_text = text
+        if external_source and supplied_uri:
+            if evidence_text == supplied_uri:
+                evidence_text = ""
+            elif evidence_text.startswith(f"{supplied_uri}\n\nNotes:\n"):
+                evidence_text = evidence_text.removeprefix(f"{supplied_uri}\n\nNotes:\n").strip()
+        fact_eligible = bool(evidence_text) and not external_source
         resolved_investigation_id = str(investigation_id or f"mcp-grow-{uuid.uuid4()}")
-        unit_id = f"src_{hashlib.sha256(f'{resolved_investigation_id}:{text}'.encode()).hexdigest()[:16]}"
+        unit_id = f"src_{hashlib.sha256(f'{resolved_investigation_id}:{evidence_text}'.encode()).hexdigest()[:16]}"
         title = str(source_label or source_uri or "Local Grow source").strip()
         source_unit = {
             "unit_id": unit_id,
@@ -61,20 +74,20 @@ except ModuleNotFoundError as exc:
             "title": title,
             "source_uri": source_uri,
             "source_type": source_kind,
-            "raw_text": text,
-            "char_count": len(text),
-            "token_estimate": max(1, (len(text) + 3) // 4) if text else 0,
+            "raw_text": evidence_text,
+            "char_count": len(evidence_text),
+            "token_estimate": max(1, (len(evidence_text) + 3) // 4) if evidence_text else 0,
             "confidence": 0.96 if source_kind == "manual_text" else 0.74,
-            "promotion_role": "primary_evidence" if text else "supporting_evidence",
-            "fact_eligible": bool(text),
-            "status": "available" if text or source_uri else "empty",
+            "promotion_role": "primary_evidence" if fact_eligible else "supporting_reference",
+            "fact_eligible": fact_eligible,
+            "status": "available" if fact_eligible else "rich_extraction_required" if external_source else "empty",
         }
         section = {
             "section_id": unit_id,
             "unit_id": unit_id,
             "title": title,
             "kind": source_unit["kind"],
-            "text": text,
+            "text": evidence_text,
             "source_uri": source_uri,
             "source_type": source_kind,
             "promotion_role": source_unit["promotion_role"],
@@ -82,17 +95,17 @@ except ModuleNotFoundError as exc:
         }
         compiler_handoff = {
             "schema_version": "agvm.compiler_handoff.v1",
-            "recommended_input_mode": "manual" if source_kind == "manual_text" else "auto",
+            "recommended_input_mode": "manual" if fact_eligible else "auto",
             "recommended_source_type": source_kind,
-            "structured_sections": [section],
+            "structured_sections": [section] if fact_eligible else [],
             "provenance_map": {unit_id: {"source_uri": source_uri, "source_label": title}},
-            "mega_text": text,
+            "mega_text": evidence_text,
         }
         return {
             "schema_version": "agvm.source_investigation.v1",
             "investigation_id": resolved_investigation_id,
             "created_at": str(created_at or datetime.now(timezone.utc).isoformat()),
-            "status": "ready" if text or source_uri else "empty",
+            "status": "ready" if fact_eligible else "rich_extraction_required" if external_source else "empty",
             "source_label": title,
             "source_uri": source_uri,
             "source_type": source_kind,
@@ -119,13 +132,14 @@ except ModuleNotFoundError as exc:
             for item in list(source_package.get("source_units") or [])
             if isinstance(item, dict)
         ]
+        ready = any(bool(unit.get("fact_eligible")) and bool(str(unit.get("raw_text") or "").strip()) for unit in source_units)
         return {
             "schema_version": "agvm.compiler_handoff_proof.v1",
             "investigation_id": str(source_package.get("investigation_id") or ""),
             "source_unit_count": len(source_units),
             "has_preview": bool(preview_bundle),
-            "ready": bool(source_units),
-            "problems": [] if source_units else ["no_source_units"],
+            "ready": ready,
+            "problems": [] if ready else ["rich_extraction_unavailable" if source_units else "no_source_units"],
         }
 
     def build_source_formation_contract(
@@ -658,6 +672,27 @@ def _grow_source_preview(tool_name: str, payload: McpGrowSourceRequest) -> McpGr
         source_units = [_local_core_source_unit(payload, investigation_id)]
         source_package["source_units"] = source_units
     source_unit = source_units[0]
+    source_has_fact_evidence = any(
+        bool(unit.get("fact_eligible"))
+        and bool(str(unit.get("raw_text") or unit.get("text") or "").strip())
+        for unit in source_units
+    )
+    source_requires_rich_extraction = str(source_package.get("status") or "") == "rich_extraction_required"
+    if source_requires_rich_extraction and not source_has_fact_evidence:
+        return _grow_blocked(
+            tool_name,
+            brain_id,
+            "rich_extraction_required",
+            started,
+            source_investigation=source_package,
+            source_formation_contract={
+                "schema_version": "agvm.core_source_formation_contract.v2",
+                "mode": "source_evidence_preflight",
+                "state": "blocked",
+                "mutates_memory": False,
+                "blocked_reason": "rich_extraction_required",
+            },
+        )
     if not payload.run_preview:
         source_investigation = source_package
         compiler_handoff_proof = build_source_compiler_handoff_proof(source_package)
@@ -1181,12 +1216,16 @@ def _grow_blocked(
     started: float,
     *,
     preview_bundle: dict[str, Any] | None = None,
+    source_investigation: dict[str, Any] | None = None,
+    source_formation_contract: dict[str, Any] | None = None,
 ) -> McpGrowToolExecutionResponse:
     return McpGrowToolExecutionResponse(
         schema_version="agvm.mcp_grow_tool_output.v1",
         brain_id=brain_id,
         tool_name=tool_name,
         status="blocked",
+        source_investigation=source_investigation or {},
+        source_formation_contract=source_formation_contract or {},
         preview_bundle=preview_bundle,
         memory_operation_lifecycle_contract={
             "schema_version": "agvm.memory_operation_lifecycle_contract.v1",

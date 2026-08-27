@@ -14,7 +14,7 @@ from typing import Any
 
 from source_security import sanitize_source_uri_for_persistence
 
-from ai_modules_v2 import validate_grow_compiler_payload
+from ai_modules_v2 import AiModuleContractError, validate_grow_compiler_payload
 from config import BUCKET_SIZE, CLAIM_MEMORY_TYPES, ENTITY_MEMORY_TYPES, FACET_FIELDS, ROUTING_FIELDS
 from llm import compiler_model, llm_enabled, structured_json
 from metamemory import build_metamemory_package
@@ -3984,7 +3984,7 @@ def llm_source_unit_semantic_compile(
         schema=schema,
         timeout=max(1.0, min(float(timeout_seconds or 45.0), 120.0)),
         role="compiler",
-        max_output_tokens=9000,
+        max_output_tokens=16000,
     )
     if not payload:
         return [], payload, error
@@ -5420,7 +5420,47 @@ def preview_bundle(
     if require_ai and not compiler_payload:
         raise ValueError(f"grow_ai_unavailable:{compiler_error or 'provider_output_missing'}")
     if require_ai:
-        compiler_payload = validate_grow_compiler_payload(compiler_payload)
+        validation_error: AiModuleContractError | None = None
+        for repair_attempt in range(3):
+            try:
+                compiler_payload = validate_grow_compiler_payload(compiler_payload)
+                validation_error = None
+                break
+            except AiModuleContractError as exc:
+                validation_error = exc
+                if compiler_payload_override is not None or repair_attempt >= 2:
+                    break
+                repair_context = dict(resolved_source_context)
+                prior_instruction = str(repair_context.get("operator_instruction") or "").strip()
+                repair_context["operator_instruction"] = "\n".join(
+                    part
+                    for part in (
+                        prior_instruction,
+                        (
+                            "Repair the previous compiler contract failure "
+                            f"({exc.code}). Recompile the same grounded source. Every primary and derived node "
+                            "must include all 12 routing_semantic_scores and all 12 routing_facets, each as a "
+                            "finite number from 0.0 through 1.0. Preserve atomic source-grounded memories; do "
+                            "not remove useful evidence merely to satisfy the schema."
+                        ),
+                    )
+                    if part
+                )
+                compiler_payload, compiler_error = llm_memory_compile(
+                    text,
+                    input_mode,
+                    identity_nucleus=identity_nucleus,
+                    nearby_context=nearby_context,
+                    timeout_seconds=compiler_timeout_seconds,
+                    source_context=repair_context,
+                    api_key_override=compiler_api_key_override,
+                    model_override=compiler_model_override,
+                    execution_metadata=compiler_execution_metadata,
+                )
+                if not compiler_payload:
+                    raise ValueError(f"grow_ai_unavailable:{compiler_error or 'provider_output_missing'}") from exc
+        if validation_error is not None:
+            raise validation_error
     derivation_mode = "llm" if compiler_payload else "heuristic"
     if compiler_error and compiler_error not in {"llm_disabled", "large_source_units_direct_preview"}:
         warnings.append({"code": "compiler_fallback", "message": f"LLM compiler unavailable, fallback to heuristic compilation: {compiler_error}"})
@@ -5720,6 +5760,7 @@ def preview_bundle(
         )
         if should_run_source_semantic_compiler:
             semantic_candidate_target = 8
+            evidence_char_target = min(32, max(8, math.ceil(len(str(text or "")) / 2800)))
             source_context_purpose = str(resolved_source_context.get("source_purpose") or "").strip().lower()
             if source_context_purpose == "self_memory":
                 semantic_candidate_target = (
@@ -5731,6 +5772,7 @@ def preview_bundle(
                 semantic_candidate_target = min(32, max(8, source_section_count))
             else:
                 semantic_candidate_target = min(18, max(6, source_section_count * 2))
+            semantic_candidate_target = max(semantic_candidate_target, evidence_char_target)
             source_semantic_items, source_semantic_payload, source_semantic_error = llm_source_unit_semantic_compile(
                 source_sections=source_sections,
                 source_label=source_label,
@@ -5786,6 +5828,54 @@ def preview_bundle(
             and str(section.get("section_id") or section.get("unit_id") or "").strip()
         }
         missing_source_unit_ids = sorted(required_source_unit_ids - set(source_ai_items_by_unit))
+        for repair_attempt in range(2):
+            if not missing_source_unit_ids:
+                break
+            missing_sections = [
+                dict(section)
+                for section in source_sections
+                if isinstance(section, dict)
+                and str(section.get("section_id") or section.get("unit_id") or "").strip()
+                in set(missing_source_unit_ids)
+            ]
+            repair_items, _, repair_error = llm_source_unit_semantic_compile(
+                source_sections=missing_sections,
+                source_label=source_label,
+                source_type=source_type,
+                source_trust=source_trust,
+                source_purpose=str(resolved_source_context.get("source_purpose") or ""),
+                operator_instruction=(
+                    str(resolved_source_context.get("operator_instruction") or "")
+                    + " Cover every supplied source unit; this is a targeted structured repair."
+                ),
+                identity_nucleus=identity_nucleus,
+                nearby_context=nearby_context,
+                source_unit_formation=source_unit_formation,
+                source_investigation_id=source_investigation_id,
+                candidate_target=min(32, max(8, len(missing_sections) * 2)),
+                timeout_seconds=max(12.0, min(float(compiler_timeout_seconds or 45.0), 120.0)),
+            )
+            if repair_error:
+                source_semantic_error = repair_error
+            compiled_derived, repaired_count = _append_source_section_preview_items(
+                compiled_derived,
+                repair_items,
+            )
+            if repaired_count:
+                warnings.append(
+                    {
+                        "code": "source_unit_semantic_compiler_repair",
+                        "message": (
+                            f"Recovered {repaired_count} source-unit candidate(s) during structured AI repair "
+                            f"attempt {repair_attempt + 1}."
+                        ),
+                    }
+                )
+                for semantic_item in repair_items:
+                    semantic_unit_id = str(semantic_item.get("source_unit_id") or "").strip()
+                    if semantic_unit_id and has_ai_semantic_vector(semantic_item):
+                        source_ai_items_by_unit[semantic_unit_id].append(semantic_item)
+            missing_source_unit_ids = sorted(required_source_unit_ids - set(source_ai_items_by_unit))
         if missing_source_unit_ids:
             reason = source_semantic_error or "provider_did_not_cover_all_fact_eligible_source_units"
             raise ValueError(

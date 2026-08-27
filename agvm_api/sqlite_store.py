@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -6939,6 +6940,15 @@ def _local_grow_v2_preview_ids(preview_bundle: dict[str, Any]) -> list[str]:
 
 def _local_grow_v2_receipt_signature(receipt: dict[str, Any]) -> str:
     unsigned = {key: value for key, value in receipt.items() if key != "signature"}
+    secret = str(os.getenv("AGVM_GROW_PREVIEW_BINDING_SECRET") or "").encode("utf-8")
+    if len(secret) < 32:
+        raise _grow_preview_binding_error("grow_v2_receipt_signing_secret_unavailable", status_code=503)
+    material = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return f"hmac-sha256:{hmac.new(secret, material, hashlib.sha256).hexdigest()}"
+
+
+def _legacy_local_grow_v2_receipt_checksum(receipt: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in receipt.items() if key != "signature"}
     return f"sha256:{canonical_sha256(unsigned)}"
 
 
@@ -6982,15 +6992,34 @@ def _validated_local_grow_v2_row(row: sqlite3.Row) -> dict[str, Any]:
     apply_result = _dict_value(record.get("apply_result"))
     signed_receipt = _dict_value(apply_result.get("signed_apply_receipt"))
     if str(record.get("state") or "") == "consumed":
+        signature_algorithm = str(signed_receipt.get("signature_algorithm") or "").upper()
+        modern_receipt_valid = signature_algorithm == "HMAC-SHA256" and hmac.compare_digest(
+            str(signed_receipt.get("signature") or ""),
+            _local_grow_v2_receipt_signature(signed_receipt),
+        )
+        legacy_receipt_valid = signature_algorithm == "SHA-256" and hmac.compare_digest(
+            str(signed_receipt.get("signature") or ""),
+            _legacy_local_grow_v2_receipt_checksum(signed_receipt),
+        )
         if (
             signed_receipt.get("schema_version") != LOCAL_GROW_V2_APPLY_RECEIPT_SCHEMA_VERSION
             or str(signed_receipt.get("investigation_id") or "") != investigation_id
             or str(signed_receipt.get("brain_id") or "") != brain_id
             or str(signed_receipt.get("preview_sha256") or "") != preview_sha256
             or str(signed_receipt.get("attestation_sha256") or "") != attestation_sha256
-            or str(signed_receipt.get("signature") or "") != _local_grow_v2_receipt_signature(signed_receipt)
+            or not (modern_receipt_valid or legacy_receipt_valid)
         ):
             raise _grow_preview_binding_error("grow_v2_apply_receipt_integrity_invalid")
+        if legacy_receipt_valid:
+            signed_receipt = {
+                **signed_receipt,
+                "authenticity": "legacy_checksum_only",
+                "authenticated_signature": False,
+            }
+            apply_result = {
+                **apply_result,
+                "signed_apply_receipt": signed_receipt,
+            }
     return {
         **record,
         "investigation_id": investigation_id,
@@ -7007,6 +7036,7 @@ def _validated_local_grow_v2_row(row: sqlite3.Row) -> dict[str, Any]:
         "attestation_sha256": attestation_sha256,
         "attestation_fingerprint": attestation_sha256,
         "status": "applied" if str(record.get("state") or "") == "consumed" else str(binding.get("status") or "preview_ready"),
+        "apply_result": apply_result,
         "signed_apply_receipt": signed_receipt,
     }
 
@@ -7276,7 +7306,8 @@ def apply_local_grow_v2_preview_transaction(
                 "selected_preview_ids": normalized_selected_ids,
                 "persisted_node_ids": persisted_node_ids,
                 "applied_at": applied_at,
-                "signature_algorithm": "SHA-256",
+                "signature_algorithm": "HMAC-SHA256",
+                "signature_key_id": "local-managed-grow-v1",
             }
             signed_receipt["signature"] = _local_grow_v2_receipt_signature(signed_receipt)
             committed = {
