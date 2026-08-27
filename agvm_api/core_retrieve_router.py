@@ -14,10 +14,17 @@ from contextlib import contextmanager
 from typing import Any, AsyncIterator, Iterator
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from brain_health import build_brain_health_report, build_mcp_brain_health_output
+from health_ai_diagnosis import runtime_health_ai_diagnoser
 from brain_registry import BrainRegistryError, resolve_brain_scope
+from feedback_ledger_runtime import (
+    persisted_feedback_events_for_health,
+    record_feedback_event,
+    record_mcp_evidence,
+    record_search_terminal,
+)
 from answering import (
     build_context_payload,
     build_document_workspace_package,
@@ -30,10 +37,13 @@ from mcp_retrieval import (
     build_mcp_route_trace_output,
 )
 from retrieval import (
+    build_search_ai_http_block_payload,
+    build_search_ai_blocked_result,
     build_landing_metadata,
     build_search_map_2d_truth,
     normalize_retrieve_response_payload,
     prepare_runtime_plan,
+    require_search_ai_admission,
     request_search_supersede,
     retrieve_runtime,
 )
@@ -57,7 +67,7 @@ from sqlite_store import (
     append_search_event,
     apply_runtime_retention_policy,
     create_search_session,
-    fail_search_session,
+    fail_search_session as _store_fail_search_session,
     fetch_active_search_session_by_thread,
     fetch_atlas,
     fetch_cluster_runtime,
@@ -71,7 +81,7 @@ from sqlite_store import (
     fetch_search_events,
     fetch_search_session,
     fetch_search_trace,
-    finalize_search_session,
+    finalize_search_session as _store_finalize_search_session,
     mark_search_running,
     preview_runtime_retention_policy,
     save_search_plan,
@@ -123,6 +133,24 @@ _MCP_SURFACE_FIELDS = (
 )
 
 
+def finalize_search_session(search_id: str, result_payload: dict[str, Any]) -> None:
+    _store_finalize_search_session(search_id, result_payload)
+    record_search_terminal(
+        brain_id=str(current_brain_id() or result_payload.get("brain_id") or ""),
+        session_id=search_id,
+        result=result_payload,
+    )
+
+
+def fail_search_session(search_id: str, error_message: str) -> None:
+    _store_fail_search_session(search_id, error_message)
+    record_search_terminal(
+        brain_id=str(current_brain_id() or ""),
+        session_id=search_id,
+        failed_reason=error_message,
+    )
+
+
 def create_core_retrieve_router() -> APIRouter:
     router = APIRouter()
 
@@ -134,15 +162,31 @@ def create_core_retrieve_router() -> APIRouter:
     def memory_query_endpoint(payload: RetrieveRequest) -> RetrieveResponse:
         with _brain_request_scope(_payload_brain_id(payload), require_retrieval_ready=True):
             normalized_payload = _normalized_retrieve_request(payload)
-            search_id, _plan = _create_planned_search_session(normalized_payload)
+            admission = _public_search_ai_admission(normalized_payload)
+            if str(admission.get("status") or "") != "admitted":
+                blocked = build_search_ai_blocked_result(normalized_payload, admission)
+                return RetrieveResponse(**_retrieve_response_schema_safe(blocked))
+            search_id, _plan = _create_planned_search_session(
+                normalized_payload,
+                ai_admission=admission,
+            )
             result = _run_search_session_sync(search_id)
             return RetrieveResponse(**_retrieve_response_schema_safe(result))
 
     @router.post("/memory/query-plan", response_model=SearchPlanResponse)
-    def memory_query_plan_endpoint(payload: RetrieveRequest) -> SearchPlanResponse:
+    def memory_query_plan_endpoint(payload: RetrieveRequest) -> SearchPlanResponse | JSONResponse:
         with _brain_request_scope(_payload_brain_id(payload), require_retrieval_ready=True):
             normalized_payload = _normalized_retrieve_request(payload)
-            search_id, plan = _create_planned_search_session(normalized_payload)
+            admission = _public_search_ai_admission(normalized_payload)
+            if str(admission.get("status") or "") != "admitted":
+                return JSONResponse(
+                    status_code=503,
+                    content=build_search_ai_http_block_payload(admission),
+                )
+            search_id, plan = _create_planned_search_session(
+                normalized_payload,
+                ai_admission=admission,
+            )
             return _search_plan_response(search_id, normalized_payload, plan)
 
     @router.post("/memory/query-run", response_model=SearchRunResponse)
@@ -152,6 +196,17 @@ def create_core_retrieve_router() -> APIRouter:
             if not session:
                 raise HTTPException(status_code=404, detail="search_not_found")
             request_payload = dict(session.get("request") or {})
+            stored_plan = dict(session.get("plan") or {})
+            stored_admission = dict(stored_plan.get("search_ai_admission") or {})
+            if str(stored_admission.get("status") or "") != "admitted":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "search_ai_admission_missing",
+                        "message": "Create a new search plan with an available AI provider before running it.",
+                        "charged_units": 0,
+                    },
+                )
             session_brain_id = str(request_payload.get("brain_id") or current_brain_id() or "").strip() or None
             thread_brain_record = brain_record
             if session_brain_id and session_brain_id != current_brain_id():
@@ -252,6 +307,34 @@ def create_core_retrieve_router() -> APIRouter:
                 blackboard=dict(trace.get("blackboard") or {}),
             )
 
+    @router.post("/memory/query-feedback")
+    def memory_query_feedback_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+        event_kind = str(payload.get("event_kind") or "").strip().lower()
+        if event_kind not in {"explicit_review", "explicit_correct"}:
+            raise HTTPException(status_code=422, detail="feedback_event_kind_invalid")
+        with _brain_request_scope(str(payload.get("brain_id") or "").strip() or None):
+            search_id = str(payload.get("search_id") or "").strip() or None
+            if search_id:
+                session = fetch_search_session(search_id)
+                if not session:
+                    raise HTTPException(status_code=404, detail="search_not_found")
+                session_brain_id = str(dict(session.get("request") or {}).get("brain_id") or "").strip()
+                if session_brain_id and session_brain_id != current_brain_id():
+                    raise HTTPException(status_code=403, detail="feedback_search_brain_scope_mismatch")
+            outcome = record_feedback_event(
+                event_kind=event_kind,
+                brain_id=str(current_brain_id() or ""),
+                session_id=search_id,
+                source_event_id=str(payload.get("event_id") or "").strip() or None,
+                node_ids=payload.get("node_ids") or payload.get("evidence_node_ids"),
+                document_ids=payload.get("document_ids"),
+                verdict=payload.get("verdict"),
+                status=payload.get("status"),
+            )
+            if outcome.get("status") != "recorded":
+                raise HTTPException(status_code=503, detail=outcome)
+            return outcome
+
     @router.get("/memory/query-stream/{search_id}")
     async def memory_query_stream_endpoint(
         search_id: str,
@@ -309,7 +392,15 @@ def create_core_retrieve_router() -> APIRouter:
     @router.post("/memory/mcp/retrieve-document", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/retrieve-document", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     def mcp_retrieve_document_endpoint(payload: McpRetrievalToolRequest) -> McpToolExecutionResponse:
-        return _run_mcp_retrieval_tool("retrieve_document", payload)
+        with _brain_request_scope(_payload_brain_id(payload), require_retrieval_ready=True):
+            response = _run_mcp_retrieval_tool("retrieve_document", payload)
+            record_mcp_evidence(
+                brain_id=str(response.brain_id or current_brain_id() or ""),
+                event_kind="evidence_hydrated",
+                payload=_model_dump(response),
+                session_id=response.search_id,
+            )
+            return response
 
     @router.post("/memory/mcp/retrieve-document-workspace", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/retrieve-document-workspace", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
@@ -363,14 +454,28 @@ def create_core_retrieve_router() -> APIRouter:
                         include_answer_demo=payload.include_answer_demo,
                         include_raw_text=payload.include_raw_text,
                     )
-                    return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+                    response = McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+                    record_mcp_evidence(
+                        brain_id=str(response.brain_id or current_brain_id() or ""),
+                        event_kind="evidence_opened",
+                        payload=_model_dump(response),
+                        session_id=payload.search_id,
+                    )
+                    return response
 
             output = build_mcp_route_trace_output(
                 search_id=payload.search_id,
                 trace=trace,
                 include_debug=payload.include_debug,
             )
-            return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+            response = McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+            record_mcp_evidence(
+                brain_id=str(response.brain_id or current_brain_id() or ""),
+                event_kind="evidence_opened",
+                payload=_model_dump(response),
+                session_id=payload.search_id,
+            )
+            return response
 
     @router.post("/memory/mcp/inspect-path-corridor", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
     @router.post("/mcp/inspect-path-corridor", response_model=McpToolExecutionResponse, response_model_exclude_none=True)
@@ -387,7 +492,13 @@ def create_core_retrieve_router() -> APIRouter:
                 cluster=cluster,
                 include_debug=payload.include_debug,
             )
-            return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+            response = McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+            record_mcp_evidence(
+                brain_id=str(response.brain_id or current_brain_id() or ""),
+                event_kind="evidence_opened",
+                payload={**_model_dump(response), "node_id": payload.node_id},
+            )
+            return response
 
     @router.get("/memory/brain-health")
     def memory_brain_health_endpoint(
@@ -511,10 +622,15 @@ def _attach_tool_brain_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+def _public_search_ai_admission(payload: RetrieveRequest) -> dict[str, Any]:
+    return require_search_ai_admission(payload, fetch_identity_nucleus())
+
+
 def _create_planned_search_session(
     payload: RetrieveRequest,
     *,
     persist_plan: bool = True,
+    ai_admission: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     plan_started_at = time.perf_counter()
     normalized_payload = _normalized_retrieve_request(payload)
@@ -537,7 +653,13 @@ def _create_planned_search_session(
             "started_at": utc_timestamp(),
         },
     )
-    plan = prepare_runtime_plan(normalized_payload, _runtime_atlas(), fetch_identity_nucleus(), defer_planner_seed=True)
+    plan = prepare_runtime_plan(
+        normalized_payload,
+        _runtime_atlas(),
+        fetch_identity_nucleus(),
+        defer_planner_seed=True,
+        ai_admission=ai_admission,
+    )
     plan_ms = round((time.perf_counter() - plan_started_at) * 1000.0, 2)
     landing_metadata = build_landing_metadata(list(plan.get("probes") or []), list(plan.get("branches") or []))
     search_map_2d_truth = build_search_map_2d_truth(
@@ -654,9 +776,10 @@ def _create_planned_search_session(
 def _search_plan_response(search_id: str, payload: RetrieveRequest, plan: dict[str, Any]) -> SearchPlanResponse:
     planner_mode = str(plan.get("planner_mode") or "heuristic")
     decomposition_mode = str(plan.get("decomposition_mode") or "heuristic")
+    existing_planner_runtime = dict(plan.get("planner_runtime") or {})
     planner_runtime = {
-        **dict(plan.get("planner_runtime") or {}),
-        "planner_path": "hybrid_initial" if planner_mode == "hybrid" else ("llm" if planner_mode == "llm" else "fallback"),
+        **existing_planner_runtime,
+        "planner_path": str(existing_planner_runtime.get("planner_path") or "ai_attested"),
     }
     return SearchPlanResponse(
         search_id=search_id,
@@ -734,6 +857,38 @@ def _run_search_session_sync(
         "brain_id": current_brain_id(),
         "core_retrieve_router": True,
     }
+    plan_admission = dict(plan.get("search_ai_admission") or {})
+    if str(plan_admission.get("status") or "") != "admitted":
+        blocked = _attach_brain_metadata(
+            normalize_retrieve_response_payload(
+                build_search_ai_blocked_result(
+                    query,
+                    {
+                        "status": "blocked",
+                        "reason": "blocked_ai_attestation_invalid",
+                        "provider_error": "search_ai_admission_missing",
+                        "chargeable": False,
+                        "charged_units": 0,
+                    },
+                    search_id=search_id,
+                )
+            )
+        )
+        blocked = _attach_mcp_surface_fields(
+            blocked,
+            tool_name=_tool_name_for_session(request_payload, plan),
+        )
+        finalize_search_session(search_id, blocked)
+        append_search_event(
+            search_id,
+            "search_failed",
+            {
+                "brain_id": current_brain_id(),
+                "error": "search_ai_admission_missing",
+                "charged_units": 0,
+            },
+        )
+        return blocked
     if prepared_plan is None and prepared_request is None:
         save_search_plan(search_id, plan)
     mark_search_running(search_id)
@@ -970,6 +1125,8 @@ def _mcp_plan_storage_snapshot(plan: dict[str, Any]) -> dict[str, Any]:
     compact_planner_runtime["plan_transport"] = "in_memory_first_package_then_compact_persistence"
     return {
         "brain_id": plan.get("brain_id"),
+        "search_ai_admission": dict(plan.get("search_ai_admission") or {}),
+        "ai_execution_attestation": dict(plan.get("ai_execution_attestation") or {}),
         "planner_mode": plan.get("planner_mode"),
         "decomposition_mode": plan.get("decomposition_mode"),
         "stop_threshold": plan.get("stop_threshold"),
@@ -1295,55 +1452,59 @@ def _mcp_index_first_package(
 def _run_mcp_retrieval_tool(tool_name: str, payload: McpRetrievalToolRequest) -> McpToolExecutionResponse:
     with _brain_request_scope(_payload_brain_id(payload), require_retrieval_ready=True) as brain_record:
         request = _mcp_retrieve_request(tool_name, payload)
+        admission = _public_search_ai_admission(request)
+        if str(admission.get("status") or "") != "admitted":
+            result = _attach_brain_metadata(
+                normalize_retrieve_response_payload(
+                    build_search_ai_blocked_result(request, admission)
+                )
+            )
+            output = build_mcp_retrieval_tool_output(
+                tool_name,
+                result,
+                include_answer_demo=payload.include_answer_demo,
+                include_raw_text=payload.include_raw_text,
+            )
+            return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
         if tool_name == "retrieve_document" and (
             payload.include_raw_text or payload.document_text_policy in {"top_raw", "all_raw"}
         ):
             direct_response = _core_direct_document_response(payload=payload, request=request)
             if direct_response is not None:
-                return direct_response
-        if tool_name == "retrieve_context":
-            search_id = _create_unplanned_search_session(request)
-            first_result = _mcp_index_first_package(search_id=search_id, request=request)
-            first_package_signal = _register_mcp_first_package_waiter(search_id)
-            if first_result:
-                first_result = _attach_brain_metadata(first_result)
-                first_result = _attach_mcp_surface_fields(first_result, tool_name=tool_name)
-                save_search_result_snapshot(search_id, first_result)
-                _start_search_thread(
-                    search_id,
-                    brain_record,
-                    prepared_request=_serialize_retrieve_request(request),
-                )
-                _consume_mcp_first_package(search_id)
-                output = build_mcp_retrieval_tool_output(
-                    tool_name,
-                    first_result,
-                    include_answer_demo=payload.include_answer_demo,
-                    include_raw_text=payload.include_raw_text,
-                )
-                return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
-            _start_search_thread(
-                search_id,
-                brain_record,
-                prepared_request=_serialize_retrieve_request(request),
-            )
-            plan: dict[str, Any] = {}
-        else:
-            search_id, plan = _create_planned_search_session(request, persist_plan=False)
-            first_package_signal = _register_mcp_first_package_waiter(search_id)
-            plan["mcp_tool_name"] = tool_name
-            plan["planner_runtime"] = {
-                **dict(plan.get("planner_runtime") or {}),
-                "mcp_tool_name": tool_name,
-                "mcp_entrypoint_tool": tool_name,
-                "core_retrieve_router": True,
-            }
-            _start_search_thread(
-                search_id,
-                brain_record,
-                prepared_plan=plan,
-                prepared_request=_serialize_retrieve_request(request),
-            )
+                direct_payload = _model_dump(direct_response)
+                direct_payload["semantic_contract_runtime"] = {
+                    **dict(direct_payload.get("semantic_contract_runtime") or {}),
+                    "schema_version": "agvm.semantic_contract_runtime.v2",
+                    "status": "completed",
+                    "source": "search_ai_admission_v2",
+                    "material": True,
+                    "ai_required": True,
+                    "provider_state": "attested",
+                    "fallback_used": False,
+                    "ai_execution_attestation": dict(
+                        admission.get("ai_execution_attestation") or {}
+                    ),
+                }
+                return McpToolExecutionResponse(**direct_payload)
+        search_id, plan = _create_planned_search_session(
+            request,
+            persist_plan=False,
+            ai_admission=admission,
+        )
+        first_package_signal = _register_mcp_first_package_waiter(search_id)
+        plan["mcp_tool_name"] = tool_name
+        plan["planner_runtime"] = {
+            **dict(plan.get("planner_runtime") or {}),
+            "mcp_tool_name": tool_name,
+            "mcp_entrypoint_tool": tool_name,
+            "core_retrieve_router": True,
+        }
+        _start_search_thread(
+            search_id,
+            brain_record,
+            prepared_plan=plan,
+            prepared_request=_serialize_retrieve_request(request),
+        )
         wait_seconds = _MCP_FIRST_PACKAGE_WAIT_SECONDS.get(str(payload.retrieval_mode or "balanced"), 4.8)
         first_package_signal.wait(timeout=wait_seconds)
         result = _consume_mcp_first_package(search_id)
@@ -1681,7 +1842,14 @@ def _inspect_mcp_result(tool_name: str, payload: McpInspectionRequest) -> McpToo
             include_answer_demo=payload.include_answer_demo,
             include_raw_text=payload.include_raw_text,
         )
-        return McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+        response = McpToolExecutionResponse(**_attach_tool_brain_metadata(output))
+        record_mcp_evidence(
+            brain_id=str(response.brain_id or current_brain_id() or ""),
+            event_kind="evidence_opened",
+            payload=_model_dump(response),
+            session_id=payload.search_id,
+        )
+        return response
 
 
 def _completed_search_result(search_id: str) -> dict[str, Any]:
@@ -1814,15 +1982,21 @@ def _build_memory_brain_health_payload(*, limit: int = 25, include_issue_samples
         busy_timeout_ms=2000,
     )
     recent_maintenance_runs = fetch_recent_maintenance_runs(limit=limit, include_report=False)
+    persisted_feedback_events = persisted_feedback_events_for_health(
+        brain_id=str(current_brain_id() or ""),
+        limit=max(limit * 8, 100),
+    )
     metamemory = metamemory_snapshot() if callable(metamemory_snapshot) else {}
     report = build_brain_health_report(
         graph,
         brain_id=current_brain_id(),
         identity_nucleus=identity_nucleus,
         recent_search_sessions=recent_search_sessions,
+        recent_feedback_events=persisted_feedback_events,
         recent_maintenance_runs=recent_maintenance_runs,
         metamemory=metamemory,
         calibration_snapshot=fetch_heuristic_calibration_snapshot(),
+        health_ai_diagnoser=runtime_health_ai_diagnoser(),
     )
     if not include_issue_samples:
         checks = dict(report.get("checks") or {})

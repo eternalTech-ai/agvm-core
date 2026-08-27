@@ -9,10 +9,13 @@ from typing import Any
 from retrieval_limits import DEFAULT_RETRIEVAL_MAX_MATCHES, MAX_RETRIEVAL_MATCHES
 
 from mcp_tool_registration import (
+    LOCAL_CORE_MAINTAIN_CLOUD_HANDOFF_TOOL_NAMES,
     MCP_TOOL_REGISTRATION_STATE,
     build_mcp_module_tool_registration_summary,
     build_mcp_tool_registration,
     build_module_requirement_from_registration,
+    local_core_tool_is_discoverable,
+    mark_local_core_cloud_handoff_registration,
     validate_mcp_tool_registration,
 )
 
@@ -89,6 +92,7 @@ REQUIRED_MCP_TOOL_NAMES = [
     "geometry_calibration_rollback",
     "matrix_calibration_preview",
     "matrix_calibration_apply",
+    "matrix_calibration_rollback",
     "sleep_preview",
     "sleep_apply",
     "sleep_rollback",
@@ -147,6 +151,7 @@ PR12J_D_IMPLEMENTED_TOOL_NAMES = {
     "geometry_calibration_rollback",
     "matrix_calibration_preview",
     "matrix_calibration_apply",
+    "matrix_calibration_rollback",
     "sleep_preview",
     "sleep_apply",
     "sleep_rollback",
@@ -388,7 +393,7 @@ def _source_apply_input_schema() -> dict[str, Any]:
                 "Learning policy for the persisted nodes.",
                 enum=["strict_review", "guided_learning", "autonomous_cautious", "autonomous_research", "sleep_review"],
             ),
-            "question_limit": _integer("Maximum clarification questions to preserve during apply.", minimum=1, maximum=8, default=3),
+            "question_limit": _integer("Maximum clarification questions to preserve during apply.", minimum=1, maximum=24, default=12),
             "confirm_apply": _boolean(
                 "Required explicit confirmation for mutation. Set true only after the preview/formation contract has been reviewed.",
                 default=False,
@@ -468,7 +473,7 @@ def _write_input_schema(*, commit: bool = False) -> dict[str, Any]:
         properties["selected_preview_ids"] = _array("Preview ids approved by the user.", item_type="string")
         properties["approved_preview_ids"] = _array("Alias/receipt list of approved preview ids when a UI review surface records approval separately.", item_type="string")
         properties["clarification_answers"] = _object("Answers to clarification questions returned by preview.")
-        properties["question_limit"] = _integer("Maximum clarification questions to preserve during apply.", minimum=1, maximum=8, default=3)
+        properties["question_limit"] = _integer("Maximum clarification questions to preserve during apply.", minimum=1, maximum=24, default=12)
         properties["confirm_apply"] = _boolean("Required explicit confirmation for mutation. Set true only after reviewing the preview bundle.", default=False)
         schema = _schema_object(
             properties=properties,
@@ -1588,6 +1593,24 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
         )
     )
 
+    contracts.append(
+        _tool_contract(
+            name="matrix_calibration_rollback",
+            title="Matrix Calibration Rollback (Deprecated Alias)",
+            description=(
+                "Backward-compatible alias for geometry_calibration_rollback. New clients must use the Geometry Calibration name."
+                + _advanced_module_visibility_note()
+            ),
+            category="maintenance",
+            planned_slice="PR-12J-D",
+            default_output_package="rollback_result",
+            input_schema=_geometry_calibration_rollback_input_schema(),
+            output_schema=_geometry_calibration_rollback_output_schema(),
+            candidate_backend_routes=["POST /memory/mcp/matrix-calibration-rollback"],
+            mutation_policy="explicit_apply",
+        )
+    )
+
     for name, title, mode, apply_tool in [
         ("sleep_preview", "Sleep Preview", "sleep", False),
         ("sleep_apply", "Sleep Apply", "sleep", True),
@@ -1924,10 +1947,15 @@ def _build_agent_memory_tool_contracts() -> list[dict[str, Any]]:
     ]
 
 
-def validate_mcp_contract_registry(registry: dict[str, Any]) -> dict[str, Any]:
+def validate_mcp_contract_registry(
+    registry: dict[str, Any],
+    *,
+    required_tool_names: list[str] | None = None,
+) -> dict[str, Any]:
     tools = [dict(tool) for tool in list(registry.get("tools") or []) if isinstance(tool, dict)]
     names = [str(tool.get("name") or "") for tool in tools]
-    missing_tools = [name for name in REQUIRED_MCP_TOOL_NAMES if name not in names]
+    required_names = list(REQUIRED_MCP_TOOL_NAMES if required_tool_names is None else required_tool_names)
+    missing_tools = [name for name in required_names if name not in names]
     duplicate_tools = sorted({name for name in names if names.count(name) > 1 and name})
     schema_errors: list[dict[str, Any]] = []
     answer_demo_default_tools: list[str] = []
@@ -1971,7 +1999,7 @@ def validate_mcp_contract_registry(registry: dict[str, Any]) -> dict[str, Any]:
     passed = not missing_tools and not duplicate_tools and not schema_errors and not answer_demo_default_tools
     return {
         "passed": passed,
-        "required_tool_count": len(REQUIRED_MCP_TOOL_NAMES),
+        "required_tool_count": len(required_names),
         "registered_tool_count": len(tools),
         "missing_tools": missing_tools,
         "duplicate_tools": duplicate_tools,
@@ -2018,4 +2046,68 @@ def build_mcp_contract_registry() -> dict[str, Any]:
         },
     }
     registry["registry_validation"] = validate_mcp_contract_registry(registry)
+    return registry
+
+
+def build_local_core_mcp_contract_registry() -> dict[str, Any]:
+    """Project the canonical catalog onto the non-mutating Local Core surface."""
+
+    registry = build_mcp_contract_registry()
+    projected_tools: list[dict[str, Any]] = []
+    for source_tool in list(registry.get("tools") or []):
+        tool = dict(source_tool)
+        name = str(tool.get("name") or "").strip()
+        if not local_core_tool_is_discoverable(name):
+            continue
+        if name in LOCAL_CORE_MAINTAIN_CLOUD_HANDOFF_TOOL_NAMES:
+            tool["tool_registration"] = mark_local_core_cloud_handoff_registration(
+                dict(tool.get("tool_registration") or {})
+            )
+            tool["module_requirement"] = build_module_requirement_from_registration(
+                tool["tool_registration"]
+            )
+            tool["backend_binding"] = {
+                **dict(tool.get("backend_binding") or {}),
+                "runtime": "hosted_mcp",
+                "local_adapter": "cloud_handoff_only",
+                "local_execution_available": False,
+            }
+            tool["safety_contract"] = {
+                **dict(tool.get("safety_contract") or {}),
+                "local_graph_mutation": "forbidden",
+                "cloud_execution_required": True,
+                "entitlement_bypass_allowed": False,
+            }
+            tool["client_usage"] = {
+                **dict(tool.get("client_usage") or {}),
+                "when_to_use": (
+                    "Use this Local Core surface to discover the paid capability and obtain the Hosted MCP "
+                    "handoff. Execution remains in Detwin Cloud."
+                ),
+                "mutation_policy": "cloud_only",
+                "followups": ["connect_detwin_cloud", "run_with_hosted_mcp"],
+            }
+        projected_tools.append(tool)
+
+    names = {str(tool.get("name") or "") for tool in projected_tools}
+    local_required = [name for name in REQUIRED_MCP_TOOL_NAMES if name in names]
+    registry.update(
+        {
+            "registry_status": "schema_registry_ready",
+            "required_tool_names": local_required,
+            "agent_memory_tool_names": [name for name in AGENT_MEMORY_MCP_TOOL_NAMES if name in names],
+            "tools": projected_tools,
+            "module_tool_registration": build_mcp_module_tool_registration_summary(projected_tools),
+        }
+    )
+    registry["implementation_granularity"] = {
+        **dict(registry.get("implementation_granularity") or {}),
+        "runtime_surface": "local_core",
+        "maintain_execution_surface": "hosted_mcp_only",
+        "local_maintain_surface": "read_only_preview_handoff",
+    }
+    registry["registry_validation"] = validate_mcp_contract_registry(
+        registry,
+        required_tool_names=local_required,
+    )
     return registry

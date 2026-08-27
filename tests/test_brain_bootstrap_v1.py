@@ -131,7 +131,7 @@ def test_bootstrap_v1_registry_exposes_nine_bounded_core_tools() -> None:
     tools = {tool["name"]: tool for tool in registry["tools"]}
 
     assert registry["registry_validation"]["passed"] is True
-    assert len(registry["tools"]) == 54
+    assert len(registry["tools"]) == 55
     assert set(BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES).issubset(tools)
     for name in BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES:
         tool = tools[name]
@@ -268,12 +268,29 @@ def test_bootstrap_v1_is_immutable_cas_guarded_and_writes_only_on_explicit_apply
 def test_adaptive_bootstrap_generates_domain_questions_and_exposes_runtime_quality_gates(tmp_path: Path) -> None:
     generated_goals: list[str] = []
 
+    attestation = {
+        "schema_version": "agvm.ai_execution_attestation.v2",
+        "status": "completed",
+        "provider_executed": True,
+        "provider": "openai_compatible",
+        "model": "gpt-4.1-mini",
+        "request_sha256": "a" * 64,
+        "output_sha256": "b" * 64,
+        "usage": {
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "reasoning_tokens": 0,
+            "total_tokens": 30,
+        },
+    }
+
     def generate_questions(goal, brain_record):
         generated_goals.append(goal)
         assert brain_record["brain_id"] == "bootstrap_v1_test_brain"
         return {
             "schema_version": "agvm.brain_bootstrap_v1.adaptive_interview.v1",
             "generation_source": "provider",
+            "ai_execution_attestation": attestation,
             "questions": [
                 f"How should the product intelligence brain handle domain requirement {index}?"
                 for index in range(1, 10)
@@ -300,6 +317,7 @@ def test_adaptive_bootstrap_generates_domain_questions_and_exposes_runtime_quali
     assert session["interview_mode"] == bootstrap_service.ADAPTIVE_INTERVIEW_MODE
     assert len(session["questions"]) == 9
     assert session["interview_plan"]["generation_source"] == "provider"
+    assert session["interview_plan"]["ai_execution_attestation"]["applicable"] is True
     assert session["quality"]["minimum_answer_count"] == 8
     assert session["quality"]["minimum_source_text_chars"] == bootstrap_service.GUIDED_SEED_MIN_SOURCE_TEXT_CHARS
     assert session["quality"]["ready_to_apply"] is False
@@ -318,6 +336,50 @@ def test_adaptive_bootstrap_generates_domain_questions_and_exposes_runtime_quali
                 "questions": ["This must never replace the provider-authored interview plan."],
             },
         )
+
+
+def test_adaptive_bootstrap_rejects_unattested_provider_questions_before_revision(
+    tmp_path: Path,
+) -> None:
+    def unattested_questions(_goal, _brain_record):
+        return {
+            "schema_version": "agvm.brain_bootstrap_v1.adaptive_interview.v1",
+            "generation_source": "provider",
+            "questions": [
+                f"How should this brain handle reviewed domain requirement {index}?"
+                for index in range(1, 7)
+            ],
+            "required_answer_count": 6,
+            "coverage_dimensions": [f"dimension-{index}" for index in range(1, 7)],
+        }
+
+    service, _apply_calls = _service(tmp_path, question_generator=unattested_questions)
+
+    with pytest.raises(
+        BootstrapV1Error,
+        match="bootstrap_question_generation_unattested",
+    ):
+        service.execute(
+            "start",
+            {
+                "brain_id": "bootstrap_v1_test_brain",
+                "session_id": "adaptive-unattested",
+                "idempotency_key": "adaptive-unattested-start",
+                "goal": "Build reviewed product intelligence.",
+                "interview_mode": bootstrap_service.ADAPTIVE_INTERVIEW_MODE,
+            },
+        )
+
+    session_dir = (
+        tmp_path
+        / "brain"
+        / "brain_bootstrap_v1"
+        / "sessions"
+        / "adaptive-unattested"
+    )
+    assert not session_dir.exists()
+
+
 def test_guided_bootstrap_cannot_apply_without_a_passing_seed_quality_report(tmp_path: Path) -> None:
     service, apply_calls = _service(tmp_path)
     started = service.execute(

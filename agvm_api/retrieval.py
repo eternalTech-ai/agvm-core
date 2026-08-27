@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 import hashlib
 import os
 import re
@@ -36,7 +37,6 @@ from answering import (
     clean_answer_surface_text,
     detect_query_aspects,
     detect_query_intent,
-    generate_grounded_answer,
     intent_bonus,
     polish_final_answer_surface,
     query_contract_allows_fast_final,
@@ -45,6 +45,7 @@ from answering import (
     _apply_answer_contract,
     _query_named_targets,
 )
+from ai_modules_v2 import AiModuleContractError, validate_ai_execution_attestation
 from public_v1_landing_contract import build_public_v1_landing_contract
 from config import ATLAS_VERSION, BUCKET_SIZE, FACET_FIELDS, INDEX_VERSION, ROUTING_FIELDS
 from document_evidence_lane import rank_document_evidence_candidates
@@ -52,7 +53,7 @@ from document_need_contract import build_target_document_need_contract
 from llm import answer_model, compiler_model, llm_enabled, retrieval_model, structured_json
 from memory_hygiene import is_answer_eligible, is_document_eligible
 from metamemory import build_metamemory_package, metamemory_snapshot, metamemory_spatial_brief
-from semantic_contract import compile_semantic_query_contract, sanitize_identity_hints
+from semantic_contract import sanitize_identity_hints
 from heuristic_calibration import (
     apply_calibration_to_spec,
     build_runtime_calibration_bundle,
@@ -2018,6 +2019,7 @@ def _run_fast_planner_seed_request(
     retrieval_mode: str,
     minimal: bool = False,
     timeout_override: float | None = None,
+    execution_metadata: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not llm_enabled():
         return None, "llm_disabled"
@@ -2099,17 +2101,25 @@ def _run_fast_planner_seed_request(
         "Fields: identity,identity_and_place,role_and_projects,relationships,communication_style,values,history,document_sources."
     )
     requested_timeout = timeout_override if timeout_override is not None else _planner_seed_timeout_seconds(retrieval_mode, query.query_text)
-    payload, error = structured_json(
-        model=retrieval_model(),
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        schema_name="agvm_fast_planner_seed",
-        schema=schema,
-        timeout=requested_timeout + _planner_seed_transport_guard_seconds(),
-        role="retrieval",
-        max_output_tokens=900 if minimal else 1400,
-    )
-    return payload, error
+    request = {
+        "model": retrieval_model(),
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "schema_name": "agvm_fast_planner_seed",
+        "schema": schema,
+        "timeout": requested_timeout + _planner_seed_transport_guard_seconds(),
+        "role": "retrieval",
+        "max_output_tokens": 900 if minimal else 1400,
+    }
+    if execution_metadata is not None:
+        return structured_json(
+            **request,
+            execution_metadata=execution_metadata,
+        )
+    return _run_attested_search_ai_json(
+        call_name="planner_seed_refinement",
+        **request,
+    ), None
 
 
 def llm_fast_planner_seed(
@@ -2124,6 +2134,723 @@ def llm_fast_planner_seed(
         retrieval_mode=retrieval_mode,
         minimal=False,
     )
+
+
+SEARCH_AI_ADMISSION_SCHEMA_VERSION = "agvm.search_ai_admission.v2"
+
+_NON_AI_PROVIDER_NAMES = {
+    "deterministic",
+    "fallback",
+    "heuristic",
+    "mock",
+    "none",
+}
+
+_SEARCH_AI_CALL_LEDGER: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "agvm_search_ai_call_ledger",
+    default=None,
+)
+
+
+class SearchAiExecutionError(AiModuleContractError):
+    def __init__(self, call_name: str, provider_error: str) -> None:
+        self.call_name = str(call_name or "unknown_search_ai_call")
+        self.provider_error = str(provider_error or "provider_error")
+        super().__init__(f"search_ai_call_failed::{self.call_name}::{self.provider_error}")
+
+
+def _run_attested_search_ai_json(
+    *,
+    call_name: str,
+    **request: Any,
+) -> dict[str, Any]:
+    """Run one Search AI request and accept it only with its own v2 proof."""
+    if not llm_enabled():
+        raise SearchAiExecutionError(call_name, "llm_disabled")
+
+    execution_metadata: dict[str, Any] = {}
+    payload, error = structured_json(
+        **request,
+        execution_metadata=execution_metadata,
+    )
+    if error:
+        raise SearchAiExecutionError(call_name, str(error))
+    if not isinstance(payload, Mapping) or not payload:
+        raise SearchAiExecutionError(call_name, "invalid_json")
+
+    try:
+        attestation = validate_ai_execution_attestation(execution_metadata)
+    except AiModuleContractError as exc:
+        raise SearchAiExecutionError(call_name, exc.code) from exc
+    provider = str(attestation.get("provider") or "").strip().lower()
+    if provider in _NON_AI_PROVIDER_NAMES:
+        raise SearchAiExecutionError(call_name, "search_ai_provider_invalid")
+
+    ledger = _SEARCH_AI_CALL_LEDGER.get()
+    if ledger is not None:
+        ledger.append(
+            {
+                "call_id": f"{call_name}:{uuid.uuid4().hex}",
+                "call_name": str(call_name),
+                "ai_execution_attestation": attestation,
+            }
+        )
+    return dict(payload)
+
+
+def _attested_search_ai_provider(call_name: str) -> Any:
+    """Adapt the spatial planner provider while preserving the Search call ledger.
+
+    The spatial planner can fan out requests on worker threads. Context variables do
+    not propagate to those threads automatically, so every invocation temporarily
+    binds the same transaction ledger and still obtains fresh execution metadata.
+    """
+    transaction_ledger = _SEARCH_AI_CALL_LEDGER.get()
+
+    def provider(**request: Any) -> tuple[dict[str, Any], None]:
+        token = _SEARCH_AI_CALL_LEDGER.set(transaction_ledger)
+        try:
+            schema_name = str(request.get("schema_name") or "request").strip()
+            payload = _run_attested_search_ai_json(
+                call_name=f"{call_name}:{schema_name}",
+                **request,
+            )
+            return payload, None
+        finally:
+            _SEARCH_AI_CALL_LEDGER.reset(token)
+
+    return provider
+
+
+def _require_materialized_ai_spatial_contract(
+    contract: dict[str, Any] | None,
+    *,
+    call_name: str,
+) -> dict[str, Any]:
+    payload = dict(contract or {})
+    if not (
+        payload.get("materialized")
+        and payload.get("certifiable")
+        and list(payload.get("inverse_answer_paths") or [])
+    ):
+        reasons = [str(item) for item in list(payload.get("missing_reasons") or []) if str(item)]
+        provider_error = str(payload.get("error") or "").strip()
+        if not provider_error:
+            provider_error = "invalid_json" if not reasons else f"invalid_json:{','.join(reasons[:4])}"
+        raise SearchAiExecutionError(call_name, provider_error)
+    return payload
+
+
+def _generate_attested_grounded_answer(
+    *,
+    query_text: str,
+    matches: list[dict[str, Any]],
+    shared_evidence: dict[str, Any] | None,
+    response_mode: str,
+    evidence_reservoir: dict[str, Any] | None = None,
+    retrieval_mode: str = "balanced",
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    context = build_context_payload(
+        matches,
+        shared_evidence,
+        evidence_reservoir=evidence_reservoir,
+        query_text=query_text,
+    )
+    if response_mode == "context":
+        return None, context
+
+    evidence_pack = [
+        {
+            "node_id": str(match.get("node_id") or ""),
+            "summary": str(match.get("summary") or "")[:1200],
+            "evidence": str(
+                match.get("evidence_snippet")
+                or dict(match.get("node") or {}).get("raw_text")
+                or dict(match.get("node") or {}).get("summary")
+                or ""
+            )[:2200],
+            "score": float(match.get("score") or match.get("raw_score") or 0.0),
+            "sources": [str(item) for item in list(match.get("sources") or [])[:8]],
+        }
+        for match in matches[:64]
+    ]
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "answer_text",
+            "confidence",
+            "evidence_node_ids",
+            "reasoning_summary",
+            "insufficient",
+            "answerability_state",
+            "context_summary",
+            "context_fragments",
+        ],
+        "properties": {
+            "answer_text": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "evidence_node_ids": {"type": "array", "items": {"type": "string"}},
+            "reasoning_summary": {"type": "string"},
+            "insufficient": {"type": "boolean"},
+            "answerability_state": {
+                "type": "string",
+                "enum": ["grounded", "partial", "insufficient"],
+            },
+            "context_summary": {"type": "string"},
+            "context_fragments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["topic", "text", "confidence", "evidence_node_ids"],
+                    "properties": {
+                        "topic": {"type": "string"},
+                        "text": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "evidence_node_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+        },
+    }
+    payload = _run_attested_search_ai_json(
+        call_name="grounded_answer",
+        model=answer_model(),
+        system_prompt=(
+            "You are the AGVM grounded answer generator. Answer only from the supplied reviewed evidence. "
+            "Never invent facts. If support is insufficient, say so explicitly and mark the answer insufficient. "
+            "Return a human-facing answer plus structured reusable context."
+        ),
+        user_prompt=json.dumps(
+            {
+                "query": query_text,
+                "retrieval_mode": retrieval_mode,
+                "evidence": evidence_pack,
+                "shared_evidence": dict(shared_evidence or {}),
+                "context_seed": context,
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+        schema_name="agvm_grounded_answer_attested",
+        schema=schema,
+        timeout=20.0,
+        role="answer",
+    )
+    answer_text = str(payload.get("answer_text") or "").strip()
+    if not answer_text:
+        raise SearchAiExecutionError("grounded_answer", "invalid_json")
+    known_ids = {
+        str(match.get("node_id") or "")
+        for match in matches
+        if str(match.get("node_id") or "")
+    }
+    evidence_node_ids = [
+        str(item)
+        for item in list(payload.get("evidence_node_ids") or [])
+        if str(item) in known_ids
+    ]
+    answerability_state = str(payload.get("answerability_state") or "insufficient")
+    if answerability_state == "grounded" and not evidence_node_ids:
+        answerability_state = "partial"
+    support_metadata = build_answer_support_metadata(
+        matches=matches,
+        shared_evidence=shared_evidence,
+        evidence_node_ids=evidence_node_ids,
+    )
+    answer = _apply_answer_contract(
+        query_text,
+        {
+            "answer_text": answer_text,
+            "mode": "llm",
+            "confidence": max(0.0, min(1.0, float(payload.get("confidence") or 0.0))),
+            "evidence_node_ids": evidence_node_ids,
+            "reasoning_summary": str(payload.get("reasoning_summary") or "").strip(),
+            "insufficient": bool(payload.get("insufficient")),
+            "answerability_state": answerability_state,
+            "evidence_snippets": _build_stream_evidence_snippets(matches),
+            "support_node_count": int(support_metadata.get("support_node_count") or 0),
+            "support_slot_count": int(support_metadata.get("support_slot_count") or 0),
+            "family_attribution_summary": dict(support_metadata.get("family_attribution_summary") or {}),
+            "contradiction_present": bool(support_metadata.get("contradiction_present")),
+        },
+        matches,
+    )
+    context = {
+        **dict(context or {}),
+        "context_summary": str(payload.get("context_summary") or "").strip(),
+        "context_fragments": list(payload.get("context_fragments") or []),
+    }
+    return answer, context if response_mode in {"context", "both"} else None
+
+
+def _require_ai_authored_plan_records(
+    records: Any,
+    *,
+    material_name: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(records, list) or not records:
+        raise AiModuleContractError("search_ai_admission_material_missing")
+    normalized: list[dict[str, Any]] = []
+    for raw_record in records:
+        if not isinstance(raw_record, Mapping):
+            raise AiModuleContractError("search_ai_admission_material_invalid")
+        record = dict(raw_record)
+        families = {
+            str(item or "").strip().lower()
+            for item in list(record.get("origin_families") or [])
+            if str(item or "").strip()
+        }
+        planner_family = str(record.get("planner_family") or "").strip().lower()
+        if planner_family:
+            families.add(planner_family)
+        if "ai" not in families:
+            raise AiModuleContractError(
+                f"search_ai_{material_name}_heuristic_material_forbidden"
+            )
+        normalized.append(record)
+    return normalized
+
+
+def _validate_search_ai_admission_boundary(
+    value: Mapping[str, Any] | None,
+    *,
+    require_seed_payload: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or not value:
+        raise AiModuleContractError("search_ai_admission_required")
+    admission = dict(value)
+    if admission.get("schema_version") != SEARCH_AI_ADMISSION_SCHEMA_VERSION:
+        raise AiModuleContractError("search_ai_admission_schema_invalid")
+    if admission.get("status") != "admitted":
+        raise AiModuleContractError("search_ai_admission_not_admitted")
+    if admission.get("reason") != "provider_plan_attested":
+        raise AiModuleContractError("search_ai_admission_reason_invalid")
+    if str(admission.get("provider_error") or "").strip():
+        raise AiModuleContractError("search_ai_admission_provider_error")
+    if bool(admission.get("fallback_used")) or bool(
+        admission.get("heuristic_result_exposed")
+    ):
+        raise AiModuleContractError("search_ai_admission_fallback_forbidden")
+
+    attestation = validate_ai_execution_attestation(
+        admission.get("ai_execution_attestation")
+    )
+    provider = str(attestation.get("provider") or "").strip().lower()
+    if provider in _NON_AI_PROVIDER_NAMES:
+        raise AiModuleContractError("search_ai_provider_invalid")
+
+    admission["answer_strands"] = _require_ai_authored_plan_records(
+        admission.get("answer_strands"),
+        material_name="strand",
+    )
+    if require_seed_payload and not isinstance(
+        admission.get("planner_seed_payload"), Mapping
+    ):
+        raise AiModuleContractError("search_ai_admission_material_missing")
+    if require_seed_payload and not dict(admission.get("planner_seed_payload") or {}):
+        raise AiModuleContractError("search_ai_admission_material_missing")
+    admission["ai_execution_attestation"] = attestation
+    return admission
+
+
+def _validate_attested_runtime_plan(plan: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(plan, Mapping) or not plan:
+        raise AiModuleContractError("search_ai_runtime_plan_required")
+    runtime_plan = dict(plan)
+    admission = _validate_search_ai_admission_boundary(
+        runtime_plan.get("search_ai_admission"),
+        require_seed_payload=False,
+    )
+    plan_attestation = validate_ai_execution_attestation(
+        runtime_plan.get("ai_execution_attestation")
+    )
+    if plan_attestation != admission["ai_execution_attestation"]:
+        raise AiModuleContractError("search_ai_runtime_attestation_mismatch")
+    _require_ai_authored_plan_records(
+        runtime_plan.get("answer_strands"),
+        material_name="strand",
+    )
+    _require_ai_authored_plan_records(
+        runtime_plan.get("probes"),
+        material_name="probe",
+    )
+    _require_ai_authored_plan_records(
+        runtime_plan.get("branches"),
+        material_name="branch",
+    )
+    planner_runtime = dict(runtime_plan.get("planner_runtime") or {})
+    if planner_runtime.get("ai_execution_attested") is not True:
+        raise AiModuleContractError("search_ai_runtime_attestation_missing")
+    if bool(planner_runtime.get("heuristic_fallback_used")):
+        raise AiModuleContractError("search_ai_runtime_fallback_forbidden")
+    return admission
+
+
+def _semantic_contract_from_attested_admission(
+    *,
+    query: RetrieveRequest,
+    retrieval_mode: str,
+    legacy_contract: Mapping[str, Any],
+    identity_hints: Mapping[str, Any],
+    admission: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    strands = _require_ai_authored_plan_records(
+        admission.get("answer_strands"),
+        material_name="strand",
+    )
+    expected_evidence: list[dict[str, Any]] = []
+    landing_hypotheses: list[dict[str, Any]] = []
+    required_sections: list[str] = []
+    for index, strand in enumerate(strands, start=1):
+        strand_id = str(strand.get("strand_id") or f"strand_ai_{index}")
+        answer_field = str(strand.get("answer_field") or strand.get("goal") or "knowledge")
+        claim_shape = str(
+            strand.get("answer_hypothesis")
+            or strand.get("landing_hint")
+            or strand.get("goal")
+            or query.query_text
+        ).strip()
+        target_id = f"evidence::{strand_id}"
+        expected_evidence.append(
+            {
+                "target_id": target_id,
+                "claim_shape": claim_shape,
+                "required_fields": [answer_field],
+                "acceptable_sources": ["reviewed_memory", "uploaded_document", "verified_source"],
+                "minimum_support": {
+                    "node_count": 1,
+                    "document_chunk_count": 0,
+                    "source_trace_count": 0,
+                },
+                "negative_conditions": ["do_not_invent_missing_evidence"],
+                "success_question": f"Does the retrieved evidence support {claim_shape}?",
+                "origin_strand_id": strand_id,
+            }
+        )
+        landing_hypotheses.append(
+            {
+                "landing_id": f"L{index}",
+                "target_evidence_ids": [target_id],
+                "textual_probe": str(strand.get("landing_hint") or claim_shape),
+                "why_traverse": str(strand.get("inverse_rationale") or claim_shape),
+                "origin_strand_id": strand_id,
+            }
+        )
+        if answer_field not in required_sections:
+            required_sections.append(answer_field)
+
+    attestation = validate_ai_execution_attestation(
+        admission.get("ai_execution_attestation")
+    )
+    contract = {
+        "schema_version": "agvm.semantic_query_contract.v2",
+        "contract_version": "2.0",
+        "contract_authority": "search_ai_admission_materialization",
+        "compiler_status": "materialized_from_attested_planner_seed",
+        "compiler_error": None,
+        "user_query": query.query_text,
+        "mcp_tool_name": query.mcp_tool_name,
+        "retrieval_mode": retrieval_mode,
+        "legacy_contract": dict(legacy_contract),
+        "identity_hints": sanitize_identity_hints(identity_hints),
+        "intent": {
+            "primary": str(dict(legacy_contract).get("query_kind") or _query_class(query.query_text)),
+            "secondary": required_sections[:8],
+            "is_followup": bool(query.thread_id),
+            "requires_document_mode": _query_class(query.query_text) == "document_lookup",
+        },
+        "expected_evidence": expected_evidence,
+        "forbidden_evidence": [
+            {"topic": "system_metadata", "reason": "never_answer_from_system_metadata"},
+            {"topic": "synthetic_test_material", "reason": "never_answer_from_synthetic_test_material"},
+        ],
+        "landing_plan": {
+            "min_landings": 1,
+            "max_landings": len(landing_hypotheses),
+            "preferred_strategy": "ai_strand_order",
+            "landing_hypotheses": landing_hypotheses,
+            "paths": [],
+            "cooperation_policy": {
+                "shared_reservoir": True,
+                "dedupe_evidence": True,
+                "allow_early_stop_from_one_landing": True,
+            },
+        },
+        "context_contract": {
+            "required_sections": required_sections,
+            "optional_sections": [],
+        },
+        "answer_strands": [dict(item) for item in strands],
+        "ai_required": True,
+    }
+    runtime = {
+        "schema_version": "agvm.semantic_contract_runtime.v2",
+        "status": "completed",
+        "source": "search_ai_admission_materialization",
+        "material": True,
+        "ai_required": True,
+        "provider_state": "attested_origin",
+        "fallback_used": False,
+        "provider_call_performed": False,
+        "origin_call_name": "planner_seed_admission",
+        "origin_attestation_fingerprint": {
+            "request_sha256": attestation.get("request_sha256"),
+            "output_sha256": attestation.get("output_sha256"),
+        },
+    }
+    return contract, runtime
+
+
+def _search_ai_block_reason(error: str | None) -> str:
+    normalized = str(error or "").strip().lower()
+    if normalized in {"llm_disabled", "missing_api_key", "not_configured"}:
+        return "blocked_ai_provider_unavailable"
+    if "timeout" in normalized or "timed out" in normalized:
+        return "blocked_ai_provider_timeout"
+    if normalized in {"invalid_json", "missing_output_text", "llm_empty"} or "json" in normalized:
+        return "blocked_ai_provider_invalid_output"
+    if normalized.startswith("ai_execution_"):
+        return "blocked_ai_attestation_invalid"
+    return "blocked_ai_provider_error"
+
+
+def build_search_ai_http_block_payload(admission: dict[str, Any]) -> dict[str, Any]:
+    """Build the stable, non-chargeable HTTP error consumed by the local UI."""
+
+    raw_reason = str(admission.get("reason") or "blocked_ai_provider_error").strip()
+    stable_codes = {
+        "blocked_ai_provider_unavailable",
+        "blocked_ai_provider_timeout",
+        "blocked_ai_provider_invalid_output",
+        "blocked_ai_provider_error",
+    }
+    if raw_reason in stable_codes:
+        code = raw_reason
+    elif raw_reason == "blocked_ai_attestation_invalid":
+        code = "blocked_ai_provider_invalid_output"
+    else:
+        code = "blocked_ai_provider_error"
+    error = {
+        "schema_version": "agvm.search_ai_http_block.v1",
+        "status": "blocked",
+        "code": code,
+        "reason": code,
+        "provider_reason": raw_reason,
+        "message": "AI unavailable. Configure or verify the provider before starting Search.",
+        "user_message": "AI unavailable — configure provider to run Search.",
+        "next_action": "configure_provider",
+        "configuration_path": "/setup/env",
+        "provider_test_path": "/setup/provider/test",
+        "search_id": None,
+        "session_created": False,
+        "mutates_memory": False,
+        "receipt": None,
+        "chargeable": False,
+        "charged_units": 0,
+    }
+    # Keep FastAPI's historical `detail` shape while also exposing the same
+    # contract at top level for UI clients that do not unwrap HTTPException.
+    return {**error, "detail": dict(error)}
+
+
+def require_search_ai_admission(
+    query: RetrieveRequest,
+    identity_source: dict[str, Any],
+) -> dict[str, Any]:
+    """Require one valid provider-authored plan before public retrieval starts."""
+    if not llm_enabled():
+        return {
+            "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
+            "status": "blocked",
+            "reason": "blocked_ai_provider_unavailable",
+            "provider_error": "llm_disabled",
+            "chargeable": False,
+            "charged_units": 0,
+        }
+
+    execution_metadata: dict[str, Any] = {}
+    retrieval_mode = str(query.retrieval_mode or _select_retrieval_mode(query)[0])
+    payload, error = _run_fast_planner_seed_request(
+        query,
+        identity_source=identity_source,
+        retrieval_mode=retrieval_mode,
+        minimal=False,
+        execution_metadata=execution_metadata,
+    )
+    if error or not payload:
+        return {
+            "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
+            "status": "blocked",
+            "reason": _search_ai_block_reason(error or "llm_empty"),
+            "provider_error": error or "llm_empty",
+            "chargeable": False,
+            "charged_units": 0,
+        }
+
+    answer_strands = _normalize_answer_strands(
+        list(payload.get("answer_strands") or []),
+        query_text=query.query_text,
+        max_probe_count=_planner_seed_max_items(
+            query.query_text,
+            query.max_probe_count,
+            query.max_total_branches,
+        ),
+        planner_family="ai",
+    )
+    answer_strands = _select_answer_strands_for_query(
+        answer_strands,
+        query_text=query.query_text,
+        max_probe_count=query.max_total_branches,
+    )
+    if not answer_strands:
+        return {
+            "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
+            "status": "blocked",
+            "reason": "blocked_ai_provider_invalid_output",
+            "provider_error": "llm_empty",
+            "chargeable": False,
+            "charged_units": 0,
+        }
+
+    try:
+        attestation = validate_ai_execution_attestation(execution_metadata)
+    except AiModuleContractError as exc:
+        return {
+            "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
+            "status": "blocked",
+            "reason": _search_ai_block_reason(exc.code),
+            "provider_error": exc.code,
+            "chargeable": False,
+            "charged_units": 0,
+        }
+
+    return {
+        "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
+        "status": "admitted",
+        "reason": "provider_plan_attested",
+        "provider_error": None,
+        "chargeable": True,
+        "charged_units": 0,
+        "planner_seed_payload": dict(payload),
+        "answer_strands": answer_strands,
+        "ai_execution_attestation": attestation,
+    }
+
+
+def build_search_ai_blocked_result(
+    query: RetrieveRequest,
+    admission: dict[str, Any],
+    *,
+    search_id: str | None = None,
+) -> dict[str, Any]:
+    reason = str(admission.get("reason") or "blocked_ai_provider_error")
+    provider_error = str(admission.get("provider_error") or reason)
+    admission_public = {
+        key: value
+        for key, value in admission.items()
+        if key not in {"planner_seed_payload", "answer_strands"}
+    }
+    semantic_runtime = {
+        "schema_version": "agvm.semantic_contract_runtime.v2",
+        "status": "blocked",
+        "source": "search_ai_fail_closed_v2",
+        "material": False,
+        "ai_required": True,
+        "provider_state": reason,
+        "provider_error": provider_error,
+        "fallback_used": False,
+        "heuristic_result_exposed": False,
+        "billing": {
+            "chargeable": False,
+            "charged_units": 0,
+            "reason": "provider_execution_not_attested",
+        },
+        "search_ai_admission": admission_public,
+    }
+    operator_message = (
+        "Search requires an available AI provider. No heuristic search was executed, "
+        "no context was returned, and no usage was charged."
+    )
+    return {
+        "search_id": search_id,
+        "query_text": query.query_text,
+        "thread_id": query.thread_id,
+        "response_mode": query.response_mode,
+        "retrieval_mode": query.retrieval_mode or "balanced",
+        "semantic_contract": {},
+        "semantic_contract_runtime": semantic_runtime,
+        "probes": [],
+        "branches": [],
+        "steps": [],
+        "matches": [],
+        "visited_node_ids": [],
+        "visited_bucket_keys": [],
+        "stop_reason": reason,
+        "answer": None,
+        "answer_short": None,
+        "answer_full": None,
+        "context": None,
+        "context_package": {},
+        "context_package_materialization": {
+            "state": "blocked",
+            "terminal": True,
+            "contract_passed": False,
+            "final_materialization_pending": False,
+        },
+        "answerability_state": "insufficient",
+        "result_materialization_state": "finalized",
+        "final_materialization_pending": False,
+        "result_ready_terminal": True,
+        "closure_state": "bounded_partial",
+        "final_closure_ready": False,
+        "ai_material_contribution": False,
+        "ai_landing_materialization": {
+            "required": True,
+            "materialized": False,
+            "validation_state": reason,
+            "blockers": [provider_error],
+        },
+        "ai_materialization_hard_gate": {
+            "required": True,
+            "blocked": True,
+            "satisfied": False,
+            "validation_state": reason,
+            "blockers": [provider_error],
+        },
+        "ai_spatial_landing_contract": {
+            "schema_version": "agvm.public_v1_landing_landing_contract.v1",
+            "status": "blocked",
+            "source": "search_ai_fail_closed_v2",
+            "materialized": False,
+            "certifiable": False,
+            "missing_reasons": [provider_error],
+        },
+        "payload_integrity": {
+            "passed": True,
+            "no_material_returned": True,
+            "heuristic_result_exposed": False,
+        },
+        "completion_contract": {
+            "state": "blocked",
+            "status": "blocked",
+            "visible_reason": reason,
+            "operator_message": operator_message,
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+        },
+        "planner_runtime": {
+            "planner_path": "blocked",
+            "planner_mode": None,
+            "decomposition_mode": None,
+            "ai_required": True,
+            "ai_execution_attested": False,
+            "heuristic_fallback_used": False,
+            "semantic_contract_runtime": semantic_runtime,
+        },
+        "timing": {"total_ms": 0.0},
+    }
 
 
 def llm_query_decomposition(query_text: str, max_probe_count: int) -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -4591,8 +5318,6 @@ def llm_branch_controller(
     branch: dict[str, Any],
     blackboard: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not llm_enabled():
-        return None, "llm_disabled"
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -4632,7 +5357,8 @@ def llm_branch_controller(
         "visited_bucket_keys": list(branch.get("visited_bucket_keys") or [])[:6],
     }
     blackboard_summary = _summarize_blackboard_for_master(blackboard, max_items_per_slot=2)
-    payload, error = structured_json(
+    payload = _run_attested_search_ai_json(
+        call_name="branch_controller",
         model=retrieval_model(),
         system_prompt=(
             "You are an AGVM branch controller. Judge only the local branch state. "
@@ -4653,9 +5379,10 @@ def llm_branch_controller(
         timeout=_controller_timeout_seconds(retrieval_mode=retrieval_mode, query_class=query_class),
         role="retrieval",
     )
-    if error or not payload:
-        return None, error or "llm_empty"
-    return _normalize_controller_recommendation(payload), None
+    normalized = _normalize_controller_recommendation(payload)
+    if not normalized:
+        raise SearchAiExecutionError("branch_controller", "invalid_json")
+    return normalized, None
 
 
 def _branch_controller_recommendation(
@@ -4666,22 +5393,6 @@ def _branch_controller_recommendation(
     branch: dict[str, Any],
     blackboard: dict[str, Any],
 ) -> dict[str, Any]:
-    fallback = _controller_recommendation_fallback(branch, query_class=query_class)
-    fallback_action = str(fallback.get("action") or "")
-    controller_selected = _should_use_ai_branch_controller(
-        retrieval_mode=retrieval_mode,
-        query_class=query_class,
-        branch=branch,
-    )
-    ai_planned_branch = str(branch.get("planner_family") or "").strip().lower() == "ai"
-    if not controller_selected and not ai_planned_branch:
-        return {
-            **fallback,
-            "decision_source": "fallback_disabled",
-            "controller_kind": "fallback_branch_controller",
-            "fallback_preview_action": fallback_action or None,
-            "override_applied": False,
-        }
     started_at = time.perf_counter()
     llm_recommendation, llm_error = llm_branch_controller(
         query_text=query_text,
@@ -4706,24 +5417,15 @@ def _branch_controller_recommendation(
             "controller_kind": "llm_branch_controller",
             "turn_ms": turn_ms,
             "evidence_basis": list(llm_recommendation.get("evidence_basis") or _controller_evidence_basis(branch)),
-            "fallback_preview_action": fallback_action or None,
-            "override_applied": bool(action and fallback_action and action != fallback_action),
+            "fallback_preview_action": None,
+            "override_applied": False,
             "escalation_needed": bool(llm_recommendation.get("escalation_needed", escalation_defaults["escalation_needed"])),
             "escalation_reason": llm_recommendation.get("escalation_reason") or escalation_defaults["escalation_reason"],
             "requested_master_action": llm_recommendation.get("requested_master_action") or escalation_defaults["requested_master_action"],
             "blocking_destination_id": llm_recommendation.get("blocking_destination_id") or escalation_defaults["blocking_destination_id"],
             "blocking_state": llm_recommendation.get("blocking_state") or escalation_defaults["blocking_state"],
         }
-    return {
-        **fallback,
-        "decision_source": _decision_source_from_error(llm_error, fallback_prefix="fallback"),
-        "fallback_reason": _fallback_reason_from_error(llm_error),
-        "controller_kind": "fallback_branch_controller",
-        "turn_ms": turn_ms,
-        "evidence_basis": list(fallback.get("evidence_basis") or _controller_evidence_basis(branch)),
-        "fallback_preview_action": fallback_action or None,
-        "override_applied": False,
-    }
+    raise SearchAiExecutionError("branch_controller", llm_error or "invalid_json")
 
 
 def _apply_controller_recommendation(branch: dict[str, Any], recommendation: dict[str, Any] | None) -> dict[str, Any]:
@@ -12123,7 +12825,7 @@ def _continuity_score(query_text: str, packet: dict[str, Any]) -> float:
 
 
 def _semantic_followup_gate(query_text: str, packet: dict[str, Any], deterministic_state: str) -> str | None:
-    if not llm_enabled() or deterministic_state != "medium_continuity":
+    if deterministic_state != "medium_continuity":
         return None
     schema = {
         "type": "object",
@@ -12134,7 +12836,8 @@ def _semantic_followup_gate(query_text: str, packet: dict[str, Any], determinist
             "reason": {"type": "string"},
         },
     }
-    payload, error = structured_json(
+    payload = _run_attested_search_ai_json(
+        call_name="followup_continuity_gate",
         model=retrieval_model(),
         system_prompt=(
             "You are the AGVM follow-up gate. Decide only whether the new query should strongly reuse, partially reuse, "
@@ -12146,10 +12849,10 @@ def _semantic_followup_gate(query_text: str, packet: dict[str, Any], determinist
         timeout=1.2,
         role="retrieval",
     )
-    if error or not payload:
-        return None
     state = str(payload.get("continuity_state") or "").strip()
-    return state if state in {"high_continuity", "medium_continuity", "low_continuity"} else None
+    if state not in {"high_continuity", "medium_continuity", "low_continuity"}:
+        raise SearchAiExecutionError("followup_continuity_gate", "invalid_json")
+    return state
 
 
 def _evaluate_continuity_details(
@@ -12892,8 +13595,6 @@ def master_judge_llm(
     round_index: int,
     timing: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not llm_enabled():
-        return None, "llm_disabled"
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -12951,7 +13652,8 @@ def master_judge_llm(
         timeout = 11.5
     else:
         timeout = 13.0
-    payload, error = structured_json(
+    payload = _run_attested_search_ai_json(
+        call_name="master_judge",
         model=retrieval_model(),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -12960,9 +13662,10 @@ def master_judge_llm(
         timeout=timeout,
         role="retrieval",
     )
-    if error:
-        return None, error
-    return _normalize_master_decision(payload), None
+    normalized = _normalize_master_decision(payload)
+    if not normalized:
+        raise SearchAiExecutionError("master_judge", "invalid_json")
+    return normalized, None
 
 
 def final_answer_approval_llm(
@@ -12976,8 +13679,6 @@ def final_answer_approval_llm(
     ai_materiality_summary: dict[str, Any],
     timing: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not llm_enabled():
-        return None, "llm_disabled"
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -13020,7 +13721,8 @@ def final_answer_approval_llm(
         "ai_materiality": dict(ai_materiality_summary or {}),
         "timing": dict(timing or {}),
     }
-    payload, error = structured_json(
+    payload = _run_attested_search_ai_json(
+        call_name="final_answer_approval",
         model=retrieval_model(),
         system_prompt=(
             "You are the AGVM final answer approval judge. Do not answer the user. "
@@ -13035,8 +13737,6 @@ def final_answer_approval_llm(
         role="retrieval",
         max_output_tokens=700,
     )
-    if error or not payload:
-        return None, error or "llm_empty"
     payload = dict(payload)
     payload["approve_final"] = bool(payload.get("approve_final"))
     payload["confidence"] = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
@@ -13207,82 +13907,6 @@ def _master_decide(
     round_index: int,
     timing: dict[str, Any],
 ) -> dict[str, Any]:
-    coverage_by_slot = dict(blackboard.get("coverage_by_slot") or {})
-    shared_confidence = max([float(value or 0.0) for value in coverage_by_slot.values()] or [0.0])
-    contract_requires_expansion = bool(
-        query_text
-        and query_class == "relation_fact"
-        and query_contract_requires_expansion(query_text, retrieval_mode=retrieval_mode)
-    )
-    if contract_requires_expansion and timing.get("answer_first_ms") is not None and shared_confidence >= 0.5:
-        fallback = _fallback_master_decide(
-            query_text=query_text,
-            retrieval_mode=retrieval_mode,
-            query_class=query_class,
-            branches=branches,
-            blackboard=blackboard,
-            stop_threshold=stop_threshold,
-            round_progress=round_progress,
-        )
-        return {
-            **fallback,
-            "decision_source": "fallback_contract_after_first_answer",
-            "fallback_reason": "contract_sla_guard_after_first_answer",
-        }
-    if query_class == "broad_summary":
-        required_slots = [slot for slot in _required_slots_for_query(query_text) if slot]
-        covered_slots = [slot for slot in required_slots if float(coverage_by_slot.get(slot) or 0.0) >= 0.55]
-        slot_floor = 5 if retrieval_mode == "heavy" else 6 if retrieval_mode == "forensic" else 4
-        if len(covered_slots) >= min(slot_floor, len(required_slots)) and shared_confidence >= 0.55:
-            fallback = _fallback_master_decide(
-                query_text=query_text,
-                retrieval_mode=retrieval_mode,
-                query_class=query_class,
-                branches=branches,
-                blackboard={**blackboard, "unresolved_slots": []},
-                stop_threshold=stop_threshold,
-                round_progress=round_progress,
-            )
-            return {
-                **fallback,
-                "decision_source": "fallback_broad_coverage",
-                "fallback_reason": "broad_summary_slot_coverage_sufficient",
-            }
-    if (
-        retrieval_mode == "flash"
-        and query_class == "direct_fact"
-        and not _explicit_temporal_terms(query_text)
-        and shared_confidence >= max(0.6, float(stop_threshold or 0.0) - 0.08)
-    ):
-        fallback = _fallback_master_decide(
-            query_text=query_text,
-            retrieval_mode=retrieval_mode,
-            query_class=query_class,
-            branches=branches,
-            blackboard=blackboard,
-            stop_threshold=stop_threshold,
-            round_progress=round_progress,
-        )
-        return {
-            **fallback,
-            "decision_source": "fallback_fast_direct_fact",
-            "fallback_reason": "fast_direct_fact_sla_guard",
-        }
-    if query_class == "direct_fact" and _explicit_temporal_terms(query_text):
-        fallback = _fallback_master_decide(
-            query_text=query_text,
-            retrieval_mode=retrieval_mode,
-            query_class=query_class,
-            branches=branches,
-            blackboard=blackboard,
-            stop_threshold=stop_threshold,
-            round_progress=round_progress,
-        )
-        return {
-            **fallback,
-            "decision_source": "fallback_temporal_guard",
-            "fallback_reason": "explicit_temporal_evidence_guard",
-        }
     llm_decision, llm_error = master_judge_llm(
         query_text=query_text,
         query_class=query_class,
@@ -13293,21 +13917,7 @@ def _master_decide(
     )
     if llm_decision:
         return {**llm_decision, "decision_source": "llm", "fallback_reason": None}
-    fallback = _fallback_master_decide(
-        query_text=query_text,
-        retrieval_mode=retrieval_mode,
-        query_class=query_class,
-        branches=branches,
-        blackboard=blackboard,
-        stop_threshold=stop_threshold,
-        round_progress=round_progress,
-    )
-    return {
-        **fallback,
-        "decision_source": _decision_source_from_error(llm_error, fallback_prefix="fallback"),
-        "fallback_reason": _fallback_reason_from_error(llm_error),
-        "decision_error": llm_error,
-    }
+    raise SearchAiExecutionError("master_judge", llm_error or "invalid_json")
 
 
 def reverse_like_projection(text: str, *, query_text: str | None = None) -> dict[str, Any]:
@@ -14561,6 +15171,10 @@ def llm_retrieval_plan(
     )
     if fast_plan:
         return fast_plan, None
+    raise SearchAiExecutionError(
+        "planner_seed_refinement",
+        fast_seed_error or "invalid_json",
+    )
     fast_seed_source = _planner_seed_source_from_error(fast_seed_error)
     retry_budget = _planner_seed_retry_timeout_seconds(effective_retrieval_mode, query.query_text)
     if (
@@ -14730,7 +15344,8 @@ def llm_retrieval_plan(
         f"Identity context: {build_identity_context(identity_source)}\n"
         f"Atlas brief: {atlas_brief}"
     )
-    payload, error = structured_json(
+    payload = _run_attested_search_ai_json(
+        call_name="retrieval_planner",
         model=retrieval_model(),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -14739,7 +15354,7 @@ def llm_retrieval_plan(
         timeout=25.0,
         role="retrieval",
     )
-    return payload, error
+    return payload, None
 
 
 def llm_navigation_actions(
@@ -14751,38 +15366,6 @@ def llm_navigation_actions(
     atlas_shortlist: list[dict[str, Any]],
     retrieval_mode: str,
 ) -> tuple[list[dict[str, Any]], str]:
-    fallback_actions: list[dict[str, Any]] = []
-    shortlist_keys = [str(bucket.get("bucket_key") or "") for bucket in atlas_shortlist[:3] if str(bucket.get("bucket_key") or "")]
-    query_class = _query_class(query.query_text)
-    if shortlist_keys:
-        fallback_actions.append(
-            {
-                "action": "inspect_adjacent_buckets" if len(shortlist_keys) > 1 else "inspect_bucket",
-                "payload": {"bucket_keys": shortlist_keys} if len(shortlist_keys) > 1 else {"bucket_key": shortlist_keys[0]},
-                "confidence": 0.48,
-                "rationale": "Fallback local navigation around shortlisted atlas buckets.",
-            }
-        )
-    if query_class == "document_lookup":
-        fallback_actions.append(
-            {
-                "action": "read_document_anchor",
-                "payload": {},
-                "confidence": 0.55,
-                "rationale": "Document lookup should prioritize document anchors.",
-            }
-        )
-    elif query_class == "broad_summary":
-        fallback_actions.append(
-            {
-                "action": "expand_radius",
-                "payload": {"delta": 0.03},
-                "confidence": 0.42,
-                "rationale": "Broad summary can widen radius slightly after the first nearby pass.",
-            }
-        )
-    if not llm_enabled():
-        return _normalize_navigation_actions(fallback_actions), "fallback"
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -14805,7 +15388,8 @@ def llm_navigation_actions(
             }
         },
     }
-    payload, error = structured_json(
+    payload = _run_attested_search_ai_json(
+        call_name="navigation_actions",
         model=retrieval_model(),
         system_prompt=(
             "You are an AGVM navigation worker. Choose only discrete retrieval actions. "
@@ -14824,9 +15408,10 @@ def llm_navigation_actions(
         timeout=2.0 if retrieval_mode == "balanced" else (2.8 if retrieval_mode == "heavy" else 3.8),
         role="retrieval",
     )
-    if error or not payload:
-        return _normalize_navigation_actions(fallback_actions), "fallback"
-    return _normalize_navigation_actions(list(payload.get("actions") or [])) or _normalize_navigation_actions(fallback_actions), "llm"
+    actions = _normalize_navigation_actions(list(payload.get("actions") or []))
+    if not actions:
+        raise SearchAiExecutionError("navigation_actions", "invalid_json")
+    return actions, "llm"
 
 
 def build_probe_from_spec(
@@ -15109,6 +15694,7 @@ def fallback_retrieval_plan(
     calibration_snapshot: dict[str, Any] | None = None,
     answer_strands: list[dict[str, Any]] | None = None,
     planner_seed_source: str | None = None,
+    strict_ai_material: bool = False,
 ) -> tuple[list[dict[str, Any]], float, str]:
     query_class = _query_class(query.query_text)
     query_contract = build_query_contract(query.query_text, retrieval_mode=query.retrieval_mode)
@@ -15130,8 +15716,13 @@ def fallback_retrieval_plan(
         answer_strands if answer_strands else heuristic_answer_strands(query.query_text, default_probe_limit),
         query_text=query.query_text,
         max_probe_count=min(query.max_probe_count, query.max_total_branches),
-        planner_family="heuristic",
+        planner_family="ai" if strict_ai_material else "heuristic",
     )
+    if strict_ai_material and (
+        not normalized_strands
+        or any(str(strand.get("planner_family") or "").strip().lower() != "ai" for strand in normalized_strands)
+    ):
+        raise AiModuleContractError("search_ai_plan_material_missing")
     normalized_strands = _select_answer_strands_for_query(
         normalized_strands,
         query_text=query.query_text,
@@ -15156,7 +15747,7 @@ def fallback_retrieval_plan(
         query_text=query.query_text,
         max_probe_count=probe_limit,
     )
-    if compiled_strands:
+    if compiled_strands and not strict_ai_material:
         incoming_ai_seed = any(str(strand.get("planner_family") or "").strip().lower() == "ai" for strand in normalized_strands)
         strand_order = normalized_strands + compiled_strands if incoming_ai_seed else compiled_strands + normalized_strands
         normalized_strands = _normalize_answer_strands(
@@ -15165,17 +15756,20 @@ def fallback_retrieval_plan(
             max_probe_count=probe_limit,
             planner_family="heuristic",
         )
-    normalized_strands = _supplement_answer_strands_for_query(
-        normalized_strands,
-        query_text=query.query_text,
-        max_probe_count=probe_limit,
-    )
+    if not strict_ai_material:
+        normalized_strands = _supplement_answer_strands_for_query(
+            normalized_strands,
+            query_text=query.query_text,
+            max_probe_count=probe_limit,
+        )
     normalized_strands = _select_answer_strands_for_query(
         normalized_strands,
         query_text=query.query_text,
         max_probe_count=probe_limit,
     )
     if not normalized_strands:
+        if strict_ai_material:
+            raise AiModuleContractError("search_ai_plan_material_missing")
         normalized_strands = _normalize_answer_strands(
             heuristic_answer_strands(query.query_text, probe_limit),
             query_text=query.query_text,
@@ -15189,7 +15783,7 @@ def fallback_retrieval_plan(
         )
     raw_specs = _dedupe_probe_specs(_answer_strands_to_probe_specs(normalized_strands[:probe_limit], root_query_text=query.query_text))[:probe_limit]
     raw_specs = _select_probe_specs_for_query(raw_specs, query_text=query.query_text, max_probe_count=probe_limit)
-    decomposition_mode = "llm" if str(planner_seed_source or "").strip().lower() == "llm" else "heuristic"
+    decomposition_mode = "llm" if strict_ai_material or str(planner_seed_source or "").strip().lower() == "llm" else "heuristic"
     multi_goal_tokens = sum(
         1
         for token in (" e ", " and ", ",", ";", " insieme ", " both ", " oltre ")
@@ -15230,6 +15824,77 @@ def fallback_retrieval_plan(
         for index, spec in enumerate(enriched_specs)
     ]
     return probes, 0.82, decomposition_mode
+
+
+def _materialize_attested_seed_probes(
+    query: RetrieveRequest,
+    *,
+    atlas_payload: dict[str, Any],
+    identity_context: dict[str, Any],
+    answer_strands: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], float, str]:
+    """Compile attested AI strands into backend probes without adding intent."""
+    probe_limit = max(1, min(int(query.max_probe_count), int(query.max_total_branches)))
+    normalized_strands = _normalize_answer_strands(
+        answer_strands,
+        query_text=query.query_text,
+        max_probe_count=probe_limit,
+        planner_family="ai",
+    )
+    if not normalized_strands or any(
+        str(strand.get("planner_family") or "").strip().lower() != "ai"
+        for strand in normalized_strands
+    ):
+        raise SearchAiExecutionError("planner_seed_admission", "invalid_json:answer_strands")
+
+    selected_strands = _select_answer_strands_for_query(
+        normalized_strands,
+        query_text=query.query_text,
+        max_probe_count=probe_limit,
+    )
+    raw_specs = _select_probe_specs_for_query(
+        _dedupe_probe_specs(
+            _answer_strands_to_probe_specs(
+                selected_strands,
+                root_query_text=query.query_text,
+            )
+        ),
+        query_text=query.query_text,
+        max_probe_count=probe_limit,
+    )[:probe_limit]
+    if not raw_specs:
+        raise SearchAiExecutionError("planner_seed_admission", "invalid_json:probe_specs")
+
+    per_probe_chars = max(1200, int(query.max_total_text_chars / max(1, len(raw_specs))))
+    probes: list[dict[str, Any]] = []
+    for index, raw_spec in enumerate(raw_specs, start=1):
+        spec = dict(raw_spec)
+        spec["planner_family"] = "ai"
+        spec["family_plan_id"] = str(spec.get("family_plan_id") or "ai_family_plan")
+        spec["search_radius"] = float(spec.get("search_radius") or 0.22)
+        spec["success_min_confidence"] = float(spec.get("success_min_confidence") or 0.8)
+        spec["max_text_chars"] = int(spec.get("max_text_chars") or per_probe_chars)
+        probe = build_probe_from_spec(
+            spec,
+            index,
+            root_query_text=query.query_text,
+            atlas_payload=atlas_payload,
+            identity_context=identity_context,
+        )
+        probes.append(
+            _annotate_probe_family(
+                probe,
+                planner_family="ai",
+                family_plan_id=str(spec["family_plan_id"]),
+                family_plan_confidence=float(
+                    spec.get("family_plan_confidence")
+                    or spec.get("branch_priority")
+                    or spec.get("weight")
+                    or 0.0
+                ),
+            )
+        )
+    return probes, 0.82, "ai"
 
 
 def _spatial_coordinate(value: Any) -> dict[str, float] | None:
@@ -16596,7 +17261,18 @@ def compute_satisfaction(matches: list[dict[str, Any]]) -> float:
     return round(0.55 * top1 + 0.25 * mean_top3 + 0.20 * evidence_bonus, 6)
 
 
-def retrieve(query: RetrieveRequest, graph: dict[str, Any], index_payload: dict[str, Any], atlas_payload: dict[str, Any]) -> dict[str, Any]:
+def retrieve(
+    query: RetrieveRequest,
+    graph: dict[str, Any],
+    index_payload: dict[str, Any],
+    atlas_payload: dict[str, Any],
+    *,
+    ai_admission: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    _validate_search_ai_admission_boundary(
+        ai_admission,
+        require_seed_payload=True,
+    )
     identity_context = build_identity_context(graph)
     planner_payload, planner_error = llm_retrieval_plan(query, identity_context, atlas_payload)
     if planner_payload:
@@ -16615,12 +17291,9 @@ def retrieve(query: RetrieveRequest, graph: dict[str, Any], index_payload: dict[
         stop_threshold = max(0.5, min(0.99, float((planner_payload.get("stop_policy") or {}).get("stop_when_confidence_ge") or 0.82)))
         decomposition_mode = "llm"
     else:
-        probes, stop_threshold, decomposition_mode = fallback_retrieval_plan(
-            query,
-            atlas_payload=atlas_payload,
-            identity_context=identity_context,
+        raise AiModuleContractError(
+            _search_ai_block_reason(planner_error or "llm_empty")
         )
-        planner_mode = "heuristic"
 
     visited_node_ids: set[str] = set()
     visited_bucket_keys: set[str] = set()
@@ -16791,7 +17464,13 @@ def retrieve(query: RetrieveRequest, graph: dict[str, Any], index_payload: dict[
         "shared_bucket_keys": sorted(visited_bucket_keys),
         "confidence": max((float(topic["confidence"]) for topic in shared_topics.values()), default=0.0),
     }
-    answer, context = generate_grounded_answer(query.query_text, matches[: query.max_matches], shared_evidence, query.response_mode)
+    answer, context = _generate_attested_grounded_answer(
+        query_text=query.query_text,
+        matches=matches[: query.max_matches],
+        shared_evidence=shared_evidence,
+        response_mode=query.response_mode,
+        retrieval_mode=str(query.retrieval_mode or "balanced"),
+    )
     if stop_reason == "budget_exhausted" and all_steps:
         stop_reason = all_steps[-1].get("stop_reason") or stop_reason
     return {
@@ -17023,7 +17702,11 @@ def _semantic_contract_final_join_wait_seconds(
 def _semantic_contract_is_ai_material(runtime: dict[str, Any] | None) -> bool:
     payload = dict(runtime or {})
     source = str(payload.get("source") or "").strip()
-    return bool(payload.get("material")) and source in {"llm", "semantic_contract_cache"}
+    return bool(payload.get("material")) and source in {
+        "llm",
+        "semantic_contract_cache",
+        "search_ai_admission_materialization",
+    }
 
 
 def _semantic_contract_runtime_rank(runtime: dict[str, Any] | None) -> int:
@@ -19057,8 +19740,6 @@ def _run_ai_branch_autojudge(
     counts: dict[str, int],
     revision_context: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, str | None, float]:
-    if not llm_enabled():
-        return None, "llm_disabled", 0.0
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -19109,7 +19790,8 @@ def _run_ai_branch_autojudge(
         },
     }
     started_at = time.perf_counter()
-    payload, error = structured_json(
+    payload = _run_attested_search_ai_json(
+        call_name="branch_autojudge",
         model=retrieval_model(),
         system_prompt=(
             "You are AGVM's branch evidence judge. Judge only this compact branch ledger. "
@@ -19125,11 +19807,9 @@ def _run_ai_branch_autojudge(
         max_output_tokens=260,
     )
     elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 3)
-    if error or not isinstance(payload, dict):
-        return None, error or "llm_empty", elapsed_ms
     normalized = _normalize_ai_branch_autojudge_payload(payload)
     if not normalized:
-        return None, "invalid_ai_branch_autojudge_payload", elapsed_ms
+        raise SearchAiExecutionError("branch_autojudge", "invalid_json")
     return normalized, None, elapsed_ms
 
 
@@ -19389,6 +20069,7 @@ def apply_branch_autojudge_to_mission_ledger(
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_by_index = {
                 executor.submit(
+                    copy_context().run,
                     _branch_autojudge_row,
                     row,
                     query_text=query_text,
@@ -21401,9 +22082,15 @@ def prepare_runtime_plan(
     identity_nucleus: dict[str, Any],
     *,
     defer_planner_seed: bool = False,
+    ai_admission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     plan_started_at = time.perf_counter()
     stage_timings_ms: dict[str, float] = {}
+    admitted_search = _validate_search_ai_admission_boundary(
+        ai_admission,
+        require_seed_payload=True,
+    )
+    admitted_attestation = dict(admitted_search["ai_execution_attestation"])
 
     def mark_stage(key: str, started_at: float) -> None:
         stage_timings_ms[key] = round((time.perf_counter() - started_at) * 1000.0, 3)
@@ -21479,17 +22166,12 @@ def prepare_runtime_plan(
         "spatial_readiness": dict(active_metamemory_spatial_brief.get("spatial_readiness_contract") or {}),
     }
     phase_started = time.perf_counter()
-    semantic_contract, semantic_contract_runtime = compile_semantic_query_contract(
-        query_text=query.query_text,
+    semantic_contract, semantic_contract_runtime = _semantic_contract_from_attested_admission(
+        query=query,
         retrieval_mode=selected_retrieval_mode,
         legacy_contract=legacy_query_contract,
         identity_hints=identity_context,
-        tool_name=query.mcp_tool_name,
-        allow_ai=bool(llm_enabled()),
-        deferred=bool(defer_planner_seed),
-        timeout=_semantic_contract_timeout_seconds(selected_retrieval_mode),
-        brain_revision=semantic_brain_revision,
-        cache_scope="retrieve_semantic_contract",
+        admission=admitted_search,
     )
     mark_stage("semantic_ai_ms", phase_started)
     semantic_identity_hints = sanitize_identity_hints(semantic_contract.get("identity_hints") or {})
@@ -21532,7 +22214,17 @@ def prepare_runtime_plan(
             }
             for strand in semantic_contract_seed_strands
         ]
-    if planner_seed_deferred:
+    if admitted_search:
+        planner_seed_payload = dict(admitted_search.get("planner_seed_payload") or {})
+        answer_strands = [dict(item) for item in list(admitted_search.get("answer_strands") or [])]
+        if not planner_seed_payload or not answer_strands:
+            raise ValueError("search_ai_admission_material_missing")
+        planner_seed_source = "llm"
+        planner_seed_status = "completed"
+        planner_seed_primary_status = "completed"
+        planner_seed_attempt_count = 1
+        planner_seed_deferred = False
+    elif planner_seed_deferred:
         planner_seed_source = "background_deferred"
         planner_seed_status = "deferred"
         planner_seed_primary_status = "deferred"
@@ -21598,15 +22290,23 @@ def prepare_runtime_plan(
                     planner_seed_error = retry_error or planner_seed_error
                     planner_seed_source = _planner_seed_source_from_error(planner_seed_error)
                     planner_seed_status = planner_seed_source
-    if not answer_strands and semantic_contract_seed_strands:
+    if not admitted_search and not answer_strands and semantic_contract_seed_strands:
         answer_strands = [dict(item) for item in semantic_contract_seed_strands]
     if not answer_strands:
+        if admitted_search:
+            raise ValueError("search_ai_admission_material_missing")
         answer_strands = _normalize_answer_strands(
             heuristic_answer_strands(query.query_text, seed_max_probe_count),
             query_text=query.query_text,
             max_probe_count=seed_max_probe_count,
             planner_family="heuristic",
         )
+        answer_strands = _select_answer_strands_for_query(
+            answer_strands,
+            query_text=query.query_text,
+            max_probe_count=seed_max_probe_count,
+        )
+    elif admitted_search:
         answer_strands = _select_answer_strands_for_query(
             answer_strands,
             query_text=query.query_text,
@@ -21656,6 +22356,12 @@ def prepare_runtime_plan(
         "seed_destination_presence": seed_destination_presence,
         "seed_used_by_bootstrap": bool(answer_strands),
         "planner_seed_error": planner_seed_error,
+        "search_ai_admission": {
+            key: value
+            for key, value in admitted_search.items()
+            if key not in {"planner_seed_payload", "answer_strands"}
+        },
+        "ai_execution_attestation": admitted_attestation,
         "semantic_contract_seed_used": bool(semantic_contract_seed_strands and answer_strands),
         "semantic_contract_ai_seed_used": bool(semantic_contract_ai_seed and answer_strands),
         "semantic_contract_seed_strand_count": len(semantic_contract_seed_strands),
@@ -21665,10 +22371,17 @@ def prepare_runtime_plan(
         "semantic_contract_brain_revision": semantic_brain_revision,
     }
     ai_spatial_initial_mode_budget = dict(retrieval_mode_budget)
-    if defer_planner_seed:
+    if planner_seed_deferred:
         ai_spatial_initial_mode_budget["source"] = "preflight_initial_plan"
         ai_spatial_initial_mode_budget["cache_only"] = True
         ai_spatial_initial_mode_budget["first_payload_deferred_initial_plan"] = True
+    ai_spatial_initial_deferred = bool(
+        planner_seed_deferred
+        and (
+            not _semantic_contract_is_ai_material(semantic_contract_runtime)
+            or bool(ai_spatial_initial_mode_budget.get("first_payload_deferred_initial_plan"))
+        )
+    )
     phase_started = time.perf_counter()
     ai_spatial_landing_contract = build_public_v1_landing_contract(
         query_text=query.query_text,
@@ -21681,15 +22394,19 @@ def prepare_runtime_plan(
         mode_budget=ai_spatial_initial_mode_budget,
         brain_revision=semantic_brain_revision,
         allow_ai=bool(llm_enabled()),
-        deferred=bool(
-            planner_seed_deferred
-            and (
-                not _semantic_contract_is_ai_material(semantic_contract_runtime)
-                or bool(ai_spatial_initial_mode_budget.get("first_payload_deferred_initial_plan"))
-            )
-        ),
+        deferred=ai_spatial_initial_deferred,
         cache_scope="retrieve_ai_spatial_contract",
+        structured_json_fn=_attested_search_ai_provider("ai_spatial_landing"),
     )
+    if (
+        not ai_spatial_initial_deferred
+        and str(ai_spatial_landing_contract.get("source") or "").strip()
+        in {"fresh_llm", "fresh_llm_sharded", "fresh_llm_shard"}
+    ):
+        ai_spatial_landing_contract = _require_materialized_ai_spatial_contract(
+            ai_spatial_landing_contract,
+            call_name="ai_spatial_landing",
+        )
     mark_stage("spatial_ai_ms", phase_started)
     ai_spatial_landing_contract_runtime = {
         "schema_version": "agvm.public_v1_landing_landing_contract_runtime.v1",
@@ -21725,24 +22442,23 @@ def prepare_runtime_plan(
     planner_seed_runtime["path_mission_contract"] = dict(path_mission_contract)
     planner_seed_runtime["path_mission_count"] = len(path_missions)
     phase_started = time.perf_counter()
-    probes, stop_threshold, decomposition_mode = fallback_retrieval_plan(
+    probes, stop_threshold, decomposition_mode = _materialize_attested_seed_probes(
         query,
         atlas_payload=atlas_payload,
         identity_context=identity_context,
-        calibration_snapshot=heuristic_calibration_snapshot,
         answer_strands=answer_strands,
-        planner_seed_source=planner_seed_source,
     )
-    mark_stage("heuristic_planner_ms", phase_started)
+    mark_stage("ai_seed_materialization_ms", phase_started)
 
     phase_started = time.perf_counter()
-    probes = _ensure_probe_goal_coverage(
-        probes,
-        query_text=query.query_text,
-        max_probes=_initial_probe_limit(query),
-        atlas_payload=atlas_payload,
-        identity_context=identity_context,
-    )
+    if not admitted_search:
+        probes = _ensure_probe_goal_coverage(
+            probes,
+            query_text=query.query_text,
+            max_probes=_initial_probe_limit(query),
+            atlas_payload=atlas_payload,
+            identity_context=identity_context,
+        )
     probes = _reindex_probes(probes)
     probes = [
         _annotate_probe_family(
@@ -21891,8 +22607,14 @@ def prepare_runtime_plan(
         calibration_snapshot_mode="hot_path_lightweight",
     )
     phase_timings = _runtime_stage_phase_timings(runtime_stage_timing)
-    return {
+    runtime_plan = {
         "identity_context": identity_context,
+        "search_ai_admission": {
+            key: value
+            for key, value in admitted_search.items()
+            if key != "planner_seed_payload"
+        },
+        "ai_execution_attestation": admitted_attestation,
         "answer_strands": answer_strands,
         "planner_seed_runtime": planner_seed_runtime,
         "seed_goal_coverage": seed_goal_coverage,
@@ -21921,7 +22643,11 @@ def prepare_runtime_plan(
             "planner_mode": planner_mode,
             "decomposition_mode": decomposition_mode,
             "branch_count": len(branches),
-            "planner_path": "hybrid_initial" if planner_mode in {"hybrid", "hybrid_ai_spatial"} else "fallback",
+            "planner_path": (
+                "ai_attested"
+                if admitted_search
+                else ("hybrid_initial" if planner_mode in {"hybrid", "hybrid_ai_spatial"} else "fallback")
+            ),
             "probe_limit_reason": probe_limit_reason,
             "broad_summary_query": _is_broad_summary_query(query.query_text),
             "query_class": _query_class(query.query_text),
@@ -21969,6 +22695,10 @@ def prepare_runtime_plan(
             "semantic_contract_blocking": bool(not defer_planner_seed),
             "semantic_contract_deferred_requested": bool(defer_planner_seed),
             "planner_error": None,
+            "search_ai_admission_status": str(admitted_search.get("status") or "internal_unchecked"),
+            "ai_execution_attested": bool(admitted_attestation),
+            "ai_execution_attestation": admitted_attestation,
+            "heuristic_fallback_used": False if admitted_search else None,
             "fast_path_used": True,
             "fast_model_profile": _fast_model_profile(
                 retrieval_mode=selected_retrieval_mode,
@@ -22021,6 +22751,8 @@ def prepare_runtime_plan(
             "mission_merge_learning_signals": list(ai_spatial_merge_summary.get("learning_signals") or []),
         },
     }
+    _validate_attested_runtime_plan(runtime_plan)
+    return runtime_plan
 
 
 def _process_branch_round(
@@ -23837,17 +24569,31 @@ def _shared_evidence_from_preflight_matches(
     }
 
 
-def retrieve_runtime(
+def _retrieve_runtime_attested_impl(
     query: RetrieveRequest,
     atlas_payload: dict[str, Any],
     identity_nucleus: dict[str, Any],
     *,
     prepared_plan: dict[str, Any] | None = None,
+    ai_admission: dict[str, Any] | None = None,
     search_id: str | None = None,
     event_callback: Any | None = None,
 ) -> dict[str, Any]:
+    if prepared_plan is not None:
+        _validate_attested_runtime_plan(prepared_plan)
+    else:
+        ai_admission = _validate_search_ai_admission_boundary(
+            ai_admission,
+            require_seed_payload=True,
+        )
     started_at = time.perf_counter()
-    runtime_plan = prepared_plan or prepare_runtime_plan(query, atlas_payload, identity_nucleus, defer_planner_seed=True)
+    runtime_plan = prepared_plan or prepare_runtime_plan(
+        query,
+        atlas_payload,
+        identity_nucleus,
+        defer_planner_seed=True,
+        ai_admission=ai_admission,
+    )
     identity_context = dict(runtime_plan["identity_context"])
     legacy_query_contract = build_query_contract(
         query.query_text,
@@ -24195,51 +24941,8 @@ def retrieve_runtime(
     semantic_contract_thread: threading.Thread | None = None
     semantic_contract_started_at: float | None = None
 
-    def _run_semantic_contract_compiler() -> None:
-        contract, runtime = compile_semantic_query_contract(
-            query_text=query.query_text,
-            retrieval_mode=retrieval_mode,
-            legacy_contract=legacy_query_contract,
-            identity_hints=identity_nucleus,
-            tool_name=query.mcp_tool_name,
-            allow_ai=True,
-            deferred=False,
-            timeout=_semantic_contract_timeout_seconds(retrieval_mode),
-            brain_revision=semantic_brain_revision,
-            cache_scope="retrieve_semantic_contract",
-        )
-        with semantic_contract_lock:
-            semantic_contract_state["contract"] = dict(contract or {})
-            semantic_contract_state["runtime"] = dict(runtime or {})
-        emit(
-            "semantic_contract_ready",
-            {
-                "runtime_phase": runtime_phase,
-                "semantic_contract": dict(contract or {}),
-                "semantic_contract_runtime": dict(runtime or {}),
-            },
-        )
-
-    initial_semantic_runtime = dict(semantic_contract_state.get("runtime") or {})
-    if (
-        str(initial_semantic_runtime.get("status") or "") in {"deferred", "fallback"}
-        and bool(initial_semantic_runtime.get("ai_required"))
-        and bool(llm_enabled())
-        and not _semantic_contract_is_ai_material(initial_semantic_runtime)
-    ):
-        semantic_contract_context = copy_context()
-        semantic_contract_started_at = time.perf_counter()
-        semantic_contract_thread = threading.Thread(
-            target=lambda: semantic_contract_context.run(_run_semantic_contract_compiler),
-            daemon=True,
-        )
-        semantic_contract_thread.start()
-
     if bool(llm_scout_state["enabled"]):
-        llm_scout_context = copy_context()
-        llm_scout_thread = threading.Thread(target=lambda: llm_scout_context.run(_run_llm_scout), daemon=True)
-        llm_scout_thread.start()
-        llm_scout_thread.join(timeout=initial_scout_wait_seconds)
+        _run_llm_scout()
 
     runtime_ai_spatial_attempted = bool(
         dict(runtime_plan.get("ai_spatial_landing_contract") or {}).get("materialized")
@@ -24534,6 +25237,11 @@ def retrieve_runtime(
                 deferred=False,
                 timeout=runtime_ai_spatial_contract_timeout_seconds(),
                 cache_scope="retrieve_ai_spatial_contract",
+                structured_json_fn=_attested_search_ai_provider("ai_spatial_landing"),
+            )
+            spatial_contract = _require_materialized_ai_spatial_contract(
+                spatial_contract,
+                call_name="ai_spatial_landing",
             )
             spatial_runtime = {
                 "schema_version": "agvm.public_v1_landing_landing_contract_runtime.v1",
@@ -28025,15 +28733,13 @@ def retrieve_runtime(
             answer.setdefault("answer_adequacy", {})
             answer = _apply_answer_contract(query.query_text, answer, matches[: query.max_matches])
     else:
-        answer, context = generate_grounded_answer(
-            query.query_text,
-            matches[: query.max_matches],
-            shared_evidence,
-            query.response_mode,
+        answer, context = _generate_attested_grounded_answer(
+            query_text=query.query_text,
+            matches=matches[: query.max_matches],
+            shared_evidence=shared_evidence,
+            response_mode=query.response_mode,
             evidence_reservoir=evidence_reservoir,
             retrieval_mode=retrieval_mode,
-            document_mode=document_mode,
-            document_packets=document_packets,
         )
     context = _build_document_context(
         document_mode=document_mode,
@@ -28608,11 +29314,6 @@ def retrieve_runtime(
         answer_full = document_answer_full
         context_dossier = document_context_dossier
     else:
-        final_context_dossier_allow_llm = query.response_mode in {"answer", "both"} and not (
-            final_answer_seed_from_early_surface
-            or str((answer or {}).get("final_seed_source") or "") == "warm_context_sufficient"
-            or partial_terminal_fast_materialization
-        )
         answer_full, context_dossier = build_context_dossier(
             query.query_text,
             matches[: query.max_matches],
@@ -28620,7 +29321,7 @@ def retrieve_runtime(
             shared_evidence,
             retrieval_mode=retrieval_mode,
             evidence_reservoir=evidence_reservoir,
-            allow_llm=final_context_dossier_allow_llm,
+            allow_llm=False,
         )
     final_section_snapshots = _section_snapshots(context or {})
     candidate_answer_full = answer_full
@@ -30938,3 +31639,112 @@ def retrieve_runtime(
         )
     _clear_search_supersede(search_id)
     return result
+
+
+def retrieve_runtime(
+    query: RetrieveRequest,
+    atlas_payload: dict[str, Any],
+    identity_nucleus: dict[str, Any],
+    *,
+    prepared_plan: dict[str, Any] | None = None,
+    ai_admission: dict[str, Any] | None = None,
+    search_id: str | None = None,
+    event_callback: Any | None = None,
+) -> dict[str, Any]:
+    """Run Search atomically with one independently validated proof per AI call."""
+    if prepared_plan is not None:
+        admission = _validate_attested_runtime_plan(prepared_plan)
+    else:
+        admission = _validate_search_ai_admission_boundary(
+            ai_admission,
+            require_seed_payload=True,
+        )
+
+    admission_attestation = dict(admission["ai_execution_attestation"])
+    call_ledger: list[dict[str, Any]] = [
+        {
+            "call_id": f"planner_seed_admission:{uuid.uuid4().hex}",
+            "call_name": "planner_seed_admission",
+            "ai_execution_attestation": admission_attestation,
+        }
+    ]
+    buffered_events: list[tuple[str, dict[str, Any]]] = []
+
+    def buffer_event(event_type: str, payload: dict[str, Any]) -> None:
+        buffered_events.append((str(event_type), dict(payload or {})))
+
+    token = _SEARCH_AI_CALL_LEDGER.set(call_ledger)
+    try:
+        result = _retrieve_runtime_attested_impl(
+            query,
+            atlas_payload,
+            identity_nucleus,
+            prepared_plan=prepared_plan,
+            ai_admission=admission,
+            search_id=search_id,
+            event_callback=buffer_event if event_callback else None,
+        )
+        execution_summary = {
+            "schema_version": "agvm.search_ai_execution.v2",
+            "status": "completed",
+            "call_count": len(call_ledger),
+            "fallback_used": False,
+            "calls": [dict(item) for item in call_ledger],
+        }
+        result["search_ai_execution"] = execution_summary
+        result["ai_execution_attestations"] = [dict(item) for item in call_ledger]
+        planner_runtime = dict(result.get("planner_runtime") or {})
+        planner_runtime["search_ai_execution"] = execution_summary
+        planner_runtime["ai_execution_attestations"] = [dict(item) for item in call_ledger]
+        result["planner_runtime"] = planner_runtime
+        if event_callback:
+            for event_type, payload in buffered_events:
+                if event_type == "result_ready":
+                    payload["result"] = result
+                event_callback(event_type, payload)
+        return result
+    except SearchAiExecutionError as exc:
+        blocked_admission = {
+            "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
+            "status": "blocked",
+            "reason": _search_ai_block_reason(exc.provider_error),
+            "provider_error": exc.provider_error,
+            "failed_call": exc.call_name,
+            "chargeable": False,
+            "charged_units": 0,
+            "fallback_used": False,
+            "heuristic_result_exposed": False,
+        }
+        blocked = build_search_ai_blocked_result(
+            query,
+            blocked_admission,
+            search_id=search_id,
+        )
+        blocked["billing"] = {
+            "chargeable": False,
+            "charged_units": 0,
+            "reason": "search_ai_call_not_attested",
+        }
+        blocked["search_ai_execution"] = {
+            "schema_version": "agvm.search_ai_execution.v2",
+            "status": "blocked",
+            "failed_call": exc.call_name,
+            "provider_error": exc.provider_error,
+            "call_count": len(call_ledger),
+            "fallback_used": False,
+            "calls": [dict(item) for item in call_ledger],
+        }
+        blocked["ai_execution_attestations"] = [dict(item) for item in call_ledger]
+        if event_callback:
+            terminal_payload = {
+                "search_id": search_id,
+                "stop_reason": blocked["stop_reason"],
+                "failed_ai_call": exc.call_name,
+                "provider_error": exc.provider_error,
+                "result": blocked,
+            }
+            event_callback("search_blocked", terminal_payload)
+            event_callback("result_ready", terminal_payload)
+        return blocked
+    finally:
+        _SEARCH_AI_CALL_LEDGER.reset(token)

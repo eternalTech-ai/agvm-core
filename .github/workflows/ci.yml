@@ -72,6 +72,7 @@ jobs:
         run: |
           python - <<'PY'
           import re
+          import subprocess
           from pathlib import Path
 
           root = Path.cwd()
@@ -79,10 +80,13 @@ jobs:
           forbidden_suffixes = {".db", ".duckdb", ".sqlite", ".sqlite3"}
           local_path = re.compile(r"(?:[A-Za-z]:\\Users\\|[A-Za-z]:/Users/)", re.IGNORECASE)
           violations = []
-          for path in root.rglob("*"):
-              if not path.is_file() or any(part in {".git", "node_modules", "dist", "__pycache__", ".pytest_cache"} for part in path.parts):
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode("utf-8").split("\0")
+          for relative in tracked:
+              if not relative:
                   continue
-              relative = path.relative_to(root).as_posix()
+              path = root / relative
+              if not path.is_file():
+                  continue
               if relative.split("/", 1)[0] in forbidden_roots:
                   violations.append(f"forbidden product root: {relative}")
               if path.suffix.lower() in forbidden_suffixes:

@@ -7,7 +7,6 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from brain_bootstrap_v1 import create_brain_bootstrap_v1_router
-from brain_profile_v1_api import create_brain_profile_v1_router
 from brain_sync_restore_materializer import create_brain_sync_restore_router
 from config import APP_NAME, APP_VERSION
 from core_browser_security import install_core_browser_security
@@ -15,8 +14,11 @@ from core_brain_router import create_core_brain_router
 from core_graph_router import create_core_graph_router
 from core_license_router import create_core_license_router
 from core_mcp_contract_router import create_core_mcp_contract_router
-from core_mcp_matrix_router import create_core_mcp_matrix_router
 from core_mcp_ops_router import create_core_mcp_ops_router
+from core_maintenance_runtime import (
+    CoreMaintenanceCloudHandoffRuntime,
+    create_core_maintenance_cloud_handoff_router,
+)
 from core_retrieve_router import create_core_retrieve_router
 from core_runtime_router import create_core_runtime_router
 from edition_gate import install_edition_route_gate, read_edition_settings
@@ -35,10 +37,9 @@ def create_core_app() -> FastAPI:
     app.include_router(create_core_brain_router())
     app.include_router(create_core_graph_router())
     app.include_router(create_core_mcp_contract_router())
-    app.include_router(create_core_mcp_ops_router())
-    app.include_router(create_core_mcp_matrix_router())
+    app.include_router(create_core_mcp_ops_router(maintenance_runtime=CoreMaintenanceCloudHandoffRuntime()))
+    app.include_router(create_core_maintenance_cloud_handoff_router())
     app.include_router(create_brain_bootstrap_v1_router())
-    app.include_router(create_brain_profile_v1_router())
     app.include_router(create_core_retrieve_router())
     app.include_router(create_core_license_router())
     app.include_router(create_brain_sync_restore_router())

@@ -232,7 +232,7 @@ class PreviewRequest(BaseModel):
     source_type: str | None = None
     source_trust: SourceTrust | None = None
     learning_mode: LearningMode = "strict_review"
-    question_limit: int = Field(default=3, ge=1, le=8)
+    question_limit: int = Field(default=12, ge=1, le=24)
 
     @field_validator("text")
     @classmethod
@@ -320,6 +320,7 @@ class WriteTrace(BaseModel):
 
 
 class PreviewBundle(BaseModel):
+    schema_version: str = "agvm.grow_preview_bundle.v1"
     brain_id: str | None = None
     primary_node_preview: PreviewNode
     derived_nodes: list[PreviewNode] = Field(default_factory=list)
@@ -333,6 +334,7 @@ class PreviewBundle(BaseModel):
     cognitive_write_plan: dict[str, Any] = Field(default_factory=dict)
     learning_policy: dict[str, Any] = Field(default_factory=dict)
     write_trace: WriteTrace
+    ai_execution_attestation: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceInvestigationOptions(BaseModel):
@@ -354,7 +356,7 @@ class SourceInvestigationOptions(BaseModel):
     max_online_queries: int = Field(default=4, ge=0, le=50)
     fetch_timeout_seconds: float = Field(default=8.0, ge=0.1, le=30.0)
     compiler_preview_timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
-    question_limit: int = Field(default=5, ge=0, le=12)
+    question_limit: int = Field(default=5, ge=0, le=24)
     max_units: int = Field(default=12, ge=1, le=1024)
     max_urls: int = Field(default=16, ge=0, le=64)
     max_total_chars: int = Field(default=120000, ge=1000, le=500000)
@@ -738,7 +740,7 @@ class McpGrowApplyRequest(BaseModel):
     learning_mode: LearningMode = "strict_review"
     clarification_answers: dict[str, str] = Field(default_factory=dict)
     approved_preview_ids: list[str] = Field(default_factory=list)
-    question_limit: int = Field(default=3, ge=1, le=8)
+    question_limit: int = Field(default=12, ge=1, le=24)
     confirm_apply: bool = False
 
     @field_validator("investigation_id")
@@ -766,7 +768,7 @@ class McpWriteMemoryCommitRequest(BaseModel):
     learning_mode: LearningMode = "strict_review"
     clarification_answers: dict[str, str] = Field(default_factory=dict)
     approved_preview_ids: list[str] = Field(default_factory=list)
-    question_limit: int = Field(default=3, ge=1, le=8)
+    question_limit: int = Field(default=12, ge=1, le=24)
     confirm_apply: bool = False
 
     @field_validator("text", "source_label", "source_type")
@@ -788,7 +790,7 @@ class McpClarificationRequest(BaseModel):
     input_kind: Literal["auto", "manual_text", "url", "website", "pdf", "docx", "image", "transcript", "mixed_bundle"] = "auto"
     options: SourceInvestigationOptions = Field(default_factory=SourceInvestigationOptions)
     learning_mode: LearningMode = "guided_learning"
-    question_limit: int = Field(default=5, ge=1, le=12)
+    question_limit: int = Field(default=12, ge=1, le=24)
 
     @field_validator("brain_id", "raw_input", "text", "source_label", "source_uri", "user_instruction")
     @classmethod
@@ -819,6 +821,8 @@ class McpGrowToolExecutionResponse(BaseModel):
     mcp_latency_profile: dict[str, Any] = Field(default_factory=dict)
     budget: dict[str, Any] = Field(default_factory=dict)
     error_contract: dict[str, Any] = Field(default_factory=dict)
+    ai_execution_attestation: dict[str, Any] = Field(default_factory=dict)
+    investigation_session: dict[str, Any] = Field(default_factory=dict)
     next_action: str | None = None
 
 
@@ -1011,6 +1015,95 @@ McpMatrixCalibrationRollbackRequest = McpGeometryCalibrationRollbackRequest
 McpMatrixCalibrationRollbackResponse = McpGeometryCalibrationRollbackResponse
 
 
+class McpCalibrateBrainV2PreviewRequest(BaseModel):
+    brain_id: str = Field(min_length=1)
+    before_profile: dict[str, Any] | None = None
+    proposed_profile: dict[str, Any]
+    feedback_digest: str = Field(min_length=1)
+    ai_execution_attestation: dict[str, Any]
+    trusted_benchmark: dict[str, Any]
+
+    @field_validator("brain_id", "feedback_digest")
+    @classmethod
+    def trim_calibrate_brain_v2_preview_text(cls, value: str) -> str:
+        resolved = value.strip()
+        if not resolved:
+            raise ValueError("calibrate_brain_v2_value_required")
+        return resolved
+
+
+class McpCalibrateBrainV2ApplyRequest(BaseModel):
+    brain_id: str = Field(min_length=1)
+    plan_signature: str = Field(min_length=1)
+    selected_revision_ids: list[str] = Field(min_length=1)
+    signed_preview_receipt_v2: dict[str, Any] = Field(
+        validation_alias=AliasChoices("signed_preview_receipt_v2", "signed_preview_receipt"),
+        serialization_alias="signed_preview_receipt_v2",
+    )
+    expected_revision_id: str | None = None
+    confirm_apply: bool = False
+    rollback_consent: bool = False
+
+    @field_validator("brain_id", "plan_signature")
+    @classmethod
+    def trim_calibrate_brain_v2_apply_text(cls, value: str) -> str:
+        resolved = value.strip()
+        if not resolved:
+            raise ValueError("calibrate_brain_v2_value_required")
+        return resolved
+
+    @field_validator("expected_revision_id")
+    @classmethod
+    def trim_optional_calibrate_brain_v2_revision(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @field_validator("selected_revision_ids")
+    @classmethod
+    def require_exact_calibrate_brain_v2_revision(cls, value: list[str]) -> list[str]:
+        revisions = [str(item or "").strip() for item in value]
+        if len(revisions) != 1 or not revisions[0]:
+            raise ValueError("calibrate_brain_v2_exact_revision_required")
+        return revisions
+
+
+class McpCalibrateBrainV2RollbackRequest(BaseModel):
+    brain_id: str = Field(min_length=1)
+    operation_id: str = Field(min_length=1)
+    confirm_rollback: bool = False
+
+    @field_validator("brain_id", "operation_id")
+    @classmethod
+    def trim_calibrate_brain_v2_rollback_text(cls, value: str) -> str:
+        resolved = value.strip()
+        if not resolved:
+            raise ValueError("calibrate_brain_v2_value_required")
+        return resolved
+
+
+class McpCalibrateBrainV2Response(BaseModel):
+    schema_version: str = "agvm.mcp_calibrate_brain_tool_output.v2"
+    brain_id: str
+    tool_name: str
+    status: Literal[
+        "preview_ready",
+        "applied",
+        "already_applied",
+        "rolled_back",
+        "already_rolled_back",
+        "blocked",
+    ]
+    plan_signature: str | None = None
+    operation_id: str | None = None
+    selected_revision_ids: list[str] = Field(default_factory=list)
+    brain_profile_v2_preview: dict[str, Any] = Field(default_factory=dict)
+    signed_preview_receipt_v2: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+    mutation_surface: dict[str, Any] = Field(default_factory=dict)
+    safety_contract: dict[str, Any] = Field(default_factory=dict)
+
+
 class McpMaintenanceToolExecutionResponse(BaseModel):
     schema_version: str
     brain_id: str | None = None
@@ -1052,7 +1145,7 @@ class PersistSelectionRequest(BaseModel):
     learning_mode: LearningMode = "strict_review"
     clarification_answers: dict[str, str] = Field(default_factory=dict)
     approved_preview_ids: list[str] = Field(default_factory=list)
-    question_limit: int = Field(default=3, ge=1, le=8)
+    question_limit: int = Field(default=12, ge=1, le=24)
 
 
 class PersistSelectionResponse(BaseModel):
@@ -1670,8 +1763,8 @@ class RetrieveResponse(BaseModel):
     thread_id: str | None = None
     response_mode: Literal["answer", "context", "both"] = "both"
     retrieval_mode: Literal["flash", "balanced", "heavy", "forensic"] = "balanced"
-    decomposition_mode: Literal["llm", "heuristic", "hybrid"] | None = None
-    planner_mode: Literal["llm", "heuristic", "hybrid"] | None = None
+    decomposition_mode: Literal["ai", "llm", "heuristic", "hybrid"] | None = None
+    planner_mode: Literal["llm", "heuristic", "hybrid", "hybrid_ai_spatial"] | None = None
     document_mode: Literal["none", "lookup", "synthesis"] = "none"
     document_lookup_kind: DocumentLookupKind = "none"
     semantic_contract: dict[str, Any] = Field(default_factory=dict)
@@ -1818,7 +1911,7 @@ class SearchPlanResponse(BaseModel):
     query_text: str
     response_mode: Literal["answer", "context", "both"] = "both"
     retrieval_mode: Literal["flash", "balanced", "heavy", "forensic"] = "balanced"
-    decomposition_mode: Literal["llm", "heuristic", "hybrid"] | None = None
+    decomposition_mode: Literal["ai", "llm", "heuristic", "hybrid"] | None = None
     planner_mode: Literal["llm", "heuristic", "hybrid", "hybrid_ai_spatial"] | None = None
     semantic_contract: dict[str, Any] = Field(default_factory=dict)
     semantic_contract_runtime: dict[str, Any] = Field(default_factory=dict)
@@ -2095,7 +2188,7 @@ class BootstrapRequest(BaseModel):
     source_type: str | None = None
     source_trust: SourceTrust | None = None
     learning_mode: LearningMode = "strict_review"
-    question_limit: int = Field(default=3, ge=1, le=8)
+    question_limit: int = Field(default=12, ge=1, le=24)
 
     @field_validator("text")
     @classmethod

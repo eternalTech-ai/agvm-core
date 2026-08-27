@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -12,12 +14,25 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections import defaultdict
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
+from ai_modules_v2 import canonical_sha256, validate_ai_execution_attestation
+from brain_feedback_ledger import (
+    BRAIN_FEEDBACK_LEDGER_PAGE_SCHEMA_VERSION,
+    canonical_feedback_digest,
+    persisted_feedback_ledger_digest,
+    prepare_feedback_signal_for_storage,
+)
+from cognitive_jobs import (
+    build_cognitive_job_capability_report,
+    cognitive_job_learning_event,
+    evaluate_cognitive_job_policy,
+    normalize_cognitive_job,
+)
 from config import (
     APP_NAME,
     APP_VERSION,
@@ -41,15 +56,29 @@ from memory_learning import (
     TOPOLOGY_FIELD_REVISION_SCHEMA_VERSION,
     build_memory_learning_capability_report,
 )
-from cognitive_jobs import (
-    build_cognitive_job_capability_report,
-    cognitive_job_learning_event,
-    evaluate_cognitive_job_policy,
-    normalize_cognitive_job,
+from projection import (
+    color_from_brainhex,
+    normalize_scores,
+    position_to_bucket,
+    position_to_topology_brainhex,
 )
-from projection import color_from_brainhex, normalize_scores, position_to_bucket, position_to_topology_brainhex
-from runtime_scope import current_atlas_path, current_brain_id, current_graph_path, current_graph_view_path, current_index_path, current_sqlite_path
-from storage import atomic_write_json, empty_atlas, empty_graph, empty_graph_view, empty_index, ensure_data_dir, utc_timestamp
+from runtime_scope import (
+    current_atlas_path,
+    current_brain_id,
+    current_graph_path,
+    current_graph_view_path,
+    current_index_path,
+    current_sqlite_path,
+)
+from storage import (
+    atomic_write_json,
+    empty_atlas,
+    empty_graph,
+    empty_graph_view,
+    empty_index,
+    ensure_data_dir,
+    utc_timestamp,
+)
 from stream_contract import annotate_stream_event
 
 _BOOTSTRAP_LOCK = threading.Lock()
@@ -70,6 +99,13 @@ _RUNTIME_RETENTION_PINNED_EVENT_TYPES = {
 GEOMETRY_CALIBRATION_OPERATION_SCHEMA_VERSION = "agvm.geometry_calibration_operation.v1"
 GEOMETRY_CALIBRATION_ROLLBACK_SCHEMA_VERSION = "agvm.geometry_calibration_rollback.v1"
 GEOMETRY_CALIBRATION_PREVIEW_AUTHORITY_SCHEMA_VERSION = "agvm.geometry_calibration_preview_authority.v1"
+BRAIN_PROFILE_V2_PREVIEW_STORE_SCHEMA_VERSION = "agvm.brain_profile_preview_store.v2"
+BRAIN_PROFILE_V2_ACTIVE_STORE_SCHEMA_VERSION = "agvm.brain_profile_active_store.v2"
+BRAIN_PROFILE_V2_OPERATION_STORE_SCHEMA_VERSION = "agvm.brain_profile_operation_store.v2"
+BRAIN_PROFILE_V2_SNAPSHOT_STORE_SCHEMA_VERSION = "agvm.brain_profile_snapshot_store.v2"
+LOCAL_GROW_V2_BINDING_SCHEMA_VERSION = "agvm.local_grow_preview_binding.v2"
+LOCAL_GROW_V2_APPLY_RECEIPT_SCHEMA_VERSION = "agvm.local_grow_apply_receipt.v2"
+LOCAL_GROW_V2_OPERATION_FAMILY = "grow_v2"
 _GEOMETRY_CALIBRATION_AUTHORITY_CYCLE_MARKER = "::authority_cycle::"
 _MAINTENANCE_PREVIEW_AUTHORITY_CYCLE_MARKER = "::authority_cycle::"
 _GEOMETRY_NODE_STATE_COLUMNS = (
@@ -95,6 +131,14 @@ _GEOMETRY_NODE_STATE_COLUMNS = (
 
 
 class GeometryCalibrationStoreError(ValueError):
+    def __init__(self, code: str, *, status_code: int = 409, context: dict[str, Any] | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+        self.context = dict(context or {})
+
+
+class BrainProfileV2StoreError(ValueError):
     def __init__(self, code: str, *, status_code: int = 409, context: dict[str, Any] | None = None) -> None:
         super().__init__(code)
         self.code = code
@@ -669,6 +713,7 @@ def bootstrap_runtime_store() -> None:
                 source_span_end INTEGER,
                 retrieval_affordance_json TEXT NOT NULL DEFAULT '{}',
                 retrieval_aliases_json TEXT NOT NULL DEFAULT '[]',
+                brain_profile_revision_json TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY (node_id) REFERENCES nodes_nav(id) ON DELETE CASCADE
             );
 
@@ -784,6 +829,25 @@ def bootstrap_runtime_store() -> None:
                 target_node_ids_json TEXT NOT NULL,
                 action_summary_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS brain_feedback_ledger_events (
+                ledger_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                ledger_event_id TEXT NOT NULL UNIQUE,
+                schema_version TEXT NOT NULL,
+                signal_schema_version TEXT NOT NULL,
+                brain_id TEXT NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                event_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                signal_family TEXT NOT NULL,
+                explicit INTEGER NOT NULL DEFAULT 0,
+                weight REAL NOT NULL DEFAULT 0.0,
+                signal_created_at TEXT NOT NULL,
+                appended_at TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                signal_json TEXT NOT NULL,
+                UNIQUE (brain_id, session_id, event_id)
             );
 
             CREATE TABLE IF NOT EXISTS region_summaries (
@@ -1036,6 +1100,83 @@ def bootstrap_runtime_store() -> None:
                 UNIQUE (brain_id, plan_signature)
             );
 
+            CREATE TABLE IF NOT EXISTS brain_profile_v2_previews (
+                brain_id TEXT NOT NULL,
+                plan_signature TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                preview_digest TEXT NOT NULL,
+                source_graph_digest TEXT NOT NULL,
+                before_revision_id TEXT NOT NULL,
+                after_revision_id TEXT NOT NULL,
+                feedback_digest TEXT NOT NULL,
+                attestation_digest TEXT NOT NULL,
+                benchmark_digest TEXT NOT NULL,
+                preview_receipt_digest TEXT NOT NULL,
+                preview_receipt_json TEXT NOT NULL,
+                preview_json TEXT NOT NULL,
+                preview_state TEXT NOT NULL DEFAULT 'ready',
+                operation_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (brain_id, plan_signature)
+            );
+
+            CREATE TABLE IF NOT EXISTS brain_profile_v2_active (
+                brain_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                parent_revision_id TEXT,
+                operation_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                profile_json TEXT NOT NULL,
+                projection_index_json TEXT NOT NULL,
+                benchmark_json TEXT NOT NULL,
+                benchmark_digest TEXT NOT NULL,
+                ai_attestation_json TEXT NOT NULL,
+                attestation_digest TEXT NOT NULL,
+                feedback_digest TEXT NOT NULL,
+                preview_receipt_json TEXT NOT NULL,
+                preview_receipt_digest TEXT NOT NULL,
+                source_graph_digest TEXT NOT NULL,
+                projection_digest TEXT NOT NULL,
+                activated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS brain_profile_v2_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                operation_id TEXT NOT NULL UNIQUE,
+                brain_id TEXT NOT NULL,
+                plan_signature TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS brain_profile_v2_operations (
+                operation_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                brain_id TEXT NOT NULL,
+                plan_signature TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                operation_state TEXT NOT NULL,
+                before_snapshot_id TEXT NOT NULL,
+                after_revision_id TEXT NOT NULL,
+                after_profile_json TEXT NOT NULL,
+                projection_index_json TEXT NOT NULL,
+                preview_receipt_json TEXT NOT NULL,
+                preview_receipt_digest TEXT NOT NULL,
+                feedback_digest TEXT NOT NULL,
+                attestation_digest TEXT NOT NULL,
+                benchmark_digest TEXT NOT NULL,
+                apply_result_json TEXT NOT NULL,
+                rollback_result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                rolled_back_at TEXT,
+                UNIQUE (brain_id, plan_signature),
+                FOREIGN KEY (before_snapshot_id) REFERENCES brain_profile_v2_snapshots(snapshot_id)
+            );
+
             CREATE TABLE IF NOT EXISTS memory_policy_revisions (
                 policy_revision_id TEXT PRIMARY KEY,
                 schema_version TEXT NOT NULL,
@@ -1134,6 +1275,12 @@ def bootstrap_runtime_store() -> None:
               ON landing_correction_events (scope_key, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_landing_correction_events_brain
               ON landing_correction_events (brain_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_brain_feedback_ledger_brain_seq
+              ON brain_feedback_ledger_events (brain_id, ledger_seq DESC);
+            CREATE INDEX IF NOT EXISTS idx_brain_feedback_ledger_session_seq
+              ON brain_feedback_ledger_events (brain_id, session_id, ledger_seq DESC);
+            CREATE INDEX IF NOT EXISTS idx_brain_feedback_ledger_family_seq
+              ON brain_feedback_ledger_events (brain_id, signal_family, ledger_seq DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_learning_events_brain_created
               ON memory_learning_events (brain_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_learning_events_operation
@@ -1162,6 +1309,12 @@ def bootstrap_runtime_store() -> None:
               ON topology_field_revisions (brain_id, activated_at DESC, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_geometry_calibration_operations_brain_state
               ON geometry_calibration_operations (brain_id, operation_state, operation_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_brain_profile_v2_previews_brain_state
+              ON brain_profile_v2_previews (brain_id, preview_state, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_brain_profile_v2_operations_brain_state
+              ON brain_profile_v2_operations (brain_id, operation_state, applied_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_brain_profile_v2_snapshots_brain_created
+              ON brain_profile_v2_snapshots (brain_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_policy_revisions_brain_status
               ON memory_policy_revisions (brain_id, status, activated_at DESC, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_policy_revisions_brain_active
@@ -1223,6 +1376,16 @@ def bootstrap_runtime_store() -> None:
             _ensure_column(conn, "node_semantics", "source_unit_formation_strategy", "TEXT")
             _ensure_column(conn, "node_semantics", "retrieval_affordance_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "node_semantics", "retrieval_aliases_json", "TEXT NOT NULL DEFAULT '[]'")
+            _ensure_column(conn, "node_semantics", "brain_profile_revision_json", "TEXT NOT NULL DEFAULT '{}'")
+            _ensure_column(conn, "brain_profile_v2_previews", "benchmark_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_previews", "preview_receipt_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_active", "benchmark_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_active", "attestation_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_active", "preview_receipt_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_operations", "preview_receipt_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_operations", "feedback_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_operations", "attestation_digest", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "brain_profile_v2_operations", "benchmark_digest", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(conn, "links", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "highways", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             if hygiene_columns_added or str(os.getenv("AGVM_RECONCILE_NODE_HYGIENE_ON_BOOTSTRAP", "")).strip().lower() in {"1", "true", "yes", "on"}:
@@ -1444,6 +1607,251 @@ def fetch_memory_learning_events(
             params,
         ).fetchall()
     return [_memory_learning_event_from_row(row) for row in rows]
+
+
+def _brain_feedback_record_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    signal = dict(_json_load(row["signal_json"], {}))
+    content_digest = str(row["content_digest"])
+    if canonical_feedback_digest(signal) != content_digest:
+        raise RuntimeError(f"brain_feedback_content_digest_mismatch:{row['ledger_event_id']}")
+    return {
+        "ledger_seq": int(row["ledger_seq"]),
+        "ledger_event_id": str(row["ledger_event_id"]),
+        "schema_version": str(row["schema_version"]),
+        "signal_schema_version": str(row["signal_schema_version"]),
+        "brain_id": str(row["brain_id"]),
+        "session_id": _text_or_none(row["session_id"]),
+        "event_id": str(row["event_id"]),
+        "source": str(row["source"]),
+        "signal_family": str(row["signal_family"]),
+        "explicit": bool(row["explicit"]),
+        "weight": float(row["weight"]),
+        "signal_created_at": str(row["signal_created_at"]),
+        "appended_at": str(row["appended_at"]),
+        "content_digest": content_digest,
+        "signal": signal,
+    }
+
+
+def _append_brain_feedback_record_in_tx(
+    conn: sqlite3.Connection,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    cursor = conn.execute(
+        """
+        INSERT INTO brain_feedback_ledger_events (
+            ledger_event_id, schema_version, signal_schema_version,
+            brain_id, session_id, event_id, source, signal_family,
+            explicit, weight, signal_created_at, appended_at,
+            content_digest, signal_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (brain_id, session_id, event_id) DO NOTHING
+        """,
+        (
+            record["ledger_event_id"],
+            record["schema_version"],
+            record["signal_schema_version"],
+            record["brain_id"],
+            record["session_id"],
+            record["event_id"],
+            record["source"],
+            record["signal_family"],
+            1 if record["explicit"] else 0,
+            record["weight"],
+            record["signal_created_at"],
+            record["appended_at"],
+            record["content_digest"],
+            _json_dump(record["signal"]),
+        ),
+    )
+    stored_row = conn.execute(
+        """
+        SELECT *
+        FROM brain_feedback_ledger_events
+        WHERE brain_id = ? AND session_id = ? AND event_id = ?
+        """,
+        (record["brain_id"], record["session_id"], record["event_id"]),
+    ).fetchone()
+    if stored_row is None:
+        raise RuntimeError("brain_feedback_append_missing_after_insert")
+    stored = _brain_feedback_record_from_row(stored_row)
+    if stored["content_digest"] != record["content_digest"]:
+        raise ValueError("brain_feedback_idempotency_replay_mismatch")
+    return {**stored, "idempotent_replay": cursor.rowcount == 0}
+
+
+def append_brain_feedback_signals(
+    signals: Iterable[dict[str, Any]],
+    *,
+    brain_id: str | None = None,
+    session_id: str | None = None,
+    event_ids: Iterable[str | None] | None = None,
+) -> list[dict[str, Any]]:
+    """Append one source event's signal projection in one strict transaction."""
+
+    signal_list = list(signals)
+    event_id_list = list(event_ids) if event_ids is not None else [None] * len(signal_list)
+    if len(event_id_list) != len(signal_list):
+        raise ValueError("brain_feedback_event_ids_length_mismatch")
+    appended_at = utc_timestamp()
+    records = [
+        prepare_feedback_signal_for_storage(
+            signal,
+            brain_id=_active_brain_id(brain_id or _text_or_none(signal.get("brain_id"))),
+            session_id=session_id,
+            event_id=event_id_list[index],
+            appended_at=appended_at,
+        )
+        for index, signal in enumerate(signal_list)
+    ]
+    if not records:
+        return []
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            stored = [_append_brain_feedback_record_in_tx(conn, record) for record in records]
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return stored
+
+
+def append_brain_feedback_signal(
+    signal: dict[str, Any],
+    *,
+    brain_id: str | None = None,
+    session_id: str | None = None,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Append one immutable feedback signal with exact idempotent replay semantics."""
+
+    return append_brain_feedback_signals(
+        [signal],
+        brain_id=brain_id,
+        session_id=session_id,
+        event_ids=[event_id],
+    )[0]
+
+
+def _encode_brain_feedback_cursor(
+    *,
+    brain_id: str,
+    session_id: str | None,
+    before_seq: int,
+    snapshot_max_seq: int,
+) -> str:
+    payload = _json_dump(
+        {
+            "v": 1,
+            "brain_id": brain_id,
+            "session_id": session_id or "",
+            "before_seq": int(before_seq),
+            "snapshot_max_seq": int(snapshot_max_seq),
+        }
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_brain_feedback_cursor(
+    cursor: str,
+    *,
+    brain_id: str,
+    session_id: str | None,
+) -> tuple[int, int]:
+    try:
+        raw = base64.urlsafe_b64decode(str(cursor).encode("ascii") + b"=" * (-len(str(cursor)) % 4))
+        payload = _json_dict(json.loads(raw.decode("utf-8")))
+        before_seq = int(payload.get("before_seq"))
+        snapshot_max_seq = int(payload.get("snapshot_max_seq"))
+    except (binascii.Error, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("brain_feedback_cursor_invalid") from exc
+    if (
+        payload.get("v") != 1
+        or str(payload.get("brain_id") or "") != brain_id
+        or str(payload.get("session_id") or "") != str(session_id or "")
+        or before_seq < 1
+        or snapshot_max_seq < before_seq
+    ):
+        raise ValueError("brain_feedback_cursor_scope_mismatch")
+    return before_seq, snapshot_max_seq
+
+
+def fetch_brain_feedback_ledger_page(
+    *,
+    brain_id: str | None = None,
+    session_id: str | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Read a stable append-only snapshot page and its canonical digests."""
+
+    resolved_brain_id = _active_brain_id(brain_id)
+    resolved_session_id = str(session_id or "").strip() or None
+    bounded_limit = max(1, min(int(limit or 100), 1000))
+    clauses = ["brain_id = ?"]
+    params: list[Any] = [resolved_brain_id]
+    if resolved_session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(resolved_session_id)
+    where = " AND ".join(clauses)
+    with connect_readonly() as conn:
+        if cursor:
+            before_seq, snapshot_max_seq = _decode_brain_feedback_cursor(
+                cursor,
+                brain_id=resolved_brain_id,
+                session_id=resolved_session_id,
+            )
+        else:
+            max_row = conn.execute(
+                f"SELECT COALESCE(MAX(ledger_seq), 0) AS max_seq FROM brain_feedback_ledger_events WHERE {where}",
+                params,
+            ).fetchone()
+            snapshot_max_seq = int(max_row["max_seq"] if max_row else 0)
+            before_seq = snapshot_max_seq + 1
+        page_rows = conn.execute(
+            f"""
+            SELECT *
+            FROM brain_feedback_ledger_events
+            WHERE {where} AND ledger_seq <= ? AND ledger_seq < ?
+            ORDER BY ledger_seq DESC
+            LIMIT ?
+            """,
+            [*params, snapshot_max_seq, before_seq, bounded_limit + 1],
+        ).fetchall()
+        digest_rows = conn.execute(
+            f"""
+            SELECT brain_id, session_id, event_id, content_digest
+            FROM brain_feedback_ledger_events
+            WHERE {where} AND ledger_seq <= ?
+            """,
+            [*params, snapshot_max_seq],
+        ).fetchall()
+    has_more = len(page_rows) > bounded_limit
+    selected_rows = page_rows[:bounded_limit]
+    items = [_brain_feedback_record_from_row(row) for row in selected_rows]
+    next_cursor = None
+    if has_more and items:
+        next_cursor = _encode_brain_feedback_cursor(
+            brain_id=resolved_brain_id,
+            session_id=resolved_session_id,
+            before_seq=int(items[-1]["ledger_seq"]),
+            snapshot_max_seq=snapshot_max_seq,
+        )
+    digest_records = [dict(row) for row in digest_rows]
+    return {
+        "schema_version": BRAIN_FEEDBACK_LEDGER_PAGE_SCHEMA_VERSION,
+        "brain_id": resolved_brain_id,
+        "session_id": resolved_session_id,
+        "items": items,
+        "count": len(items),
+        "snapshot_count": len(digest_records),
+        "snapshot_max_seq": snapshot_max_seq,
+        "next_cursor": next_cursor,
+        "page_digest": persisted_feedback_ledger_digest(items),
+        "ledger_digest": persisted_feedback_ledger_digest(digest_records),
+        "append_only": True,
+    }
 
 
 def _cognitive_job_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -2689,8 +3097,9 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             source_unit_id, source_unit_title, source_unit_kind, source_unit_role,
             promotion_role, source_unit_formation_strategy,
             source_span_start, source_span_end,
-            retrieval_affordance_json, retrieval_aliases_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            retrieval_affordance_json, retrieval_aliases_json,
+            brain_profile_revision_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(node_id) DO UPDATE SET
             routing_brainhex_json=excluded.routing_brainhex_json,
             semantic_color_json=excluded.semantic_color_json,
@@ -2710,7 +3119,8 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             source_span_start=excluded.source_span_start,
             source_span_end=excluded.source_span_end,
             retrieval_affordance_json=excluded.retrieval_affordance_json,
-            retrieval_aliases_json=excluded.retrieval_aliases_json
+            retrieval_aliases_json=excluded.retrieval_aliases_json,
+            brain_profile_revision_json=excluded.brain_profile_revision_json
         """,
         (
             str(node["id"]),
@@ -2733,6 +3143,7 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             node.get("source_span_end"),
             _json_dump(dict(node.get("retrieval_affordance") or {})),
             _json_dump(list(node.get("retrieval_aliases") or [])),
+            _json_dump(dict(node.get("brain_profile_revision") or {})),
         ),
     )
 _RELATION_STORAGE_FIELDS = frozenset({"target_node_id", "strength", "reason", "kind", "stability"})
@@ -2933,6 +3344,11 @@ def _row_to_node(
         document_role = "fact"
     explicit_anchor_id = str(row["document_anchor_id"] or "").strip() if "document_anchor_id" in available and row["document_anchor_id"] else ""
     document_anchor_id = explicit_anchor_id or (str(row["id"]) if is_document_anchor else None)
+    brain_profile_revision = (
+        _json_load(row["brain_profile_revision_json"], {})
+        if "brain_profile_revision_json" in available
+        else {}
+    )
     return {
         "id": str(row["id"]),
         "node_kind": str(row["node_kind"]),
@@ -3000,6 +3416,7 @@ def _row_to_node(
         "topology_revision_id": row["topology_revision_id"] if "topology_revision_id" in available else None,
         "matrix_calibration_plan_signature": row["matrix_calibration_plan_signature"] if "matrix_calibration_plan_signature" in available else None,
         "matrix_calibrated_at": row["matrix_calibrated_at"] if "matrix_calibrated_at" in available else None,
+        **({"brain_profile_revision": brain_profile_revision} if brain_profile_revision else {}),
     }
 
 
@@ -3038,6 +3455,7 @@ def _fetch_node_rows(conn: sqlite3.Connection, *, node_ids: list[str] | None = N
             s.source_span_end,
             {retrieval_affordance_json},
             {retrieval_aliases_json}
+            ,{brain_profile_revision_json}
         FROM nodes_nav n
         LEFT JOIN node_text t ON t.node_id = n.id
         LEFT JOIN node_semantics s ON s.node_id = n.id
@@ -3053,6 +3471,7 @@ def _fetch_node_rows(conn: sqlite3.Connection, *, node_ids: list[str] | None = N
         source_unit_formation_strategy=semantic_column("source_unit_formation_strategy"),
         retrieval_affordance_json=semantic_column("retrieval_affordance_json"),
         retrieval_aliases_json=semantic_column("retrieval_aliases_json"),
+        brain_profile_revision_json=semantic_column("brain_profile_revision_json"),
     )
     params: list[Any] = []
     if node_ids:
@@ -6495,6 +6914,425 @@ def finish_grow_preview_binding(
     if finalized is None:
         raise _grow_preview_binding_error("preview_binding_store_unavailable", status_code=503)
     return _grow_preview_binding_row(finalized)
+
+
+def _normalized_local_grow_v2_ids(values: Any) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in list(values or []):
+        node_id = str(value or "").strip()
+        if not node_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        normalized.append(node_id)
+    return normalized
+
+
+def _local_grow_v2_preview_ids(preview_bundle: dict[str, Any]) -> list[str]:
+    primary_id = str(_dict_value(preview_bundle.get("primary_node_preview")).get("id") or "").strip()
+    derived_ids = [
+        str(_dict_value(item).get("id") or "").strip()
+        for item in list(preview_bundle.get("derived_nodes") or [])
+    ]
+    return _normalized_local_grow_v2_ids([primary_id, *derived_ids])
+
+
+def _local_grow_v2_receipt_signature(receipt: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in receipt.items() if key != "signature"}
+    return f"sha256:{canonical_sha256(unsigned)}"
+
+
+def _validated_local_grow_v2_row(row: sqlite3.Row) -> dict[str, Any]:
+    record = _grow_preview_binding_row(row)
+    binding = _dict_value(record.get("binding"))
+    source_payload = _dict_value(record.get("source_payload"))
+    preview_payload = _dict_value(record.get("preview_payload"))
+    preview_bundle = _dict_value(preview_payload.get("preview_bundle"))
+    attestation = validate_ai_execution_attestation(
+        _dict_value(preview_payload.get("ai_execution_attestation"))
+    )
+    investigation_session = _dict_value(preview_payload.get("investigation_session"))
+    investigation_id = str(binding.get("token_id") or "").strip()
+    brain_id = str(binding.get("brain_id") or "").strip()
+    if (
+        binding.get("schema_version") != LOCAL_GROW_V2_BINDING_SCHEMA_VERSION
+        or str(binding.get("operation_family") or "") != LOCAL_GROW_V2_OPERATION_FAMILY
+        or not investigation_id
+        or investigation_id != str(row["token_id"])
+        or brain_id != str(row["brain_id"])
+        or str(row["operation_family"]) != LOCAL_GROW_V2_OPERATION_FAMILY
+    ):
+        raise _grow_preview_binding_error("grow_v2_preview_binding_invalid")
+    source_sha256 = canonical_sha256(source_payload)
+    preview_sha256 = canonical_sha256(preview_bundle)
+    attestation_sha256 = canonical_sha256(attestation)
+    if (
+        source_sha256 != str(row["source_sha256"])
+        or source_sha256 != str(binding.get("source_sha256") or "")
+        or preview_sha256 != str(row["preview_sha256"])
+        or preview_sha256 != str(binding.get("preview_sha256") or "")
+        or attestation_sha256 != str(binding.get("attestation_sha256") or "")
+    ):
+        raise _grow_preview_binding_error("grow_v2_preview_integrity_invalid")
+    available_preview_ids = _local_grow_v2_preview_ids(preview_bundle)
+    if not available_preview_ids or available_preview_ids != _normalized_local_grow_v2_ids(
+        binding.get("server_issued_preview_ids")
+    ):
+        raise _grow_preview_binding_error("grow_v2_preview_selection_binding_invalid")
+    apply_result = _dict_value(record.get("apply_result"))
+    signed_receipt = _dict_value(apply_result.get("signed_apply_receipt"))
+    if str(record.get("state") or "") == "consumed":
+        if (
+            signed_receipt.get("schema_version") != LOCAL_GROW_V2_APPLY_RECEIPT_SCHEMA_VERSION
+            or str(signed_receipt.get("investigation_id") or "") != investigation_id
+            or str(signed_receipt.get("brain_id") or "") != brain_id
+            or str(signed_receipt.get("preview_sha256") or "") != preview_sha256
+            or str(signed_receipt.get("attestation_sha256") or "") != attestation_sha256
+            or str(signed_receipt.get("signature") or "") != _local_grow_v2_receipt_signature(signed_receipt)
+        ):
+            raise _grow_preview_binding_error("grow_v2_apply_receipt_integrity_invalid")
+    return {
+        **record,
+        "investigation_id": investigation_id,
+        "brain_id": brain_id,
+        "brain_revision": str(binding.get("brain_revision") or ""),
+        "source_investigation": _dict_value(source_payload.get("source_investigation")),
+        "source_formation_contract": _dict_value(source_payload.get("source_formation_contract")),
+        "preview_bundle": preview_bundle,
+        "ai_execution_attestation": attestation,
+        "investigation_session": investigation_session,
+        "server_issued_preview_ids": available_preview_ids,
+        "preview_sha256": preview_sha256,
+        "preview_fingerprint": preview_sha256,
+        "attestation_sha256": attestation_sha256,
+        "attestation_fingerprint": attestation_sha256,
+        "status": "applied" if str(record.get("state") or "") == "consumed" else str(binding.get("status") or "preview_ready"),
+        "signed_apply_receipt": signed_receipt,
+    }
+
+
+def store_local_grow_v2_preview(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    tool_name: str,
+    source_investigation: dict[str, Any],
+    source_formation_contract: dict[str, Any],
+    preview_bundle: dict[str, Any],
+    ai_execution_attestation: dict[str, Any],
+    investigation_session: dict[str, Any],
+    expected_brain_revision: str,
+    issued_at: int | None = None,
+    ttl_seconds: int = 86_400,
+) -> dict[str, Any]:
+    """Persist one provider-attested local Grow V2 preview as apply authority."""
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    normalized_tool_name = str(tool_name or "grow_source_preview").strip()
+    normalized_expected_revision = str(expected_brain_revision or "").strip()
+    bundle = deepcopy(_dict_value(preview_bundle))
+    attestation = validate_ai_execution_attestation(ai_execution_attestation)
+    session = deepcopy(_dict_value(investigation_session))
+    available_preview_ids = _local_grow_v2_preview_ids(bundle)
+    if not normalized_investigation_id or not normalized_expected_revision or not available_preview_ids:
+        raise _grow_preview_binding_error("grow_v2_preview_binding_invalid", status_code=400)
+    source_payload = {
+        "source_investigation": deepcopy(_dict_value(source_investigation)),
+        "source_formation_contract": deepcopy(_dict_value(source_formation_contract)),
+    }
+    preview_payload = {
+        "preview_bundle": bundle,
+        "ai_execution_attestation": attestation,
+        "investigation_session": session,
+    }
+    source_sha256 = canonical_sha256(source_payload)
+    preview_sha256 = canonical_sha256(bundle)
+    attestation_sha256 = canonical_sha256(attestation)
+    issued = int(issued_at if issued_at is not None else datetime.now(timezone.utc).timestamp())
+    expires = issued + max(60, int(ttl_seconds))
+    source_units = list(_dict_value(source_investigation).get("source_units") or [])
+    source_id = str(_dict_value(source_units[0]).get("unit_id") or normalized_investigation_id).strip()
+    status = str(_dict_value(source_investigation).get("status") or "preview_ready").strip()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        brain_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if brain_revision != normalized_expected_revision:
+            raise _grow_preview_binding_error(
+                "grow_v2_preview_stale",
+                expected_brain_revision=normalized_expected_revision,
+                current_brain_revision=brain_revision,
+            )
+        binding = {
+            "schema_version": LOCAL_GROW_V2_BINDING_SCHEMA_VERSION,
+            "token_id": normalized_investigation_id,
+            "revision": f"grow-v2:{preview_sha256[:24]}",
+            "brain_id": normalized_brain_id,
+            "source_id": source_id,
+            "operation_family": LOCAL_GROW_V2_OPERATION_FAMILY,
+            "brain_revision": brain_revision,
+            "source_sha256": source_sha256,
+            "preview_sha256": preview_sha256,
+            "attestation_sha256": attestation_sha256,
+            "server_issued_preview_ids": available_preview_ids,
+            "status": status,
+            "issued_at": issued,
+            "expires_at": expires,
+        }
+        try:
+            conn.execute(
+                """
+                INSERT INTO grow_preview_bindings (
+                    token_id, preview_revision, brain_id, source_id, operation_family,
+                    brain_revision, source_sha256, preview_sha256, binding_json,
+                    source_payload_json, preview_payload_json, tool_name, state,
+                    apply_result_json, issued_at, expires_at, state_updated_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', '{}', ?, ?, ?, ?)
+                """,
+                (
+                    normalized_investigation_id,
+                    str(binding["revision"]),
+                    normalized_brain_id,
+                    source_id,
+                    LOCAL_GROW_V2_OPERATION_FAMILY,
+                    brain_revision,
+                    source_sha256,
+                    preview_sha256,
+                    _json_dump(binding),
+                    _json_dump(source_payload),
+                    _json_dump(preview_payload),
+                    normalized_tool_name,
+                    issued,
+                    expires,
+                    issued,
+                    utc_timestamp(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            raise _grow_preview_binding_error("grow_v2_preview_token_conflict") from exc
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise _grow_preview_binding_error("grow_v2_preview_store_unavailable", status_code=503)
+    return _validated_local_grow_v2_row(row)
+
+
+def fetch_local_grow_v2_preview(*, brain_id: str, investigation_id: str) -> dict[str, Any] | None:
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    if not normalized_investigation_id:
+        return None
+    with connect_readonly() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM grow_preview_bindings
+            WHERE token_id = ? AND brain_id = ? AND operation_family = ?
+            """,
+            (normalized_investigation_id, normalized_brain_id, LOCAL_GROW_V2_OPERATION_FAMILY),
+        ).fetchone()
+    return _validated_local_grow_v2_row(row) if row is not None else None
+
+
+def apply_local_grow_v2_preview_transaction(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    selected_preview_ids: list[str],
+    apply_fingerprint: str,
+    apply_material: dict[str, Any],
+    preview_sha256: str,
+    attestation_sha256: str,
+    mutate_graph: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Validate and apply a local Grow V2 preview in one SQLite transaction."""
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    normalized_selected_ids = _normalized_local_grow_v2_ids(selected_preview_ids)
+    normalized_apply_fingerprint = str(apply_fingerprint or "").strip()
+    normalized_preview_sha256 = str(preview_sha256 or "").strip()
+    normalized_attestation_sha256 = str(attestation_sha256 or "").strip()
+    applied_epoch = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    if (
+        not normalized_investigation_id
+        or not normalized_selected_ids
+        or canonical_sha256(apply_material) != normalized_apply_fingerprint
+    ):
+        raise _grow_preview_binding_error("grow_v2_apply_request_invalid", status_code=400)
+
+    committed: dict[str, Any] | None = None
+    replayed = False
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        if row is None:
+            raise _grow_preview_binding_error("server_preview_not_found", status_code=404)
+        stored = _validated_local_grow_v2_row(row)
+        if stored["brain_id"] != normalized_brain_id:
+            raise _grow_preview_binding_error("server_preview_brain_mismatch")
+        if (
+            stored["preview_sha256"] != normalized_preview_sha256
+            or stored["attestation_sha256"] != normalized_attestation_sha256
+        ):
+            raise _grow_preview_binding_error("server_preview_hash_mismatch")
+        if any(node_id not in set(stored["server_issued_preview_ids"]) for node_id in normalized_selected_ids):
+            raise _grow_preview_binding_error("selected_preview_ids_not_server_issued")
+        if str(stored.get("state") or "") == "consumed":
+            persisted = _dict_value(stored.get("apply_result"))
+            if (
+                str(persisted.get("apply_fingerprint") or "") != normalized_apply_fingerprint
+                or _normalized_local_grow_v2_ids(persisted.get("selected_preview_ids"))
+                != normalized_selected_ids
+            ):
+                raise _grow_preview_binding_error("apply_receipt_mismatch")
+            committed = persisted
+            replayed = True
+            conn.rollback()
+        else:
+            if str(stored.get("state") or "") != "active":
+                raise _grow_preview_binding_error("server_preview_not_applyable")
+            binding = _dict_value(stored.get("binding"))
+            if applied_epoch >= int(binding.get("expires_at") or 0):
+                conn.execute(
+                    """
+                    UPDATE grow_preview_bindings
+                    SET state = 'invalidated', state_updated_at = ?
+                    WHERE token_id = ? AND state = 'active'
+                    """,
+                    (applied_epoch, normalized_investigation_id),
+                )
+                conn.commit()
+                raise _grow_preview_binding_error("server_preview_expired")
+            before_graph = _fetch_graph_snapshot_conn(conn)
+            before_revision = maintenance_graph_revision(before_graph)
+            if before_revision != str(stored.get("brain_revision") or ""):
+                conn.execute(
+                    """
+                    UPDATE grow_preview_bindings
+                    SET state = 'invalidated', state_updated_at = ?
+                    WHERE token_id = ? AND state = 'active'
+                    """,
+                    (applied_epoch, normalized_investigation_id),
+                )
+                conn.commit()
+                raise _grow_preview_binding_error("server_preview_stale")
+            mutation = _dict_value(
+                mutate_graph(deepcopy(before_graph), deepcopy(stored["preview_bundle"]))
+            )
+            updated_graph = _dict_value(mutation.pop("updated_graph", None))
+            persisted_node_ids = _normalized_local_grow_v2_ids(mutation.get("persisted_node_ids"))
+            if not updated_graph or not persisted_node_ids:
+                raise _grow_preview_binding_error("zero_persisted_nodes")
+            before_node_ids = {
+                str(_dict_value(node).get("id") or "").strip()
+                for node in list(before_graph.get("nodes") or [])
+                if str(_dict_value(node).get("id") or "").strip()
+            }
+            updated_node_ids = {
+                str(_dict_value(node).get("id") or "").strip()
+                for node in list(updated_graph.get("nodes") or [])
+                if str(_dict_value(node).get("id") or "").strip()
+            }
+            if any(node_id in before_node_ids or node_id not in updated_node_ids for node_id in persisted_node_ids):
+                raise _grow_preview_binding_error("persisted_node_proof_invalid")
+            _replace_runtime_graph_conn(conn, updated_graph)
+            committed_graph = _fetch_graph_snapshot_conn(conn)
+            committed_node_ids = {
+                str(_dict_value(node).get("id") or "").strip()
+                for node in list(committed_graph.get("nodes") or [])
+                if str(_dict_value(node).get("id") or "").strip()
+            }
+            if (
+                len(committed_node_ids) <= len(before_node_ids)
+                or any(node_id not in committed_node_ids for node_id in persisted_node_ids)
+            ):
+                raise _grow_preview_binding_error("persistence_mutation_not_verified")
+            after_revision = maintenance_graph_revision(committed_graph)
+            applied_at = datetime.fromtimestamp(applied_epoch, tz=timezone.utc).replace(
+                microsecond=0
+            ).isoformat().replace("+00:00", "Z")
+            receipt_id = f"grow_apply_{canonical_sha256({'investigation_id': normalized_investigation_id, 'apply_fingerprint': normalized_apply_fingerprint})[:24]}"
+            signed_receipt = {
+                "schema_version": LOCAL_GROW_V2_APPLY_RECEIPT_SCHEMA_VERSION,
+                "receipt_id": receipt_id,
+                "investigation_id": normalized_investigation_id,
+                "brain_id": normalized_brain_id,
+                "before_brain_revision": before_revision,
+                "after_brain_revision": after_revision,
+                "preview_sha256": normalized_preview_sha256,
+                "attestation_sha256": normalized_attestation_sha256,
+                "apply_fingerprint": normalized_apply_fingerprint,
+                "selected_preview_ids": normalized_selected_ids,
+                "persisted_node_ids": persisted_node_ids,
+                "applied_at": applied_at,
+                "signature_algorithm": "SHA-256",
+            }
+            signed_receipt["signature"] = _local_grow_v2_receipt_signature(signed_receipt)
+            committed = {
+                "schema_version": "agvm.local_grow_apply_result.v2",
+                "investigation_id": normalized_investigation_id,
+                "brain_id": normalized_brain_id,
+                "apply_fingerprint": normalized_apply_fingerprint,
+                "selected_preview_ids": normalized_selected_ids,
+                "persisted_node_ids": persisted_node_ids,
+                "persisted_edge_count": int(mutation.get("persisted_edge_count") or 0),
+                "merged_into_existing_ids": _normalized_local_grow_v2_ids(
+                    mutation.get("merged_into_existing_ids")
+                ),
+                "learning_policy": _dict_value(mutation.get("learning_policy")),
+                "before_brain_revision": before_revision,
+                "after_brain_revision": after_revision,
+                "signed_apply_receipt": signed_receipt,
+            }
+            updated = conn.execute(
+                """
+                UPDATE grow_preview_bindings
+                SET state = 'consumed', state_updated_at = ?, apply_result_json = ?
+                WHERE token_id = ? AND brain_id = ? AND operation_family = ? AND state = 'active'
+                """,
+                (
+                    applied_epoch,
+                    _json_dump(committed),
+                    normalized_investigation_id,
+                    normalized_brain_id,
+                    LOCAL_GROW_V2_OPERATION_FAMILY,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise _grow_preview_binding_error("grow_v2_apply_concurrency_conflict")
+            conn.execute(
+                """
+                UPDATE grow_preview_bindings
+                SET state = 'invalidated', state_updated_at = ?
+                WHERE brain_id = ? AND operation_family = ? AND token_id <> ? AND state = 'active'
+                """,
+                (
+                    applied_epoch,
+                    normalized_brain_id,
+                    LOCAL_GROW_V2_OPERATION_FAMILY,
+                    normalized_investigation_id,
+                ),
+            )
+            conn.commit()
+    if committed is None:
+        raise _grow_preview_binding_error("grow_v2_apply_result_missing", status_code=500)
+    export_refresh: dict[str, Any] = {"status": "ready"}
+    try:
+        _refresh_graph_exports()
+    except Exception as exc:  # pragma: no cover - SQLite is authoritative; replay retries exports.
+        export_refresh = {"status": "pending", "reason": type(exc).__name__}
+    return {**deepcopy(committed), "idempotent_replay": replayed, "export_refresh": export_refresh}
 
 
 def _maintenance_preview_error(

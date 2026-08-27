@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from ai_modules_v2 import AiModuleContractError, validate_ai_execution_attestation
 from brain_registry import BrainRegistryError, brain_root_path, refresh_local_brain_record, resolve_brain_scope
 from derivation import _source_grounding_assessment, persist_selection, preview_bundle, resolve_persist_selection
 from retrieval import build_index
@@ -148,6 +149,19 @@ class BrainBootstrapV1Service:
                 if questions:
                     raise BootstrapV1Error("bootstrap_adaptive_interview_questions_forbidden", status_code=422)
                 interview_plan = self._question_generator(goal, brain_record)
+                try:
+                    interview_attestation = validate_ai_execution_attestation(
+                        dict(interview_plan.get("ai_execution_attestation") or {})
+                    )
+                except AiModuleContractError as exc:
+                    raise BootstrapV1Error(
+                        "bootstrap_question_generation_unattested",
+                        status_code=502,
+                    ) from exc
+                interview_plan = {
+                    **dict(interview_plan),
+                    "ai_execution_attestation": interview_attestation,
+                }
                 questions = _validated_adaptive_questions(interview_plan)
                 minimum_answer_count = _validated_adaptive_required_answer_count(
                     interview_plan,
@@ -666,6 +680,7 @@ def _generate_adaptive_interview(goal: str, brain_record: dict[str, Any]) -> dic
         "additionalProperties": False,
     }
     brain_name = str(brain_record.get("display_name") or brain_record.get("brain_id") or "New brain").strip()
+    execution_metadata: dict[str, Any] = {}
     generated, error = structured_json(
         system_prompt=(
             "Design an adaptive human-in-the-loop interview for a new memory brain. "
@@ -686,14 +701,23 @@ def _generate_adaptive_interview(goal: str, brain_record: dict[str, Any]) -> dic
         role="compiler",
         max_output_tokens=3_000,
         api_key_override=api_key,
+        execution_metadata=execution_metadata,
     )
     if error or not isinstance(generated, dict):
         raise BootstrapV1Error("bootstrap_question_generation_unavailable", status_code=503)
+    try:
+        attestation = validate_ai_execution_attestation(execution_metadata)
+    except AiModuleContractError as exc:
+        raise BootstrapV1Error(
+            "bootstrap_question_generation_unattested",
+            status_code=502,
+        ) from exc
     return {
         **generated,
         "schema_version": "agvm.brain_bootstrap_v1.adaptive_interview.v1",
         "generation_source": "provider",
         "model": compiler_model(),
+        "ai_execution_attestation": attestation,
     }
 
 

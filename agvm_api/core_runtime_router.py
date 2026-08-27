@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,6 +17,48 @@ from setup_env import ProviderKeyTestError, managed_env_status, save_managed_env
 
 
 HostedRegistrySummaryProvider = Callable[[], dict[str, Any]]
+
+
+def runtime_configuration_status() -> dict[str, Any]:
+    """Describe provider readiness without turning missing setup into failed liveness."""
+
+    setup = managed_env_status()
+    provider = dict(setup.get("provider") or {})
+    llm = dict(setup.get("llm") or {})
+    edition = str(os.getenv("AGVM_EDITION") or "local").strip().lower() or "local"
+    request_scoped_provider = edition == "cloud"
+    llm_enabled = bool(llm.get("enabled", True))
+    provider_configured = bool(provider.get("configured"))
+    ai_ready = bool(llm_enabled and (provider_configured or request_scoped_provider))
+    if ai_ready:
+        state = "request_scoped_provider" if request_scoped_provider and not provider_configured else "ready"
+    elif not llm_enabled:
+        state = "ai_disabled"
+    else:
+        state = "configuration_required"
+    return {
+        "schema_version": "agvm.runtime_configuration.v1",
+        "state": state,
+        "edition": edition,
+        "service_live": True,
+        "ai_ready": ai_ready,
+        "needs_configuration": state == "configuration_required",
+        "provider": {
+            "name": "openai",
+            "configured": provider_configured,
+            "source": provider.get("source") or "missing",
+            "credential_mode": "request_scoped" if request_scoped_provider else "local_managed_or_process_env",
+        },
+        "llm": {
+            "enabled": llm_enabled,
+            "model": llm.get("model"),
+        },
+        "setup": {
+            "status_path": "/setup/env",
+            "save_path": "/setup/env",
+            "provider_test_path": "/setup/provider/test",
+        },
+    }
 
 
 class SetupEnvSaveRequest(BaseModel):
@@ -73,10 +116,14 @@ def create_core_runtime_router(
     def health() -> dict[str, Any]:
         summary = active_brain_summary()
         hosted_summary = _hosted_registry_summary(hosted_registry_summary_provider)
+        configuration = runtime_configuration_status()
         return {
             "ok": True,
             "service": app_name,
             "version": app_version,
+            "ai_ready": configuration["ai_ready"],
+            "needs_configuration": configuration["needs_configuration"],
+            "runtime_configuration": configuration,
             "active_brain_id": summary.get("brain_id"),
             "brain_registry_ready": bool(summary.get("brain_id")),
             "hosted_tenant_registry_ready": bool((hosted_summary.get("validation") or {}).get("passed")),

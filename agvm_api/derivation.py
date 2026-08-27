@@ -14,6 +14,7 @@ from typing import Any
 
 from source_security import sanitize_source_uri_for_persistence
 
+from ai_modules_v2 import validate_grow_compiler_payload
 from config import BUCKET_SIZE, CLAIM_MEMORY_TYPES, ENTITY_MEMORY_TYPES, FACET_FIELDS, ROUTING_FIELDS
 from llm import compiler_model, llm_enabled, structured_json
 from metamemory import build_metamemory_package
@@ -29,7 +30,6 @@ from projection import (
     normalize_scores,
     quantize_to_brainhex,
     scores_to_latent_vector,
-    semantic_similarity,
     summarize_text,
 )
 from retrieval import build_index, finalize_node, node_for_index, shortlist_atlas_buckets
@@ -268,7 +268,22 @@ def _strip_generated_source_unit_prefix(value: str) -> str:
 def _source_grounding_requires_filter(*, source_type: str | None, input_mode: str) -> bool:
     folded_source_type = _source_grounding_fold(source_type or "")
     return folded_source_type in {"source_investigation", "source investigation"} or (
-        str(input_mode or "").strip().lower() == "document" and folded_source_type in {"uploaded_document", "uploaded document", "public_web", "public web"}
+        str(input_mode or "").strip().lower() == "document"
+        and folded_source_type
+        in {
+            "uploaded_document",
+            "uploaded document",
+            "public_web",
+            "public web",
+            "project_workspace",
+            "project workspace",
+            "public_dossier",
+            "public dossier",
+            "reference_library",
+            "reference library",
+            "technical_document",
+            "technical document",
+        }
     )
 
 
@@ -696,9 +711,6 @@ def _extract_identity_subject_candidates(text: str) -> list[str]:
         "amministratore delegato",
     )
     role_pattern = "|".join(re.escape(term) for term in sorted(role_terms, key=len, reverse=True))
-    role_pattern_ci = f"(?i:{role_pattern})"
-    be_pattern_ci = r"(?i:is|was|ÃƒÂ¨|e)"
-    article_pattern_ci = r"(?i:a|an|il|la|un|una|the)"
     person_pattern = r"([A-Z][\w'â€™-]+(?:\s+[A-Z][\w'â€™-]+){1,2})"
     patterns = [
         rf"\b{person_pattern}\s+(?:is|was|Ã¨|e)\s+(?:a|an|il|la|un|una|the)?\s*(?:{role_pattern})\b",
@@ -1146,7 +1158,29 @@ def _stabilize_compiled_semantics(
     routing_facets: dict[str, Any],
     granularity: float | None,
     novelty: float | None,
+    trust_compiled: bool = False,
 ) -> dict[str, Any]:
+    if trust_compiled:
+        try:
+            trusted_scores = {
+                field: max(0.0, min(1.0, float(routing_scores[field])))
+                for field in ROUTING_FIELDS
+            }
+            trusted_facets = {
+                field: max(0.0, min(1.0, float(routing_facets[field])))
+                for field in FACET_FIELDS
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("grow_ai_semantic_vector_invalid") from exc
+        return {
+            "routing_semantic_scores": trusted_scores,
+            "routing_facets": trusted_facets,
+            "memory_type": map_runtime_memory_type(memory_type),
+            "guide_area": guide_area or infer_guide_area(raw_text or summary),
+            "granularity": max(0.1, min(1.0, float(granularity if granularity is not None else 0.5))),
+            "novelty": max(0.0, min(1.0, float(novelty if novelty is not None else 0.5))),
+            "heuristic_projection": None,
+        }
     heuristic = heuristic_projection(raw_text or summary, input_mode=input_mode)
     score_weight = 0.78 if _distribution_is_degenerate(routing_scores, ROUTING_FIELDS) else 0.28
     facet_weight = 0.72 if _distribution_is_degenerate(routing_facets, FACET_FIELDS) else 0.22
@@ -1574,8 +1608,8 @@ def _normalize_question_limit(value: Any) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        parsed = 3
-    return max(1, min(8, parsed))
+        parsed = 12
+    return max(1, min(24, parsed))
 
 
 def _normalize_persist_preview_limit(value: Any, *, default: int = 128) -> int:
@@ -2175,6 +2209,7 @@ def _build_cognitive_write_plan(
     identity_decisions: list[dict[str, Any]],
     identity_nucleus: dict[str, Any],
     nearby_context: dict[str, Any],
+    question_limit: int,
 ) -> dict[str, Any]:
     source_classification = _cognitive_source_classification(
         text=text,
@@ -2307,7 +2342,10 @@ def _build_cognitive_write_plan(
     alias_count = sum(1 for item in memory_acts if item.get("persist_mode") == "attach_as_alias_or_variant")
     suppressed_count = sum(1 for item in memory_acts if item.get("act_type") == "no_op_duplicate")
     review_required_count = sum(1 for item in memory_acts if item.get("requires_human_review"))
-    clarification_questions = _unique_strings(clarification_questions, limit=3)
+    clarification_questions = _unique_strings(
+        clarification_questions,
+        limit=max(1, int(question_limit)),
+    )
     review_reasons = _unique_strings(review_reasons_all, limit=16)
     return {
         "version": "pr12e.cognitive_write_plan.v1",
@@ -3229,10 +3267,26 @@ def classify_entity_type(name: str, source_text: str, input_mode: str) -> str:
         "prodotto",
     )
     person_markers = ("ceo", "founder", "founded", "founded by", "dr.", "mr.", "ms.", "professor", "self-taught", "born")
+    relationship_person_markers = (
+        "partner",
+        "collaborator",
+        "colleague",
+        "friend",
+        "father",
+        "mother",
+        "brother",
+        "sister",
+        "padre",
+        "madre",
+        "fratello",
+        "sorella",
+    )
     organization_name_markers = {"corporation", "corp", "inc", "ltd", "university", "universita", "studio", "foundation", "foundry", "electric"}
     if input_mode == "document" and any(token in organization_name_markers for token in name_tokens):
         return "organization"
     if input_mode == "document" and " " in name and len(name_tokens) in {2, 3} and any(token in local_context for token in person_markers):
+        return "person"
+    if " " in name and len(name_tokens) in {2, 3} and any(token in local_context for token in relationship_person_markers):
         return "person"
     if input_mode == "document" and any(token in local_context for token in project_markers):
         return "project"
@@ -3458,8 +3512,11 @@ def llm_memory_compile(
     nearby_context: dict[str, Any],
     source_context: dict[str, Any] | None = None,
     timeout_seconds: float | None = None,
+    api_key_override: str | None = None,
+    model_override: str | None = None,
+    execution_metadata: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not llm_enabled():
+    if api_key_override is None and not llm_enabled():
         return None, "llm_disabled"
     metamemory = build_metamemory_package("compiler")
     schema = {
@@ -3741,13 +3798,15 @@ def llm_memory_compile(
         f"Nearby context:\n{nearby_context}\n"
     )
     payload, error = structured_json(
-        model=compiler_model(),
+        model=model_override or compiler_model(),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         schema_name="agvm_memory_compiler",
         schema=schema,
         timeout=max(1.0, min(float(timeout_seconds or 60.0), 120.0)),
         role="compiler",
+        api_key_override=api_key_override,
+        execution_metadata=execution_metadata,
     )
     return payload, error
 
@@ -3838,6 +3897,8 @@ def llm_source_unit_semantic_compile(
                         "memory_act_type",
                         "raw_text",
                         "summary",
+                        "routing_semantic_scores",
+                        "routing_facets",
                         "confidence",
                         "memory_confidence",
                         "evidence_confidence",
@@ -3852,6 +3913,18 @@ def llm_source_unit_semantic_compile(
                         "memory_act_type": {"type": "string", "enum": sorted(_COGNITIVE_MEMORY_ACT_TYPES)},
                         "raw_text": {"type": "string"},
                         "summary": {"type": "string"},
+                        "routing_semantic_scores": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ROUTING_FIELDS,
+                            "properties": {field: {"type": "number"} for field in ROUTING_FIELDS},
+                        },
+                        "routing_facets": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": FACET_FIELDS,
+                            "properties": {field: {"type": "number"} for field in FACET_FIELDS},
+                        },
                         "confidence": {"type": "number"},
                         "memory_confidence": {"type": "number"},
                         "evidence_confidence": {"type": "number"},
@@ -3885,6 +3958,8 @@ def llm_source_unit_semantic_compile(
         "- If source_purpose is self_memory, rewrite first-person public material into memory about the selected brain/person while keeping the claim evidence-bound.\n"
         "- For self_memory, use first person when the source is first-person, or the selected person's name/neutral wording otherwise. Do not write candidate memories with he/she/his/her pronouns.\n"
         "- Keep one atomic idea per node. A good rich source should produce several distinct candidate nodes, not one mega paragraph.\n"
+        "- Cover every fact-eligible source unit with at least one candidate whenever it contains usable evidence.\n"
+        "- Assign all 12 routing_semantic_scores and all 12 routing_facets from the candidate meaning; these values drive placement and retrieval.\n"
         "- Candidate target is not a quota for hallucination, but if the source contains enough evidence you should approach it by splitting identity, project purpose, organizations, values, relationship/legacy, decision style, and future intention into separate nodes.\n"
         "- Never merge different cognitive categories into one node: a company list, a value statement, a family/legacy relation, and a decision-style statement must be separate candidates when supported.\n"
         "- For compact self-memory text with semicolons or multiple clauses, extract each supported clause as its own candidate instead of returning one combined summary.\n"
@@ -4007,6 +4082,14 @@ def llm_source_unit_semantic_compile(
                 "raw_text": claim_text,
                 "summary": summarize_text(str(item.get("summary") or claim_text), limit=180),
                 "memory_type": map_runtime_memory_type(None, claim_type=claim_type),
+                "routing_semantic_scores": {
+                    field: max(0.0, min(1.0, float(dict(item.get("routing_semantic_scores") or {})[field])))
+                    for field in ROUTING_FIELDS
+                },
+                "routing_facets": {
+                    field: max(0.0, min(1.0, float(dict(item.get("routing_facets") or {})[field])))
+                    for field in FACET_FIELDS
+                },
                 "confidence": confidence,
                 "memory_confidence": max(0.0, min(1.0, float(item.get("memory_confidence") or confidence))),
                 "evidence_confidence": max(0.0, min(1.0, float(item.get("evidence_confidence") or confidence))),
@@ -4390,8 +4473,9 @@ def _preview_source_quality_reasons(
     if is_primary:
         if not bool(node.get("is_document_anchor")) or memory_type != "document_anchor" or document_role != "anchor":
             reasons.append("source_primary_must_be_raw_document_anchor")
-        if len(raw_text) < 180:
-            reasons.append("source_primary_anchor_too_thin")
+        # A raw anchor is the exact source artifact, not a synthesized memory.
+        # Its length is not a safety signal; atomic child nodes carry the
+        # self-containment and minimum-information quality checks below.
         return _unique_strings(reasons, limit=8)
 
     if document_role in {"chunk", "summary", "fact"} or source_unit_id:
@@ -5246,7 +5330,14 @@ def preview_bundle(
     compiler_timeout_seconds: float | None = None,
     derivation_timeout_seconds: float | None = None,
     geometry_profile_context: dict[str, Any] | None = None,
+    compiler_payload_override: dict[str, Any] | None = None,
+    compiler_error_override: str | None = None,
+    compiler_api_key_override: str | None = None,
+    compiler_model_override: str | None = None,
+    compiler_execution_metadata: dict[str, Any] | None = None,
+    require_ai: bool = False,
 ) -> dict[str, Any]:
+    question_limit = _normalize_question_limit(question_limit)
     warnings: list[dict[str, str]] = []
     source_investigation_scope = _is_source_investigation_scope(source_type=source_type, source_sections=source_sections)
     if source_investigation_scope and str(input_mode or "").strip().lower() != "document":
@@ -5299,7 +5390,10 @@ def preview_bundle(
         or None
     )
 
-    if direct_source_unit_preview:
+    if compiler_payload_override is not None:
+        compiler_payload = dict(compiler_payload_override)
+        compiler_error = compiler_error_override
+    elif direct_source_unit_preview and not require_ai:
         compiler_payload = None
         compiler_error = "large_source_units_direct_preview"
         warnings.append(
@@ -5319,7 +5413,14 @@ def preview_bundle(
             nearby_context=nearby_context,
             timeout_seconds=compiler_timeout_seconds,
             source_context=resolved_source_context,
+            api_key_override=compiler_api_key_override,
+            model_override=compiler_model_override,
+            execution_metadata=compiler_execution_metadata,
         )
+    if require_ai and not compiler_payload:
+        raise ValueError(f"grow_ai_unavailable:{compiler_error or 'provider_output_missing'}")
+    if require_ai:
+        compiler_payload = validate_grow_compiler_payload(compiler_payload)
     derivation_mode = "llm" if compiler_payload else "heuristic"
     if compiler_error and compiler_error not in {"llm_disabled", "large_source_units_direct_preview"}:
         warnings.append({"code": "compiler_fallback", "message": f"LLM compiler unavailable, fallback to heuristic compilation: {compiler_error}"})
@@ -5361,6 +5462,7 @@ def preview_bundle(
         routing_facets=dict(primary_compiled.get("routing_facets") or {}),
         granularity=primary_compiled.get("granularity"),
         novelty=primary_compiled.get("novelty"),
+        trust_compiled=bool(require_ai and compiler_payload),
     )
     primary_compiled = {
         **primary_compiled,
@@ -5432,9 +5534,11 @@ def preview_bundle(
                         "mentioned_in_claim_indexes": [int(idx) for idx in list(item.get("mentioned_in_claim_indexes") or []) if int(idx) >= 0],
                     }
                 )
-    elif source_investigation_scope:
-        fallback_derivation_mode = "heuristic"
-        derivation_mode = "heuristic"
+    elif source_investigation_scope or require_ai:
+        # An empty AI deduction set is a valid reviewed outcome. V2 must not
+        # manufacture deductions through the legacy heuristic path.
+        fallback_derivation_mode = "llm" if require_ai else "heuristic"
+        derivation_mode = "llm" if require_ai else "heuristic"
     else:
         claims, entities, fallback_derivation_mode, derivation_warnings = derive_structures(
             text,
@@ -5453,7 +5557,7 @@ def preview_bundle(
     )
     if merge_grounding_warning:
         warnings.append(merge_grounding_warning)
-    if not merge_decisions and source_investigation_scope:
+    if not merge_decisions and (source_investigation_scope or require_ai):
         merge_decisions = []
     elif not merge_decisions:
         merge_decisions = heuristic_merge_decisions(
@@ -5471,7 +5575,7 @@ def preview_bundle(
     )
     if identity_grounding_warning:
         warnings.append(identity_grounding_warning)
-    if not identity_decisions and source_investigation_scope:
+    if not identity_decisions and (source_investigation_scope or require_ai):
         identity_decisions = []
     elif not identity_decisions:
         identity_decisions = heuristic_identity_decisions(
@@ -5557,7 +5661,7 @@ def preview_bundle(
             }
         )
 
-    if not compiled_derived and not source_investigation_scope:
+    if not compiled_derived and not source_investigation_scope and not require_ai:
         compiled_derived = [
             {
                 "derivation_role": "claim",
@@ -5606,7 +5710,8 @@ def preview_bundle(
     if source_investigation_scope and source_sections:
         source_context_purpose = str(resolved_source_context.get("source_purpose") or "").strip().lower()
         should_run_source_semantic_compiler = (
-            direct_source_unit_preview
+            require_ai
+            or direct_source_unit_preview
             or source_context_purpose == "self_memory"
             or (
                 source_section_count >= 4
@@ -5661,10 +5766,37 @@ def preview_bundle(
         else:
             source_semantic_min_viable = 4 if source_section_count >= 4 else 1
 
+    def has_ai_semantic_vector(item: dict[str, Any]) -> bool:
+        scores = dict(item.get("routing_semantic_scores") or {})
+        facets = dict(item.get("routing_facets") or {})
+        return all(field in scores for field in ROUTING_FIELDS) and all(field in facets for field in FACET_FIELDS)
+
+    source_ai_items_by_unit: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for semantic_item in compiled_derived:
+        semantic_unit_id = str(semantic_item.get("source_unit_id") or "").strip()
+        if semantic_unit_id and has_ai_semantic_vector(semantic_item):
+            source_ai_items_by_unit[semantic_unit_id].append(semantic_item)
+
+    if require_ai and source_investigation_scope and source_sections:
+        required_source_unit_ids = {
+            str(section.get("section_id") or section.get("unit_id") or "").strip()
+            for section in source_sections
+            if isinstance(section, dict)
+            and bool(section.get("fact_eligible") if section.get("fact_eligible") is not None else True)
+            and str(section.get("section_id") or section.get("unit_id") or "").strip()
+        }
+        missing_source_unit_ids = sorted(required_source_unit_ids - set(source_ai_items_by_unit))
+        if missing_source_unit_ids:
+            reason = source_semantic_error or "provider_did_not_cover_all_fact_eligible_source_units"
+            raise ValueError(
+                "grow_ai_source_unit_coverage_incomplete:"
+                f"{reason}:missing={','.join(missing_source_unit_ids[:12])}"
+            )
+
     source_claim_items: list[dict[str, Any]] = []
     source_claims_added = 0
     source_semantic_sufficient = source_semantic_added >= source_semantic_min_viable
-    if not source_semantic_sufficient:
+    if not require_ai and not source_semantic_sufficient:
         source_claim_items = _source_section_claim_preview_items(
             source_text=text,
             source_sections=source_sections,
@@ -5681,7 +5813,7 @@ def preview_bundle(
 
     source_qa_items: list[dict[str, Any]] = []
     source_qa_added = 0
-    if not source_semantic_sufficient:
+    if not require_ai and not source_semantic_sufficient:
         source_qa_items = _source_section_qa_preview_items(
             source_text=text,
             source_sections=source_sections,
@@ -5698,7 +5830,6 @@ def preview_bundle(
 
     source_micro_chunk_items: list[dict[str, Any]] = []
     source_micro_chunks_added = 0
-    source_has_claim_level_preview = bool(source_semantic_added or source_claims_added or source_qa_added)
     if source_investigation_scope and source_sections:
         source_micro_chunk_items = _source_section_micro_chunk_preview_items(
             source_text=text,
@@ -5706,6 +5837,22 @@ def preview_bundle(
             source_sections=source_sections,
             source_investigation_id=source_investigation_id,
         )
+        if require_ai:
+            ai_scored_chunks: list[dict[str, Any]] = []
+            for chunk in source_micro_chunk_items:
+                source_unit_id = str(chunk.get("source_unit_id") or "").strip()
+                vector_source = (source_ai_items_by_unit.get(source_unit_id) or [None])[0]
+                if not isinstance(vector_source, dict):
+                    continue
+                ai_scored_chunks.append(
+                    {
+                        **chunk,
+                        "routing_semantic_scores": dict(vector_source.get("routing_semantic_scores") or {}),
+                        "routing_facets": dict(vector_source.get("routing_facets") or {}),
+                        "semantic_vector_source": "ai_source_unit_candidate",
+                    }
+                )
+            source_micro_chunk_items = ai_scored_chunks
         compiled_derived, source_micro_chunks_added = _append_source_section_preview_items(compiled_derived, source_micro_chunk_items)
         if source_micro_chunks_added:
             warnings.append(
@@ -5717,7 +5864,7 @@ def preview_bundle(
 
     source_preview_items: list[dict[str, Any]] = []
     source_has_claim_or_chunk_preview = bool(source_semantic_added or source_claims_added or source_qa_added or source_micro_chunks_added)
-    if not source_has_claim_or_chunk_preview:
+    if not require_ai and not source_has_claim_or_chunk_preview:
         source_preview_items = _source_section_preview_items(
             source_text=text,
             input_mode=input_mode,
@@ -5781,6 +5928,7 @@ def preview_bundle(
             routing_facets=dict(item.get("routing_facets") or {}),
             granularity=None,
             novelty=None,
+            trust_compiled=bool(require_ai and compiler_payload),
         )
         item_memory_type = item_semantics["memory_type"]
         if item_document_role == "chunk":
@@ -5935,6 +6083,7 @@ def preview_bundle(
         identity_decisions=identity_decisions,
         identity_nucleus=identity_nucleus,
         nearby_context=nearby_context,
+        question_limit=question_limit,
     )
     primary_preview = _apply_cognitive_write_annotations(primary_preview, cognitive_write_plan)
     derived_nodes = [_apply_cognitive_write_annotations(node, cognitive_write_plan) for node in derived_nodes]
@@ -5962,7 +6111,8 @@ def preview_bundle(
         source_sections=source_sections,
     )
 
-    return {
+    result = {
+        "schema_version": "agvm.grow_preview_bundle.v2" if require_ai else "agvm.grow_preview_bundle.v1",
         "primary_node_preview": primary_preview,
         "derived_nodes": derived_nodes,
         "derived_edges": derived_edges,
@@ -5989,6 +6139,12 @@ def preview_bundle(
             identity_nucleus=identity_nucleus,
         ),
     }
+    if require_ai:
+        attestation = dict(compiler_execution_metadata or {})
+        if str(attestation.get("status") or "") != "completed":
+            raise ValueError("grow_ai_attestation_missing")
+        result["ai_execution_attestation"] = attestation
+    return result
 
 
 def resolve_persist_selection(

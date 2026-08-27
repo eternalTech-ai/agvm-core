@@ -1665,6 +1665,8 @@ def _status_for_tool(tool_name: str, result: dict[str, Any], package: Any) -> st
         return "partial"
     answer_context_alignment = _as_dict(context_contract.get("answer_context_alignment"))
     stop_reason = str(result.get("stop_reason") or "").strip()
+    if stop_reason.startswith("blocked_ai_provider_") or stop_reason == "blocked_ai_attestation_invalid":
+        return "blocked"
     ai_spatial_landing_contract = _as_dict(
         result.get("ai_spatial_landing_contract") or planner_runtime.get("ai_spatial_landing_contract")
     )
@@ -7230,19 +7232,8 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
         document_refs=document_refs,
         evidence_limit=evidence_limit,
     )
-    completion = _selected_public_metadata(
-        output.get("completion_contract"),
-        (
-            "schema_version",
-            "state",
-            "visible_reason",
-            "status",
-            "final_materialization_pending",
-            "result_ready_terminal",
-            "operator_message",
-            "inspection",
-            "degradation",
-        ),
+    completion = _as_dict(
+        _strip_raw_text(deepcopy(output.get("completion_contract")))
     )
     delivery = _as_dict(
         _strip_raw_text(deepcopy(output.get("mcp_delivery_contract")))
@@ -7251,12 +7242,87 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
     # and did not apply; omitting it would be ambiguous to older MCP clients.
     delivery.setdefault("degradation", {})
     delivery.setdefault("next_recommended_call", None)
+    payload_truth_contract = _selected_public_metadata(
+        output.get("payload_truth_contract"),
+        (
+            "schema_version",
+            "status",
+            "tool_name",
+            "primary_mcp_payload",
+            "answer_demo",
+            "support_alignment",
+            "missing_reasons",
+        ),
+        list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
+    )
+    payload_truth_documents = _selected_public_metadata(
+        _as_dict(output.get("payload_truth_contract")).get("documents"),
+        (
+            "document_ref_count",
+            "actionable_document_ref_count",
+            "raw_available_document_ref_count",
+            "document_delivery_state",
+            "mcp_client_receives_first",
+            "raw_text_already_in_primary_payload",
+            "raw_text_follow_up_required",
+            "raw_included_document_count",
+            "raw_available_not_included_count",
+            "document_bundle_state",
+            "document_bundle_document_count",
+            "document_workspace_document_count",
+            "raw_text_policy",
+            "raw_text_follow_up_tool",
+            "raw_text_follow_up_required_when_refs_only",
+        ),
+    )
+    if payload_truth_documents:
+        payload_truth_contract["documents"] = payload_truth_documents
     projected: dict[str, Any] = {
         "schema_version": output.get("schema_version"),
         "tool_name": output.get("tool_name"),
         "search_id": output.get("search_id"),
         "status": output.get("status"),
         "context_package": compact_package,
+        "hot_working_memory": _selected_public_metadata(
+            output.get("hot_working_memory"),
+            (
+                "schema_version",
+                "state",
+                "brain_id",
+                "thread_id",
+                "source_run_ids",
+                "package_revision_ids",
+                "hot_node_ids",
+                "read_ledger",
+                "token_budget",
+                "update_delta",
+            ),
+            list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
+        ),
+        "hot_working_memory_contract": _selected_public_metadata(
+            output.get("hot_working_memory_contract"),
+            (
+                "schema_version",
+                "search_id",
+                "thread_id",
+                "state",
+                "reuse_state",
+                "available",
+                "reused_for_query",
+                "reused_item_count",
+                "reused_node_ids",
+                "available_item_count",
+                "hot_node_count",
+                "document_ref_count",
+                "demoted_item_count",
+                "separate_from_context_package",
+                "included_in_mcp_context_package",
+                "must_be_explicitly_promoted_to_package",
+                "stale_guard",
+                "ui_contract",
+            ),
+            list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
+        ),
         "context_package_materialization": _selected_public_metadata(
             output.get("context_package_materialization"),
             (
@@ -7291,7 +7357,25 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
         ),
         "semantic_contract_runtime": _selected_public_metadata(
             output.get("semantic_contract_runtime"),
-            ("schema_version", "status", "source", "material", "ai_required", "provider_state", "contract_passed", "cache"),
+            (
+                "schema_version",
+                "status",
+                "source",
+                "material",
+                "ai_required",
+                "provider_state",
+                "provider_error",
+                "contract_passed",
+                "cache",
+                "cache_status",
+                "cache_hit",
+                "cache_tier",
+                "fallback_used",
+                "heuristic_result_exposed",
+                "billing",
+                "search_ai_admission",
+                "ai_execution_attestation",
+            ),
         ),
         "target_document_need_contract": _selected_public_metadata(
             output.get("target_document_need_contract"),
@@ -7329,6 +7413,40 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
         ),
         "mission_learning_rollup": _as_dict(
             _strip_raw_text(deepcopy(output.get("mission_learning_rollup")))
+        ),
+        "ai_landing_materialization": _selected_public_metadata(
+            output.get("ai_landing_materialization"),
+            (
+                "schema_version",
+                "required",
+                "validation_state",
+                "materialized",
+                "route_level_materialized",
+                "semantic_route_candidate_materialized",
+                "ai_landing_count",
+                "blockers",
+                "honest_failure",
+                "semantic_contract",
+                "landing",
+                "branch",
+                "path",
+                "judge",
+            ),
+            list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
+        ),
+        "ai_materialization_hard_gate": _selected_public_metadata(
+            output.get("ai_materialization_hard_gate"),
+            (
+                "schema_version",
+                "required",
+                "state",
+                "status",
+                "passed",
+                "materialized",
+                "blockers",
+                "missing_reasons",
+            ),
+            list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
         ),
         "mcp_background_cap": _as_dict(
             _strip_raw_text(deepcopy(output.get("mcp_background_cap")))
@@ -7382,23 +7500,28 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
         ),
         "payload_integrity": _selected_public_metadata(
             output.get("payload_integrity"),
-            ("schema_version", "passed", "state", "status", "reason", "reason_codes", "missing_reasons"),
-            list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
-        ),
-        "payload_truth_contract": _selected_public_metadata(
-            output.get("payload_truth_contract"),
             (
                 "schema_version",
-                "status",
                 "tool_name",
-                "primary_mcp_payload",
-                "documents",
-                "answer_demo",
-                "support_alignment",
+                "package_field",
+                "context_package_is_product",
+                "answer_demo_secondary",
+                "answer_support_node_count",
+                "package_node_id_count",
+                "answer_support_node_ids_missing_from_package",
+                "contract_missing_evidence_node_ids",
+                "answer_context_alignment_checked",
+                "answer_context_alignment_passed",
+                "passed",
+                "state",
+                "status",
+                "reason",
+                "reason_codes",
                 "missing_reasons",
             ),
             list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
         ),
+        "payload_truth_contract": payload_truth_contract,
         "budget": _selected_public_metadata(
             output.get("budget"),
             (
@@ -7413,23 +7536,25 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
                 "probe_count",
                 "branch_count",
                 "exhausted",
+                "semantic_contract",
             ),
         ),
         "timing": _selected_public_metadata(
             output.get("timing"),
-            ("schema_version", "first_context_ms", "first_useful_package_ms", "total_ms", "final_materialization_completed_ms", "stage_timing_summary"),
-        ),
-        "latency_contract": _selected_public_metadata(
-            output.get("latency_contract"),
             (
                 "schema_version",
-                "benchmark_latency_basis",
-                "first_useful_package_ms",
                 "first_context_ms",
+                "first_useful_package_ms",
                 "total_ms",
-                "under_slo",
-                "completion_contract",
+                "final_materialization_completed_ms",
+                "phase_timings",
+                "semantic_contract",
+                "stage_timings",
+                "stage_timing_summary",
             ),
+        ),
+        "latency_contract": _as_dict(
+            _strip_raw_text(deepcopy(output.get("latency_contract")))
         ),
         "completion_contract": completion,
         "run_lifecycle_contract": _selected_public_metadata(

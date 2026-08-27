@@ -68,7 +68,7 @@ Ask the client to call `get_agvm_usage_guide` and then list the AGVM tools it
 can see. If the tool is missing, check the process working directory, Python
 environment and `AGVM_API_BASE_URL`.
 
-The current V1 contract registry defines 54 tool contracts. `tools/list` is the
+The current V1 contract registry defines 55 tool contracts. `tools/list` is the
 runtime authority because client permission policy can expose a filtered set. Grow,
 brain registry, retrieval, write-preview/commit and local graph inspection
 tools are Core tools. The registry also includes nine bounded
