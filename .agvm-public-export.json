@@ -87,7 +87,7 @@
       "agvm_api/local_entitlements.py": "779c2029b341b1a8ce6d40d0338e8ecad7e64e4e899b0ede8e319d70392b59ac",
       "agvm_api/local_module_manifest_router.py": "b8595b974314e117b5cc2d5c7726a989124b607723f931766910f9fa53753358",
       "agvm_api/mcp_contracts.py": "11d8e7794e849ce3c660c0ca3b41e0ca9cb5339f0ab9f802beb23978421d9620",
-      "agvm_api/mcp_retrieval.py": "3d08308898f4e66b010128b119e71cf969acb4f8bca9612751c0195eb589c335",
+      "agvm_api/mcp_retrieval.py": "077ff8c28785dc02119eea1322e0c1385f5c3e5b33538c96de82b3aa2ce9bff1",
       "agvm_api/mcp_stability.py": "df3a535d644990be57e3707c8220dbae5cc76cecdd14530cacdc6269118a041c",
       "agvm_api/mcp_tool_registration.py": "e6537f1a4460be9ffd88e408523a5fddf138d98afd962d8e1a890a4270affb27",
       "agvm_api/memory_hygiene.py": "5c74a70ad5ab5c3dd1adb583eb840852bf98796fce1e50dd97db67593997d6b0",
@@ -99,7 +99,7 @@
       "agvm_api/projection.py": "d081516933126eda57c5e9ac034df8fb57fc3c4700255ec36893834ea4fc7d47",
       "agvm_api/public_cloud_action_contract.py": "efecd488c7443038f9637cc8000517b0be368986e3c327e5cfa28b9105431beb",
       "agvm_api/public_v1_geometry_placement.py": "b7e48c352169ea178eba6d694b889657a23bf66ba312536c71116d98a13f2a97",
-      "agvm_api/public_v1_landing_contract.py": "18098b6cf475be8f06ad16d367f62e20cfd48eff37de36b20679bf945cfd33dd",
+      "agvm_api/public_v1_landing_contract.py": "36bf06c100b21055b56376d40fdf4ea581d89f4a3788754482e4c732114772b5",
       "agvm_api/release_provenance.py": "cd8decb58a5a5e3d4d4455cd1d05e17768b4e4ee655028e084aadfe6714d156e",
       "agvm_api/requirements.txt": "351bef2722885a2d29c896f4a522f776a28d03f42dd96192034d5327200dd1b3",
       "agvm_api/retrieval.py": "f420ba37c5d137404c34ccdda9f9c62c8d4062a85694608d19168655f1aa239a",
@@ -113,7 +113,7 @@
       "agvm_api/semantic_contract.py": "ffe336ceebe3b37dcc0862164de083e877de905ddf185ef2b95b6a11bcbf7ddc",
       "agvm_api/setup_env.py": "9d74dcbe8a842caf0c578a8181425c9c283b0257f9652f60bb45c0d3c4c92c18",
       "agvm_api/source_security.py": "c375460d946b56ce4ecaf81dd7e2b210eea9a944c7e23d69028f8951eed11f65",
-      "agvm_api/sqlite_store.py": "bcecf263c4f1a9d9e77de83fe7c907fc8afd88f8738f212455285a582f549821",
+      "agvm_api/sqlite_store.py": "01c0ae2095aa8de4ed454a6c76a563a74b59839b6405c22cb3ffff1e065b9843",
       "agvm_api/storage.py": "6a4a491ba5998c9f365174b2abf023ceb7e2e68861505504226dacb31c6a3be2",
       "agvm_api/stream_contract.py": "17830ab426e1efc410de233b76f837bc18e0b2620eb329c171a9abedf6555b52",
       "agvm_cockpit_prototype/Dockerfile": "59325f2ff5dbdbd0dbd2eb0429328625bf628f3c43b7fb80c11d949b337a92f5",
@@ -186,7 +186,7 @@
       "tests/test_ocm7_local_license_supervisor.py": "64e9cddff1a1bdb3db13a0392fca1eeaac2f97d97008f7618bc5b83611f548a0",
       "tests/test_pr12m_c_local_mcp_server_package.py": "2f9d1c966e0d9b49e218642ebec52005f60e98c67ce7556c2da439db72190b6b",
       "tests/test_public_release_contract.py": "79824368bd47f3e0f1285fcd58858781902f3643f1f1bfbd5ee4c3b4705c9f47",
-      "tests/test_public_v1_landing_contract.py": "801aac81629ecb25e57d6ba5d607f0bfb194535fc2c0168d03b6dfe91ca9fc91",
+      "tests/test_public_v1_landing_contract.py": "5584a7053f49e9a5fc3168cfb1734c656922ce35aa9865a94853da1d27b95ee7",
       "tests/test_public_v1_search_edition_boundary.py": "1f14114637e2c038869aae4163b2d405d793e96bb9c554186c6a8a1fc30708f0",
       "tests/test_search_ai_fail_closed_v2.py": "ef1d2fea1d573164effbd9fe7bb929eaf50f2446a2299b0080ecc087e1283833",
       "tests/test_setup_env_runtime.py": "47fa07a9a6f531c25f2b1a86aae2c91930032dfcd6323bebb63da6615b881d7b"
@@ -202,7 +202,7 @@
       "agvm_cockpit_prototype/vite.config.js",
       "brains"
     ],
-    "tree_sha256": "c196dff1515eb3ca7292d0d112db0412b67f79be197c1c633ae1a0bd3ee0b0bc"
+    "tree_sha256": "5096c50b31d9cdce7ade274c3df9c644d1fc0d7249d6127bf5b97d90d01f6647"
   },
   "commentable_file_count": 166,
   "exported_file_count": 181,
@@ -210,7 +210,7 @@
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v2",
   "source_clean": true,
-  "source_commit": "688efa8216e514918183e2c8fb8c47d1444ee0d3",
+  "source_commit": "5bf580899696486101a9504de0f23d5d4e66c268",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 87
 }

@@ -8,6 +8,8 @@ import json
 import time
 from typing import Any, Callable
 
+from llm import ai_spatial_model
+
 
 PUBLIC_V1_LANDING_SCHEMA_VERSION = "agvm.public_v1_landing_plan.v1"
 _PUBLIC_V1_PROMPT_SCHEMA_VERSION = "agvm.public_v1_landing_prompt.v1"
@@ -458,6 +460,7 @@ def build_public_v1_landing_contract(
             "forensic": 24.0,
         }.get(mode, 12.0)
     payload, provider_error = structured_json_fn(
+        model=ai_spatial_model(),
         system_prompt=(
             "You are the public AGVM coordinate-first landing planner. Do not answer the user. "
             "For every admitted answer strand, reuse its mission_id and strand_id and author one inverse answer path. "

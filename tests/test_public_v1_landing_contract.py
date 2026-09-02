@@ -13,6 +13,9 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+API_DIR = ROOT / "agvm_api"
+if str(API_DIR) not in sys.path:
+    sys.path.insert(0, str(API_DIR))
 MODULE_PATH = ROOT / "public-core-docs" / "backend-src" / "public_v1_landing_contract.py"
 if not MODULE_PATH.is_file():
     MODULE_PATH = ROOT / "agvm_api" / "public_v1_landing_contract.py"
@@ -87,6 +90,7 @@ def _kwargs() -> dict[str, Any]:
 
 def test_public_v1_landing_planner_materializes_ai_coordinate_paths() -> None:
     module = _load_module()
+    module.ai_spatial_model = lambda: "test-ai-spatial-model"
     calls: list[dict[str, Any]] = []
 
     def provider(**request: Any) -> tuple[dict[str, Any], None]:
@@ -134,6 +138,7 @@ def test_public_v1_landing_planner_materializes_ai_coordinate_paths() -> None:
     )
 
     assert len(calls) == 1
+    assert calls[0]["model"] == "test-ai-spatial-model"
     assert calls[0]["schema_name"] == "agvm_public_v1_landing_plan_v1"
     assert contract["status"] == "materialized"
     assert contract["materialized"] is True

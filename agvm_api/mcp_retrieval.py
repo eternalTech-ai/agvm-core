@@ -1819,6 +1819,136 @@ def _collect_node_ids(value: Any) -> set[str]:
     return node_ids
 
 
+def _strip_stale_answer_alignment_notice(agent_markdown: Any) -> str:
+    lines = str(agent_markdown or "").splitlines()
+    filtered = [
+        line
+        for line in lines
+        if not line.strip().lstrip("- ").startswith("Answer/context alignment is unresolved:")
+    ]
+    compact: list[str] = []
+    for index, line in enumerate(filtered):
+        if line.strip() == "## Unresolved Or Missing":
+            following = [item.strip() for item in filtered[index + 1 :] if item.strip()]
+            if not following:
+                while compact and not compact[-1].strip():
+                    compact.pop()
+                continue
+        compact.append(line)
+    return "\n".join(compact).strip()
+
+
+def _revalidate_stale_answer_context_alignment(result: dict[str, Any]) -> dict[str, Any]:
+    context_package = _as_dict(result.get("context_package"))
+    context_contract = _as_dict(context_package.get("contract"))
+    alignment = _as_dict(context_contract.get("answer_context_alignment"))
+    stored_missing_terms = [
+        str(item).strip()
+        for item in _as_list(alignment.get("missing_terms"))
+        if str(item).strip()
+    ]
+    if (
+        not bool(alignment.get("checked"))
+        or bool(alignment.get("passed", True))
+        or not stored_missing_terms
+    ):
+        return result
+    answer = _as_dict(result.get("answer"))
+    agent_markdown = str(context_package.get("agent_markdown") or "").strip()
+    if not answer or not agent_markdown:
+        return result
+
+    from answering import _fold_text, _mcp_answer_alignment_terms, _mcp_answer_payload_text
+
+    current_terms = _mcp_answer_alignment_terms(_mcp_answer_payload_text(answer))
+    current_term_set = set(current_terms)
+    folded_agent_markdown = _fold_text(agent_markdown)
+    current_missing_terms = [
+        term
+        for term in current_terms
+        if term and term not in folded_agent_markdown
+    ]
+    stale_missing_terms = [
+        term
+        for term in stored_missing_terms
+        if _fold_text(term) not in current_term_set
+    ]
+    answer_evidence_ids = {
+        str(item).strip()
+        for item in _as_list(answer.get("evidence_node_ids"))
+        if str(item).strip()
+    }
+    package_node_ids = _collect_node_ids(context_package)
+    missing_evidence_ids = {
+        str(item).strip()
+        for item in _as_list(alignment.get("missing_evidence_node_ids"))
+        if str(item).strip()
+    }
+    if (
+        len(stale_missing_terms) != len(stored_missing_terms)
+        or current_missing_terms
+        or missing_evidence_ids
+        or not answer_evidence_ids
+        or not answer_evidence_ids.issubset(package_node_ids)
+    ):
+        return result
+
+    alignment.update(
+        {
+            "passed": True,
+            "missing_terms": [],
+            "missing_evidence_node_ids": [],
+            "stale_missing_terms_ignored": stale_missing_terms,
+            "revalidated_at_projection": True,
+        }
+    )
+    unresolved_sections = [
+        str(item).strip()
+        for item in _as_list(context_contract.get("unresolved_sections"))
+        if str(item).strip() and str(item).strip() != "answer_context_alignment"
+    ]
+    semantic_missing_slot_keys = [
+        str(item).strip()
+        for item in _as_list(context_contract.get("semantic_missing_slot_keys"))
+        if str(item).strip()
+    ]
+    contract_passed = not unresolved_sections and not semantic_missing_slot_keys
+    context_contract.update(
+        {
+            "answer_context_alignment": alignment,
+            "unresolved_sections": unresolved_sections,
+            "passed": contract_passed,
+        }
+    )
+    context_package["contract"] = context_contract
+    if contract_passed:
+        context_package["status"] = "contract_satisfied"
+        context_package["agent_markdown"] = _strip_stale_answer_alignment_notice(agent_markdown)
+    metrics = _as_dict(context_package.get("metrics"))
+    metrics.update(
+        {
+            "contract_passed": contract_passed,
+            "unresolved_sections": unresolved_sections,
+            "answer_context_aligned": True,
+            "answer_context_missing_terms": [],
+            "answer_context_missing_term_count": 0,
+        }
+    )
+    context_package["metrics"] = metrics
+    result["context_package"] = context_package
+    materialization = _as_dict(result.get("context_package_materialization"))
+    if materialization and contract_passed:
+        materialization.update(
+            {
+                "contract_passed": True,
+                "unresolved_sections": [],
+                "status": "usable",
+            }
+        )
+        result["context_package_materialization"] = materialization
+    return result
+
+
 def _payload_integrity(result: dict[str, Any], *, tool_name: str, package_field: str, package: Any) -> dict[str, Any]:
     answer = _as_dict(result.get("answer"))
     context_package = _as_dict(result.get("context_package"))
@@ -1840,7 +1970,19 @@ def _payload_integrity(result: dict[str, Any], *, tool_name: str, package_field:
         for item in list(answer_context_alignment.get("missing_evidence_node_ids") or [])
         if str(item).strip()
     ]
-    passed = not missing_ids and not alignment_missing_ids and bool(answer_context_alignment.get("passed", True))
+    current_missing_terms = [
+        str(item).strip()
+        for item in list(answer_context_alignment.get("missing_terms") or [])
+        if str(item).strip()
+    ]
+    stale_missing_terms = [
+        str(item).strip()
+        for item in list(answer_context_alignment.get("stale_missing_terms_ignored") or [])
+        if str(item).strip()
+    ]
+    alignment_passed = bool(answer_context_alignment.get("passed", True))
+    alignment_checked = bool(answer_context_alignment.get("checked"))
+    passed = not missing_ids and not alignment_missing_ids and not current_missing_terms and alignment_passed
     return {
         "schema_version": "agvm.mcp_payload_integrity.v1",
         "tool_name": tool_name,
@@ -1851,8 +1993,10 @@ def _payload_integrity(result: dict[str, Any], *, tool_name: str, package_field:
         "package_node_id_count": len(package_node_ids),
         "answer_support_node_ids_missing_from_package": missing_ids[:16],
         "contract_missing_evidence_node_ids": alignment_missing_ids[:16],
-        "answer_context_alignment_checked": bool(answer_context_alignment.get("checked")),
-        "answer_context_alignment_passed": bool(answer_context_alignment.get("passed", True)),
+        "contract_missing_answer_terms": current_missing_terms[:16],
+        "stale_contract_missing_answer_terms_ignored": stale_missing_terms[:16],
+        "answer_context_alignment_checked": alignment_checked,
+        "answer_context_alignment_passed": bool(alignment_passed),
         "passed": bool(passed),
     }
 
@@ -8149,6 +8293,8 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
                 "package_node_id_count",
                 "answer_support_node_ids_missing_from_package",
                 "contract_missing_evidence_node_ids",
+                "contract_missing_answer_terms",
+                "stale_contract_missing_answer_terms_ignored",
                 "answer_context_alignment_checked",
                 "answer_context_alignment_passed",
                 "passed",
@@ -8390,6 +8536,7 @@ def build_mcp_retrieval_tool_output(
     if tool_name not in PR12J_B_RETRIEVAL_TOOL_NAMES - {"inspect_route", "inspect_memory_object"}:
         raise ValueError(f"unsupported_mcp_retrieval_tool:{tool_name}")
     normalized = normalize_retrieve_response_payload(deepcopy(dict(result or {})))
+    normalized = _revalidate_stale_answer_context_alignment(normalized)
     persisted_terminal_inspection = _persisted_terminal_inspection_authority(
         tool_name, normalized
     )

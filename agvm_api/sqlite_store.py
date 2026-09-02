@@ -104,6 +104,7 @@ _BOOTSTRAP_LOCK = threading.Lock()
 _BOOTSTRAPPED_RUNTIME_STORE_PATHS: set[str] = set()
 _SEARCH_HEALTH_BACKFILL_BOOTSTRAPPED_PATHS: set[str] = set()
 RUNTIME_RETENTION_REPORT_SCHEMA_VERSION = "agvm.runtime_retention_report.v1"
+SEARCH_RESTART_RECOVERY_SCHEMA_VERSION = "agvm.search_restart_recovery.v1"
 _RUNTIME_RETENTION_ACTIVE_STATUSES = {"created", "planning", "running", "finalizing"}
 _RUNTIME_RETENTION_PINNED_EVENT_TYPES = {
     "answer_final",
@@ -501,6 +502,190 @@ def _maybe_backfill_search_health_on_bootstrap(conn: sqlite3.Connection, sqlite_
     _backfill_recent_search_plan_health(conn, limit=200)
     _backfill_recent_search_result_health(conn, limit=50)
     _SEARCH_HEALTH_BACKFILL_BOOTSTRAPPED_PATHS.add(sqlite_path_key)
+
+
+def _recover_interrupted_search_sessions_on_bootstrap(conn: sqlite3.Connection) -> int:
+    """Terminalize only Search workers that cannot survive a process restart.
+
+    A synchronous ``query-plan`` is intentionally persisted as ``planning``
+    until a later ``query-run`` and must remain runnable after restart.  In
+    contrast, ``running``/``finalizing`` sessions and accepted background
+    pipelines have process-owned workers; once this process is bootstrapping,
+    those old workers no longer exist.  Persist a terminal failure package so
+    result polling and stream reattachment cannot remain open forever.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT
+            session.search_id,
+            session.status,
+            session.query_text,
+            session.response_mode,
+            session.request_json,
+            session.result_json,
+            session.first_useful_result_json,
+            session.latest_useful_result_json,
+            session.final_result_json
+        FROM search_sessions AS session
+        WHERE session.status IN ('running', 'finalizing')
+           OR (
+                session.status IN ('created', 'planning')
+                AND EXISTS (
+                    SELECT 1
+                    FROM search_events AS event
+                    WHERE event.search_id = session.search_id
+                      AND (
+                          event.event_type = 'worker_started'
+                          OR (
+                              event.event_type IN ('planning_started', 'planning_complete')
+                              AND lower(COALESCE(json_extract(event.payload_json, '$.plan_transport'), ''))
+                                  LIKE '%background%'
+                          )
+                      )
+                )
+           )
+        ORDER BY session.created_at ASC, session.search_id ASC
+        """
+    ).fetchall()
+    if not rows:
+        return 0
+
+    recovered_at = utc_timestamp()
+    for row in rows:
+        search_id = str(row["search_id"])
+        previous_status = str(row["status"] or "running").strip().lower()
+        request_payload = _json_load(row["request_json"], {})
+        if not isinstance(request_payload, dict):
+            request_payload = {}
+        retrieval_mode = str(request_payload.get("retrieval_mode") or "balanced").strip().lower()
+        if retrieval_mode not in {"flash", "balanced", "heavy", "forensic"}:
+            retrieval_mode = "balanced"
+        response_mode = str(row["response_mode"] or request_payload.get("response_mode") or "both").strip().lower()
+        if response_mode not in {"answer", "context", "both"}:
+            response_mode = "both"
+        brain_id = str(request_payload.get("brain_id") or current_brain_id() or "").strip()
+        reason = "runtime_restart_interrupted"
+        recovery_contract = {
+            "schema_version": SEARCH_RESTART_RECOVERY_SCHEMA_VERSION,
+            "state": "recovered_as_failed",
+            "reason": reason,
+            "previous_status": previous_status,
+            "recovered_at": recovered_at,
+            "worker_resumable": False,
+            "retry_policy": "create_new_search",
+        }
+        terminal = {
+            "search_id": search_id,
+            "brain_id": brain_id or None,
+            "query_text": str(row["query_text"] or request_payload.get("query_text") or ""),
+            "thread_id": str(request_payload.get("thread_id") or "") or None,
+            "response_mode": response_mode,
+            "retrieval_mode": retrieval_mode,
+            "status": "failed",
+            "completion_state": reason,
+            "canonical_search_state": "failed",
+            "terminal_for_client": True,
+            "probes": [],
+            "steps": [],
+            "matches": [],
+            "visited_node_ids": [],
+            "visited_bucket_keys": [],
+            "stop_reason": reason,
+            "answerability_state": "insufficient",
+            "closure_state": "open",
+            "final_closure_ready": False,
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "result_materialization_state": "none",
+            "completion_contract": {
+                "state": "failed",
+                "status": "failed",
+                "canonical_search_state": "failed",
+                "visible_reason": reason,
+                "result_ready_terminal": True,
+                "final_materialization_pending": False,
+            },
+            "mcp_delivery_contract": {
+                "completion_state": "failed",
+                "canonical_search_state": "failed",
+                "client_payload_state": "failed",
+                "terminal_for_client": True,
+                "final_materialization_pending": False,
+                "background_state": "stopped",
+            },
+            "runtime_state_contract": recovery_contract,
+            "planner_runtime": {
+                "restart_recovery": recovery_contract,
+            },
+        }
+        parent = {}
+        for column in (
+            "final_result_json",
+            "latest_useful_result_json",
+            "first_useful_result_json",
+            "result_json",
+        ):
+            candidate = _json_load(row[column], {}) if row[column] else {}
+            if isinstance(candidate, dict) and candidate:
+                parent = candidate
+                break
+        merged = _merge_search_snapshot_payload(parent, terminal) if parent else terminal
+        final = _canonical_persisted_search_snapshot(
+            search_id,
+            merged,
+            snapshot_kind="final",
+            brain_id=brain_id,
+            parent=parent,
+        )
+        result_json = _json_dump(final)
+        result_health_json = _json_dump(
+            _search_result_health_summary(final, result_json_length=len(result_json))
+        )
+        conn.execute(
+            """
+            UPDATE search_sessions
+            SET status = 'failed',
+                result_json = ?,
+                final_result_json = ?,
+                result_health_json = ?,
+                stop_reason = ?,
+                answerability_state = 'insufficient',
+                updated_at = ?
+            WHERE search_id = ?
+              AND status IN ('created', 'planning', 'running', 'finalizing')
+            """,
+            (
+                result_json,
+                result_json,
+                result_health_json,
+                reason,
+                recovered_at,
+                search_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO search_events (search_id, event_type, payload_json, created_at)
+            VALUES (?, 'search_failed', ?, ?)
+            """,
+            (
+                search_id,
+                _json_dump(
+                    {
+                        "search_id": search_id,
+                        "brain_id": brain_id or None,
+                        "error": reason,
+                        "previous_status": previous_status,
+                        "canonical_search_state": "failed",
+                        "terminal_result_persisted": True,
+                        "restart_recovery": recovery_contract,
+                    }
+                ),
+                recovered_at,
+            ),
+        )
+    return len(rows)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1396,6 +1581,7 @@ def bootstrap_runtime_store() -> None:
             _ensure_column(conn, "search_sessions", "first_useful_result_json", "TEXT")
             _ensure_column(conn, "search_sessions", "latest_useful_result_json", "TEXT")
             _ensure_column(conn, "search_sessions", "final_result_json", "TEXT")
+            _recover_interrupted_search_sessions_on_bootstrap(conn)
             _ensure_column(conn, "grow_preview_bindings", "before_graph_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "grow_preview_bindings", "rollback_result_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "grow_preview_bindings", "investigation_json", "TEXT NOT NULL DEFAULT '{}'")
