@@ -83,7 +83,7 @@
       "agvm_api/hot_working_memory.py": "e31e74ff68ecb2028131a91557e5874620f70d14a1a029b4ad9299acafa94bf2",
       "agvm_api/investigative_agent.py": "e4c7010a214f48426f006d634c166dd8d5f405e03b9e18ae7465ebe1adc1ebc6",
       "agvm_api/investigative_search.py": "fbafe4060b5cad70f8ae7c9df267b92d950226b421da01f99ea57d7a57f9c466",
-      "agvm_api/llm.py": "8fa0e67e01152b85e356d3a0eaaf3d7813c830a623802fc194e4768c2f2ea8f8",
+      "agvm_api/llm.py": "0e117586dea48e0d533eada541a8b621ef71b16936f95a1bba0dc6ece4976226",
       "agvm_api/local_entitlements.py": "779c2029b341b1a8ce6d40d0338e8ecad7e64e4e899b0ede8e319d70392b59ac",
       "agvm_api/local_module_manifest_router.py": "b8595b974314e117b5cc2d5c7726a989124b607723f931766910f9fa53753358",
       "agvm_api/mcp_contracts.py": "11d8e7794e849ce3c660c0ca3b41e0ca9cb5339f0ab9f802beb23978421d9620",
@@ -202,7 +202,7 @@
       "agvm_cockpit_prototype/vite.config.js",
       "brains"
     ],
-    "tree_sha256": "0ea1e2e13ef1e033bbde4f47690666f73a2e5c855fd02c52f476baabf9faf533"
+    "tree_sha256": "24e04437775e54994f304b0648dc0b080018818ca6c3fb0a0c084d8787366e68"
   },
   "commentable_file_count": 166,
   "exported_file_count": 181,
@@ -210,7 +210,7 @@
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v2",
   "source_clean": true,
-  "source_commit": "c6651912101a3173cee1431ed641b0912ee0b0d1",
+  "source_commit": "3ae4b5e422667e75002884a9a35292b86d4373b1",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 87
 }

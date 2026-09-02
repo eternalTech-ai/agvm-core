@@ -416,7 +416,14 @@ def structured_json(
 
     semaphore = _llm_provider_semaphore()
     queue_started_at = time.perf_counter()
-    acquired = semaphore.acquire(timeout=_llm_queue_timeout_seconds(timeout))
+    # ``timeout`` is the end-to-end budget for this provider attempt.  Waiting
+    # for local capacity must not grant the transport a second full budget.
+    # Keep the optional queue ceiling, but also cap it at the call deadline.
+    queue_timeout = min(
+        _llm_queue_timeout_seconds(timeout),
+        max(0.0, float(timeout) - (time.monotonic() - call_started_at)),
+    )
+    acquired = semaphore.acquire(timeout=queue_timeout)
     queue_wait_ms = round((time.perf_counter() - queue_started_at) * 1000.0, 2)
     if role in _ROLE_NAMES:
         _LLM_RUNTIME["last_queue_wait_ms"][role] = queue_wait_ms
@@ -427,9 +434,16 @@ def structured_json(
         record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
         return None, error
 
+    provider_timeout = float(timeout) - (time.monotonic() - call_started_at)
+    if provider_timeout <= 0.0:
+        semaphore.release()
+        error = f"llm_queue_timeout:deadline_exhausted:waited_ms={queue_wait_ms}"
+        record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
+        return None, error
+
     try:
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with urllib.request.urlopen(req, timeout=provider_timeout) as response:
                 response_bytes = response.read()
                 payload = json.loads(response_bytes.decode("utf-8"))
         finally:
