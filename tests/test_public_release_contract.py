@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -39,6 +38,10 @@ def _canonical_file_digest(path: Path) -> str:
     else:
         canonical = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _normalized_text(path: Path) -> str:
+    return " ".join(path.read_text(encoding="utf-8").split())
 
 
 def test_public_release_excludes_paid_profile_and_geometry_implementations() -> None:
@@ -196,6 +199,12 @@ def test_public_mcp_contract_has_v1_bootstrap_profile_and_free_grow() -> None:
         assert classification.category == "core"
         assert classification.public_core_allowed is True
 
+    for name in ("change_node_content", "delete_node"):
+        classification = classify_mcp_tool(name)
+        assert classification is not None
+        assert classification.category == "core"
+        assert classification.public_core_allowed is True
+
     for name in (
         "sleep_preview",
         "sleep_apply",
@@ -213,22 +222,44 @@ def test_public_mcp_contract_has_v1_bootstrap_profile_and_free_grow() -> None:
 
 
 def test_public_docs_describe_visibility_without_claiming_authorization() -> None:
-    modules = (ROOT / "docs" / "modules.md").read_text(encoding="utf-8")
-    local_mcp = (ROOT / "docs" / "local-mcp.md").read_text(encoding="utf-8")
-    cloud = (ROOT / "docs" / "cloud-and-pro.md").read_text(encoding="utf-8")
-    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    modules = _normalized_text(ROOT / "docs" / "modules.md")
+    local_mcp = _normalized_text(ROOT / "docs" / "local-mcp.md")
+    cloud = _normalized_text(ROOT / "docs" / "cloud-and-pro.md")
+    changelog = _normalized_text(ROOT / "CHANGELOG.md")
     assert "complete current contract catalog" in modules
-    documented_count = re.search(r"defines (\d+) tool contracts", local_mcp)
-    assert documented_count is not None
-    assert int(documented_count.group(1)) == len(
-        [*GUIDE_MCP_TOOL_NAMES, *REQUIRED_MCP_TOOL_NAMES, *AGENT_MEMORY_MCP_TOOL_NAMES]
-    )
+    assert "generated at runtime from `GET /mcp/contracts`" in local_mcp
+    assert "Do not hard-code a tool count" in local_mcp
+    assert "retrieve_context" in local_mcp
+    assert "Local Core tools do not consume Detwin Cloud credits" in local_mcp
     assert "brain_bootstrap_*" in local_mcp
     assert "brain_profile_*" in local_mcp
     assert "Grow" in modules and "Core" in modules
     assert "module_tool_not_enabled_by_local_mcp_lease" in modules
     assert "visibility is never treated as authorization" in cloud
     assert "structured Detwin Cloud action contract" in changelog
+
+
+def test_public_fresh_user_docs_separate_local_byok_from_hosted_credits() -> None:
+    readme = _normalized_text(ROOT / "README.md")
+    local_install = _normalized_text(ROOT / "docs" / "local-install.md")
+    bootstrap = _normalized_text(ROOT / "docs" / "brain-bootstrap.md")
+    local_mcp = _normalized_text(ROOT / "docs" / "local-mcp.md")
+    env_example = _normalized_text(ROOT / ".env.example")
+
+    assert "docker compose up --build" in readme
+    assert "http://localhost:3020" in readme
+    assert "local BYOK" in readme
+    assert "no Detwin account or Detwin credits" in readme
+    assert "test and save your provider key" in readme
+    assert "provider billing and quota" in local_install.lower()
+    assert "The **AI interview** option is also a Local Core workflow" in bootstrap
+    assert "Manual questions replace only question generation" in bootstrap
+    assert "platform_memory_credit_unavailable" in bootstrap
+    assert "platform_memory_outbox_worker_unavailable" in bootstrap
+    assert "retrieve_context" in local_mcp
+    assert "AGVM_HOSTED_MCP_URL=https://mcp.detwin.ai" in env_example
+    assert "AGVM_HOSTED_MCP_API_KEY=" in env_example
+    assert "required only" in env_example and "Sleep and Evolve" in env_example
 
 
 def test_public_ci_contains_release_hygiene_gates() -> None:

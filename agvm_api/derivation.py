@@ -13,8 +13,9 @@ from collections import defaultdict
 from typing import Any
 
 from source_security import sanitize_source_uri_for_persistence
+from storage import utc_timestamp
 
-from ai_modules_v2 import validate_grow_compiler_payload
+from ai_modules_v2 import AiModuleContractError, validate_grow_compiler_payload
 from config import BUCKET_SIZE, CLAIM_MEMORY_TYPES, ENTITY_MEMORY_TYPES, FACET_FIELDS, ROUTING_FIELDS
 from llm import compiler_model, llm_enabled, structured_json
 from metamemory import build_metamemory_package
@@ -27,6 +28,7 @@ from projection import (
     infer_guide_area,
     latent_vector_to_angles,
     lexical_overlap,
+    normalize_unit_confidence,
     normalize_scores,
     quantize_to_brainhex,
     scores_to_latent_vector,
@@ -263,6 +265,21 @@ def _strip_generated_source_unit_prefix(value: str) -> str:
             break
         text = stripped
     return text
+
+
+def _source_section_text(section: Mapping[str, Any]) -> str:
+    text = str(
+        section.get("text")
+        or section.get("raw_text")
+        or section.get("clean_text")
+        or section.get("summary")
+        or ""
+    )
+    lines = [
+        re.sub(r"[ \t]+", " ", line).strip()
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    return "\n".join(line for line in lines if line).strip()
 
 
 def _source_grounding_requires_filter(*, source_type: str | None, input_mode: str) -> bool:
@@ -1313,6 +1330,11 @@ def normalize_runtime_graph(graph: dict[str, Any]) -> dict[str, Any]:
         rebuilt["valid_from"] = node.get("valid_from")
         rebuilt["valid_to"] = node.get("valid_to")
         rebuilt["observed_at"] = node.get("observed_at")
+        rebuilt["created_at"] = node.get("created_at")
+        rebuilt["updated_at"] = node.get("updated_at")
+        rebuilt["ingested_at"] = node.get("ingested_at")
+        rebuilt["superseded_at"] = node.get("superseded_at")
+        rebuilt["node_revision"] = node.get("node_revision")
         rebuilt["superseded_by"] = node.get("superseded_by")
         rebuilt["obsoletes"] = list(node.get("obsoletes") or [])
         rebuilt["temporal_confidence"] = node.get("temporal_confidence")
@@ -3030,6 +3052,60 @@ def _span_bounds_in_lower_source(lower_source: str, fragment: str) -> tuple[int 
     return start, start + len(fragment)
 
 
+_SEMANTIC_TIME_FIELDS = (
+    "temporal_role",
+    "observed_at",
+    "valid_from",
+    "valid_to",
+    "temporal_confidence",
+)
+_SOURCE_CHRONOLOGY_FIELDS = (
+    "source_published_at",
+    "source_acquired_at",
+    "source_retrieved_at",
+    "temporal_scope",
+)
+
+
+def _explicit_temporal_materialization(
+    *sources: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Project only explicitly authored semantic time and source chronology.
+
+    Later sources have greater authority.  Technical timestamps such as
+    created_at, ingested_at and recorded_at are deliberately not candidates:
+    they describe storage/audit activity, not the time asserted by a memory.
+    """
+
+    semantic_time: dict[str, Any] = {}
+    source_chronology: dict[str, Any] = {}
+    for raw_source in sources:
+        if not isinstance(raw_source, dict):
+            continue
+        source = dict(raw_source)
+        provenance = dict(source.get("provenance") or {})
+        for field in _SEMANTIC_TIME_FIELDS:
+            if field not in source:
+                continue
+            value = source.get(field)
+            if field == "temporal_confidence" and value is not None:
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(value) or value < 0.0 or value > 1.0:
+                    continue
+            elif value is not None:
+                value = str(value).strip() or None
+            semantic_time[field] = value
+        for field in _SOURCE_CHRONOLOGY_FIELDS:
+            if field in provenance:
+                source_chronology[field] = provenance.get(field)
+            if field in source:
+                source_chronology[field] = source.get(field)
+    return semantic_time, source_chronology
+
+
 def build_seed(
     *,
     raw_text: str,
@@ -3076,6 +3152,15 @@ def build_seed(
     merge_target_node_id: str | None = None,
     identity_resolution_target_node_id: str | None = None,
     identity_resolution_type: str | None = None,
+    temporal_role: str | None = None,
+    observed_at: str | None = None,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
+    temporal_confidence: float | None = None,
+    source_published_at: str | None = None,
+    source_acquired_at: str | None = None,
+    source_retrieved_at: str | None = None,
+    temporal_scope: Any = None,
     geometry_profile_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     projection = heuristic_projection(raw_text, input_mode=input_mode, node_kind_hint=node_kind_hint)
@@ -3119,6 +3204,21 @@ def build_seed(
         "source_ref_id": str(source_ref_id or "").strip() or None,
         "guide_conceptual_area": guide_conceptual_area,
     }
+    explicit_temporal_input = {
+        "temporal_role": temporal_role,
+        "observed_at": observed_at,
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+        "temporal_confidence": temporal_confidence,
+        "source_published_at": source_published_at,
+        "source_acquired_at": source_acquired_at,
+        "source_retrieved_at": source_retrieved_at,
+        "temporal_scope": temporal_scope,
+    }
+    semantic_time, source_chronology = _explicit_temporal_materialization(
+        {key: value for key, value in explicit_temporal_input.items() if value is not None}
+    )
+    provenance.update(source_chronology)
     hygiene = build_hygiene_metadata(
         raw_text=raw_text,
         input_mode=input_mode,
@@ -3151,7 +3251,7 @@ def build_seed(
         "profile_eligible": hygiene["profile_eligible"],
         "document_eligible": hygiene["document_eligible"],
         "derivation_role": derivation_role,
-        "derivation_confidence": derivation_confidence,
+        "derivation_confidence": normalize_unit_confidence(derivation_confidence),
         "derived_from_preview_id": derived_from_preview_id,
         "document_role": document_role,
         "document_anchor_id": document_anchor_id,
@@ -3164,10 +3264,10 @@ def build_seed(
         "source_unit_formation_strategy": source_unit_formation_strategy,
         "source_span_start": source_span_start,
         "source_span_end": source_span_end,
-        "memory_confidence": memory_confidence,
-        "identity_resolution_confidence": identity_resolution_confidence,
-        "evidence_confidence": evidence_confidence,
-        "stability_confidence": stability_confidence,
+        "memory_confidence": normalize_unit_confidence(memory_confidence),
+        "identity_resolution_confidence": normalize_unit_confidence(identity_resolution_confidence),
+        "evidence_confidence": normalize_unit_confidence(evidence_confidence),
+        "stability_confidence": normalize_unit_confidence(stability_confidence),
         "sleep_revision_count": 0,
         "last_sleep_review_at": None,
         "local_correction_plan": dict(local_correction_plan or {}),
@@ -3182,6 +3282,12 @@ def build_seed(
         "merge_target_node_id": merge_target_node_id,
         "identity_resolution_target_node_id": identity_resolution_target_node_id,
         "identity_resolution_type": identity_resolution_type,
+        **{
+            **semantic_time,
+            "temporal_confidence": normalize_unit_confidence(
+                semantic_time.get("temporal_confidence")
+            ),
+        },
     }
     return apply_public_v1_geometry_profile_to_seed(seed, geometry_profile_context)
 
@@ -3446,7 +3552,10 @@ def llm_autoderive(text: str, input_mode: str, *, timeout_seconds: float | None 
         user_prompt=f"Input mode: {input_mode}\n\n{text}",
         schema_name="agvm_preview_derivation",
         schema=schema,
-        timeout=max(1.0, min(float(timeout_seconds or 20.0), 60.0)),
+        timeout=max(
+            1.0,
+            min(float(20.0 if timeout_seconds is None else timeout_seconds), 1800.0),
+        ),
         role="compiler",
     )
     return payload, error
@@ -3547,6 +3656,12 @@ def llm_memory_compile(
                     "memory_confidence",
                     "evidence_confidence",
                     "stability_confidence",
+                    "temporal_role",
+                    "observed_at",
+                    "valid_from",
+                    "valid_to",
+                    "temporal_confidence",
+                    "temporal_scope",
                 ],
                 "properties": {
                     "summary": {"type": "string"},
@@ -3569,6 +3684,12 @@ def llm_memory_compile(
                     "memory_confidence": {"type": "number"},
                     "evidence_confidence": {"type": "number"},
                     "stability_confidence": {"type": "number"},
+                    "temporal_role": {"type": ["string", "null"]},
+                    "observed_at": {"type": ["string", "null"]},
+                    "valid_from": {"type": ["string", "null"]},
+                    "valid_to": {"type": ["string", "null"]},
+                    "temporal_confidence": {"type": ["number", "null"]},
+                    "temporal_scope": {"type": ["string", "null"]},
                 },
             },
             "derived_nodes": {
@@ -3586,6 +3707,12 @@ def llm_memory_compile(
                         "confidence",
                         "memory_confidence",
                         "evidence_confidence",
+                        "temporal_role",
+                        "observed_at",
+                        "valid_from",
+                        "valid_to",
+                        "temporal_confidence",
+                        "temporal_scope",
                     ],
                     "properties": {
                         "derivation_role": {"type": "string", "enum": ["claim", "entity"]},
@@ -3611,6 +3738,12 @@ def llm_memory_compile(
                         "evidence_confidence": {"type": "number"},
                         "identity_resolution_confidence": {"type": ["number", "null"]},
                         "stability_confidence": {"type": ["number", "null"]},
+                        "temporal_role": {"type": ["string", "null"]},
+                        "observed_at": {"type": ["string", "null"]},
+                        "valid_from": {"type": ["string", "null"]},
+                        "valid_to": {"type": ["string", "null"]},
+                        "temporal_confidence": {"type": ["number", "null"]},
+                        "temporal_scope": {"type": ["string", "null"]},
                     },
                 },
             },
@@ -3782,6 +3915,10 @@ def llm_memory_compile(
         "The local_correction_plan must include a meaningful radial_policy, attraction/repulsion targets when useful, and a realistic minimum_separation. "
         "Fill cognitive_write_plan with the intended memory acts, review policy, hypotheses, deductions, state transitions, and sleep/evolve targets. "
         "Keep facts, deductions, hypotheses, documents, relationship states, project states, and source metadata separate.\n\n"
+        "Author semantic time only when the source text or reviewed answers support it: temporal_role, observed_at, "
+        "valid_from, valid_to, temporal_confidence, and a structured temporal_scope. Use null when the source does "
+        "not establish the field. Never derive semantic time from created_at, updated_at, ingested_at, recorded_at, "
+        "source acquisition time, or retrieval time; those timestamps are provenance/audit only.\n\n"
         "Source-learning extraction policy:\n"
         "- If the source context says self_memory, compile the material as memory about the selected brain/person, not as a generic web-page collage.\n"
         "- Extract what a future agent would need to answer: identity, values, operating style, projects, relationships, dated events, decisions, ambitions, and grounded implications.\n"
@@ -3803,7 +3940,10 @@ def llm_memory_compile(
         user_prompt=user_prompt,
         schema_name="agvm_memory_compiler",
         schema=schema,
-        timeout=max(1.0, min(float(timeout_seconds or 60.0), 120.0)),
+        timeout=max(
+            1.0,
+            min(float(60.0 if timeout_seconds is None else timeout_seconds), 1800.0),
+        ),
         role="compiler",
         api_key_override=api_key_override,
         execution_metadata=execution_metadata,
@@ -3814,9 +3954,9 @@ def llm_memory_compile(
 def _compact_source_sections_for_semantic_compiler(
     source_sections: list[dict[str, Any]] | None,
     *,
-    max_sections: int = 36,
-    per_section_chars: int = 1200,
-    total_chars: int = 24_000,
+    max_sections: int = 48,
+    per_section_chars: int = 1600,
+    total_chars: int = 72_000,
 ) -> list[dict[str, Any]]:
     compact: list[dict[str, Any]] = []
     char_budget = max(0, int(total_chars))
@@ -3824,7 +3964,7 @@ def _compact_source_sections_for_semantic_compiler(
         if len(compact) >= max_sections or char_budget <= 0:
             break
         section_id = str(raw_section.get("section_id") or raw_section.get("unit_id") or "").strip()
-        text = re.sub(r"\s+", " ", str(raw_section.get("text") or "").replace("\r", "\n")).strip()
+        text = re.sub(r"\s+", " ", _source_section_text(raw_section)).strip()
         if not section_id or len(text) < 24:
             continue
         clipped = text[: min(len(text), per_section_chars, char_budget)].strip()
@@ -3841,13 +3981,16 @@ def _compact_source_sections_for_semantic_compiler(
                 "promotion_role": str(raw_section.get("promotion_role") or "").strip(),
                 "fact_eligible": bool(raw_section.get("fact_eligible") if raw_section.get("fact_eligible") is not None else True),
                 "supporting_evidence_eligible": bool(raw_section.get("supporting_evidence_eligible") or False),
+                "source_acquired_at": raw_section.get("source_acquired_at"),
+                "source_retrieved_at": raw_section.get("source_retrieved_at"),
+                "temporal_scope": raw_section.get("temporal_scope"),
                 "text": clipped,
             }
         )
     return compact
 
 
-def llm_source_unit_semantic_compile(
+def _llm_source_unit_semantic_compile_batch(
     *,
     source_sections: list[dict[str, Any]] | None,
     source_label: str | None,
@@ -3861,11 +4004,14 @@ def llm_source_unit_semantic_compile(
     source_investigation_id: str | None = None,
     candidate_target: int | None = None,
     timeout_seconds: float | None = None,
+    api_key_override: str | None = None,
+    model_override: str | None = None,
+    execution_metadata: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     sections = _compact_source_sections_for_semantic_compiler(source_sections)
     if not sections:
         return [], None, "no_source_sections"
-    if not llm_enabled():
+    if api_key_override is None and not llm_enabled():
         return [], None, "llm_disabled"
 
     metamemory = build_metamemory_package("compiler")
@@ -3905,6 +4051,12 @@ def llm_source_unit_semantic_compile(
                         "stability_confidence",
                         "retrieval_aliases",
                         "reason",
+                        "temporal_role",
+                        "observed_at",
+                        "valid_from",
+                        "valid_to",
+                        "temporal_confidence",
+                        "temporal_scope",
                     ],
                     "properties": {
                         "source_unit_id": {"type": "string"},
@@ -3931,6 +4083,12 @@ def llm_source_unit_semantic_compile(
                         "stability_confidence": {"type": "number"},
                         "retrieval_aliases": {"type": "array", "items": {"type": "string"}},
                         "reason": {"type": "string"},
+                        "temporal_role": {"type": ["string", "null"]},
+                        "observed_at": {"type": ["string", "null"]},
+                        "valid_from": {"type": ["string", "null"]},
+                        "valid_to": {"type": ["string", "null"]},
+                        "temporal_confidence": {"type": ["number", "null"]},
+                        "temporal_scope": {"type": ["string", "null"]},
                     },
                 },
             },
@@ -3945,7 +4103,7 @@ def llm_source_unit_semantic_compile(
         "source_purpose": source_purpose or "unknown",
         "operator_instruction": operator_instruction,
         "source_unit_formation": dict(source_unit_formation or {}),
-        "candidate_target": max(1, min(int(candidate_target or 8), 48)),
+        "candidate_target": max(1, min(int(candidate_target or 8), 96)),
     }
     system_prompt = (
         "You are the AGVM source-unit semantic compiler.\n\n"
@@ -3967,6 +4125,9 @@ def llm_source_unit_semantic_compile(
         "- Use create_deduction or create_hypothesis only when the source supports an implication but does not directly state it.\n"
         "- Never emit navigation, cookie text, SEO fragments, slogans without factual content, headings alone, source URLs, or title dumps as memory.\n"
         "- Include retrieval_aliases that a future agent could ask naturally in English and Italian.\n"
+        "- Author temporal_role, observed_at, valid_from, valid_to, temporal_confidence, and temporal_scope only from "
+        "the claim text in the traced source unit. Use null when unsupported. source_acquired_at, source_retrieved_at, "
+        "created_at, ingested_at, and recorded_at are provenance/audit timestamps and never establish claim time.\n"
         "- If something may conflict with existing memory, keep it as a candidate and describe the issue in quality_notes or clarification_hints."
     )
     user_prompt = (
@@ -3977,14 +4138,16 @@ def llm_source_unit_semantic_compile(
         f"Traced source units:\n{json.dumps(sections, ensure_ascii=False, sort_keys=True)}"
     )
     payload, error = structured_json(
-        model=compiler_model(),
+        model=model_override or compiler_model(),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         schema_name="agvm_source_unit_semantic_compiler",
         schema=schema,
-        timeout=max(1.0, min(float(timeout_seconds or 45.0), 120.0)),
+        timeout=max(1.0, min(float(timeout_seconds or 900.0), 1800.0)),
         role="compiler",
-        max_output_tokens=9000,
+        max_output_tokens=32000,
+        api_key_override=api_key_override,
+        execution_metadata=execution_metadata,
     )
     if not payload:
         return [], payload, error
@@ -4006,16 +4169,28 @@ def llm_source_unit_semantic_compile(
         return len(categories) >= 2
 
     payload_items: list[dict[str, Any]] = []
-    for raw_item in list(payload.get("derived_nodes") or [])[:96]:
+    for raw_item in list(payload.get("derived_nodes") or [])[:192]:
         if isinstance(raw_item, dict):
             payload_items.extend(_source_atomized_item_variants(raw_item))
+    ordered_source_unit_ids = [str(section.get("source_unit_id") or "") for section in sections]
 
-    for item in payload_items[:128]:
+    for item_index, item in enumerate(payload_items[:384]):
         source_unit_id = str(item.get("source_unit_id") or "").strip()
+        if (
+            not source_unit_id
+            and item_index < len(ordered_source_unit_ids)
+            and ordered_source_unit_ids[item_index]
+        ):
+            item = {**item, "source_unit_id": ordered_source_unit_ids[item_index]}
+            source_unit_id = ordered_source_unit_ids[item_index]
         section = known_sections.get(source_unit_id)
         if not section:
             continue
         claim_text = preserve_node_raw_text(_strip_generated_source_unit_prefix(str(item.get("raw_text") or item.get("summary") or "").strip()), limit=900)
+        claim_text, _ = _make_source_unit_text_self_contained(
+            text=claim_text,
+            title=str(section.get("title") or source_label or source_unit_id),
+        )
         if len(claim_text) < 36:
             continue
         if crosses_atomic_categories(claim_text):
@@ -4075,21 +4250,27 @@ def llm_source_unit_semantic_compile(
         elif local_claim_type != "fact" and local_claim_type != claim_type:
             claim_type = local_claim_type
         confidence = max(0.0, min(1.0, float(item.get("confidence") or 0.78)))
+        summary_text = summarize_text(str(item.get("summary") or claim_text), limit=180)
+        stabilized_semantics = _stabilize_compiled_semantics(
+            raw_text=claim_text,
+            input_mode="document",
+            summary=summary_text,
+            memory_type=map_runtime_memory_type(None, claim_type=claim_type),
+            guide_area=None,
+            routing_scores=dict(item.get("routing_semantic_scores") or {}),
+            routing_facets=dict(item.get("routing_facets") or {}),
+            granularity=None,
+            novelty=None,
+        )
         output.append(
             {
                 "derivation_role": "claim",
                 "claim_type": claim_type,
                 "raw_text": claim_text,
-                "summary": summarize_text(str(item.get("summary") or claim_text), limit=180),
-                "memory_type": map_runtime_memory_type(None, claim_type=claim_type),
-                "routing_semantic_scores": {
-                    field: max(0.0, min(1.0, float(dict(item.get("routing_semantic_scores") or {})[field])))
-                    for field in ROUTING_FIELDS
-                },
-                "routing_facets": {
-                    field: max(0.0, min(1.0, float(dict(item.get("routing_facets") or {})[field])))
-                    for field in FACET_FIELDS
-                },
+                "summary": summary_text,
+                "memory_type": stabilized_semantics["memory_type"],
+                "routing_semantic_scores": stabilized_semantics["routing_semantic_scores"],
+                "routing_facets": stabilized_semantics["routing_facets"],
                 "confidence": confidence,
                 "memory_confidence": max(0.0, min(1.0, float(item.get("memory_confidence") or confidence))),
                 "evidence_confidence": max(0.0, min(1.0, float(item.get("evidence_confidence") or confidence))),
@@ -4128,6 +4309,129 @@ def llm_source_unit_semantic_compile(
             }
         )
     return output, payload, None
+
+
+def llm_source_unit_semantic_compile(
+    *,
+    source_sections: list[dict[str, Any]] | None,
+    source_label: str | None,
+    source_type: str | None,
+    source_trust: str | None,
+    source_purpose: str | None,
+    operator_instruction: str | None,
+    identity_nucleus: dict[str, Any],
+    nearby_context: dict[str, Any],
+    source_unit_formation: dict[str, Any] | None = None,
+    source_investigation_id: str | None = None,
+    candidate_target: int | None = None,
+    timeout_seconds: float | None = None,
+    api_key_override: str | None = None,
+    model_override: str | None = None,
+    execution_metadata: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+    """Compile every traced source unit in bounded provider calls.
+
+    The per-call prompt stays bounded, but there is no global 20/32/48 source or
+    candidate ceiling. The caller's coverage guard remains authoritative.
+    """
+
+    normalized_sections = [
+        dict(section)
+        for section in list(source_sections or [])
+        if isinstance(section, dict)
+        and str(section.get("section_id") or section.get("unit_id") or "").strip()
+        and len(_source_section_text(section)) >= 24
+    ]
+    if not normalized_sections:
+        return [], None, "no_source_sections"
+
+    batch_size = 48
+    if len(normalized_sections) <= batch_size:
+        return _llm_source_unit_semantic_compile_batch(
+            source_sections=normalized_sections,
+            source_label=source_label,
+            source_type=source_type,
+            source_trust=source_trust,
+            source_purpose=source_purpose,
+            operator_instruction=operator_instruction,
+            identity_nucleus=identity_nucleus,
+            nearby_context=nearby_context,
+            source_unit_formation=source_unit_formation,
+            source_investigation_id=source_investigation_id,
+            candidate_target=max(int(candidate_target or 8), len(normalized_sections)),
+            timeout_seconds=timeout_seconds,
+            api_key_override=api_key_override,
+            model_override=model_override,
+            execution_metadata=execution_metadata,
+        )
+
+    total_target = max(int(candidate_target or 8), len(normalized_sections))
+    all_items: list[dict[str, Any]] = []
+    batch_payloads: list[dict[str, Any]] = []
+    batch_attestations: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for offset in range(0, len(normalized_sections), batch_size):
+        batch = normalized_sections[offset : offset + batch_size]
+        batch_target = max(
+            len(batch),
+            math.ceil(total_target * len(batch) / max(1, len(normalized_sections))),
+        )
+        batch_metadata: dict[str, Any] = {}
+        items, payload, error = _llm_source_unit_semantic_compile_batch(
+            source_sections=batch,
+            source_label=source_label,
+            source_type=source_type,
+            source_trust=source_trust,
+            source_purpose=source_purpose,
+            operator_instruction=operator_instruction,
+            identity_nucleus=identity_nucleus,
+            nearby_context=nearby_context,
+            source_unit_formation=source_unit_formation,
+            source_investigation_id=source_investigation_id,
+            candidate_target=batch_target,
+            timeout_seconds=timeout_seconds,
+            api_key_override=api_key_override,
+            model_override=model_override,
+            execution_metadata=batch_metadata,
+        )
+        all_items.extend(items)
+        if isinstance(payload, dict):
+            batch_payloads.append(payload)
+        if error:
+            errors.append(f"batch_{offset // batch_size + 1}:{error}")
+        if str(batch_metadata.get("status") or "") == "completed":
+            batch_attestations.append(batch_metadata)
+
+    if execution_metadata is not None:
+        execution_metadata.clear()
+        if not errors and len(batch_attestations) == math.ceil(len(normalized_sections) / batch_size):
+            usage = {
+                field: sum(int(dict(attestation.get("usage") or {}).get(field) or 0) for attestation in batch_attestations)
+                for field in ("input_tokens", "output_tokens", "reasoning_tokens", "total_tokens")
+            }
+            request_digests = [str(item.get("request_sha256") or "") for item in batch_attestations]
+            output_digests = [str(item.get("output_sha256") or "") for item in batch_attestations]
+            execution_metadata.update(
+                {
+                    **batch_attestations[-1],
+                    "request_sha256": hashlib.sha256("|".join(request_digests).encode("ascii")).hexdigest(),
+                    "output_sha256": hashlib.sha256("|".join(output_digests).encode("ascii")).hexdigest(),
+                    "usage": usage,
+                    "batch_count": len(batch_attestations),
+                    "response_ids": [str(item.get("response_id") or "") for item in batch_attestations],
+                    "batch_request_sha256": request_digests,
+                    "batch_output_sha256": output_digests,
+                }
+            )
+
+    aggregate_payload = {
+        "schema_version": "agvm.source_unit_semantic_compiler_batches.v1",
+        "batch_count": len(batch_payloads),
+        "source_unit_count": len(normalized_sections),
+        "candidate_count": len(all_items),
+        "batches": batch_payloads,
+    }
+    return all_items, aggregate_payload, ";".join(errors) if errors else None
 
 
 def heuristic_merge_decisions(
@@ -4193,7 +4497,7 @@ def _source_section_preview_items(
         title = str(section.get("title") or section_id or f"Source unit {index}").strip()
         content_title = "" if str(section.get("kind") or "") == "manual_block" else title
         text, self_containment = _make_source_unit_text_self_contained(
-            text=str(section.get("text") or ""),
+            text=_source_section_text(section),
             title=content_title,
         )
         if len(text) < 16:
@@ -4258,7 +4562,7 @@ _CONTEXT_DEPENDENT_SOURCE_START_RE = re.compile(
     r"^\s*(?:"
     r"it|this|that|these|those|he|she|they|his|her|their|"
     r"esso|essa|questo|questa|questi|queste|lui|lei|loro|suo|sua|suoi|sue|"
-    r"the\s+(?:monument|company|project|document|release|source|site|profile|page|team|work)"
+    r"the\s+(?:monument|company|project|program|initiative|platform|document|release|source|site|profile|page|team|work)"
     r")\b",
     re.IGNORECASE,
 )
@@ -4338,13 +4642,18 @@ _SOURCE_CLAIM_ACTION_RE = re.compile(
     r"is|are|was|were|announces?|announced|acquires?|acquired|founds?|founded|"
     r"has|have|lists?|listed|employs?|employed|"
     r"provides?|provided|develops?|developed|specializes?|specialised|specialized|"
+    r"reduces?|reduced|decreases?|decreased|increases?|increased|improves?|improved|"
+    r"links?|linked|collaborates?|collaborated|coordinates?|coordinated|"
     r"focuses?|focused|integrates?|integrated|supports?|supported|creates?|created|"
     r"builds?|building|built|designs?|designed|helps?|helped|connects?|connected|"
     r"shapes?|shaped|believes?|believed|wants?|wanted|am|"
     r"manages?|managed|leads?|led|serves?|served|operates?|operated|"
+    r"retrieves?|retrieved|retrievable|hydrates?|hydrated|persists?|persisted|"
+    r"stores?|stored|saves?|saved|applies?|applied|updates?|updated|deletes?|deleted|"
     r"e|era|sono|annuncia|annunciato|acquisisce|acquisito|fonda|fondato|"
     r"sviluppa|sviluppato|fornisce|specializza|integra|supporta|gestisce|"
-    r"costruisce|costruito|progetta|progettato|crede|vuole|collega"
+    r"costruisce|costruito|progetta|progettato|crede|vuole|collega|collegato|"
+    r"riduce|ridotto|aumenta|aumentato|migliora|migliorato|coordina|coordinato"
     r")\b",
     re.IGNORECASE,
 )
@@ -4819,7 +5128,7 @@ def _source_section_claim_preview_items(
         if not fact_eligible:
             continue
         emitted_for_section = 0
-        section_text = str(section.get("text") or "")
+        section_text = _source_section_text(section)
         structured_candidates = _source_structured_claim_candidates(text=section_text, title=content_title)
         section_limit = max_claims_per_section
         if structured_candidates:
@@ -5046,7 +5355,7 @@ def _source_section_qa_preview_items(
         if not fact_eligible:
             continue
         emitted_for_section = 0
-        section_text = str(section.get("text") or "")
+        section_text = _source_section_text(section)
         sentence_candidates = [
             *_source_structured_claim_candidates(text=section_text, title=content_title),
             *_source_claim_sentence_candidates(section_text),
@@ -5142,7 +5451,7 @@ def _source_section_micro_chunk_preview_items(
         supporting_eligible = bool(section.get("supporting_evidence_eligible") or False)
         if not fact_eligible and not supporting_eligible:
             continue
-        section_text = str(section.get("text") or "")
+        section_text = _source_section_text(section)
         for chunk_index, window in enumerate(_source_evidence_window_candidates(section_text, max_windows=max_chunks_per_section), start=1):
             chunk_text, self_containment = _make_source_unit_text_self_contained(
                 text=window,
@@ -5223,14 +5532,37 @@ def _append_source_section_preview_items(
 ) -> tuple[list[dict[str, Any]], int]:
     if not source_items:
         return compiled_derived, 0
-    seen_texts = {
-        _source_grounding_fold(str(item.get("raw_text") or item.get("summary") or ""))
-        for item in compiled_derived
-    }
+
+    def source_unit_id_for(item: dict[str, Any]) -> str:
+        return str(
+            item.get("source_unit_id")
+            or item.get("sourceUnitId")
+            or dict(item.get("provenance") or {}).get("source_unit_id")
+            or ""
+        ).strip()
+
+    def normalized_text_for(item: dict[str, Any]) -> str:
+        return _source_grounding_fold(str(item.get("raw_text") or item.get("summary") or ""))
+
+    def seen_key_for(item: dict[str, Any]) -> tuple[str, str]:
+        normalized_text = normalized_text_for(item)
+        source_unit_id = source_unit_id_for(item)
+        return source_unit_id, normalized_text
+
+    seen_keys = {seen_key_for(item) for item in compiled_derived}
     output = list(compiled_derived)
     added = 0
+
     def merge_aliases(base: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
         merged = dict(base)
+        semantic_time, source_chronology = _explicit_temporal_materialization(base, item)
+        merged.update(semantic_time)
+        if source_chronology:
+            merged["provenance"] = {
+                **dict(merged.get("provenance") or {}),
+                **source_chronology,
+            }
+            merged.update(source_chronology)
         if item.get("retrieval_affordance") and not merged.get("retrieval_affordance"):
             merged["retrieval_affordance"] = dict(item.get("retrieval_affordance") or {})
         elif item.get("retrieval_affordance") and merged.get("retrieval_affordance"):
@@ -5253,19 +5585,38 @@ def _append_source_section_preview_items(
     def enrich_existing(normalized_text: str, item: dict[str, Any]) -> bool:
         if not (item.get("retrieval_affordance") or item.get("retrieval_aliases")):
             return False
+        item_source_unit_id = source_unit_id_for(item)
         for index in range(len(output) - 1, -1, -1):
             existing = output[index]
-            if _source_grounding_fold(str(existing.get("raw_text") or existing.get("summary") or "")) != normalized_text:
+            if normalized_text_for(existing) != normalized_text:
+                continue
+            existing_source_unit_id = source_unit_id_for(existing)
+            if item_source_unit_id and existing_source_unit_id and existing_source_unit_id != item_source_unit_id:
                 continue
             output[index] = merge_aliases(existing, item)
             return True
         return False
 
-    def replace_or_enrich_contained(existing_key: str, new_key: str, item: dict[str, Any]) -> bool:
+    def replace_or_enrich_contained(
+        existing_source_unit_id: str,
+        existing_text_key: str,
+        new_source_unit_id: str,
+        new_text_key: str,
+        item: dict[str, Any],
+    ) -> bool:
         for index in range(len(output) - 1, -1, -1):
             existing = output[index]
-            current_key = _source_grounding_fold(str(existing.get("raw_text") or existing.get("summary") or ""))
-            if current_key != existing_key:
+            current_text_key = normalized_text_for(existing)
+            current_source_unit_id = source_unit_id_for(existing)
+            if current_text_key != existing_text_key:
+                continue
+            if (
+                existing_source_unit_id
+                and current_source_unit_id
+                and current_source_unit_id != existing_source_unit_id
+            ):
+                continue
+            if new_source_unit_id and current_source_unit_id and current_source_unit_id != new_source_unit_id:
                 continue
             existing_role = str(existing.get("document_role") or "").strip().lower()
             item_role = str(item.get("document_role") or "").strip().lower()
@@ -5277,33 +5628,54 @@ def _append_source_section_preview_items(
                 return False
             if _source_preview_item_is_qa_affordance(item):
                 return False
-            if existing_key in new_key and len(new_key) > len(existing_key) + 24:
+            if existing_text_key in new_text_key and len(new_text_key) > len(existing_text_key) + 24:
                 replacement = merge_aliases(dict(item), existing)
                 output[index] = replacement
-                seen_texts.discard(existing_key)
-                seen_texts.add(new_key)
+                seen_keys.discard((existing_source_unit_id, existing_text_key))
+                seen_keys.add((new_source_unit_id, new_text_key))
                 return True
             output[index] = merge_aliases(existing, item)
             return True
         return False
 
     for item in source_items:
-        normalized = _source_grounding_fold(str(item.get("raw_text") or item.get("summary") or ""))
-        if not normalized or normalized in seen_texts:
+        normalized = normalized_text_for(item)
+        source_unit_id = source_unit_id_for(item)
+        seen_key = (source_unit_id, normalized)
+        if not normalized or seen_key in seen_keys:
             enrich_existing(normalized, item)
             continue
+        comparable_seen_keys = [
+            (existing_source_unit_id, existing_text_key)
+            for existing_source_unit_id, existing_text_key in seen_keys
+            if existing_text_key
+            and (
+                not source_unit_id
+                or not existing_source_unit_id
+                or existing_source_unit_id == source_unit_id
+            )
+        ]
         if (
-            len(seen_texts) < 512
-            and any(existing and (existing in normalized or normalized in existing) for existing in seen_texts)
+            len(seen_keys) < 512
+            and any(
+                existing_text_key in normalized or normalized in existing_text_key
+                for _existing_source_unit_id, existing_text_key in comparable_seen_keys
+            )
         ):
             handled = False
-            for existing in list(seen_texts):
-                if existing and (existing in normalized or normalized in existing):
-                    handled = replace_or_enrich_contained(existing, normalized, item)
+            for existing_source_unit_id, existing_text_key in comparable_seen_keys:
+                if existing_text_key in normalized or normalized in existing_text_key:
+                    handled = replace_or_enrich_contained(
+                        existing_source_unit_id,
+                        existing_text_key,
+                        source_unit_id,
+                        normalized,
+                        item,
+                    )
                     break
             if handled:
                 continue
-        seen_texts.add(normalized)
+        seen_keys.add(seen_key)
         output.append(item)
         added += 1
     return output, added
@@ -5365,6 +5737,10 @@ def preview_bundle(
         "source_unit_formation_status": dict(source_unit_formation or {}).get("status"),
     }
     source_request = dict(resolved_source_context.get("source_request") or {})
+    _, primary_source_chronology = _explicit_temporal_materialization(
+        resolved_source_context,
+        source_request,
+    )
     source_sections_by_id = {
         str(section.get("section_id") or section.get("unit_id") or "").strip(): dict(section)
         for section in list(source_sections or [])
@@ -5420,7 +5796,47 @@ def preview_bundle(
     if require_ai and not compiler_payload:
         raise ValueError(f"grow_ai_unavailable:{compiler_error or 'provider_output_missing'}")
     if require_ai:
-        compiler_payload = validate_grow_compiler_payload(compiler_payload)
+        validation_error: AiModuleContractError | None = None
+        for repair_attempt in range(3):
+            try:
+                compiler_payload = validate_grow_compiler_payload(compiler_payload)
+                validation_error = None
+                break
+            except AiModuleContractError as exc:
+                validation_error = exc
+                if compiler_payload_override is not None or repair_attempt >= 2:
+                    break
+                repair_context = dict(resolved_source_context)
+                prior_instruction = str(repair_context.get("operator_instruction") or "").strip()
+                repair_context["operator_instruction"] = "\n".join(
+                    part
+                    for part in (
+                        prior_instruction,
+                        (
+                            "Repair the previous compiler contract failure "
+                            f"({exc.code}). Recompile the same grounded source. Every primary and derived node "
+                            "must include all 12 routing_semantic_scores and all 12 routing_facets, each as a "
+                            "finite number from 0.0 through 1.0. Preserve atomic source-grounded memories; do "
+                            "not remove useful evidence merely to satisfy the schema."
+                        ),
+                    )
+                    if part
+                )
+                compiler_payload, compiler_error = llm_memory_compile(
+                    text,
+                    input_mode,
+                    identity_nucleus=identity_nucleus,
+                    nearby_context=nearby_context,
+                    timeout_seconds=compiler_timeout_seconds,
+                    source_context=repair_context,
+                    api_key_override=compiler_api_key_override,
+                    model_override=compiler_model_override,
+                    execution_metadata=compiler_execution_metadata,
+                )
+                if not compiler_payload:
+                    raise ValueError(f"grow_ai_unavailable:{compiler_error or 'provider_output_missing'}") from exc
+        if validation_error is not None:
+            raise validation_error
     derivation_mode = "llm" if compiler_payload else "heuristic"
     if compiler_error and compiler_error not in {"llm_disabled", "large_source_units_direct_preview"}:
         warnings.append({"code": "compiler_fallback", "message": f"LLM compiler unavailable, fallback to heuristic compilation: {compiler_error}"})
@@ -5618,6 +6034,19 @@ def preview_bundle(
         merge_target_node_id=(primary_merge or {}).get("target_node_id"),
         identity_resolution_target_node_id=(primary_identity or {}).get("resolved_node_id"),
         identity_resolution_type=(primary_identity or {}).get("resolution_type"),
+        temporal_role=primary_compiled.get("temporal_role"),
+        observed_at=primary_compiled.get("observed_at"),
+        valid_from=primary_compiled.get("valid_from"),
+        valid_to=primary_compiled.get("valid_to"),
+        temporal_confidence=primary_compiled.get("temporal_confidence"),
+        source_published_at=primary_source_chronology.get("source_published_at"),
+        source_acquired_at=primary_source_chronology.get("source_acquired_at"),
+        source_retrieved_at=primary_source_chronology.get("source_retrieved_at"),
+        temporal_scope=(
+            primary_compiled.get("temporal_scope")
+            if "temporal_scope" in primary_compiled
+            else primary_source_chronology.get("temporal_scope")
+        ),
         geometry_profile_context=geometry_profile_context,
     )
     primary_node = finalize_node(primary_seed, graph, index_payload, fixed_id="preview_primary")
@@ -5720,17 +6149,19 @@ def preview_bundle(
         )
         if should_run_source_semantic_compiler:
             semantic_candidate_target = 8
+            evidence_char_target = max(8, math.ceil(len(str(text or "")) / 2800))
             source_context_purpose = str(resolved_source_context.get("source_purpose") or "").strip().lower()
             if source_context_purpose == "self_memory":
                 semantic_candidate_target = (
                     6
                     if source_section_count <= 1 and len(str(text or "")) < 700
-                    else min(32, max(10, source_section_count // 2))
+                    else max(10, source_section_count // 2)
                 )
             elif direct_source_unit_preview:
-                semantic_candidate_target = min(32, max(8, source_section_count))
+                semantic_candidate_target = max(8, source_section_count)
             else:
-                semantic_candidate_target = min(18, max(6, source_section_count * 2))
+                semantic_candidate_target = max(6, source_section_count * 2)
+            semantic_candidate_target = max(semantic_candidate_target, evidence_char_target)
             source_semantic_items, source_semantic_payload, source_semantic_error = llm_source_unit_semantic_compile(
                 source_sections=source_sections,
                 source_label=source_label,
@@ -5743,7 +6174,10 @@ def preview_bundle(
                 source_unit_formation=source_unit_formation,
                 source_investigation_id=source_investigation_id,
                 candidate_target=semantic_candidate_target,
-                timeout_seconds=max(12.0, min(float(compiler_timeout_seconds or 45.0), 120.0)),
+                timeout_seconds=max(12.0, min(float(compiler_timeout_seconds or 900.0), 1800.0)),
+                api_key_override=compiler_api_key_override,
+                model_override=compiler_model_override,
+                execution_metadata=compiler_execution_metadata,
             )
             compiled_derived, source_semantic_added = _append_source_section_preview_items(compiled_derived, source_semantic_items)
             if source_semantic_added:
@@ -5786,12 +6220,175 @@ def preview_bundle(
             and str(section.get("section_id") or section.get("unit_id") or "").strip()
         }
         missing_source_unit_ids = sorted(required_source_unit_ids - set(source_ai_items_by_unit))
-        if missing_source_unit_ids:
-            reason = source_semantic_error or "provider_did_not_cover_all_fact_eligible_source_units"
-            raise ValueError(
-                "grow_ai_source_unit_coverage_incomplete:"
-                f"{reason}:missing={','.join(missing_source_unit_ids[:12])}"
+        for repair_attempt in range(2):
+            if not missing_source_unit_ids:
+                break
+            missing_sections = [
+                dict(section)
+                for section in source_sections
+                if isinstance(section, dict)
+                and str(section.get("section_id") or section.get("unit_id") or "").strip()
+                in set(missing_source_unit_ids)
+            ]
+            repair_items, _, repair_error = llm_source_unit_semantic_compile(
+                source_sections=missing_sections,
+                source_label=source_label,
+                source_type=source_type,
+                source_trust=source_trust,
+                source_purpose=str(resolved_source_context.get("source_purpose") or ""),
+                operator_instruction=(
+                    str(resolved_source_context.get("operator_instruction") or "")
+                    + " Cover every supplied source unit; this is a targeted structured repair."
+                ),
+                identity_nucleus=identity_nucleus,
+                nearby_context=nearby_context,
+                source_unit_formation=source_unit_formation,
+                source_investigation_id=source_investigation_id,
+                candidate_target=max(8, len(missing_sections) * 2),
+                timeout_seconds=max(12.0, min(float(compiler_timeout_seconds or 900.0), 1800.0)),
+                api_key_override=compiler_api_key_override,
+                model_override=compiler_model_override,
+                execution_metadata=compiler_execution_metadata,
             )
+            if repair_error:
+                source_semantic_error = repair_error
+            compiled_derived, repaired_count = _append_source_section_preview_items(
+                compiled_derived,
+                repair_items,
+            )
+            if repaired_count:
+                warnings.append(
+                    {
+                        "code": "source_unit_semantic_compiler_repair",
+                        "message": (
+                            f"Recovered {repaired_count} source-unit candidate(s) during structured AI repair "
+                            f"attempt {repair_attempt + 1}."
+                        ),
+                    }
+                )
+                for semantic_item in repair_items:
+                    semantic_unit_id = str(semantic_item.get("source_unit_id") or "").strip()
+                    if semantic_unit_id and has_ai_semantic_vector(semantic_item):
+                        source_ai_items_by_unit[semantic_unit_id].append(semantic_item)
+            missing_source_unit_ids = sorted(required_source_unit_ids - set(source_ai_items_by_unit))
+        if missing_source_unit_ids:
+            if source_semantic_error == "llm_disabled":
+                missing_sections = [
+                    dict(section)
+                    for section in source_sections
+                    if isinstance(section, dict)
+                    and str(section.get("section_id") or section.get("unit_id") or "").strip()
+                    in set(missing_source_unit_ids)
+                ]
+                deterministic_items = _source_section_claim_preview_items(
+                    source_text=text,
+                    source_sections=missing_sections,
+                    source_investigation_id=source_investigation_id,
+                )
+                stabilized_items: list[dict[str, Any]] = []
+                for item in deterministic_items:
+                    claim_text = str(item.get("raw_text") or item.get("summary") or "").strip()
+                    stabilized_semantics = _stabilize_compiled_semantics(
+                        raw_text=claim_text,
+                        input_mode=input_mode,
+                        summary=str(item.get("summary") or claim_text),
+                        memory_type=map_runtime_memory_type(None, claim_type=str(item.get("claim_type") or "fact")),
+                        guide_area=None,
+                        routing_scores=dict(item.get("routing_semantic_scores") or {}),
+                        routing_facets=dict(item.get("routing_facets") or {}),
+                        granularity=None,
+                        novelty=None,
+                    )
+                    stabilized = {
+                        **item,
+                        "memory_type": stabilized_semantics["memory_type"],
+                        "routing_semantic_scores": stabilized_semantics["routing_semantic_scores"],
+                        "routing_facets": stabilized_semantics["routing_facets"],
+                        "semantic_vector_source": "source_bound_deterministic_coverage",
+                    }
+                    stabilized_items.append(stabilized)
+                compiled_derived, fallback_count = _append_source_section_preview_items(
+                    compiled_derived,
+                    stabilized_items,
+                )
+                for semantic_item in stabilized_items:
+                    semantic_unit_id = str(semantic_item.get("source_unit_id") or "").strip()
+                    if semantic_unit_id and has_ai_semantic_vector(semantic_item):
+                        source_ai_items_by_unit[semantic_unit_id].append(semantic_item)
+                if fallback_count:
+                    warnings.append(
+                        {
+                            "code": "source_unit_semantic_compiler_source_bound_coverage",
+                            "message": (
+                                f"Covered {fallback_count} source unit candidate(s) with deterministic "
+                                "source-bound vectors because the per-unit semantic compiler is disabled."
+                            ),
+                        }
+                    )
+                missing_source_unit_ids = sorted(required_source_unit_ids - set(source_ai_items_by_unit))
+                if missing_source_unit_ids:
+                    missing_sections = [
+                        dict(section)
+                        for section in source_sections
+                        if isinstance(section, dict)
+                        and str(section.get("section_id") or section.get("unit_id") or "").strip()
+                        in set(missing_source_unit_ids)
+                    ]
+                    chunk_items = _source_section_micro_chunk_preview_items(
+                        source_text=text,
+                        input_mode=input_mode,
+                        source_sections=missing_sections,
+                        source_investigation_id=source_investigation_id,
+                        max_chunks_per_section=1,
+                        max_total_chunks=len(missing_sections),
+                    )
+                    stabilized_chunks: list[dict[str, Any]] = []
+                    for item in chunk_items:
+                        chunk_text = str(item.get("raw_text") or item.get("summary") or "").strip()
+                        stabilized_semantics = _stabilize_compiled_semantics(
+                            raw_text=chunk_text,
+                            input_mode=input_mode,
+                            summary=str(item.get("summary") or chunk_text),
+                            memory_type=str(item.get("memory_type") or "document_chunk"),
+                            guide_area=None,
+                            routing_scores=dict(item.get("routing_semantic_scores") or {}),
+                            routing_facets=dict(item.get("routing_facets") or {}),
+                            granularity=None,
+                            novelty=None,
+                        )
+                        stabilized = {
+                            **item,
+                            "memory_type": stabilized_semantics["memory_type"],
+                            "routing_semantic_scores": stabilized_semantics["routing_semantic_scores"],
+                            "routing_facets": stabilized_semantics["routing_facets"],
+                            "semantic_vector_source": "source_bound_deterministic_chunk_coverage",
+                        }
+                        stabilized_chunks.append(stabilized)
+                    compiled_derived, chunk_fallback_count = _append_source_section_preview_items(
+                        compiled_derived,
+                        stabilized_chunks,
+                    )
+                    for semantic_item in stabilized_chunks:
+                        semantic_unit_id = str(semantic_item.get("source_unit_id") or "").strip()
+                        if semantic_unit_id and has_ai_semantic_vector(semantic_item):
+                            source_ai_items_by_unit[semantic_unit_id].append(semantic_item)
+                    if chunk_fallback_count:
+                        warnings.append(
+                            {
+                                "code": "source_unit_micro_chunk_coverage",
+                                "message": (
+                                    f"Covered {chunk_fallback_count} additional source unit(s) with "
+                                    "source-bound micro chunks because semantic per-unit compiler output was incomplete."
+                                ),
+                            }
+                        )
+                    missing_source_unit_ids = sorted(required_source_unit_ids - set(source_ai_items_by_unit))
+            if missing_source_unit_ids:
+                reason = source_semantic_error or "provider_did_not_cover_all_fact_eligible_source_units"
+                raise ValueError(
+                    "grow_ai_source_unit_coverage_incomplete:"
+                    f"{reason}:missing={','.join(missing_source_unit_ids[:12])}"
+                )
 
     source_claim_items: list[dict[str, Any]] = []
     source_claims_added = 0
@@ -5950,9 +6547,15 @@ def preview_bundle(
         )
         item_source_unit_id = str(item.get("source_unit_id") or "").strip()
         item_source_section = source_sections_by_id.get(item_source_unit_id, {})
+        _, item_source_chronology = _explicit_temporal_materialization(
+            resolved_source_context,
+            source_request,
+            item_source_section,
+        )
         item_source_uri = sanitize_source_uri_for_persistence(
             item.get("source_uri") or item_source_section.get("source_uri") or primary_source_uri
         )
+        compiled_confidence = normalize_unit_confidence(item.get("confidence"), default=0.75)
         seed = build_seed(
             raw_text=raw_text_value,
             input_mode=node_input_mode,
@@ -5967,7 +6570,7 @@ def preview_bundle(
             summary_override=str(item.get("summary") or summarize_text(raw_text_value, limit=120)),
             memory_type_override=memory_type_override,
             derivation_role=role,
-            derivation_confidence=float(item.get("confidence") or 0.75),
+            derivation_confidence=compiled_confidence,
             derived_from_preview_id="preview_primary",
             document_role=item_document_role,
             document_anchor_id=item_document_anchor_id,
@@ -5982,10 +6585,16 @@ def preview_bundle(
             source_span_end=item.get("source_span_end"),
             routing_scores_override=dict(item_semantics["routing_semantic_scores"]),
             routing_facets_override=dict(item_semantics["routing_facets"]),
-            memory_confidence=float(item.get("memory_confidence") or item.get("confidence") or 0.75),
+            memory_confidence=normalize_unit_confidence(
+                item.get("memory_confidence"), default=compiled_confidence
+            ),
             identity_resolution_confidence=float((identity_decision or {}).get("confidence") or item.get("identity_resolution_confidence") or 0.0) or None,
-            evidence_confidence=float(item.get("evidence_confidence") or item.get("confidence") or 0.75),
-            stability_confidence=float(item.get("stability_confidence") or 0.6),
+            evidence_confidence=normalize_unit_confidence(
+                item.get("evidence_confidence"), default=compiled_confidence
+            ),
+            stability_confidence=normalize_unit_confidence(
+                item.get("stability_confidence"), default=0.6
+            ),
             local_correction_plan=_default_local_correction_plan(
                 raw_text=raw_text_value,
                 input_mode=node_input_mode,
@@ -6000,10 +6609,23 @@ def preview_bundle(
             merge_target_node_id=(merge_decision or {}).get("target_node_id"),
             identity_resolution_target_node_id=(identity_decision or {}).get("resolved_node_id"),
             identity_resolution_type=(identity_decision or {}).get("resolution_type"),
+            temporal_role=item.get("temporal_role"),
+            observed_at=item.get("observed_at"),
+            valid_from=item.get("valid_from"),
+            valid_to=item.get("valid_to"),
+            temporal_confidence=item.get("temporal_confidence"),
+            source_published_at=item_source_chronology.get("source_published_at"),
+            source_acquired_at=item_source_chronology.get("source_acquired_at"),
+            source_retrieved_at=item_source_chronology.get("source_retrieved_at"),
+            temporal_scope=(
+                item.get("temporal_scope")
+                if "temporal_scope" in item
+                else item_source_chronology.get("temporal_scope")
+            ),
             geometry_profile_context=geometry_profile_context,
         )
         node = finalize_node(seed, working_graph, working_index, fixed_id=preview_id)
-        preview_confidence = float(item.get("confidence") or 0.75)
+        preview_confidence = float(compiled_confidence or 0.0)
         selected_override = item.get("selected_by_default_override")
         selected_by_default = bool(selected_override) if selected_override is not None else preview_confidence >= (0.72 if role == "claim" else 0.82)
         source_grounding = dict(item.get("source_grounding") or {})
@@ -6247,8 +6869,20 @@ def persist_selection(
     }
     persisted_nodes: list[dict[str, Any]] = []
     preview_to_persisted: dict[str, str] = {}
+    grow_mutation_candidates: dict[str, dict[str, Any]] = {}
     current_index = index_payload
     merged_into_existing_ids: list[str] = []
+    write_time = utc_timestamp()
+    investigation_authority = dict(bundle.get("investigation_authority") or {})
+    grow_authority_active = (
+        str(investigation_authority.get("schema_version") or "")
+        == "agvm.grow_compiler_authority.v1"
+    )
+    binding_by_preview_id = {
+        str(item.get("preview_id") or ""): dict(item)
+        for item in list(investigation_authority.get("claim_decision_bindings") or [])
+        if isinstance(item, dict) and str(item.get("preview_id") or "").strip()
+    } if grow_authority_active else {}
 
     def _source_identity_key(node: dict[str, Any]) -> tuple[Any, ...] | None:
         source_unit_id = str(node.get("source_unit_id") or "").strip()
@@ -6315,10 +6949,16 @@ def persist_selection(
         return True
 
     for preview_node in ordered_nodes:
+        authority_binding = binding_by_preview_id.get(str(preview_node.get("id") or ""))
+        authority_decision = str((authority_binding or {}).get("claim_decision") or "").strip()
+        is_grow_target_mutation = bool(
+            grow_authority_active
+            and authority_decision in {"evolve_existing", "delete_existing"}
+        )
         source_identity_key = _source_identity_key(preview_node)
         existing_source_node_id = (
             existing_by_source_identity.get(source_identity_key)
-            if source_identity_key is not None
+            if source_identity_key is not None and not is_grow_target_mutation
             else None
         )
         if existing_source_node_id:
@@ -6415,6 +7055,33 @@ def persist_selection(
                 "self_containment_repair",
             }
         }
+        if authority_binding and (
+            str(authority_binding.get("claim_id") or "")
+            == str(preview_node.get("claim_id") or "")
+            and str(authority_binding.get("decision_id") or "")
+            == str(preview_node.get("decision_id") or "")
+            and str(authority_binding.get("claim_decision") or "")
+            == str(preview_node.get("claim_decision") or "")
+        ):
+            # The server-bound Grow investigation is later authority than the
+            # compiler.  Bootstrap has no such binding, so its semantic time can
+            # only originate in the reviewed source/answers seen by the compiler.
+            semantic_time, source_chronology = _explicit_temporal_materialization(
+                preview_node,
+                authority_binding,
+            )
+            seed.update(semantic_time)
+            seed["provenance"] = {
+                **dict(seed.get("provenance") or {}),
+                **source_chronology,
+            }
+        else:
+            semantic_time, source_chronology = _explicit_temporal_materialization(preview_node)
+            seed.update(semantic_time)
+            seed["provenance"] = {
+                **dict(seed.get("provenance") or {}),
+                **source_chronology,
+            }
         derived_from_ref = str(seed.get("derived_from_preview_id") or "").strip()
         if derived_from_ref in preview_to_persisted:
             seed["derived_from_preview_id"] = preview_to_persisted[derived_from_ref]
@@ -6422,7 +7089,27 @@ def persist_selection(
         if anchor_ref in preview_to_persisted:
             seed["document_anchor_id"] = preview_to_persisted[anchor_ref]
         seed = apply_public_v1_geometry_profile_to_seed(seed, geometry_profile_context)
+        # Technical time is assigned once at the write boundary. Semantic/source time
+        # (observed_at, valid_from, valid_to) remains source-bound and is never inferred here.
+        seed["created_at"] = write_time
+        seed["updated_at"] = write_time
+        seed["ingested_at"] = write_time
+        seed["superseded_at"] = None
+        seed["node_revision"] = 1
         persisted = finalize_node(seed, working_graph, current_index)
+        if is_grow_target_mutation:
+            target_ids = [
+                str(target_id).strip()
+                for target_id in list((authority_binding or {}).get("target_node_ids") or [])
+                if str(target_id).strip()
+            ]
+            if not target_ids:
+                raise AiModuleContractError("grow_v3_persist_decision_target_required")
+            if authority_decision == "evolve_existing" and len(target_ids) != 1:
+                raise AiModuleContractError("grow_v3_persist_evolve_single_target_required")
+            preview_to_persisted[preview_node["id"]] = target_ids[0]
+            grow_mutation_candidates[str(preview_node["id"])] = persisted
+            continue
         if str(persisted.get("document_role") or "") == "anchor":
             persisted["document_anchor_id"] = persisted["id"]
         elif str(persisted.get("document_anchor_id") or "") in {"preview_primary", str(preview_node.get("id") or "")}:
@@ -6462,6 +7149,171 @@ def persist_selection(
         for edge in list(working_graph.get("edges") or [])
         if isinstance(edge, dict)
     }
+    if grow_authority_active:
+        decision_action = {
+            "new_memory": (None, False),
+            "enrich_existing": ("enriches", False),
+            "evolve_existing": (None, False),
+            "contradicts_existing": ("contradicts", False),
+            "supersedes_existing": ("supersedes", True),
+            "delete_existing": (None, False),
+        }
+        node_index_by_id = {
+            str(node.get("id") or ""): index
+            for index, node in enumerate(list(working_graph.get("nodes") or []))
+            if isinstance(node, dict) and str(node.get("id") or "").strip()
+        }
+        for preview_node in ordered_nodes:
+            preview_id = str(preview_node.get("id") or "").strip()
+            binding = binding_by_preview_id.get(preview_id)
+            if not binding:
+                raise AiModuleContractError("grow_v3_persist_authority_binding_missing")
+            if (
+                str(binding.get("claim_id") or "") != str(preview_node.get("claim_id") or "")
+                or str(binding.get("decision_id") or "") != str(preview_node.get("decision_id") or "")
+                or str(binding.get("claim_decision") or "") != str(preview_node.get("claim_decision") or "")
+            ):
+                raise AiModuleContractError("grow_v3_persist_authority_binding_mismatch")
+            decision = str(preview_node.get("claim_decision") or "").strip()
+            action = decision_action.get(decision)
+            if action is None:
+                raise AiModuleContractError("grow_v3_persist_decision_invalid")
+            if str(preview_node.get("persist_mode") or "") != "create" or preview_node.get("merge_target_node_id"):
+                raise AiModuleContractError("grow_v3_persist_compiler_action_override")
+            relation_type, supersedes_target = action
+            target_node_ids = [
+                str(target_id).strip()
+                for target_id in list(preview_node.get("target_node_ids") or [])
+                if str(target_id).strip()
+            ]
+            bound_target_node_ids = [
+                str(target_id).strip()
+                for target_id in list(binding.get("target_node_ids") or [])
+                if str(target_id).strip()
+            ]
+            if target_node_ids != bound_target_node_ids:
+                raise AiModuleContractError("grow_v3_persist_decision_target_mismatch")
+            if decision == "new_memory" and target_node_ids:
+                raise AiModuleContractError("grow_v3_persist_new_memory_target_forbidden")
+            if decision != "new_memory" and not target_node_ids:
+                raise AiModuleContractError("grow_v3_persist_decision_target_required")
+            persisted_id = str(preview_to_persisted.get(preview_id) or "").strip()
+            if not persisted_id:
+                continue
+            for target_node_id in target_node_ids:
+                target_index = node_index_by_id.get(target_node_id)
+                if target_index is None:
+                    raise AiModuleContractError("grow_v3_persist_decision_target_missing")
+                if persisted_id == target_node_id and decision not in {"evolve_existing", "delete_existing"}:
+                    raise AiModuleContractError("grow_v3_persist_self_target_forbidden")
+                if decision in {"evolve_existing", "delete_existing"}:
+                    target = dict(working_graph["nodes"][target_index])
+                    if str(target.get("lifecycle_status") or "active") == "deleted":
+                        raise AiModuleContractError("grow_v3_persist_target_already_deleted")
+                    target_provenance = dict(target.get("provenance") or {})
+                    history = [
+                        dict(item)
+                        for item in list(target_provenance.pop("grow_mutation_history", []) or [])
+                        if isinstance(item, dict)
+                    ]
+                    prior_snapshot = {
+                        **target,
+                        "provenance": target_provenance,
+                    }
+                    prior_digest = hashlib.sha256(
+                        json.dumps(
+                            prior_snapshot,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    history.append(
+                        {
+                            "schema_version": "agvm.grow_memory_mutation_history.v1",
+                            "action": decision,
+                            "changed_at": write_time,
+                            "claim_id": str(preview_node.get("claim_id") or ""),
+                            "decision_id": str(preview_node.get("decision_id") or ""),
+                            "prior_node_revision": max(1, int(target.get("node_revision") or 1)),
+                            "prior_state_sha256": prior_digest,
+                            "prior_snapshot": prior_snapshot,
+                        }
+                    )
+                    if decision == "evolve_existing":
+                        candidate = dict(grow_mutation_candidates.get(preview_id) or {})
+                        if not candidate:
+                            raise AiModuleContractError("grow_v3_persist_evolve_candidate_missing")
+                        evolved = {
+                            **candidate,
+                            "id": target_node_id,
+                            "created_at": target.get("created_at"),
+                            "ingested_at": target.get("ingested_at"),
+                            "updated_at": write_time,
+                            "node_revision": max(1, int(target.get("node_revision") or 1)) + 1,
+                            "lifecycle_status": str(target.get("lifecycle_status") or "active"),
+                            "superseded_at": target.get("superseded_at"),
+                            "superseded_by": target.get("superseded_by"),
+                            "provenance": {
+                                **target_provenance,
+                                **dict(candidate.get("provenance") or {}),
+                                "grow_mutation_history": history,
+                                "grow_last_mutation": {
+                                    "action": decision,
+                                    "changed_at": write_time,
+                                    "claim_id": str(preview_node.get("claim_id") or ""),
+                                    "decision_id": str(preview_node.get("decision_id") or ""),
+                                },
+                            },
+                        }
+                        working_graph["nodes"][target_index] = evolved
+                        persisted_nodes.append(evolved)
+                    else:
+                        tombstone = {
+                            **target,
+                            "lifecycle_status": "deleted",
+                            "updated_at": write_time,
+                            "node_revision": max(1, int(target.get("node_revision") or 1)) + 1,
+                            "provenance": {
+                                **target_provenance,
+                                "grow_mutation_history": history,
+                                "grow_last_mutation": {
+                                    "action": decision,
+                                    "changed_at": write_time,
+                                    "claim_id": str(preview_node.get("claim_id") or ""),
+                                    "decision_id": str(preview_node.get("decision_id") or ""),
+                                },
+                                "deleted_at": write_time,
+                            },
+                        }
+                        working_graph["nodes"][target_index] = tombstone
+                        persisted_nodes.append(tombstone)
+                    merged_into_existing_ids.append(target_node_id)
+                    continue
+                edge_key = (persisted_id, target_node_id, str(relation_type or ""))
+                if relation_type and edge_key not in existing_edge_keys:
+                    working_graph["edges"].append(
+                        {
+                            "source_node_id": persisted_id,
+                            "target_node_id": target_node_id,
+                            "edge_type": relation_type,
+                            "confidence": float(preview_node.get("preview_confidence") or 0.9),
+                            "reason": f"ai_investigator:{decision}",
+                            "claim_id": str(preview_node.get("claim_id") or ""),
+                            "decision_id": str(preview_node.get("decision_id") or ""),
+                        }
+                    )
+                    existing_edge_keys.add(edge_key)
+                    edge_count += 1
+                if supersedes_target:
+                    target = dict(working_graph["nodes"][target_index])
+                    target["lifecycle_status"] = "superseded"
+                    target["superseded_at"] = write_time
+                    target["updated_at"] = write_time
+                    target["node_revision"] = max(1, int(target.get("node_revision") or 1)) + 1
+                    target["superseded_by"] = persisted_id
+                    working_graph["nodes"][target_index] = target
     for edge in list(bundle.get("derived_edges") or []):
         source_id = preview_to_persisted.get(edge["source_preview_id"])
         target_id = preview_to_persisted.get(edge["target_preview_id"])

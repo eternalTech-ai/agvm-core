@@ -41,7 +41,7 @@
     "visibility_policy": "block_unlicensed",
     "status_source": "local_license_supervisor",
     "license_state_path": null,
-    "public_core_behavior": "All 54 registry tools remain visible. Core tools execute locally. Module-required paid tools execute only through Detwin Hosted MCP when AGVM_HOSTED_MCP_API_KEY is set; otherwise they return a structured account and billing recovery contract."
+    "public_core_behavior": "The runtime registry remains discoverable subject to client permission policy. Core tools execute locally. Module-required paid tools execute only through Detwin Hosted MCP when AGVM_HOSTED_MCP_API_KEY is set; otherwise they return a structured account and billing recovery contract."
   },
   "permission_profiles": {
     "read_only_recall": {

@@ -26,6 +26,11 @@ CLAIM_STATUS_VALUES = {
     "test_artifact",
 }
 
+MEMORY_LIFECYCLE_SCOPES = {"current", "history", "audit"}
+MEMORY_LIFECYCLE_CURRENT_STATUS = "active"
+MEMORY_LIFECYCLE_HISTORY_STATUSES = {"superseded"}
+MEMORY_LIFECYCLE_DELETED_STATUS = "deleted"
+
 ANSWER_BLOCKING_SOURCE_TRUST = {"synthetic_test", "system_metadata"}
 ANSWER_BLOCKING_CLAIM_STATUS = {"source_metadata", "instruction", "test_artifact"}
 
@@ -115,6 +120,59 @@ def _normalized_source_trust(value: Any) -> str | None:
 def _normalized_claim_status(value: Any) -> str | None:
     candidate = str(value or "").strip().lower()
     return candidate if candidate in CLAIM_STATUS_VALUES else None
+
+
+def normalized_lifecycle_status(value: Any) -> str:
+    """Normalize persisted lifecycle state without inferring it from content.
+
+    Missing lifecycle metadata is a legacy active memory. Any explicit unknown
+    state fails closed as non-current rather than becoming current truth.
+    """
+
+    candidate = str(value or "").strip().lower()
+    return candidate or MEMORY_LIFECYCLE_CURRENT_STATUS
+
+
+def normalized_lifecycle_scope(value: Any) -> str:
+    candidate = str(value or "current").strip().lower()
+    if candidate not in MEMORY_LIFECYCLE_SCOPES:
+        raise ValueError(f"unsupported_memory_lifecycle_scope:{candidate}")
+    return candidate
+
+
+def lifecycle_eligibility(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Project one lifecycle state into Search's current/history/audit views."""
+
+    nested_node = payload.get("node") if isinstance(payload, dict) else None
+    node = dict(nested_node) if isinstance(nested_node, dict) else dict(payload or {})
+    merged = {
+        **node,
+        **({key: value for key, value in payload.items() if key != "node"} if isinstance(payload, dict) else {}),
+    }
+    status = normalized_lifecycle_status(merged.get("lifecycle_status"))
+    current_eligible = status == MEMORY_LIFECYCLE_CURRENT_STATUS
+    deleted = status == MEMORY_LIFECYCLE_DELETED_STATUS
+    history_eligible = current_eligible or status in MEMORY_LIFECYCLE_HISTORY_STATUSES
+    if current_eligible:
+        tier = "hot"
+    elif deleted:
+        tier = "audit"
+    else:
+        tier = "cold"
+    return {
+        "lifecycle_status": status,
+        "retrieval_tier": tier,
+        "current_eligible": current_eligible,
+        "history_eligible": history_eligible,
+        "audit_eligible": True,
+        "semantic_answer_eligible": current_eligible,
+    }
+
+
+def is_lifecycle_eligible(payload: dict[str, Any] | None, *, scope: str = "current") -> bool:
+    projection = lifecycle_eligibility(payload)
+    normalized_scope = normalized_lifecycle_scope(scope)
+    return bool(projection[f"{normalized_scope}_eligible"])
 
 
 def looks_like_system_metadata_source(*values: Any) -> bool:
@@ -326,7 +384,16 @@ def apply_hygiene_metadata(node: dict[str, Any], *, input_mode: str | None = Non
         document_role=payload.get("document_role"),
         is_document_anchor=bool(payload.get("is_document_anchor")),
     )
-    payload.update(hygiene)
+    lifecycle = lifecycle_eligibility(payload)
+    payload.update(
+        {
+            **hygiene,
+            "answer_eligible": bool(hygiene.get("answer_eligible")) and lifecycle["current_eligible"],
+            "profile_eligible": bool(hygiene.get("profile_eligible")) and lifecycle["current_eligible"],
+            "document_eligible": bool(hygiene.get("document_eligible")) and lifecycle["current_eligible"],
+            "lifecycle_eligibility": lifecycle,
+        }
+    )
     return payload
 
 
@@ -337,7 +404,9 @@ def _payload_node(payload: dict[str, Any]) -> dict[str, Any]:
 
 def effective_hygiene(payload: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(payload, dict):
-        return build_hygiene_metadata(raw_text="")
+        hygiene = build_hygiene_metadata(raw_text="")
+        lifecycle = lifecycle_eligibility(None)
+        return {**hygiene, **lifecycle}
     node = _payload_node(payload)
     merged = {**node, **{key: value for key, value in payload.items() if key != "node"}}
     source_trust = _normalized_source_trust(merged.get("source_trust"))
@@ -361,16 +430,18 @@ def effective_hygiene(payload: dict[str, Any] | None) -> dict[str, Any]:
         or looks_like_source_metadata_text(raw_for_check)
         or looks_like_instruction_text(raw_for_check)
     )
+    lifecycle = lifecycle_eligibility(merged)
     if source_trust and claim_status and all(key in merged for key in ("answer_eligible", "profile_eligible", "document_eligible")):
         if not metadata_override_required:
             return {
                 "source_trust": source_trust,
                 "claim_status": claim_status,
-                "answer_eligible": bool(merged.get("answer_eligible")),
-                "profile_eligible": bool(merged.get("profile_eligible")),
-                "document_eligible": bool(merged.get("document_eligible")),
+                "answer_eligible": bool(merged.get("answer_eligible")) and lifecycle["current_eligible"],
+                "profile_eligible": bool(merged.get("profile_eligible")) and lifecycle["current_eligible"],
+                "document_eligible": bool(merged.get("document_eligible")) and lifecycle["current_eligible"],
+                **lifecycle,
             }
-    return build_hygiene_metadata(
+    hygiene = build_hygiene_metadata(
         raw_text=raw_for_check,
         input_mode="document" if bool(merged.get("is_document_anchor")) else "auto",
         provenance=dict(merged.get("provenance") or {}),
@@ -383,6 +454,13 @@ def effective_hygiene(payload: dict[str, Any] | None) -> dict[str, Any]:
         document_role=merged.get("document_role"),
         is_document_anchor=bool(merged.get("is_document_anchor")),
     )
+    return {
+        **hygiene,
+        "answer_eligible": bool(hygiene.get("answer_eligible")) and lifecycle["current_eligible"],
+        "profile_eligible": bool(hygiene.get("profile_eligible")) and lifecycle["current_eligible"],
+        "document_eligible": bool(hygiene.get("document_eligible")) and lifecycle["current_eligible"],
+        **lifecycle,
+    }
 
 
 def is_answer_eligible(payload: dict[str, Any] | None) -> bool:

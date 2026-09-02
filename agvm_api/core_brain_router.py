@@ -21,6 +21,7 @@ from brain_registry import (
     delete_local_brain,
     export_local_brain,
     import_local_brain_archive,
+    load_local_brain_registry,
     refresh_local_brain_registry,
     rename_local_brain,
     resolve_brain_scope,
@@ -52,12 +53,15 @@ def create_core_brain_router() -> APIRouter:
 
     @router.get("/memory/brains", response_model=BrainRegistryResponse)
     def list_brains() -> BrainRegistryResponse:
-        registry = refresh_local_brain_registry()
+        # Registry reads are on the hot path for every product shell. A GET must
+        # not rescan every brain storage (some contain large vector databases);
+        # mutations already refresh and persist the affected records.
+        registry = load_local_brain_registry()
         return BrainRegistryResponse(**registry)
 
     @router.get("/mcp/brains", response_model=BrainRegistryResponse)
     def mcp_list_brains() -> BrainRegistryResponse:
-        registry = refresh_local_brain_registry()
+        registry = load_local_brain_registry()
         return BrainRegistryResponse(**registry)
 
     @router.get("/memory/brains/active")

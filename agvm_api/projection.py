@@ -15,6 +15,27 @@ def clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def normalize_unit_confidence(value: Any, *, default: float | None = None) -> float | None:
+    """Normalize confidence values while preserving legacy 0-10 compiler output.
+
+    Confidence fields are stored and exposed on a 0-1 scale.  Some early AI
+    compiler responses used the interview-style 0-10 scale, so a value such as
+    ``9.0`` must become ``0.9`` rather than merely being clamped to ``1.0``.
+    """
+
+    if value is None or value == "":
+        return default
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(normalized):
+        return default
+    if 1.0 < normalized <= 10.0:
+        normalized /= 10.0
+    return max(0.0, min(1.0, normalized))
+
+
 def normalize_scores(values: dict[str, float], fields: list[str]) -> dict[str, float]:
     raw = {field: clamp01(values.get(field, 0.0)) for field in fields}
     total = sum(raw.values())

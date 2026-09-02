@@ -45,12 +45,12 @@ No dependency is currently marked for manual review by the generator.
 | --- | --- | --- | --- | --- |
 | python | `cryptography` | `cryptography==50.0.0` | Apache-2.0 OR BSD-3-Clause | standard |
 | python | `fastapi` | `fastapi==0.133.0` | MIT | standard |
-| python | `pillow` | `Pillow>=10.0.0,<13.0.0` | MIT-CMU | standard |
-| python | `playwright` | `playwright>=1.45.0,<2.0.0` | Apache-2.0 | standard |
+| python | `pillow` | `Pillow==12.3.0` | MIT-CMU | standard |
+| python | `playwright` | `playwright==1.58.0` | Apache-2.0 | standard |
 | python | `pydantic` | `pydantic==2.11.9` | MIT | standard |
-| python | `pypdf` | `pypdf>=5.0.0,<7.0.0` | BSD-3-Clause | standard |
-| python | `pypdfium2` | `pypdfium2>=4.30.0,<5.0.0` | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | standard |
-| python | `pytesseract` | `pytesseract>=0.3.13,<0.4.0` | Apache-2.0 | standard |
+| python | `pypdf` | `pypdf==6.15.0` | BSD-3-Clause | standard |
+| python | `pypdfium2` | `pypdfium2==4.30.0` | BSD-3-Clause OR Apache-2.0 + PDFium dependency licenses | standard |
+| python | `pytesseract` | `pytesseract==0.3.13` | Apache-2.0 | standard |
 | python | `python-dotenv` | `python-dotenv==1.2.2` | BSD-3-Clause | standard |
 | python | `python-multipart` | `python-multipart==0.0.32` | Apache-2.0 | standard |
 | python | `uvicorn` | `uvicorn[standard]==0.37.0` | BSD-3-Clause | standard |

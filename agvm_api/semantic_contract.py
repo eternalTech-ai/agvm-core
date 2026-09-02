@@ -50,6 +50,7 @@ _SEMANTIC_CONTRACT_DISK_CACHE_FILENAME = "semantic_contract_cache.v1.json"
 _SEMANTIC_CONTRACT_DISK_CACHE_SCHEMA = "agvm.semantic_contract_cache_store.v1"
 _SEMANTIC_CONTRACT_DISK_CACHE_MAX_ITEMS = 512
 _SEMANTIC_CONTRACT_CACHE_REVISION = "dwe2_target_document_need_v1"
+_SEARCH_SEMANTIC_AUTHORITY_REVISION = "ai_v2_s1"
 _SEMANTIC_CONTRACT_CACHE_LOCK = threading.Lock()
 _SEMANTIC_CONTRACT_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -119,6 +120,7 @@ def _semantic_contract_cache_key(
     identity_hints: dict[str, Any] | None,
     brain_revision: str | None,
     cache_scope: str | None,
+    semantic_authority: str = "legacy",
 ) -> str:
     payload = {
         "schema_version": "agvm.semantic_contract_cache_key.v1",
@@ -127,6 +129,10 @@ def _semantic_contract_cache_key(
         "retrieval_mode": str(retrieval_mode or "balanced").strip().lower(),
         "brain_revision": str(brain_revision or "").strip(),
         "cache_scope": str(cache_scope or "").strip(),
+        "semantic_authority": {
+            "mode": "ai_v2" if str(semantic_authority or "legacy").strip().lower() == "ai_v2" else "legacy",
+            "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+        },
         "contract_view": _semantic_cache_contract_view(legacy_contract, fallback_contract),
         "identity_hints_hash": _stable_json_hash(_semantic_cache_identity_view(identity_hints))[:24],
     }
@@ -2248,6 +2254,220 @@ def _ai_schema() -> dict[str, Any]:
     }
 
 
+def _ai_v2_authoritative_schema() -> dict[str, Any]:
+    schema = deepcopy(_ai_compact_schema())
+    properties = dict(schema.get("properties") or {})
+    properties["intent_primary"] = {"type": "string", "minLength": 1}
+    properties["evidence_targets"] = {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 16,
+        "items": {"type": "string", "minLength": 1},
+    }
+    properties["required_sections"] = {
+        "type": "array",
+        "maxItems": 16,
+        "items": {"type": "string", "minLength": 1},
+    }
+    properties["optional_sections"] = {
+        "type": "array",
+        "maxItems": 16,
+        "items": {"type": "string", "minLength": 1},
+    }
+    properties["landing_strategy"] = {"type": "string", "minLength": 1}
+    schema["properties"] = properties
+    schema["required"] = [
+        *list(schema.get("required") or []),
+        "required_sections",
+        "optional_sections",
+    ]
+    return schema
+
+
+def _ai_v2_contract_label(value: Any) -> str:
+    text = " ".join(str(value or "").strip().split())
+    return text[:120]
+
+
+def _merge_ai_v2_authoritative_payload(
+    *,
+    fallback_contract: dict[str, Any],
+    ai_payload: dict[str, Any],
+) -> dict[str, Any]:
+    contract = deepcopy(fallback_contract)
+    intent_primary = str(ai_payload.get("intent_primary") or "").strip()
+    raw_targets = _unique(
+        [
+            str(item.get("target_id") or item.get("goal") or item.get("claim_shape") or "").strip()
+            if isinstance(item, dict)
+            else str(item or "").strip()
+            for item in list(ai_payload.get("expected_evidence") or ai_payload.get("evidence_targets") or [])
+        ],
+        limit=16,
+    )
+    if not intent_primary or not raw_targets:
+        raise ValueError("ai_v2_semantic_contract_missing_authoritative_fields")
+    document_mode = str(ai_payload.get("document_mode") or "none").strip() or "none"
+    expected_evidence: list[dict[str, Any]] = []
+    detailed_targets = [item for item in list(ai_payload.get("expected_evidence") or []) if isinstance(item, dict)]
+    details_by_target = {
+        str(item.get("target_id") or item.get("goal") or item.get("claim_shape") or "").strip(): item
+        for item in detailed_targets
+    }
+    for target in raw_targets:
+        details = dict(details_by_target.get(target) or {})
+        claim_shape = str(details.get("claim_shape") or target).strip()
+        expected_evidence.append(
+            {
+                "target_id": target,
+                "canonical_target_id": None,
+                "raw_ai_target_id": target,
+                "raw_ai_claim_shape": claim_shape,
+                "ai_freeform_goal": str(details.get("goal") or claim_shape).strip(),
+                "ai_target_text": str(details.get("target_text") or details.get("textual_probe") or claim_shape).strip(),
+                "claim_shape": claim_shape,
+                "required_fields": _unique(list(details.get("required_fields") or []), limit=12),
+                "acceptable_sources": ["verified_public", "user_asserted", "uploaded_document"],
+                "minimum_support": {
+                    "node_count": 1,
+                    "document_chunk_count": 1 if document_mode != "none" else 0,
+                    "source_trace_count": 1 if document_mode == "source_trace_for_answer" else 0,
+                },
+                "negative_conditions": _unique(list(details.get("negative_conditions") or []), limit=12),
+                "success_question": str(details.get("success_question") or f"Does promoted evidence directly satisfy: {claim_shape}?").strip(),
+            }
+        )
+    required_sections = _unique(
+        [_ai_v2_contract_label(item) for item in list(ai_payload.get("required_sections") or [])],
+        limit=16,
+    )
+    optional_sections = _unique(
+        [_ai_v2_contract_label(item) for item in list(ai_payload.get("optional_sections") or [])],
+        limit=16,
+    )
+    if not required_sections:
+        required_sections = [_ai_v2_contract_label(target) for target in raw_targets]
+    required_sections = [section for section in required_sections if section]
+    optional_sections = [section for section in optional_sections if section and section not in set(required_sections)]
+    mode_landing_cap = _mode_landing_cap(str(contract.get("retrieval_mode") or "balanced"))
+    min_landings = max(1, min(mode_landing_cap, int(ai_payload.get("min_landings") or 1)))
+    max_landings = max(min_landings, min(mode_landing_cap, int(ai_payload.get("max_landings") or min_landings)))
+    contract["contract_authority"] = "ai_v2"
+    contract["compiler_status"] = "completed"
+    contract["compiler_error"] = None
+    contract["semantic_authority"] = {
+        "mode": "ai_v2",
+        "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+        "fallback_used": False,
+    }
+    contract["intent"] = {
+        "primary": intent_primary,
+        "secondary": _unique(list(ai_payload.get("intent_secondary") or []), limit=12),
+        "requires_first_person": bool(ai_payload.get("requires_first_person")),
+        "requires_document_mode": bool(ai_payload.get("requires_document_mode")) or document_mode != "none",
+        "requires_broad_context": bool(ai_payload.get("requires_broad_context")),
+    }
+    contract["expected_evidence"] = expected_evidence
+    contract["semantic_slot_contract_version"] = "agvm.semantic_slot_contract.v1"
+    contract["semantic_slot_contracts"] = []
+    contract["forbidden_evidence"] = [
+        {"topic": topic, "reason": "ai_contract_forbidden_topic"}
+        for topic in _unique(list(ai_payload.get("forbidden_topics") or []), limit=12)
+    ] + [
+        {"topic": "system_metadata", "reason": "never_answer_from_system_metadata"},
+        {"topic": "synthetic_test_material", "reason": "never_answer_from_synthetic_test_material"},
+    ]
+    contract["landing_plan"]["min_landings"] = min_landings
+    contract["landing_plan"]["max_landings"] = max_landings
+    contract["landing_plan"]["preferred_strategy"] = str(ai_payload.get("landing_strategy") or "ai_directed").strip()
+    contract["landing_plan"]["landing_hypotheses"] = [
+        {
+            "landing_id": f"L{index + 1}",
+            "target_evidence_ids": [target["target_id"]],
+            "textual_probe": str(target.get("ai_target_text") or target.get("claim_shape") or ""),
+            "canonical_target_id": None,
+            "raw_ai_target_id": str(target.get("target_id") or ""),
+            "ai_freeform_goal": str(target.get("ai_freeform_goal") or ""),
+            "route_budget": {"max_hops": 5, "max_nodes": 24, "max_document_chunks": 8 if document_mode != "none" else 2},
+        }
+        for index, target in enumerate(expected_evidence[:max_landings])
+    ]
+    allowed_landing_ids = {
+        str(item.get("landing_id") or "")
+        for item in list(contract["landing_plan"].get("landing_hypotheses") or [])
+        if isinstance(item, dict)
+    }
+    fallback_paths = _build_path_itinerary(
+        list(contract["landing_plan"].get("landing_hypotheses") or []),
+        preferred_strategy=str(contract["landing_plan"].get("preferred_strategy") or "ai_directed"),
+        document_mode=document_mode,
+        source="ai_v2_inferred",
+    )
+    contract["landing_plan"]["paths"] = _normalize_ai_path_itinerary(
+        list(ai_payload.get("path_itinerary") or []),
+        fallback_paths=fallback_paths,
+        allowed_landing_ids=allowed_landing_ids,
+    )
+    contract["context_contract"]["required_sections"] = required_sections
+    contract["context_contract"]["optional_sections"] = optional_sections
+    contract["context_contract"]["semantic_required_slot_keys"] = []
+    contract["context_contract"]["semantic_optional_slot_keys"] = []
+    contract["context_contract"]["dossier_goal"] = "ai_directed"
+    contract["document_contract"]["mode"] = document_mode
+    contract["document_contract"]["require_title_overlap"] = document_mode == "exact_document_lookup"
+    contract["document_contract"]["require_entity_overlap"] = document_mode != "none"
+    contract["answer_contract"]["voice"] = str(ai_payload.get("answer_voice") or "neutral")
+    contract["answer_contract"]["style"] = str(ai_payload.get("answer_style") or "human_clone")
+    contract["answer_contract"]["must_answer_directly"] = bool(ai_payload.get("must_answer_directly", True))
+    contract["ai_required"] = True
+    contract["deterministic_seal_allowed"] = False
+    contract["compiler_rationale"] = str(ai_payload.get("rationale") or "").strip()
+    # MissionPlanV2 is the semantic authority in this branch.  The fallback
+    # contract was already built before the provider call, so applying the
+    # deterministic document-need classifier again here would let keywords in
+    # the unchanged user goal overwrite the provider-authored intent, evidence
+    # targets, document preference and itinerary.  Keep that classifier on the
+    # legacy/fallback path only; downstream code may still use the bounded
+    # document payload types selected by this AI-authored contract.
+    return contract
+
+
+def _ai_v2_failed_contract(
+    fallback_contract: dict[str, Any],
+    *,
+    error: str,
+    status: str = "failed",
+) -> dict[str, Any]:
+    contract = deepcopy(fallback_contract)
+    contract["contract_authority"] = "ai_v2_failed_closed"
+    contract["compiler_status"] = status
+    contract["compiler_error"] = error
+    contract["semantic_authority"] = {
+        "mode": "ai_v2",
+        "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+        "fallback_used": False,
+    }
+    contract["intent"] = {
+        "primary": "unresolved",
+        "secondary": [],
+        "requires_first_person": False,
+        "requires_document_mode": False,
+        "requires_broad_context": False,
+    }
+    contract["expected_evidence"] = []
+    contract["semantic_slot_contracts"] = []
+    contract["context_contract"]["required_sections"] = []
+    contract["context_contract"]["optional_sections"] = []
+    contract["context_contract"]["semantic_required_slot_keys"] = []
+    contract["context_contract"]["semantic_optional_slot_keys"] = []
+    contract["landing_plan"]["landing_hypotheses"] = []
+    contract["landing_plan"]["paths"] = []
+    contract["ai_required"] = True
+    contract["deterministic_seal_allowed"] = False
+    contract["admission_state"] = "blocked"
+    return contract
+
+
 def _ai_compact_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -2832,6 +3052,7 @@ def compile_semantic_query_contract(
     cache_scope: str | None = None,
     use_cache: bool = True,
     profile_variant: str | None = None,
+    semantic_authority: str = "legacy",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     started_at = time.perf_counter()
     fallback_status = "deferred" if deferred else "fallback"
@@ -2842,6 +3063,9 @@ def compile_semantic_query_contract(
     compiler_profile_name = str(compiler_profile.get("profile") or "compact_first")
     compiler_schema_name = str(compiler_profile.get("schema_name") or "agvm_semantic_query_contract_v2_compact")
     compiler_max_output_tokens = int(compiler_profile.get("max_output_tokens") or 640)
+    authority_mode = "ai_v2" if str(semantic_authority or "legacy").strip().lower() == "ai_v2" else "legacy"
+    if authority_mode == "ai_v2":
+        compiler_schema_name = f"{compiler_schema_name}_ai_v2"
     fallback_contract = _build_fallback_contract(
         query_text=query_text,
         retrieval_mode=retrieval_mode,
@@ -2850,7 +3074,7 @@ def compile_semantic_query_contract(
         ai_status=fallback_status,
         tool_name=tool_name,
     )
-    ai_required = bool(fallback_contract.get("ai_required"))
+    ai_required = True if authority_mode == "ai_v2" else bool(fallback_contract.get("ai_required"))
     sanitized_identity_hints = _sanitize_identity_hints(identity_hints)
     cache_enabled = bool(use_cache and (str(brain_revision or "").strip() or str(cache_scope or "").strip()))
     cache_key = (
@@ -2862,6 +3086,7 @@ def compile_semantic_query_contract(
             identity_hints=sanitized_identity_hints,
             brain_revision=brain_revision,
             cache_scope=cache_scope,
+            semantic_authority=authority_mode,
         )
         if cache_enabled
         else ""
@@ -2906,6 +3131,11 @@ def compile_semantic_query_contract(
         runtime["degraded_reason"] = provider_degraded_reason
         runtime["fresh_provider_call"] = bool(runtime.get("source") == "llm" and not cache_hit)
         runtime["cached_ai_contract"] = bool(cache_hit and runtime.get("material"))
+        runtime["semantic_authority"] = {
+            "mode": authority_mode,
+            "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+            "fallback_used": False if authority_mode == "ai_v2" else bool(runtime.get("source") in {"heuristic_draft", "heuristic_fallback"}),
+        }
         runtime["provider_retry_policy"] = {
             "schema_version": "agvm.semantic_contract_provider_retry_policy.v1",
             "retry_allowed_on": ["timeout", "provider_error", "rate_limit", "overloaded", "temporarily_unavailable", "api_error", "connection"],
@@ -2955,6 +3185,18 @@ def compile_semantic_query_contract(
             return cached_contract, finalize_runtime(runtime, cache_status="hit", cache_hit=True)
 
     if deferred:
+        if authority_mode == "ai_v2":
+            contract = _ai_v2_failed_contract(fallback_contract, error="ai_v2_semantic_compilation_deferred", status="deferred")
+            runtime = {
+                "schema_version": "agvm.semantic_contract_runtime.v1",
+                "enabled": bool(llm_enabled()),
+                "ai_required": True,
+                "status": "deferred",
+                "source": "ai_v2_deferred",
+                "material": False,
+                "error": "ai_v2_semantic_compilation_deferred",
+            }
+            return contract, finalize_runtime(runtime, cache_status="miss" if cache_enabled else "disabled")
         enabled = bool(llm_enabled())
         status = "deferred" if enabled and ai_required else "not_required" if not ai_required else "fallback"
         source = fallback_source if status in {"deferred", "fallback"} else "deterministic_strict_contract"
@@ -2988,6 +3230,19 @@ def compile_semantic_query_contract(
         fallback_contract["compiler_status"] = "not_required"
         return fallback_contract, finalize_runtime(runtime, cache_status="not_applicable" if cache_enabled else "disabled")
     if not allow_ai or not llm_enabled():
+        if authority_mode == "ai_v2":
+            failure_error = "llm_disabled_or_not_allowed"
+            contract = _ai_v2_failed_contract(fallback_contract, error=failure_error)
+            runtime = {
+                "schema_version": "agvm.semantic_contract_runtime.v1",
+                "enabled": bool(llm_enabled()),
+                "ai_required": True,
+                "status": "failed",
+                "source": "ai_v2_failed_closed",
+                "material": False,
+                "error": failure_error,
+            }
+            return contract, finalize_runtime(runtime, cache_status="miss" if cache_enabled else "disabled")
         runtime = {
             "schema_version": "agvm.semantic_contract_runtime.v1",
             "enabled": bool(llm_enabled()),
@@ -3001,7 +3256,14 @@ def compile_semantic_query_contract(
         fallback_contract["compiler_error"] = "llm_disabled_or_not_allowed"
         return fallback_contract, finalize_runtime(runtime, cache_status="miss" if cache_enabled else "disabled")
 
-    if compiler_profile_name == "ultra_first":
+    if authority_mode == "ai_v2":
+        system_prompt = (
+            "You are AGVM's authoritative semantic mission compiler. Do not answer the user. "
+            "Describe the user's intent, freeform evidence targets, required and optional context sections, exclusions, "
+            "landing strategy and path itinerary. Target and section names are open vocabulary: preserve the user's actual meaning. "
+            "Do not translate an unknown concept into a legacy category and do not use heuristic fallback semantics."
+        )
+    elif compiler_profile_name == "ultra_first":
         system_prompt = (
             "You are AGVM's first-hop semantic route compiler. Do not answer the user. "
             "Return only the minimal authoritative contract: intent, evidence target ids, forbidden topics, landing strategy, "
@@ -3021,10 +3283,12 @@ def compile_semantic_query_contract(
     prompt_payload = {
         "query": query_text,
         "retrieval_mode": retrieval_mode,
-        "legacy_contract": legacy_contract,
         "identity_hints": _compact_identity_hints_for_retry(sanitized_identity_hints),
-        "canonical_target_ids": sorted(_CANONICAL_TARGET_IDS),
-        "fallback_contract_summary": {
+    }
+    if authority_mode != "ai_v2":
+        prompt_payload["legacy_contract"] = legacy_contract
+        prompt_payload["canonical_target_ids"] = sorted(_CANONICAL_TARGET_IDS)
+        prompt_payload["fallback_contract_summary"] = {
             "intent": fallback_contract["intent"],
             "required_sections": fallback_contract["context_contract"]["required_sections"],
             "optional_sections": fallback_contract["context_contract"]["optional_sections"],
@@ -3037,20 +3301,33 @@ def compile_semantic_query_contract(
             "target_document_need_contract": fallback_contract.get("target_document_need_contract"),
             "ai_required": fallback_contract["ai_required"],
             "deterministic_seal_allowed": fallback_contract["deterministic_seal_allowed"],
-        },
-    }
+        }
+    def merge_compiler_payload(candidate: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            contract = (
+                _merge_ai_v2_authoritative_payload(fallback_contract=fallback_contract, ai_payload=candidate)
+                if authority_mode == "ai_v2"
+                else _merge_ai_payload(fallback_contract=fallback_contract, ai_payload=candidate)
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return None, f"semantic_contract_merge_error:{type(exc).__name__}:{exc}"
+        return contract, None
+
     payload, error = structured_json(
         model=compiler_model(),
         system_prompt=system_prompt,
         user_prompt=json.dumps(prompt_payload, ensure_ascii=False),
         schema_name=compiler_schema_name,
-        schema=dict(compiler_profile.get("schema") or _ai_compact_schema()),
+        schema=_ai_v2_authoritative_schema() if authority_mode == "ai_v2" else dict(compiler_profile.get("schema") or _ai_compact_schema()),
         timeout=requested_timeout,
         role="compiler",
         max_output_tokens=compiler_max_output_tokens,
     )
+    contract = None
     if payload and not error:
-        contract = _merge_ai_payload(fallback_contract=fallback_contract, ai_payload=payload)
+        contract, merge_error = merge_compiler_payload(payload)
+        error = merge_error
+    if contract is not None and not error:
         runtime = {
             "schema_version": "agvm.semantic_contract_runtime.v1",
             "enabled": True,
@@ -3079,30 +3356,40 @@ def compile_semantic_query_contract(
         retry_system_prompt = (
             "You are AGVM's compact semantic route compiler retry path. "
             "Return the smallest valid route contract. Do not answer the user. "
-            "AI owns semantic targets, landings, exclusions and validation. Use canonical target ids only."
+            "AI owns semantic targets, landings, exclusions and validation. "
+            + ("Use freeform targets and sections; never substitute a legacy category." if authority_mode == "ai_v2" else "Use canonical target ids only.")
         )
         retry_payload, retry_error = structured_json(
             model=compiler_model(),
             system_prompt=retry_system_prompt,
             user_prompt=json.dumps(
-                _semantic_retry_prompt_payload(
+                ({
+                    "query": query_text,
+                    "retrieval_mode": retrieval_mode,
+                    "identity_hints": _compact_identity_hints_for_retry(sanitized_identity_hints),
+                    "primary_error": primary_error,
+                } if authority_mode == "ai_v2" else _semantic_retry_prompt_payload(
                     query_text=query_text,
                     retrieval_mode=retrieval_mode,
                     legacy_contract=legacy_contract,
                     fallback_contract=fallback_contract,
                     identity_hints=identity_hints,
                     primary_error=primary_error,
-                ),
+                )),
                 ensure_ascii=False,
             ),
             schema_name=compiler_schema_name,
-            schema=dict(compiler_profile.get("schema") or _ai_compact_schema()),
+            schema=_ai_v2_authoritative_schema() if authority_mode == "ai_v2" else dict(compiler_profile.get("schema") or _ai_compact_schema()),
             timeout=retry_timeout,
             role="compiler",
             max_output_tokens=min(compiler_max_output_tokens, 520),
         )
+        retry_contract = None
         if retry_payload and not retry_error:
-            contract = _merge_ai_payload(fallback_contract=fallback_contract, ai_payload=retry_payload)
+            retry_contract, retry_merge_error = merge_compiler_payload(retry_payload)
+            retry_error = retry_merge_error
+        if retry_contract is not None and not retry_error:
+            contract = retry_contract
             runtime = {
                 "schema_version": "agvm.semantic_contract_runtime.v1",
                 "enabled": True,
@@ -3125,6 +3412,27 @@ def compile_semantic_query_contract(
                 _store_semantic_contract_cache_entry(cache_key, contract=contract, runtime=runtime)
             return contract, runtime
         retry_status = "failed"
+    if authority_mode == "ai_v2":
+        failure_error = str(retry_error or primary_error or "ai_v2_semantic_contract_failed")
+        contract = _ai_v2_failed_contract(fallback_contract, error=failure_error)
+        runtime = {
+            "schema_version": "agvm.semantic_contract_runtime.v1",
+            "enabled": bool(llm_enabled()),
+            "ai_required": True,
+            "status": "failed",
+            "source": "ai_v2_failed_closed",
+            "material": False,
+            "error": failure_error,
+            "compiler_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
+            "model": compiler_model(),
+            "attempt_count": 2 if retry_status in {"running", "failed"} else 1,
+            "retry_used": retry_status in {"running", "failed"},
+            "retry_status": retry_status,
+            "retry_timeout_seconds": retry_timeout if retry_status in {"running", "failed"} else None,
+            "primary_error": primary_error,
+            "retry_error": retry_error,
+        }
+        return contract, finalize_runtime(runtime, cache_status="miss" if cache_enabled else "disabled")
     fallback_contract["compiler_error"] = retry_error or primary_error
     runtime = {
         "schema_version": "agvm.semantic_contract_runtime.v1",

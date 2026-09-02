@@ -6,14 +6,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import re
 import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Any, AsyncIterator, Iterator
+from contextvars import copy_context
+from typing import Any, AsyncIterator, Iterator, Mapping
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from brain_health import build_brain_health_report, build_mcp_brain_health_output
@@ -31,12 +33,18 @@ from answering import (
     build_mcp_context_package,
     build_query_contract,
 )
+from core_document_registry import preview_document_node
 from mcp_retrieval import (
     build_mcp_memory_object_output,
     build_mcp_retrieval_tool_output,
     build_mcp_route_trace_output,
 )
 from retrieval import (
+    _apply_plan_first_usable_partial_public_projection,
+    _planner_seed_transport_guard_seconds,
+    _search_ai_admission_timeout_seconds,
+    SearchAiExecutionError,
+    build_search_ai_execution_http_block_payload,
     build_search_ai_http_block_payload,
     build_search_ai_blocked_result,
     build_landing_metadata,
@@ -46,8 +54,10 @@ from retrieval import (
     require_search_ai_admission,
     request_search_supersede,
     retrieve_runtime,
+    search_identity_nucleus_for_named_targets,
 )
 from runtime_scope import current_brain_id, runtime_scope_summary, use_runtime_brain
+from search_lifecycle_heartbeat import FINAL_MATERIALIZATION_HEARTBEATS
 from schemas import (
     McpBrainHealthRequest,
     McpBrainHealthToolExecutionResponse,
@@ -66,6 +76,7 @@ from schemas import (
 from sqlite_store import (
     append_search_event,
     apply_runtime_retention_policy,
+    cancel_search_session as _store_cancel_search_session,
     create_search_session,
     fail_search_session as _store_fail_search_session,
     fetch_active_search_session_by_thread,
@@ -88,6 +99,7 @@ from sqlite_store import (
     save_search_result_snapshot,
 )
 from storage import utc_timestamp
+from stream_contract import annotate_stream_event, project_search_result_lifecycle, search_result_ref
 
 try:
     from metamemory import metamemory_snapshot
@@ -106,6 +118,29 @@ _MCP_FIRST_PACKAGE_WAIT_SECONDS = {
     "heavy": 6.0,
     "forensic": 6.0,
 }
+
+
+def _query_stream_after_seq(after_seq: int = 0, last_event_id: str | None = None) -> int:
+    if isinstance(last_event_id, str) and last_event_id:
+        value = str(last_event_id).strip()
+        if value:
+            try:
+                return max(0, int(value))
+            except ValueError:
+                match = re.search(r"(\d+)$", value)
+                if match:
+                    return max(0, int(match.group(1)))
+    try:
+        return max(0, int(after_seq or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sse_search_event_frame(event: dict[str, Any], *, retry_ms: int = 1000) -> str:
+    event_type = str(event.get("event_type") or "message")
+    seq = int(event.get("seq") or 0)
+    payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    return f"id: {seq}\nevent: {event_type}\nretry: {int(retry_ms)}\ndata: {payload}\n\n"
 _MCP_SURFACE_FIELDS = (
     "payload_integrity",
     "payload_truth_contract",
@@ -133,13 +168,14 @@ _MCP_SURFACE_FIELDS = (
 )
 
 
-def finalize_search_session(search_id: str, result_payload: dict[str, Any]) -> None:
-    _store_finalize_search_session(search_id, result_payload)
+def finalize_search_session(search_id: str, result_payload: dict[str, Any]) -> dict[str, Any]:
+    final = _store_finalize_search_session(search_id, result_payload) or dict(result_payload or {})
     record_search_terminal(
-        brain_id=str(current_brain_id() or result_payload.get("brain_id") or ""),
+        brain_id=str(current_brain_id() or final.get("brain_id") or ""),
         session_id=search_id,
-        result=result_payload,
+        result=final,
     )
+    return final
 
 
 def fail_search_session(search_id: str, error_message: str) -> None:
@@ -149,6 +185,42 @@ def fail_search_session(search_id: str, error_message: str) -> None:
         session_id=search_id,
         failed_reason=error_message,
     )
+
+
+def cancel_search_session(
+    search_id: str,
+    *,
+    expected_state_revision: int | None = None,
+    idempotency_key: str | None = None,
+    reason: str = "user_cancelled",
+) -> dict[str, Any] | None:
+    return _store_cancel_search_session(
+        search_id,
+        expected_state_revision=expected_state_revision,
+        idempotency_key=idempotency_key,
+        reason=reason,
+    )
+
+
+def _search_stream_url(search_id: str) -> str:
+    return f"/memory/query-stream/{search_id}?brain_id={current_brain_id()}"
+
+
+def _search_result_url(search_id: str) -> str:
+    return f"/memory/query-result/{search_id}?brain_id={current_brain_id()}"
+
+
+def _search_accept_payload(search_id: str, payload: RetrieveRequest) -> dict[str, Any]:
+    return {
+        "schema_version": "agvm.search_accept.v1",
+        "status": "accepted",
+        "search_id": search_id,
+        "brain_id": current_brain_id(),
+        "thread_id": payload.thread_id,
+        "query_text": payload.query_text,
+        "stream_url": _search_stream_url(search_id),
+        "result_url": _search_result_url(search_id),
+    }
 
 
 def create_core_retrieve_router() -> APIRouter:
@@ -173,20 +245,58 @@ def create_core_retrieve_router() -> APIRouter:
             result = _run_search_session_sync(search_id)
             return RetrieveResponse(**_retrieve_response_schema_safe(result))
 
+    @router.post("/memory/query-create")
+    def memory_query_create_endpoint(payload: RetrieveRequest) -> JSONResponse:
+        with _brain_request_scope(_payload_brain_id(payload), require_retrieval_ready=True) as brain_record:
+            normalized_payload = _normalized_retrieve_request(payload)
+            search_id = _create_unplanned_search_session(
+                normalized_payload,
+                plan_transport="early_search_identity_background_plan",
+            )
+            # Provider admission and planning belong to the accepted Search worker.
+            # Keeping them off the request thread preserves the early-identity
+            # contract even when provider readiness checks are slow or blocked.
+            _start_accepted_search_pipeline(search_id, brain_record)
+            return JSONResponse(
+                status_code=202,
+                content=_search_accept_payload(search_id, normalized_payload),
+            )
+
     @router.post("/memory/query-plan", response_model=SearchPlanResponse)
-    def memory_query_plan_endpoint(payload: RetrieveRequest) -> SearchPlanResponse | JSONResponse:
+    def memory_query_plan_endpoint(
+        payload: RetrieveRequest,
+        respond_async: bool = Query(default=False),
+    ) -> SearchPlanResponse | JSONResponse:
         with _brain_request_scope(_payload_brain_id(payload), require_retrieval_ready=True):
             normalized_payload = _normalized_retrieve_request(payload)
+            if respond_async:
+                brain_record = _resolve_brain_record(current_brain_id())
+                search_id = _create_unplanned_search_session(
+                    normalized_payload,
+                    plan_transport="early_query_plan_background_plan",
+                )
+                _start_accepted_search_pipeline(search_id, brain_record)
+                return JSONResponse(
+                    status_code=202,
+                    content=_search_accept_payload(search_id, normalized_payload),
+                )
             admission = _public_search_ai_admission(normalized_payload)
             if str(admission.get("status") or "") != "admitted":
                 return JSONResponse(
                     status_code=503,
                     content=build_search_ai_http_block_payload(admission),
                 )
-            search_id, plan = _create_planned_search_session(
-                normalized_payload,
-                ai_admission=admission,
-            )
+            try:
+                search_id, plan = _create_planned_search_session(
+                    normalized_payload,
+                    ai_admission=admission,
+                )
+            except SearchAiExecutionError as exc:
+                blocked = _planning_failure_http_payload(exc)
+                return JSONResponse(
+                    status_code=503,
+                    content=blocked,
+                )
             return _search_plan_response(search_id, normalized_payload, plan)
 
     @router.post("/memory/query-run", response_model=SearchRunResponse)
@@ -196,9 +306,13 @@ def create_core_retrieve_router() -> APIRouter:
             if not session:
                 raise HTTPException(status_code=404, detail="search_not_found")
             request_payload = dict(session.get("request") or {})
+            session_brain_id = str(request_payload.get("brain_id") or current_brain_id() or "").strip() or None
+            thread_brain_record = brain_record
+            if session_brain_id and session_brain_id != current_brain_id():
+                thread_brain_record = _resolve_brain_record(session_brain_id)
             stored_plan = dict(session.get("plan") or {})
             stored_admission = dict(stored_plan.get("search_ai_admission") or {})
-            if str(stored_admission.get("status") or "") != "admitted":
+            if stored_plan and str(stored_admission.get("status") or "") != "admitted":
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -207,11 +321,10 @@ def create_core_retrieve_router() -> APIRouter:
                         "charged_units": 0,
                     },
                 )
-            session_brain_id = str(request_payload.get("brain_id") or current_brain_id() or "").strip() or None
-            thread_brain_record = brain_record
-            if session_brain_id and session_brain_id != current_brain_id():
-                thread_brain_record = _resolve_brain_record(session_brain_id)
-            _start_search_thread(payload.search_id, thread_brain_record)
+            if stored_plan:
+                _start_search_thread(payload.search_id, thread_brain_record)
+            else:
+                _start_accepted_search_pipeline(payload.search_id, thread_brain_record)
             refreshed = fetch_search_session(payload.search_id)
             status = str((refreshed or {}).get("status") or "running")
             if status not in {"created", "running", "completed", "failed"}:
@@ -220,9 +333,31 @@ def create_core_retrieve_router() -> APIRouter:
                 search_id=payload.search_id,
                 brain_id=current_brain_id(),
                 status=status,  # type: ignore[arg-type]
-                stream_url=f"/memory/query-stream/{payload.search_id}?brain_id={current_brain_id()}",
-                result_url=f"/memory/query-result/{payload.search_id}?brain_id={current_brain_id()}",
+                stream_url=_search_stream_url(payload.search_id),
+                result_url=_search_result_url(payload.search_id),
             )
+
+    @router.post("/memory/query-cancel/{search_id}")
+    def memory_query_cancel_endpoint(
+        search_id: str,
+        payload: dict[str, Any] | None = None,
+        brain_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        with _brain_request_scope(brain_id):
+            body = dict(payload or {})
+            try:
+                expected_revision = body.get("expected_state_revision")
+                outcome = cancel_search_session(
+                    search_id,
+                    expected_state_revision=int(expected_revision) if expected_revision is not None else None,
+                    idempotency_key=str(body.get("idempotency_key") or "").strip() or None,
+                    reason=str(body.get("reason") or "user_cancelled"),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not outcome:
+            raise HTTPException(status_code=404, detail="search_not_found")
+        return outcome
 
     @router.get("/memory/query-result/{search_id}", response_model=RetrieveResponse)
     def memory_query_result_endpoint(
@@ -338,7 +473,10 @@ def create_core_retrieve_router() -> APIRouter:
     @router.get("/memory/query-stream/{search_id}")
     async def memory_query_stream_endpoint(
         search_id: str,
+        request: Request,
         brain_id: str | None = Query(default=None),
+        after_seq: int = Query(default=0, ge=0),
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     ) -> StreamingResponse:
         with _brain_request_scope(brain_id):
             if not fetch_search_session(search_id):
@@ -347,30 +485,49 @@ def create_core_retrieve_router() -> APIRouter:
 
         async def event_generator() -> AsyncIterator[str]:
             with use_runtime_brain(stream_brain_record):
-                last_seq = 0
+                last_seq = _query_stream_after_seq(after_seq, last_event_id)
+                last_heartbeat = time.monotonic()
                 while True:
+                    if await request.is_disconnected():
+                        return
                     events = fetch_search_events(search_id, after_seq=last_seq, limit=200)
                     for event in events:
                         last_seq = int(event.get("seq") or last_seq)
-                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        served_event = annotate_stream_event(dict(event))
+                        yield _sse_search_event_frame(served_event)
                         event_type = str(event.get("event_type") or "")
                         event_payload = dict(event.get("payload") or {})
                         if event_type == "result_ready" and not bool(event_payload.get("final_materialization_pending")):
                             return
-                        if event_type == "search_failed":
+                        if event_type in {"search_cancelled", "search_failed"}:
                             return
+                    if events:
+                        last_heartbeat = time.monotonic()
                     refreshed = fetch_search_session(search_id)
                     if not refreshed:
                         return
-                    if refreshed.get("status") in {"completed", "failed"} and not events:
+                    if refreshed.get("status") in {"blocked", "cancelled", "completed", "failed", "review_required", "superseded"} and not events:
+                        if refreshed.get("status") == "cancelled":
+                            return
                         if refreshed.get("result"):
+                            fallback_result = _completed_search_result(search_id)
                             payload = {
                                 "seq": last_seq + 1,
                                 "event_type": "result_ready",
                                 "payload": {
-                                    "result": _attach_brain_metadata(
-                                        normalize_retrieve_response_payload(dict(refreshed["result"]))
-                                    ),
+                                    "search_id": search_id,
+                                    "brain_id": fallback_result.get("brain_id") or current_brain_id(),
+                                    "result": fallback_result,
+                                    "result_ref": search_result_ref(search_id, fallback_result),
+                                    "snapshot_kind": fallback_result.get("snapshot_kind") or "final",
+                                    "parent_package_revision": fallback_result.get("parent_package_revision"),
+                                    "package_revision": fallback_result.get("package_revision"),
+                                    "snapshot_counters": dict(fallback_result.get("snapshot_counters") or {}),
+                                    "visited_current": fallback_result.get("visited_current", 0),
+                                    "visited_total": fallback_result.get("visited_total", 0),
+                                    "promoted": fallback_result.get("promoted", 0),
+                                    "hydrated": fallback_result.get("hydrated", 0),
+                                    "package": fallback_result.get("package", 0),
                                     "result_materialization_state": "finalized",
                                     "final_materialization_pending": False,
                                     "result_ready_terminal": True,
@@ -378,8 +535,11 @@ def create_core_retrieve_router() -> APIRouter:
                                 "created_at": utc_timestamp(),
                                 "terminal": True,
                             }
-                            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                            yield _sse_search_event_frame(annotate_stream_event(payload))
                         return
+                    if time.monotonic() - last_heartbeat >= 5.0:
+                        yield f": heartbeat search_id={search_id} last_seq={last_seq}\n\n"
+                        last_heartbeat = time.monotonic()
                     await asyncio.sleep(0.35)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -623,7 +783,224 @@ def _attach_tool_brain_metadata(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_search_ai_admission(payload: RetrieveRequest) -> dict[str, Any]:
-    return require_search_ai_admission(payload, fetch_identity_nucleus())
+    identity_nucleus = fetch_identity_nucleus()
+    identity_source = search_identity_nucleus_for_named_targets(payload.query_text, identity_nucleus)
+    timeout_seconds = max(
+        0.1,
+        min(
+            95.0,
+            _search_ai_admission_timeout_seconds(payload.retrieval_mode, payload.query_text)
+            + _planner_seed_transport_guard_seconds()
+            + 0.5,
+        ),
+    )
+    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+    context = copy_context()
+
+    def run_admission() -> None:
+        try:
+            result_queue.put_nowait(
+                (
+                    "ok",
+                    require_search_ai_admission(
+                        payload,
+                        identity_source,
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            result_queue.put_nowait(("error", exc))
+
+    thread = threading.Thread(
+        target=lambda: context.run(run_admission),
+        name="agvm-core-search-ai-admission",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    if thread.is_alive():
+        return {
+            "schema_version": "agvm.search_ai_admission.v2",
+            "status": "blocked",
+            "reason": "blocked_ai_provider_timeout",
+            "provider_error": f"search_ai_admission_lifecycle_timeout:{timeout_seconds:.2f}s",
+            "chargeable": False,
+            "charged_units": 0,
+        }
+    try:
+        status, value = result_queue.get_nowait()
+    except queue.Empty:
+        return {
+            "schema_version": "agvm.search_ai_admission.v2",
+            "status": "blocked",
+            "reason": "blocked_ai_provider_timeout",
+            "provider_error": "search_ai_admission_empty_worker_result",
+            "chargeable": False,
+            "charged_units": 0,
+        }
+    if status == "error":
+        raise value
+    return dict(value or {})
+
+
+def _search_ai_failure_code(provider_error: str | None) -> str:
+    payload = build_search_ai_execution_http_block_payload(provider_error)
+    return str(payload.get("code") or "blocked_ai_provider_error")
+
+
+def _planning_failure_http_payload(exc: SearchAiExecutionError) -> dict[str, Any]:
+    blocked = build_search_ai_execution_http_block_payload(exc.provider_error)
+    search_id = str(getattr(exc, "search_id", "") or "").strip()
+    if not search_id:
+        return blocked
+    result_ref = dict(getattr(exc, "result_ref", {}) or {})
+    result_url = str(result_ref.get("endpoint") or f"/memory/query-result/{search_id}").strip()
+    blocked.update(
+        {
+            "search_id": search_id,
+            "session_created": True,
+            "terminal_result_persisted": True,
+            "terminal_for_client": True,
+            "result_available": True,
+            "result_url": result_url,
+            "result_ref": result_ref or None,
+            "receipt": {
+                "search_id": search_id,
+                "result_ref": result_ref or None,
+                "terminal_state": "failed",
+            },
+        }
+    )
+    blocked["detail"] = {
+        key: value
+        for key, value in blocked.items()
+        if key != "detail"
+    }
+    return blocked
+
+
+def _build_planning_failed_search_result(
+    search_id: str,
+    request: RetrieveRequest,
+    exc: SearchAiExecutionError,
+    *,
+    elapsed_ms: float,
+) -> dict[str, Any]:
+    reason = _search_ai_failure_code(exc.provider_error)
+    provider_error = str(exc.provider_error or reason)
+    human_message = (
+        "Search planning failed because the AI spatial planner returned output that could not be used. "
+        "No heuristic or keyword fallback was run, no context was returned, and no usage was charged. "
+        "Retry the same query to create a fresh plan."
+    )
+    result = build_search_ai_blocked_result(
+        request,
+        {
+            "schema_version": "agvm.search_ai_admission.v2",
+            "status": "blocked",
+            "reason": reason,
+            "provider_error": provider_error,
+            "chargeable": False,
+            "charged_units": 0,
+        },
+        search_id=search_id,
+    )
+    result.update(
+        {
+            "search_id": search_id,
+            "brain_id": current_brain_id(),
+            "status": "failed",
+            "completion_state": "planning_failed",
+            "canonical_search_state": "failed",
+            "stop_reason": reason,
+            "answer_surface_state": "not_ready",
+            "answerability_state": "insufficient",
+            "closure_state": "bounded_partial",
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "terminal_for_client": True,
+            "result_materialization_state": "finalized",
+            "detwin_credits_charged": 0,
+            "timing": {"total_ms": round(float(elapsed_ms), 2), "planning_ms": round(float(elapsed_ms), 2)},
+        }
+    )
+    result["planning_failure"] = {
+        "schema_version": "agvm.search_planning_failure.v1",
+        "state": "planning_failed",
+        "failed_call": exc.call_name,
+        "reason": reason,
+        "provider_error": provider_error,
+        "message": human_message,
+        "heuristic_fallback_used": False,
+        "keyword_fallback_used": False,
+        "new_search_created": False,
+        "charged_units": 0,
+    }
+    result["context_package"] = {
+        "status": "planning_failed",
+        "agent_markdown": human_message,
+        "contract": {
+            "passed": False,
+            "state": "planning_failed",
+            "reason": reason,
+        },
+    }
+    materialization = dict(result.get("context_package_materialization") or {})
+    materialization.update(
+        {
+            "state": "planning_failed",
+            "terminal": True,
+            "terminal_for_mcp_client": True,
+            "contract_passed": False,
+            "final_materialization_pending": False,
+        }
+    )
+    result["context_package_materialization"] = materialization
+    completion = dict(result.get("completion_contract") or {})
+    completion.update(
+        {
+            "state": "failed",
+            "status": "failed",
+            "completion_state": "planning_failed",
+            "canonical_search_state": "failed",
+            "visible_reason": reason,
+            "operator_message": human_message,
+            "result_materialization_state": "planning_failed",
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+        }
+    )
+    result["completion_contract"] = completion
+    result["mcp_delivery_contract"] = {
+        "schema_version": "agvm.mcp_delivery_contract.v1",
+        "search_id": search_id,
+        "brain_id": current_brain_id(),
+        "canonical_search_state": "failed",
+        "client_payload_state": "failed",
+        "completion_state": "planning_failed",
+        "result_materialization_state": "planning_failed",
+        "terminal_for_client": True,
+        "partial_for_client": False,
+        "final_materialization_pending": False,
+        "more_evidence_needed": False,
+        "missing_reasons": [reason],
+        "operator_message": human_message,
+        "result_ref": search_result_ref(search_id, result),
+    }
+    runtime = dict(result.get("planner_runtime") or {})
+    runtime.update(
+        {
+            "planner_path": "ai_planning_failed",
+            "ai_execution_attested": False,
+            "heuristic_fallback_used": False,
+            "keyword_fallback_used": False,
+            "failed_call": exc.call_name,
+            "provider_error": provider_error,
+            "planning_failure_reason": reason,
+        }
+    )
+    result["planner_runtime"] = runtime
+    return _retrieve_response_schema_safe(project_search_result_lifecycle(result, "failed"))
 
 
 def _create_planned_search_session(
@@ -653,13 +1030,55 @@ def _create_planned_search_session(
             "started_at": utc_timestamp(),
         },
     )
-    plan = prepare_runtime_plan(
-        normalized_payload,
-        _runtime_atlas(),
-        fetch_identity_nucleus(),
-        defer_planner_seed=True,
-        ai_admission=ai_admission,
-    )
+    try:
+        plan = prepare_runtime_plan(
+            normalized_payload,
+            _runtime_atlas(),
+            fetch_identity_nucleus(),
+            defer_planner_seed=True,
+            ai_admission=ai_admission,
+        )
+    except SearchAiExecutionError as exc:
+        plan_ms = round((time.perf_counter() - plan_started_at) * 1000.0, 2)
+        reason = _search_ai_failure_code(exc.provider_error)
+        append_search_event(
+            search_id,
+            "planning_failed",
+            {
+                "brain_id": current_brain_id(),
+                "failed_call": exc.call_name,
+                "reason": reason,
+                "provider_error": exc.provider_error,
+                "elapsed_ms": plan_ms,
+                "terminal_result_persisted": True,
+            },
+        )
+        fail_search_session(search_id, str(exc))
+        terminal_result = _build_planning_failed_search_result(
+            search_id,
+            normalized_payload,
+            exc,
+            elapsed_ms=plan_ms,
+        )
+        persisted_terminal_result = finalize_search_session(search_id, terminal_result)
+        exc.search_id = search_id
+        exc.result_ref = search_result_ref(search_id, persisted_terminal_result)
+        append_search_event(
+            search_id,
+            "result_ready",
+            {
+                "brain_id": current_brain_id(),
+                "result": persisted_terminal_result,
+                "result_ref": search_result_ref(search_id, persisted_terminal_result),
+                "canonical_search_state": "failed",
+                "completion_state": "planning_failed",
+                "result_materialization_state": "planning_failed",
+                "final_materialization_pending": False,
+                "result_ready_terminal": True,
+                "terminal_for_client": True,
+            },
+        )
+        raise
     plan_ms = round((time.perf_counter() - plan_started_at) * 1000.0, 2)
     landing_metadata = build_landing_metadata(list(plan.get("probes") or []), list(plan.get("branches") or []))
     search_map_2d_truth = build_search_map_2d_truth(
@@ -844,6 +1263,9 @@ def _run_search_session_sync(
         session = {}
         request_payload = dict(prepared_request)
     query = _normalized_retrieve_request(RetrieveRequest(**request_payload))
+    search_brain_id = str(
+        request_payload.get("brain_id") or query.brain_id or current_brain_id() or ""
+    ).strip() or None
     atlas_payload = _runtime_atlas()
     identity_nucleus = fetch_identity_nucleus()
     plan = (
@@ -897,9 +1319,58 @@ def _run_search_session_sync(
         "worker_started",
         {"search_id": search_id, "brain_id": current_brain_id(), "started_at": utc_timestamp()},
     )
+
+    def append_lifecycle_event(event_type: str, event_payload: Mapping[str, Any] | None) -> None:
+        payload = {
+            **dict(event_payload or {}),
+            "brain_id": search_brain_id,
+        }
+        if search_brain_id and search_brain_id != current_brain_id():
+            # EvidenceJudge, MasterJudge, and final-materialization heartbeats
+            # execute in raw threads created below the router boundary.  Those
+            # threads do not inherit ContextVars, so always re-enter the
+            # request's authoritative brain before touching the Search store.
+            with _brain_request_scope(search_brain_id):
+                append_search_event(search_id, event_type, payload)
+            return
+        append_search_event(search_id, event_type, payload)
+
+    def persist_lifecycle_event(event_type: str, event_payload: dict[str, Any]) -> None:
+        if search_brain_id and search_brain_id != current_brain_id():
+            with _brain_request_scope(search_brain_id):
+                persist_lifecycle_event(
+                    event_type,
+                    {**dict(event_payload or {}), "brain_id": search_brain_id},
+                )
+            return
+        append_lifecycle_event(event_type, event_payload)
+        lifecycle_payload = {
+            **dict(event_payload or {}),
+            "brain_id": search_brain_id,
+        }
+        FINAL_MATERIALIZATION_HEARTBEATS.after_event(
+            search_id,
+            event_type,
+            lifecycle_payload,
+            persist_heartbeat=lambda heartbeat_type, heartbeat_payload: append_lifecycle_event(
+                heartbeat_type,
+                heartbeat_payload,
+            ),
+            persist_diagnostic=lambda diagnostic_type, diagnostic_payload: append_lifecycle_event(
+                diagnostic_type,
+                diagnostic_payload,
+            ),
+        )
+
     try:
         def persist_runtime_event(event_type: str, event_payload: dict[str, Any]) -> None:
-            append_search_event(search_id, event_type, event_payload)
+            if search_brain_id and search_brain_id != current_brain_id():
+                with _brain_request_scope(search_brain_id):
+                    persist_runtime_event(
+                        event_type,
+                        {**dict(event_payload or {}), "brain_id": search_brain_id},
+                    )
+                return
             if event_type == "context_update":
                 snapshot = _mcp_snapshot_from_context_update(
                     search_id=search_id,
@@ -910,8 +1381,10 @@ def _run_search_session_sync(
             elif event_type == "result_snapshot_ready":
                 snapshot = dict(event_payload.get("result_snapshot") or event_payload.get("result") or {})
             else:
+                persist_lifecycle_event(event_type, event_payload)
                 return
             if not snapshot:
+                persist_lifecycle_event(event_type, event_payload)
                 return
             snapshot = _attach_brain_metadata(
                 normalize_retrieve_response_payload({**snapshot, "search_id": search_id})
@@ -920,8 +1393,26 @@ def _run_search_session_sync(
                 snapshot,
                 tool_name=_tool_name_for_session(request_payload, plan),
             )
-            _publish_mcp_first_package(search_id, snapshot)
-            save_search_result_snapshot(search_id, snapshot)
+            persisted = save_search_result_snapshot(search_id, snapshot) or snapshot
+            enriched_event_payload = {
+                **dict(event_payload or {}),
+                "search_id": search_id,
+                "brain_id": persisted.get("brain_id") or current_brain_id(),
+                "snapshot_kind": persisted.get("snapshot_kind"),
+                "parent_package_revision": persisted.get("parent_package_revision"),
+                "package_revision": persisted.get("package_revision"),
+                "snapshot_counters": dict(persisted.get("snapshot_counters") or {}),
+                "visited_current": persisted.get("visited_current", 0),
+                "visited_total": persisted.get("visited_total", 0),
+                "promoted": persisted.get("promoted", 0),
+                "hydrated": persisted.get("hydrated", 0),
+                "package": persisted.get("package", 0),
+                "result_ref": search_result_ref(search_id, persisted),
+            }
+            if event_type == "result_snapshot_ready":
+                enriched_event_payload["result_snapshot"] = persisted
+            persist_lifecycle_event(event_type, enriched_event_payload)
+            _publish_mcp_first_package(search_id, persisted)
 
         result = retrieve_runtime(
             query,
@@ -931,17 +1422,39 @@ def _run_search_session_sync(
             search_id=search_id,
             event_callback=persist_runtime_event,
         )
+        authoritative_runtime_result = dict(result or {})
         result = _attach_brain_metadata(
             normalize_retrieve_response_payload({**dict(result or {}), "search_id": search_id})
         )
         result = _attach_mcp_surface_fields(result, tool_name=_tool_name_for_session(request_payload, plan))
+        # MCP surface construction is a renderer/transport adapter, not a
+        # second sufficiency judge. Reapply the already validated bounded
+        # Master partial from its untouched runtime snapshot so score/DTO
+        # normalization cannot invalidate the ledger digest it judged.
+        result, _ = _apply_plan_first_usable_partial_public_projection(
+            result,
+            master_judgement=dict(
+                authoritative_runtime_result.get("master_judgement") or {}
+            ),
+            plan_first_runtime=dict(
+                dict(authoritative_runtime_result.get("planner_runtime") or {}).get(
+                    "plan_first_runtime"
+                )
+                or {}
+            ),
+            mission_evidence_ledger=dict(
+                authoritative_runtime_result.get("mission_evidence_ledger") or {}
+            ),
+        )
+        result = _retrieve_response_schema_safe(
+            project_search_result_lifecycle(result, str(result.get("status") or "completed"))
+        )
         if prepared_plan is not None or prepared_request is not None:
             # The MCP path starts traversal from the in-memory plan so large-plan
             # serialization cannot delay its first useful context package.
             save_search_plan(search_id, _mcp_plan_storage_snapshot(plan))
-        finalize_search_session(search_id, result)
-        append_search_event(
-            search_id,
+        result = finalize_search_session(search_id, result)
+        persist_lifecycle_event(
             "result_ready",
             {
                 "search_id": search_id,
@@ -954,11 +1467,16 @@ def _run_search_session_sync(
         )
         return result
     except Exception as exc:  # noqa: BLE001
-        append_search_event(search_id, "search_failed", {"brain_id": current_brain_id(), "error": str(exc)})
+        persist_lifecycle_event(
+            "search_failed",
+            {"brain_id": current_brain_id(), "error": str(exc)},
+        )
         fail_search_session(search_id, str(exc))
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        FINAL_MATERIALIZATION_HEARTBEATS.stop(search_id)
 
 
 def _mcp_snapshot_from_context_update(
@@ -1174,6 +1692,227 @@ def _start_search_thread(
         thread.start()
 
 
+def _search_session_status(search_id: str) -> str:
+    try:
+        session = fetch_search_session(search_id, busy_timeout_ms=45, return_on_busy=True) or {}
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(session.get("status") or "").strip().lower()
+
+
+def _prepare_accepted_search_plan(
+    search_id: str,
+    payload: RetrieveRequest,
+    *,
+    ai_admission: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    plan_started_at = time.perf_counter()
+    try:
+        plan = prepare_runtime_plan(
+            payload,
+            _runtime_atlas(),
+            fetch_identity_nucleus(),
+            defer_planner_seed=True,
+            ai_admission=ai_admission,
+        )
+    except SearchAiExecutionError as exc:
+        plan_ms = round((time.perf_counter() - plan_started_at) * 1000.0, 2)
+        reason = _search_ai_failure_code(exc.provider_error)
+        append_search_event(
+            search_id,
+            "planning_failed",
+            {
+                "brain_id": current_brain_id(),
+                "failed_call": exc.call_name,
+                "reason": reason,
+                "provider_error": exc.provider_error,
+                "elapsed_ms": plan_ms,
+                "terminal_result_persisted": True,
+                "plan_transport": "early_search_identity_background_plan",
+            },
+        )
+        fail_search_session(search_id, str(exc))
+        terminal_result = _build_planning_failed_search_result(
+            search_id,
+            payload,
+            exc,
+            elapsed_ms=plan_ms,
+        )
+        persisted_terminal_result = finalize_search_session(search_id, terminal_result)
+        exc.search_id = search_id
+        exc.result_ref = search_result_ref(search_id, persisted_terminal_result)
+        append_search_event(
+            search_id,
+            "result_ready",
+            {
+                "brain_id": current_brain_id(),
+                "result": persisted_terminal_result,
+                "result_ref": search_result_ref(search_id, persisted_terminal_result),
+                "canonical_search_state": "failed",
+                "completion_state": "planning_failed",
+                "result_materialization_state": "planning_failed",
+                "final_materialization_pending": False,
+                "result_ready_terminal": True,
+                "terminal_for_client": True,
+                "plan_transport": "early_search_identity_background_plan",
+            },
+        )
+        raise
+    if _search_session_status(search_id) == "cancelled":
+        return {}
+    plan_ms = round((time.perf_counter() - plan_started_at) * 1000.0, 2)
+    landing_metadata = build_landing_metadata(list(plan.get("probes") or []), list(plan.get("branches") or []))
+    search_map_2d_truth = build_search_map_2d_truth(
+        search_id=search_id,
+        thread_id=payload.thread_id,
+        probes=list(plan.get("probes") or []),
+        branches=list(plan.get("branches") or []),
+        landing_metadata=landing_metadata,
+        route_truth_summary={},
+        phase="planning",
+    )
+    map_stream_state = {
+        "schema_version": "agvm.search_map_progressive_stream.v1",
+        "phase": "planning",
+        "landing_count": int((search_map_2d_truth.get("metrics") or {}).get("landing_count") or 0),
+        "route_plan_count": int((search_map_2d_truth.get("metrics") or {}).get("route_plan_count") or 0),
+        "route_step_count": int((search_map_2d_truth.get("metrics") or {}).get("route_step_count") or 0),
+        "travel_step_count": int((search_map_2d_truth.get("metrics") or {}).get("travel_event_count") or 0),
+        "route_segment_count": int((search_map_2d_truth.get("metrics") or {}).get("route_segment_count") or 0),
+        "ai_material_contribution": False,
+        "terminal_frozen": False,
+    }
+    plan["landing_metadata"] = landing_metadata
+    plan["route_truth_summary"] = {}
+    plan["search_map_2d_truth"] = search_map_2d_truth
+    plan["map_stream_state"] = map_stream_state
+    plan["brain_id"] = current_brain_id()
+    plan["planner_runtime"] = {
+        **dict(plan.get("planner_runtime") or {}),
+        "brain_id": current_brain_id(),
+        "plan_ms": plan_ms,
+        "landing_metadata_count": len(landing_metadata),
+        "route_truth_summary": {},
+        "search_map_2d_truth": search_map_2d_truth,
+        "map_stream_state": map_stream_state,
+        "core_retrieve_router": True,
+        "plan_transport": "early_search_identity_background_plan",
+    }
+    save_search_plan(search_id, plan)
+    append_search_event(
+        search_id,
+        "planning_complete",
+        {
+            "search_id": search_id,
+            "thread_id": payload.thread_id,
+            "brain_id": current_brain_id(),
+            "query_text": payload.query_text,
+            "retrieval_mode": _retrieval_mode_from_plan(plan, payload),
+            "planner_mode": plan.get("planner_mode"),
+            "decomposition_mode": plan.get("decomposition_mode"),
+            "semantic_contract": dict(plan.get("semantic_contract") or {}),
+            "semantic_contract_runtime": dict(plan.get("semantic_contract_runtime") or {}),
+            "planner_runtime": dict(plan.get("planner_runtime") or {}),
+            "probes": list(plan.get("probes") or []),
+            "branches": list(plan.get("branches") or []),
+            "landing_metadata": landing_metadata,
+            "route_truth_summary": {},
+            "search_map_2d_truth": search_map_2d_truth,
+            "map_stream_state": map_stream_state,
+            "plan_transport": "early_search_identity_background_plan",
+        },
+    )
+    return plan
+
+
+def _start_accepted_search_pipeline(
+    search_id: str,
+    brain_record: dict[str, Any],
+    *,
+    ai_admission: dict[str, Any] | None = None,
+) -> None:
+    with _SEARCH_THREAD_LOCK:
+        for existing_search_id, existing_thread in list(_SEARCH_THREADS.items()):
+            if not existing_thread.is_alive():
+                _SEARCH_THREADS.pop(existing_search_id, None)
+        existing = _SEARCH_THREADS.get(search_id)
+        if existing and existing.is_alive():
+            return
+
+        def worker() -> None:
+            try:
+                with use_runtime_brain(brain_record):
+                    session = fetch_search_session(search_id)
+                    if not session:
+                        return
+                    request_payload = dict(session.get("request") or {})
+                    request = _normalized_retrieve_request(RetrieveRequest(**request_payload))
+                    admission = ai_admission or _public_search_ai_admission(request)
+                    if str(admission.get("status") or "") != "admitted":
+                        result = _attach_brain_metadata(
+                            normalize_retrieve_response_payload(
+                                build_search_ai_blocked_result(request, admission, search_id=search_id)
+                            )
+                        )
+                        result = _attach_mcp_surface_fields(
+                            result,
+                            tool_name=_tool_name_for_session(request_payload, {}),
+                        )
+                        final_result = finalize_search_session(search_id, result)
+                        append_search_event(
+                            search_id,
+                            "search_failed",
+                            {
+                                "brain_id": current_brain_id(),
+                                "error": str(admission.get("reason") or "search_ai_admission_missing"),
+                                "charged_units": 0,
+                            },
+                        )
+                        append_search_event(
+                            search_id,
+                            "result_ready",
+                            {
+                                "search_id": search_id,
+                                "brain_id": current_brain_id(),
+                                "result": final_result,
+                                "result_ref": search_result_ref(search_id, final_result),
+                                "canonical_search_state": "failed",
+                                "completion_state": "planning_failed",
+                                "result_materialization_state": "planning_failed",
+                                "final_materialization_pending": False,
+                                "result_ready_terminal": True,
+                                "terminal_for_client": True,
+                            },
+                        )
+                        return
+                    plan = _prepare_accepted_search_plan(search_id, request, ai_admission=admission)
+                    if not plan or _search_session_status(search_id) == "cancelled":
+                        return
+                    _run_search_session_sync(
+                        search_id,
+                        prepared_plan=plan,
+                        prepared_request=_serialize_retrieve_request(request),
+                    )
+            except SearchAiExecutionError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                append_search_event(
+                    search_id,
+                    "search_failed",
+                    {"brain_id": current_brain_id(), "error": str(exc)},
+                )
+                fail_search_session(search_id, str(exc))
+            finally:
+                with _SEARCH_THREAD_LOCK:
+                    current = _SEARCH_THREADS.get(search_id)
+                    if current is threading.current_thread() or (current and not current.is_alive()):
+                        _SEARCH_THREADS.pop(search_id, None)
+
+        thread = threading.Thread(target=worker, name=f"agvm-core-query-accepted-{search_id}", daemon=True)
+        _SEARCH_THREADS[search_id] = thread
+        thread.start()
+
+
 def _mcp_retrieve_request(tool_name: str, payload: McpRetrievalToolRequest) -> RetrieveRequest:
     query_text = payload.query_text
     if tool_name == "retrieve_document":
@@ -1223,7 +1962,11 @@ def _mcp_retrieve_request(tool_name: str, payload: McpRetrievalToolRequest) -> R
     )
 
 
-def _create_unplanned_search_session(payload: RetrieveRequest) -> str:
+def _create_unplanned_search_session(
+    payload: RetrieveRequest,
+    *,
+    plan_transport: str = "background_after_index_first_package",
+) -> str:
     normalized_payload = _normalized_retrieve_request(payload)
     search_id = str(uuid.uuid4())
     request_payload = _serialize_retrieve_request(normalized_payload)
@@ -1242,7 +1985,7 @@ def _create_unplanned_search_session(payload: RetrieveRequest) -> str:
             "thread_id": normalized_payload.thread_id,
             "brain_id": current_brain_id(),
             "started_at": utc_timestamp(),
-            "plan_transport": "background_after_index_first_package",
+            "plan_transport": plan_transport,
         },
     )
     return search_id
@@ -1351,8 +2094,6 @@ def _mcp_index_first_package(
             for value in (
                 node.get("raw_text"),
                 summary,
-                node.get("memory_type"),
-                node.get("guide_area"),
                 node.get("source_unit_title"),
                 dict(node.get("provenance") or {}).get("source_label"),
             )
@@ -1452,6 +2193,23 @@ def _mcp_index_first_package(
 def _run_mcp_retrieval_tool(tool_name: str, payload: McpRetrievalToolRequest) -> McpToolExecutionResponse:
     with _brain_request_scope(_payload_brain_id(payload), require_retrieval_ready=True) as brain_record:
         request = _mcp_retrieve_request(tool_name, payload)
+        if tool_name == "retrieve_document" and (
+            payload.include_raw_text or payload.document_text_policy in {"top_raw", "all_raw"}
+        ):
+            direct_response = _core_direct_document_response(payload=payload, request=request)
+            if direct_response is not None:
+                direct_payload = _model_dump(direct_response)
+                direct_payload["semantic_contract_runtime"] = {
+                    **dict(direct_payload.get("semantic_contract_runtime") or {}),
+                    "schema_version": "agvm.semantic_contract_runtime.v2",
+                    "status": "completed",
+                    "source": "direct_document_lookup",
+                    "material": True,
+                    "ai_required": False,
+                    "provider_state": "not_required",
+                    "fallback_used": False,
+                }
+                return McpToolExecutionResponse(**direct_payload)
         admission = _public_search_ai_admission(request)
         if str(admission.get("status") or "") != "admitted":
             result = _attach_brain_metadata(
@@ -1637,6 +2395,9 @@ def _core_direct_document_candidate(
         nodes = fetch_nodes_by_ids([document_id], include_raw_text=True)
         if nodes:
             return dict(nodes[0] or {}), []
+        preview_node = preview_document_node(document_id)
+        if preview_node:
+            return preview_node, []
 
     terms = _core_direct_document_terms(payload, request)
     if not terms:
@@ -1673,12 +2434,28 @@ def _core_document_packet(node: dict[str, Any]) -> dict[str, Any]:
     title = str(node.get("summary") or provenance.get("source_label") or node_id or "Document").strip()
     source_label = str(provenance.get("source_label") or node.get("source_label") or title).strip()
     source_type = str(provenance.get("source_type") or node.get("source_type") or "document").strip()
+    source_uri = str(provenance.get("source_uri") or node.get("source_uri") or "").strip() or None
+    content_hash = (
+        str(
+            provenance.get("content_hash")
+            or provenance.get("content_digest")
+            or provenance.get("source_hash")
+            or provenance.get("source_ref_id")
+            or node.get("content_hash")
+            or node.get("content_digest")
+            or node.get("source_hash")
+            or ""
+        ).strip()
+        or None
+    )
     raw_text_truncated = len(full_raw_text) > len(raw_text)
     return {
         "anchor_node_id": node_id,
         "title": title,
         "source_label": source_label,
         "source_type": source_type,
+        "source_uri": source_uri,
+        "content_hash": content_hash,
         "source_trust": node.get("source_trust") or "user_asserted",
         "claim_status": node.get("claim_status") or "fact",
         "answer_eligible": bool(node.get("answer_eligible", True)),
@@ -1717,7 +2494,8 @@ def _core_document_packet(node: dict[str, Any]) -> dict[str, Any]:
                 "text_char_count": len(full_raw_text) if full_raw_text else len(title),
                 "text_included_char_count": len(raw_text or title),
                 "text_truncated": raw_text_truncated,
-                "source_uri": provenance.get("source_uri"),
+                "source_uri": source_uri,
+                "content_hash": content_hash,
             }
         ],
         "project_tags": [],
@@ -1860,7 +2638,11 @@ def _completed_search_result(search_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="search_not_completed")
     request_payload = dict(session.get("request") or {})
     result = _attach_brain_metadata(normalize_retrieve_response_payload(dict(session.get("result") or {})))
-    return _attach_mcp_surface_fields(result, tool_name=_tool_name_for_session(request_payload, dict(session.get("plan") or {})))
+    result = _attach_mcp_surface_fields(
+        result,
+        tool_name=_tool_name_for_session(request_payload, dict(session.get("plan") or {})),
+    )
+    return _retrieve_response_schema_safe(project_search_result_lifecycle(result, str(session.get("status") or "")))
 
 
 def _tool_name_for_session(request_payload: dict[str, Any], plan: dict[str, Any]) -> str:
@@ -1873,6 +2655,150 @@ def _tool_name_for_session(request_payload: dict[str, Any], plan: dict[str, Any]
     if context_mode == "forensic_trace" and bool(request_payload.get("complete_paths")):
         return "retrieve_path_corridor"
     return "retrieve_context"
+
+
+def _master_final_seal_is_authoritative(result: Mapping[str, Any] | None) -> bool:
+    payload = dict(result or {})
+    master = dict(
+        payload.get("master_judgement")
+        or dict(payload.get("context_package") or {}).get("master_judgement")
+        or dict(payload.get("planner_runtime") or {}).get("master_judgement")
+        or {}
+    )
+    return bool(
+        str(payload.get("status") or "").strip().lower() == "completed"
+        and str(payload.get("canonical_search_state") or "").strip().lower() == "completed"
+        and bool(payload.get("terminal_for_client"))
+        and bool(payload.get("result_ready_terminal"))
+        and not bool(payload.get("final_materialization_pending"))
+        and bool(payload.get("final_closure_ready"))
+        and str(payload.get("closure_state") or "").strip() == "final_sealed"
+        and str(payload.get("answer_surface_state") or "").strip() == "final_sealed"
+        and str(master.get("master_state") or "").strip() == "terminal"
+        and bool(master.get("final_seal_allowed"))
+        and not bool(master.get("review_required"))
+        and not list(master.get("missing_goals") or [])
+        and not list(master.get("unresolved_goals") or [])
+        and not list(master.get("partial_goals") or [])
+    )
+
+
+def _master_grounded_answer_for_final_surface(payload: Mapping[str, Any]) -> dict[str, Any]:
+    master = dict(
+        payload.get("master_judgement")
+        or dict(payload.get("context_package") or {}).get("master_judgement")
+        or dict(payload.get("planner_runtime") or {}).get("master_judgement")
+        or {}
+    )
+    sufficiency = dict(master.get("sufficiency_judge") or {})
+    decision = dict(sufficiency.get("ai_master_decision") or master.get("ai_master_decision") or {})
+    grounded = dict(decision.get("grounded_answer") or {})
+    answer_text = str(grounded.get("answer_text") or "").strip()
+    if not answer_text or not _master_final_seal_is_authoritative(payload):
+        return {}
+    evidence_ids = [
+        str(item).strip()
+        for item in list(
+            grounded.get("evidence_node_ids")
+            or grounded.get("supporting_evidence_node_ids")
+            or grounded.get("support_ids")
+            or []
+        )
+        if str(item).strip()
+    ]
+    snippets = [
+        dict(item)
+        for item in list(grounded.get("evidence_snippets") or [])
+        if isinstance(item, Mapping)
+    ]
+    try:
+        confidence = max(0.0, min(1.0, float(grounded.get("confidence") or 0.95)))
+    except (TypeError, ValueError):
+        confidence = 0.95
+    try:
+        support_node_count = max(0, int(grounded.get("support_node_count") or len(evidence_ids)))
+    except (TypeError, ValueError):
+        support_node_count = len(evidence_ids)
+    try:
+        support_slot_count = max(0, int(grounded.get("support_slot_count") or len(evidence_ids) or 1))
+    except (TypeError, ValueError):
+        support_slot_count = len(evidence_ids) or 1
+    answerability_state = str(grounded.get("answerability_state") or payload.get("answerability_state") or "grounded").strip()
+    if answerability_state not in {"grounded", "partial", "insufficient", "ai_pending"}:
+        answerability_state = "grounded"
+    mode = str(grounded.get("mode") or "llm").strip()
+    if mode not in {
+        "llm",
+        "heuristic",
+        "insufficient",
+        "partial_known_insufficient",
+        "grounded_facts",
+        "document_packet",
+        "document_lookup_guard",
+        "human_synthesizer",
+        "contract_human_synthesis",
+    }:
+        mode = "llm"
+    semantic_authority = dict(
+        grounded.get("semantic_authority")
+        or master.get("semantic_authority")
+        or {
+            "mode": "ai_v2",
+            "source": "master_judgement",
+            "fallback_used": False,
+        }
+    )
+    return {
+        "answer_text": answer_text,
+        "mode": mode,
+        "confidence": confidence,
+        "evidence_node_ids": evidence_ids,
+        "reasoning_summary": str(
+            grounded.get("reasoning_summary")
+            or decision.get("reasoning_summary")
+            or "Master-attested grounded answer materialized from the final seal."
+        ),
+        "insufficient": False,
+        "answerability_state": answerability_state,
+        "evidence_snippets": snippets,
+        "support_node_count": support_node_count,
+        "support_slot_count": support_slot_count,
+        "semantic_authority": semantic_authority,
+    }
+
+
+def _materialize_master_grounded_answer_surface(payload: dict[str, Any]) -> dict[str, Any]:
+    safe = dict(payload or {})
+    existing_answer = safe.get("answer")
+    existing_text = ""
+    if isinstance(existing_answer, Mapping):
+        existing_text = str(existing_answer.get("answer_text") or "").strip()
+    if existing_text and str(safe.get("answer_short") or "").strip() and str(safe.get("answer_full") or "").strip():
+        return safe
+    grounded_answer = _master_grounded_answer_for_final_surface(safe)
+    if not grounded_answer:
+        return safe
+    answer_text = str(grounded_answer.get("answer_text") or "").strip()
+    if not existing_text:
+        safe["answer"] = grounded_answer
+    if not str(safe.get("answer_short") or "").strip():
+        safe["answer_short"] = answer_text
+    if not str(safe.get("answer_full") or "").strip():
+        safe["answer_full"] = answer_text
+    materialization = dict(safe.get("answer_demo_materialization") or {})
+    materialization.update(
+        {
+            "schema_version": "agvm.answer_demo_materialization.v1",
+            "state": "ready",
+            "reason": "master_grounded_answer_materialized",
+            "source": "master_judgement.sufficiency_judge.ai_master_decision.grounded_answer",
+            "blocked_by_ai_materialization_hard_gate": False,
+            "context_package_is_source_of_truth": True,
+            "primary_context_package_preserved": True,
+        }
+    )
+    safe["answer_demo_materialization"] = materialization
+    return safe
 
 
 def _retrieve_response_schema_safe(result: dict[str, Any]) -> dict[str, Any]:
@@ -1908,7 +2834,7 @@ def _retrieve_response_schema_safe(result: dict[str, Any]) -> dict[str, Any]:
     if state and state not in allowed_states:
         safe["answerability_state"] = "grounded" if state in {"ready", "finalized"} else "partial"
     safe["brain_id"] = current_brain_id() or safe.get("brain_id")
-    return safe
+    return _materialize_master_grounded_answer_surface(safe)
 
 
 def _run_ledger_entry_from_session(session: dict[str, Any]) -> dict[str, Any]:

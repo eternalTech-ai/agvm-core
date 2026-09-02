@@ -103,6 +103,32 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
                     pass
 
 
+def write_imported_bootstrap_lifecycle_marker(
+    *,
+    registry_brain_path: Path,
+    brain_id: str,
+    session_id: str,
+    source: str,
+    revision: int = 0,
+    overwrite: bool = False,
+) -> None:
+    marker_path = registry_brain_path / "brain_bootstrap_v1" / "import_lifecycle.json"
+    if marker_path.exists() and not overwrite:
+        return
+    _atomic_write_json(
+        marker_path,
+        {
+            "schema_version": IMPORTED_BOOTSTRAP_LIFECYCLE_SCHEMA_VERSION,
+            "lifecycle_state": "applied",
+            "brain_id": brain_id,
+            "session_id": session_id,
+            "revision": int(revision),
+            "source": source,
+            "recorded_at": utc_timestamp(),
+        },
+    )
+
+
 def _safe_id(value: str) -> str:
     value = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(value or "").strip().lower()).strip("_")
     return value or "brain"
@@ -321,16 +347,11 @@ def _ensure_nonempty_import_bootstrap_lifecycle(
     marker_path = registry_brain_path / "brain_bootstrap_v1" / "import_lifecycle.json"
     if bootstrap or bootstrap_error or marker_path.exists():
         return
-    _atomic_write_json(
-        marker_path,
-        {
-            "schema_version": IMPORTED_BOOTSTRAP_LIFECYCLE_SCHEMA_VERSION,
-            "lifecycle_state": "applied",
-            "session_id": f"archive-import:{brain_id}",
-            "revision": 0,
-            "source": "nonempty_archive_import",
-            "recorded_at": utc_timestamp(),
-        },
+    write_imported_bootstrap_lifecycle_marker(
+        registry_brain_path=registry_brain_path,
+        brain_id=brain_id,
+        session_id=f"archive-import:{brain_id}",
+        source="nonempty_archive_import",
     )
 
 

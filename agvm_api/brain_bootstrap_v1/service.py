@@ -12,15 +12,28 @@ import re
 import unicodedata
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
 from ai_modules_v2 import AiModuleContractError, validate_ai_execution_attestation
 from brain_registry import BrainRegistryError, brain_root_path, refresh_local_brain_record, resolve_brain_scope
 from derivation import _source_grounding_assessment, persist_selection, preview_bundle, resolve_persist_selection
+from llm import llm_provider_concurrency_limit
 from retrieval import build_index
 from runtime_scope import use_runtime_brain
+from source_security import (
+    SourceIntakeSecurityError,
+    open_public_source_request,
+    read_response_bounded,
+    sanitize_source_uri_for_persistence,
+    validate_public_source_url,
+)
 from sqlite_store import bootstrap_runtime_store, fetch_atlas, fetch_graph_snapshot, replace_runtime_graph
 
 from .contracts import (
@@ -37,6 +50,8 @@ MAX_ANSWERS = 128
 MAX_SOURCES = 32
 MAX_ANSWER_CHARS = 16_000
 MAX_SOURCE_CHARS = 100_000
+MAX_BOOTSTRAP_WEB_RESPONSE_BYTES = 2_000_000
+BOOTSTRAP_WEB_TIMEOUT_SECONDS = 12.0
 GUIDED_SEED_QUALITY_POLICY = "guided_seed_v1"
 GUIDED_SEED_MIN_CANDIDATES = 12
 GUIDED_SEED_TARGET_CANDIDATES = 24
@@ -49,6 +64,9 @@ ADAPTIVE_INTERVIEW_MAX_QUESTIONS = 16
 SEED_CANDIDATE_MIN_LEXICAL_UNITS = 8
 SEED_CANDIDATE_MIN_ALNUM_CHARS = 36
 SEED_CANDIDATE_MAX_LEXICAL_UNITS = 80
+BOOTSTRAP_TEMPORAL_SCOPE_SCHEMA_VERSION = "agvm.brain_bootstrap_v1.temporal_scope.v1"
+BOOTSTRAP_SOURCE_UNIT_SCHEMA_VERSION = "agvm.brain_bootstrap_v1.source_unit.v1"
+_BOOTSTRAP_SEMANTIC_TIME_FIELDS = ("observed_at", "valid_from", "valid_to")
 
 
 class BootstrapV1Error(RuntimeError):
@@ -69,6 +87,7 @@ class BrainBootstrapV1Service:
         mutation_probe: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
         question_generator: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
         registry_committer: Callable[[dict[str, Any], dict[str, Any], Path], dict[str, Any]] | None = None,
+        source_resolver: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self._brain_resolver = brain_resolver
         self._brain_root_resolver = brain_root_resolver
@@ -77,6 +96,7 @@ class BrainBootstrapV1Service:
         self._mutation_probe = mutation_probe or _probe_manual_grow_mutation
         self._question_generator = question_generator or _generate_adaptive_interview
         self._registry_committer = registry_committer or _commit_bootstrap_registry
+        self._source_resolver = source_resolver or _resolve_bootstrap_source_uri
 
     def execute(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         if operation not in OPERATIONS:
@@ -346,15 +366,58 @@ class BrainBootstrapV1Service:
             raise BootstrapV1Error("bootstrap_source_text_or_uri_required", status_code=422)
         if len(source_text) > MAX_SOURCE_CHARS:
             raise BootstrapV1Error("bootstrap_source_text_too_large", status_code=422)
+        resolved_source: dict[str, Any] = {}
+        if source_uri and not source_text:
+            resolved_source = self._source_resolver(source_uri)
+            source_text = str(resolved_source.get("source_text") or "").strip()
+            source_uri = str(resolved_source.get("source_uri") or source_uri).strip()
+            if not source_text:
+                raise BootstrapV1Error("bootstrap_source_fetch_returned_no_text", status_code=422)
+        recorded_at = _utc_now()
+        raw_text = source_text[:MAX_SOURCE_CHARS]
+        published_at = _optional_bootstrap_chronology_value(
+            payload.get("published_at") or resolved_source.get("published_at")
+        )
+        acquired_at = _optional_bootstrap_chronology_value(
+            payload.get("acquired_at") or resolved_source.get("acquired_at")
+        )
+        retrieved_at = _optional_bootstrap_chronology_value(
+            payload.get("retrieved_at") or resolved_source.get("retrieved_at")
+        )
         sources.append(
             {
                 "source_id": str(payload.get("source_id") or f"source-{len(sources) + 1}"),
-                "label": str(payload.get("source_label") or source_uri or f"Source {len(sources) + 1}")[:1_000],
-                "kind": str(payload.get("source_kind") or ("url_reference" if source_uri else "manual_text")),
-                "source_text": source_text,
+                "label": str(
+                    payload.get("source_label")
+                    or resolved_source.get("title")
+                    or source_uri
+                    or f"Source {len(sources) + 1}"
+                )[:1_000],
+                "kind": str(
+                    payload.get("source_kind")
+                    or resolved_source.get("source_kind")
+                    or ("website" if source_uri else "manual_text")
+                ),
+                # Keep the legacy key for stored-session compatibility while making
+                # the canonical source-unit text explicit for compiler/provenance use.
+                "source_text": raw_text,
+                "raw_text": raw_text,
                 "source_uri": source_uri or None,
-                "trust": str(payload.get("source_trust") or "user_asserted"),
-                "recorded_at": _utc_now(),
+                "trust": str(payload.get("source_trust") or ("verified_public" if source_uri else "user_asserted")),
+                "extraction": dict(resolved_source.get("extraction") or {}),
+                "chronology": {
+                    key: value
+                    for key, value in {
+                        "published_at": published_at,
+                        "acquired_at": acquired_at,
+                        "retrieved_at": retrieved_at,
+                    }.items()
+                    if value is not None
+                },
+                "published_at": published_at,
+                "acquired_at": acquired_at,
+                "retrieved_at": retrieved_at,
+                "recorded_at": recorded_at,
             }
         )
         updated = copy.deepcopy(current)
@@ -372,7 +435,10 @@ class BrainBootstrapV1Service:
         key: str,
         digest: str,
     ) -> dict[str, Any]:
-        preview = self._preview_builder(current, brain_record)
+        preview = _bind_bootstrap_preview_temporal_authority(
+            self._preview_builder(current, brain_record),
+            current,
+        )
         if not list(preview.get("selected_preview_ids") or []):
             raise BootstrapV1Error("bootstrap_preview_has_no_reviewable_candidates", status_code=409)
         updated = copy.deepcopy(current)
@@ -784,6 +850,7 @@ def _build_manual_grow_preview(session: dict[str, Any], brain_record: dict[str, 
                 source_trust="user_asserted",
                 learning_mode="strict_review",
                 source_purpose="bootstrap_seed",
+                source_context=_bootstrap_compiler_source_context(session),
             )
     screening: dict[str, Any] | None = None
     if str(session.get("quality_policy") or "") == GUIDED_SEED_QUALITY_POLICY:
@@ -811,9 +878,11 @@ def _build_guided_seed_bundle(
     atlas: dict[str, Any],
     requirements: dict[str, int],
 ) -> dict[str, Any]:
-    statements = _reviewed_atomic_seed_statements(session)
-    candidates: list[dict[str, Any]] = []
-    for position, statement in enumerate(statements[: requirements["maximum_candidate_count"]], start=1):
+    statement_rows = _reviewed_atomic_seed_rows(session)[: requirements["maximum_candidate_count"]]
+
+    def compile_statement(position: int, statement_row: dict[str, Any]) -> dict[str, Any] | None:
+        statement = str(statement_row["statement"])
+        source_unit = dict(statement_row["source_unit"])
         atom_bundle = preview_bundle(
             statement,
             "text",
@@ -827,6 +896,7 @@ def _build_guided_seed_bundle(
             source_purpose="bootstrap_seed",
             operator_instruction="Preserve this reviewed atomic memory exactly; do not expand or invent content.",
             source_context={
+                **_bootstrap_compiler_source_context(session, source_units=[source_unit]),
                 "bootstrap_quality_policy": GUIDED_SEED_QUALITY_POLICY,
                 "candidate_target": requirements["target_candidate_count"],
                 "candidate_maximum": requirements["maximum_candidate_count"],
@@ -835,7 +905,7 @@ def _build_guided_seed_bundle(
         )
         candidate = dict(atom_bundle.get("primary_node_preview") or {})
         if not candidate:
-            continue
+            return None
         preview_id = f"bootstrap_seed_{position:03d}"
         candidate.update(
             {
@@ -849,6 +919,9 @@ def _build_guided_seed_bundle(
                 "source_label": "Brain Bootstrap V1 reviewed material",
                 "source_type": "manual_bootstrap",
                 "source_trust": "user_asserted",
+                "source_unit_id": str(source_unit.get("source_id") or "") or None,
+                "source_span_start": statement_row.get("source_span_start"),
+                "source_span_end": statement_row.get("source_span_end"),
             }
         )
         candidate.pop("summary_full", None)
@@ -862,7 +935,22 @@ def _build_guided_seed_bundle(
             }
         )
         candidate["provenance"] = provenance
-        candidates.append(candidate)
+        return candidate
+
+    worker_count = min(len(statement_rows), max(1, llm_provider_concurrency_limit()))
+    if worker_count <= 1:
+        compiled_candidates = [
+            compile_statement(position, statement_row)
+            for position, statement_row in enumerate(statement_rows, start=1)
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="bootstrap-seed") as executor:
+            futures = [
+                executor.submit(copy_context().run, compile_statement, position, statement_row)
+                for position, statement_row in enumerate(statement_rows, start=1)
+            ]
+            compiled_candidates = [future.result() for future in futures]
+    candidates = [candidate for candidate in compiled_candidates if candidate]
     return {
         "schema_version": "agvm.preview_bundle.v1",
         "input_mode": "text",
@@ -883,28 +971,180 @@ def _build_guided_seed_bundle(
     }
 
 
-def _reviewed_atomic_seed_statements(session: dict[str, Any]) -> list[str]:
-    source_chunks = [
-        str(item.get("source_text") or "").strip()
-        for item in list(session.get("sources") or [])
-        if isinstance(item, dict) and str(item.get("source_text") or "").strip()
-    ]
-    answer_chunks = [
-        str(item.get("answer") or "").strip()
-        for item in list(session.get("answers") or [])
-        if isinstance(item, dict) and str(item.get("answer") or "").strip()
-    ]
-    raw_candidates: list[str] = []
-    for chunk in [*source_chunks, *answer_chunks]:
-        raw_candidates.extend(
-            part.strip()
-            for part in re.split(r"(?<=[.!?\u3002\uff01\uff1f])\s+|[\r\n]+", chunk)
-            if part.strip()
+class _BootstrapHtmlTextExtractor(HTMLParser):
+    """Small public-Core HTML reader for first-brain foundation URLs."""
+
+    _SKIPPED_TAGS = {"script", "style", "noscript", "svg", "template"}
+    _BLOCK_TAGS = {
+        "article",
+        "blockquote",
+        "br",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "main",
+        "p",
+        "section",
+        "td",
+        "th",
+        "title",
+        "tr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._inside_title = False
+        self._text_parts: list[str] = []
+        self._title_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
+        clean_tag = tag.lower()
+        if clean_tag in self._SKIPPED_TAGS:
+            self._skip_depth += 1
+        elif clean_tag == "title":
+            self._inside_title = True
+        if not self._skip_depth and clean_tag in self._BLOCK_TAGS:
+            self._text_parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        clean_tag = tag.lower()
+        if clean_tag in self._SKIPPED_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if clean_tag == "title":
+            self._inside_title = False
+        if not self._skip_depth and clean_tag in self._BLOCK_TAGS:
+            self._text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        clean = " ".join(str(data or "").split()).strip()
+        if not clean:
+            return
+        self._text_parts.append(clean)
+        if self._inside_title:
+            self._title_parts.append(clean)
+
+    def result(self) -> tuple[str, str]:
+        lines = []
+        for line in " ".join(self._text_parts).splitlines():
+            clean = " ".join(line.split()).strip()
+            if clean and (not lines or clean != lines[-1]):
+                lines.append(clean)
+        return "\n".join(lines), " ".join(self._title_parts).strip()
+
+
+def _resolve_bootstrap_source_uri(source_uri: str) -> dict[str, Any]:
+    """Fetch one reviewed public foundation URL without depending on Grow."""
+
+    try:
+        validated_url = validate_public_source_url(source_uri)
+        request = Request(
+            validated_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
+                "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+                "User-Agent": "Mozilla/5.0 (compatible; AGVM-BrainBootstrap/1.0; +https://agvm.local)",
+            },
         )
-    statements: list[str] = []
+        with open_public_source_request(request, timeout_seconds=BOOTSTRAP_WEB_TIMEOUT_SECONDS) as response:
+            body, truncated = read_response_bounded(
+                response,
+                max_bytes=MAX_BOOTSTRAP_WEB_RESPONSE_BYTES,
+            )
+            retrieved_at = _utc_now()
+            content_type = str(response.headers.get("content-type") or "").lower()
+            charset = response.headers.get_content_charset() or "utf-8"
+            final_url = str(response.geturl() or validated_url)
+    except SourceIntakeSecurityError as exc:
+        raise BootstrapV1Error(exc.code, status_code=422) from exc
+    except (HTTPError, URLError, OSError, TimeoutError) as exc:
+        raise BootstrapV1Error("bootstrap_source_fetch_failed", status_code=422) from exc
+
+    if not any(kind in content_type for kind in ("html", "text/plain", "xhtml")):
+        raise BootstrapV1Error("bootstrap_source_content_type_unsupported", status_code=422)
+    decoded = body.decode(charset, errors="replace")
+    title = ""
+    if "html" in content_type or "xhtml" in content_type:
+        parser = _BootstrapHtmlTextExtractor()
+        try:
+            parser.feed(decoded)
+            source_text, title = parser.result()
+        except Exception as exc:  # noqa: BLE001 - malformed HTML must fail closed.
+            raise BootstrapV1Error("bootstrap_source_html_invalid", status_code=422) from exc
+    else:
+        source_text = "\n".join(
+            clean
+            for raw_line in decoded.splitlines()
+            if (clean := " ".join(raw_line.split()).strip())
+        )
+    source_text = source_text.strip()[:MAX_SOURCE_CHARS]
+    if not source_text:
+        raise BootstrapV1Error("bootstrap_source_fetch_returned_no_text", status_code=422)
+    return {
+        "source_text": source_text,
+        "source_uri": sanitize_source_uri_for_persistence(final_url) or validated_url,
+        "source_kind": "website",
+        "title": title,
+        "acquired_at": retrieved_at,
+        "retrieved_at": retrieved_at,
+        "extraction": {
+            "schema_version": "agvm.brain_bootstrap_v1.source_extraction.v1",
+            "method": "public_core_static_html",
+            "content_type": content_type.split(";", 1)[0],
+            "byte_count": len(body),
+            "truncated": truncated,
+            "provider_executed": False,
+        },
+    }
+
+
+def _reviewed_atomic_seed_statements(session: dict[str, Any]) -> list[str]:
+    return [str(item["statement"]) for item in _reviewed_atomic_seed_rows(session)]
+
+
+def _reviewed_atomic_seed_rows(session: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_candidates: list[dict[str, Any]] = []
+    for unit in _bootstrap_source_units(session, include_answers=True):
+        chunk = str(unit.get("raw_text") or "")
+        cursor = 0
+        for raw_part in re.split(r"(?<=[.!?\u3002\uff01\uff1f])\s+|[\r\n]+", chunk):
+            part = raw_part.strip()
+            if not part:
+                cursor += len(raw_part)
+                continue
+            start = chunk.find(part, cursor)
+            if start < 0:
+                start = chunk.find(part)
+            if start < 0:
+                continue
+            end = start + len(part)
+            cursor = end
+            raw_candidates.append(
+                {
+                    "raw_fragment": part,
+                    "source_span_end": end,
+                    "source_span_start": start,
+                    "source_unit": unit,
+                }
+            )
+    rows: list[dict[str, Any]] = []
     semantic_rows: list[tuple[str, set[str]]] = []
-    for value in raw_candidates:
-        statement = " ".join(value.split()).strip()
+    for row in raw_candidates:
+        statement = " ".join(str(row["raw_fragment"]).split()).strip()
         if statement and statement[-1] not in ".!?\u3002\uff01\uff1f":
             statement = f"{statement}."
         shape = _seed_candidate_shape(statement)
@@ -917,8 +1157,8 @@ def _reviewed_atomic_seed_statements(session: dict[str, Any]) -> list[str]:
         ):
             continue
         semantic_rows.append((semantic_text, semantic_tokens))
-        statements.append(statement)
-    return statements
+        rows.append({**row, "statement": statement})
+    return rows
 
 
 def _bootstrap_seed_quality(
@@ -945,6 +1185,7 @@ def _bootstrap_seed_quality(
     reviewed_material = _bootstrap_reviewed_material(session)
     ungrounded_candidate_ids: list[str] = []
     incomplete_candidate_ids: list[str] = []
+    truncated_candidate_ids: list[str] = []
     low_information_candidate_ids: list[str] = []
     non_atomic_candidate_ids: list[str] = []
     unverifiable_provenance_candidate_ids: list[str] = []
@@ -956,6 +1197,8 @@ def _bootstrap_seed_quality(
         candidate_shape = _seed_candidate_shape(candidate_text)
         if not candidate_shape["complete_sentence"]:
             incomplete_candidate_ids.append(candidate_id)
+        if candidate_shape["truncated"]:
+            truncated_candidate_ids.append(candidate_id)
         if not candidate_shape["informative"]:
             low_information_candidate_ids.append(candidate_id)
         if not candidate_shape["atomic"]:
@@ -1002,6 +1245,8 @@ def _bootstrap_seed_quality(
             issues.append("selected_candidates_missing_from_preview")
         if incomplete_candidate_ids:
             issues.append("incomplete_candidate_sentences_detected")
+        if truncated_candidate_ids:
+            issues.append("truncated_candidates_detected")
         if low_information_candidate_ids:
             issues.append("candidate_information_below_minimum")
         if non_atomic_candidate_ids:
@@ -1023,6 +1268,7 @@ def _bootstrap_seed_quality(
         "duplicate_candidate_ids": duplicate_candidate_ids,
         "missing_candidate_ids": missing_candidate_ids,
         "incomplete_candidate_ids": incomplete_candidate_ids,
+        "truncated_candidate_ids": truncated_candidate_ids,
         "low_information_candidate_ids": low_information_candidate_ids,
         "non_atomic_candidate_ids": non_atomic_candidate_ids,
         "unverifiable_provenance_candidate_ids": unverifiable_provenance_candidate_ids,
@@ -1038,10 +1284,14 @@ def _seed_candidate_shape(value: str) -> dict[str, Any]:
     text = _seed_candidate_content_text(value)
     lexical_units = _seed_candidate_lexical_units(text)
     alnum_chars = sum(1 for char in text if char.isalnum())
+    truncated = bool(
+        re.search(r"\.{3,}|\u2026|\[[^\]]{0,80}truncat(?:ed|ion)[^\]]{0,80}\]", text, re.IGNORECASE)
+    )
     terminal_count = len(re.findall(r"[.!?\u3002\uff01\uff1f]+(?:[\"'\)\]\u201d\u2019]+)?(?=\s|$)", text))
     first_cased = next((char for char in text if char.isalpha() and char.lower() != char.upper()), "")
     complete_sentence = bool(
         text
+        and not truncated
         and terminal_count == 1
         and re.search(r"[.!?\u3002\uff01\uff1f](?:[\"'\)\]\u201d\u2019]*)$", text)
         and (not first_cased or first_cased.isupper())
@@ -1051,11 +1301,16 @@ def _seed_candidate_shape(value: str) -> dict[str, Any]:
         and alnum_chars >= SEED_CANDIDATE_MIN_ALNUM_CHARS
         and len(set(lexical_units)) >= max(5, SEED_CANDIDATE_MIN_LEXICAL_UNITS // 2)
     )
-    atomic = bool(terminal_count == 1 and len(lexical_units) <= SEED_CANDIDATE_MAX_LEXICAL_UNITS)
+    atomic = bool(
+        not truncated
+        and terminal_count == 1
+        and len(lexical_units) <= SEED_CANDIDATE_MAX_LEXICAL_UNITS
+    )
     return {
         "complete_sentence": complete_sentence,
         "informative": informative,
         "atomic": atomic,
+        "truncated": truncated,
         "lexical_unit_count": len(lexical_units),
         "alnum_char_count": alnum_chars,
         "terminal_count": terminal_count,
@@ -1128,6 +1383,8 @@ def _screen_seed_candidates(*, session: dict[str, Any], bundle: dict[str, Any]) 
             reasons.append("candidate_identity_missing")
         if not shape["complete_sentence"]:
             reasons.append("incomplete_sentence")
+        if shape["truncated"]:
+            reasons.append("candidate_text_truncated")
         if not shape["informative"]:
             reasons.append("information_below_minimum")
         if not shape["atomic"]:
@@ -1223,6 +1480,247 @@ def _bounded_requirement(value: Any, *, default: int, minimum: int, maximum: int
     if not minimum <= parsed <= maximum:
         raise BootstrapV1Error("bootstrap_quality_requirements_invalid", status_code=409)
     return parsed
+
+
+def _optional_bootstrap_chronology_value(value: Any) -> str | None:
+    clean = str(value or "").strip()
+    return clean[:256] or None
+
+
+def _bootstrap_source_units(
+    session: dict[str, Any],
+    *,
+    include_answers: bool = False,
+) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for position, raw_source in enumerate(list(session.get("sources") or []), start=1):
+        if not isinstance(raw_source, dict):
+            continue
+        source = dict(raw_source)
+        raw_text = str(source.get("raw_text") or source.get("source_text") or "").strip()
+        if not raw_text:
+            continue
+        source_id = str(source.get("source_id") or f"source-{position}").strip()
+        if not source_id or source_id in seen_ids:
+            source_id = f"source-{position}"
+        seen_ids.add(source_id)
+        chronology_source = dict(source.get("chronology") or {})
+        chronology = {
+            key: value
+            for key in ("published_at", "acquired_at", "retrieved_at")
+            if (
+                value := _optional_bootstrap_chronology_value(
+                    source.get(key) if source.get(key) not in (None, "") else chronology_source.get(key)
+                )
+            )
+            is not None
+        }
+        units.append(
+            {
+                "schema_version": BOOTSTRAP_SOURCE_UNIT_SCHEMA_VERSION,
+                "source_id": source_id,
+                "raw_text": raw_text,
+                "source_kind": str(source.get("kind") or "manual_text"),
+                "source_uri": source.get("source_uri"),
+                "source_label": str(source.get("label") or source_id),
+                "source_trust": str(source.get("trust") or "user_asserted"),
+                "chronology": chronology,
+            }
+        )
+    if include_answers:
+        for position, raw_answer in enumerate(list(session.get("answers") or []), start=1):
+            if not isinstance(raw_answer, dict):
+                continue
+            answer = dict(raw_answer)
+            raw_text = str(answer.get("answer") or "").strip()
+            if not raw_text:
+                continue
+            answer_id = str(answer.get("answer_id") or f"answer-{position}").strip() or f"answer-{position}"
+            source_id = f"reviewed-answer:{answer_id}"
+            units.append(
+                {
+                    "schema_version": BOOTSTRAP_SOURCE_UNIT_SCHEMA_VERSION,
+                    "source_id": source_id,
+                    "raw_text": raw_text,
+                    "source_kind": "reviewed_answer",
+                    "source_uri": None,
+                    "source_label": str(answer.get("question_id") or answer_id),
+                    "source_trust": "human_reviewed",
+                    "chronology": {},
+                }
+            )
+    return units
+
+
+def _bootstrap_compiler_source_context(
+    session: dict[str, Any],
+    *,
+    source_units: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    units = [copy.deepcopy(dict(item)) for item in (source_units or _bootstrap_source_units(session, include_answers=True))]
+    return {
+        "bootstrap_source_units_schema_version": BOOTSTRAP_SOURCE_UNIT_SCHEMA_VERSION,
+        "bootstrap_source_units": units,
+        "bootstrap_temporal_policy": {
+            "schema_version": BOOTSTRAP_TEMPORAL_SCOPE_SCHEMA_VERSION,
+            "semantic_time_requires_exact_source_span": True,
+            "source_chronology_is_provenance_only": True,
+            "recorded_created_ingested_are_audit_only": True,
+        },
+    }
+
+
+def _bootstrap_temporal_basis_units(
+    node: dict[str, Any],
+    units: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    source_unit_id = str(node.get("source_unit_id") or "").strip()
+    if not source_unit_id:
+        return units
+    return [unit for unit in units if str(unit.get("source_id") or "") == source_unit_id]
+
+
+def _bootstrap_exact_temporal_mention(
+    *,
+    field: str,
+    value: Any,
+    units: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    exact_text = str(value or "").strip()
+    if not exact_text:
+        return None
+    for unit in units:
+        raw_text = str(unit.get("raw_text") or "")
+        start = raw_text.find(exact_text)
+        if start < 0:
+            continue
+        return {
+            "basis_kind": "reviewed_source_span",
+            "basis_ref": str(unit.get("source_id") or ""),
+            "field": field,
+            "span_start": start,
+            "span_end": start + len(exact_text),
+            "exact_text": exact_text,
+        }
+    return None
+
+
+def _validated_bootstrap_temporal_node(
+    raw_node: dict[str, Any],
+    units: list[dict[str, Any]],
+) -> tuple[dict[str, Any], bool, list[str]]:
+    node = copy.deepcopy(raw_node)
+    semantic_present = bool(
+        str(node.get("temporal_role") or "").strip()
+        or any(str(node.get(field) or "").strip() for field in _BOOTSTRAP_SEMANTIC_TIME_FIELDS)
+        or str(node.get("temporal_scope") or "").strip()
+    )
+    if not semantic_present:
+        return node, False, []
+    basis_units = _bootstrap_temporal_basis_units(node, units)
+    mentions: list[dict[str, Any]] = []
+    cleared_fields: list[str] = []
+    for field in _BOOTSTRAP_SEMANTIC_TIME_FIELDS:
+        value = node.get(field)
+        if value in (None, ""):
+            continue
+        mention = _bootstrap_exact_temporal_mention(field=field, value=value, units=basis_units)
+        if mention:
+            mentions.append(mention)
+        else:
+            node[field] = None
+            cleared_fields.append(field)
+    compiler_scope = node.get("temporal_scope")
+    if not mentions and isinstance(compiler_scope, str) and compiler_scope.strip():
+        scope_mention = _bootstrap_exact_temporal_mention(
+            field="temporal_scope",
+            value=compiler_scope,
+            units=basis_units,
+        )
+        if scope_mention:
+            mentions.append(scope_mention)
+    provenance = dict(node.get("provenance") or {})
+    if not mentions:
+        for field in ("temporal_role", "observed_at", "valid_from", "valid_to", "temporal_confidence"):
+            if node.get(field) not in (None, "") and field not in cleared_fields:
+                cleared_fields.append(field)
+            node[field] = None
+        node["temporal_scope"] = None
+        provenance.pop("temporal_scope", None)
+        provenance["bootstrap_temporal_authority"] = "semantic_time_cleared_unbound"
+        node["provenance"] = provenance
+        return node, False, sorted(set(cleared_fields))
+
+    bound_ids = list(dict.fromkeys(str(item["basis_ref"]) for item in mentions))
+    bound_units = [unit for unit in basis_units if str(unit.get("source_id") or "") in bound_ids]
+    chronology_by_source = {
+        str(unit.get("source_id") or ""): dict(unit.get("chronology") or {})
+        for unit in bound_units
+        if dict(unit.get("chronology") or {})
+    }
+    temporal_scope = {
+        "schema_version": BOOTSTRAP_TEMPORAL_SCOPE_SCHEMA_VERSION,
+        "summary": "Semantic time is bound to exact reviewed-source spans.",
+        "temporal_role": str(node.get("temporal_role") or "").strip() or None,
+        "observed_at": node.get("observed_at"),
+        "valid_from": node.get("valid_from"),
+        "valid_to": node.get("valid_to"),
+        "temporal_mentions": mentions,
+    }
+    node["temporal_scope"] = temporal_scope
+    if len(bound_ids) == 1:
+        node["source_unit_id"] = bound_ids[0]
+    provenance.update(
+        {
+            "bootstrap_temporal_authority": "exact_reviewed_source_span",
+            "bootstrap_temporal_scope": temporal_scope,
+            "bootstrap_source_chronology": chronology_by_source,
+            "temporal_scope": temporal_scope,
+        }
+    )
+    node["provenance"] = provenance
+    return node, True, sorted(set(cleared_fields))
+
+
+def _bind_bootstrap_preview_temporal_authority(
+    raw_preview: dict[str, Any],
+    session: dict[str, Any],
+) -> dict[str, Any]:
+    preview = copy.deepcopy(dict(raw_preview or {}))
+    bundle = copy.deepcopy(dict(preview.get("preview_bundle") or {}))
+    units = _bootstrap_source_units(session, include_answers=True)
+    validated_count = 0
+    cleared: dict[str, list[str]] = {}
+
+    primary = dict(bundle.get("primary_node_preview") or {})
+    if primary:
+        primary, validated, cleared_fields = _validated_bootstrap_temporal_node(primary, units)
+        validated_count += int(validated)
+        if cleared_fields:
+            cleared[str(primary.get("preview_id") or primary.get("id") or "primary")] = cleared_fields
+        bundle["primary_node_preview"] = primary
+
+    derived_nodes: list[dict[str, Any]] = []
+    for position, raw_node in enumerate(list(bundle.get("derived_nodes") or []), start=1):
+        if not isinstance(raw_node, dict):
+            continue
+        node, validated, cleared_fields = _validated_bootstrap_temporal_node(dict(raw_node), units)
+        validated_count += int(validated)
+        if cleared_fields:
+            cleared[str(node.get("preview_id") or node.get("id") or f"derived-{position}")] = cleared_fields
+        derived_nodes.append(node)
+    bundle["derived_nodes"] = derived_nodes
+    preview["preview_bundle"] = bundle
+    preview["temporal_validation"] = {
+        "schema_version": BOOTSTRAP_TEMPORAL_SCOPE_SCHEMA_VERSION,
+        "source_unit_count": len(units),
+        "validated_node_count": validated_count,
+        "cleared_unbound_fields": cleared,
+        "semantic_time_requires_exact_source_span": True,
+        "source_chronology_is_provenance_only": True,
+    }
+    return preview
 
 
 def _bootstrap_reviewed_material(session: dict[str, Any]) -> str:

@@ -160,6 +160,17 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         ),
     ),
     RouteRule(
+        name="mcp_core_memory_os_read_only_review",
+        category="paid_module",
+        owner="agvm_maintain_studio",
+        public_core_allowed=False,
+        rationale="Read-only review inventory is served locally for Maintain-enabled runtimes, but must not be exposed by the public Core edition gate.",
+        exact=(
+            "/memory/mcp/list-contradictions",
+            "/mcp/list-contradictions",
+        ),
+    ),
+    RouteRule(
         name="brain_bootstrap_v1",
         category="core",
         owner="agvm_core_mcp",
@@ -231,7 +242,7 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         public_core_allowed=True,
         rationale="Local setup and process health are required for self-hosted core.",
         prefixes=("/setup/",),
-        exact=("/health", "/runtime/edition"),
+        exact=("/health", "/version", "/runtime/edition"),
     ),
     RouteRule(
         name="brain_registry",
@@ -302,6 +313,19 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
         ),
     ),
     RouteRule(
+        name="mcp_search_composition",
+        category="core",
+        owner="agvm_core_mcp",
+        public_core_allowed=True,
+        rationale="Evidence-bound answer and search narration compose persisted Search results without starting or changing Search.",
+        exact=(
+            "/memory/mcp/compose-search-narrative",
+            "/mcp/compose-search-narrative",
+            "/memory/mcp/compose-grounded-answer",
+            "/mcp/compose-grounded-answer",
+        ),
+    ),
+    RouteRule(
         name="mcp_memory_write_primitive",
         category="core",
         owner="agvm_core_mcp",
@@ -314,6 +338,10 @@ ROUTE_RULES: tuple[RouteRule, ...] = (
             "/mcp/write-memory-commit",
             "/memory/mcp/ask-memory-clarification",
             "/mcp/ask-memory-clarification",
+            "/memory/mcp/change-node-content",
+            "/mcp/change-node-content",
+            "/memory/mcp/delete-node",
+            "/mcp/delete-node",
         ),
     ),
     RouteRule(
@@ -527,7 +555,14 @@ def classify_mcp_tool(tool_name: str) -> SurfaceClassification | None:
         )
     if clean.startswith("retrieve_") or clean.startswith("inspect_"):
         return SurfaceClassification("core", "agvm_core_mcp", True, "MCP retrieval and inspection tools are core.")
-    if clean in {"write_memory_preview", "write_memory_commit", "ask_memory_clarification", "brain_health"}:
+    if clean in {
+        "write_memory_preview",
+        "write_memory_commit",
+        "ask_memory_clarification",
+        "change_node_content",
+        "delete_node",
+        "brain_health",
+    }:
         return SurfaceClassification("core", "agvm_core_mcp", True, "Raw memory write/health primitives stay core with explicit permission policy.")
     required_module_id = required_module_id_for_tool_name(clean)
     if clean.startswith("grow_"):

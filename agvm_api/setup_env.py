@@ -39,6 +39,12 @@ MANAGED_ENV_KEYS = {
     "AGVM_RETRIEVAL_MODEL",
     "AGVM_ANSWER_MODEL",
     "AGVM_SLEEP_MODEL",
+    "AGVM_PLANNER_MODEL",
+    "AGVM_AI_SPATIAL_MODEL",
+    "AGVM_BRANCH_CONTROLLER_MODEL",
+    "AGVM_EVIDENCE_JUDGE_MODEL",
+    "AGVM_MASTER_MODEL",
+    "AGVM_GROW_SEMANTIC_MODEL",
     "AGVM_CLONE_APP_ARBITER_MODEL",
     "AGVM_CLONE_APP_SUFFICIENCY_MODEL",
     "AGVM_CLONE_APP_SPEAKER_MODEL",
@@ -207,6 +213,12 @@ def managed_env_status() -> dict[str, Any]:
             "retrieval_model": _env_or_managed(managed_values, "AGVM_RETRIEVAL_MODEL"),
             "answer_model": _env_or_managed(managed_values, "AGVM_ANSWER_MODEL"),
             "sleep_model": _env_or_managed(managed_values, "AGVM_SLEEP_MODEL"),
+            "planner_model": _env_or_managed(managed_values, "AGVM_PLANNER_MODEL"),
+            "ai_spatial_model": _env_or_managed(managed_values, "AGVM_AI_SPATIAL_MODEL"),
+            "branch_controller_model": _env_or_managed(managed_values, "AGVM_BRANCH_CONTROLLER_MODEL"),
+            "evidence_judge_model": _env_or_managed(managed_values, "AGVM_EVIDENCE_JUDGE_MODEL"),
+            "master_model": _env_or_managed(managed_values, "AGVM_MASTER_MODEL"),
+            "grow_semantic_model": _env_or_managed(managed_values, "AGVM_GROW_SEMANTIC_MODEL"),
             "clone_app": {
                 "arbiter_model": _env_or_managed(managed_values, "AGVM_CLONE_APP_ARBITER_MODEL"),
                 "sufficiency_model": _env_or_managed(managed_values, "AGVM_CLONE_APP_SUFFICIENCY_MODEL"),
@@ -219,6 +231,35 @@ def managed_env_status() -> dict[str, Any]:
             "default_brain_id": _env_or_managed(managed_values, "AGVM_DEFAULT_BRAIN_ID"),
         },
     }
+
+
+def _configured_model_capability_targets() -> list[dict[str, str]]:
+    managed_values = read_managed_env_values()
+
+    def configured_model(env_key: str, fallback: str) -> str:
+        return str(os.getenv(env_key) or managed_values.get(env_key) or fallback).strip() or fallback
+
+    semantic_model = configured_model("AGVM_LLM_MODEL", "gpt-5")
+    retrieval_model = configured_model("AGVM_RETRIEVAL_MODEL", semantic_model)
+    answer_model = configured_model("AGVM_ANSWER_MODEL", semantic_model)
+    compiler_model = configured_model("AGVM_COMPILER_MODEL", "gpt-4o-mini")
+    candidates = [
+        ("base", semantic_model),
+        ("compiler", compiler_model),
+        ("retrieval", retrieval_model),
+        ("answer", answer_model),
+        ("planner", configured_model("AGVM_PLANNER_MODEL", retrieval_model)),
+        ("ai_spatial", configured_model("AGVM_AI_SPATIAL_MODEL", retrieval_model)),
+        ("branch_controller", configured_model("AGVM_BRANCH_CONTROLLER_MODEL", retrieval_model)),
+        ("evidence_judge", configured_model("AGVM_EVIDENCE_JUDGE_MODEL", retrieval_model)),
+        ("master", configured_model("AGVM_MASTER_MODEL", answer_model)),
+        ("grow_semantic", configured_model("AGVM_GROW_SEMANTIC_MODEL", retrieval_model)),
+    ]
+    return [
+        {"role": role, "model": model}
+        for role, model in candidates
+        if str(role).strip() and str(model).strip()
+    ]
 
 
 def test_openai_provider_key(
@@ -244,29 +285,38 @@ def test_openai_provider_key(
             status_code=400,
         )
 
-    model = str(os.getenv("AGVM_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+    model_targets = _configured_model_capability_targets()
+    primary_model = model_targets[0]["model"] if model_targets else "gpt-5"
     timeout = max(1.0, min(float(timeout_seconds), PROVIDER_KEY_TEST_TIMEOUT_MAX_SECONDS))
-    request = urllib.request.Request(
-        url=f"https://api.openai.com/v1/models/{urllib.parse.quote(model, safe='')}",
-        method="GET",
-        headers={"Authorization": f"Bearer {candidate}", "Accept": "application/json"},
-    )
 
+    probed_models: list[dict[str, str]] = []
+    verified_model_keys: set[str] = set()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            if int(getattr(response, "status", 200)) != 200:
-                raise ProviderKeyTestError(
-                    "provider_capability_unavailable",
-                    message="The provider could not verify model access.",
-                    retryable=True,
-                    status="unavailable",
-                    status_code=503,
+        for target in model_targets:
+            model = target["model"]
+            model_key = model.casefold()
+            if model_key not in verified_model_keys:
+                request = urllib.request.Request(
+                    url=f"https://api.openai.com/v1/models/{urllib.parse.quote(model, safe='')}",
+                    method="GET",
+                    headers={"Authorization": f"Bearer {candidate}", "Accept": "application/json"},
                 )
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    if int(getattr(response, "status", 200)) != 200:
+                        raise ProviderKeyTestError(
+                            "provider_capability_unavailable",
+                            message=f"The provider could not verify model access for role {target['role']} using {model}.",
+                            retryable=True,
+                            status="unavailable",
+                            status_code=503,
+                        )
+                verified_model_keys.add(model_key)
+            probed_models.append({"role": target["role"], "model": model, "status": "valid"})
     except urllib.error.HTTPError as exc:
         if exc.code in {401, 403, 404}:
             raise ProviderKeyTestError(
                 "provider_key_rejected",
-                message="The provider rejected this key. Check the key and organization access.",
+                message="The provider rejected this key or one configured model. Check the key, organization access and role model names.",
                 retryable=False,
                 status="rejected",
                 status_code=401,
@@ -311,7 +361,7 @@ def test_openai_provider_key(
             status_code=503,
         ) from None
 
-    return _provider_key_test_payload(ok=True, status="valid", model=model)
+    return _provider_key_test_payload(ok=True, status="valid", model=primary_model, models=probed_models)
 
 
 def _provider_key_test_payload(
@@ -319,6 +369,7 @@ def _provider_key_test_payload(
     ok: bool,
     status: str,
     model: str | None = None,
+    models: list[dict[str, str]] | None = None,
     error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -332,6 +383,8 @@ def _provider_key_test_payload(
     }
     if model:
         payload["model"] = model
+    if models is not None:
+        payload["models"] = [dict(item) for item in models]
     if error:
         payload["error"] = error
     return payload

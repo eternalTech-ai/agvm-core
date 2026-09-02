@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -22,8 +24,14 @@ import brain_bootstrap_v1.service as bootstrap_service  # noqa: E402
 from brain_bootstrap_v1.service import BrainBootstrapV1Service, BootstrapV1Error  # noqa: E402
 from brain_bootstrap_v1.store import BootstrapSessionStore, BootstrapStoreError  # noqa: E402
 from brain_registry import create_local_brain  # noqa: E402
-from mcp_contracts import BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES, build_mcp_contract_registry  # noqa: E402
-from runtime_scope import use_runtime_brain  # noqa: E402
+from mcp_contracts import (  # noqa: E402
+    AGENT_MEMORY_MCP_TOOL_NAMES,
+    BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES,
+    GUIDE_MCP_TOOL_NAMES,
+    REQUIRED_MCP_TOOL_NAMES,
+    build_mcp_contract_registry,
+)
+from runtime_scope import current_brain_id, use_runtime_brain  # noqa: E402
 from sqlite_store import fetch_graph_snapshot, replace_runtime_graph  # noqa: E402
 from storage import load_graph, load_graph_view  # noqa: E402
 
@@ -67,6 +75,7 @@ def _service(
     fail_apply: bool = False,
     question_generator=None,
     registry_committer=None,
+    source_resolver=None,
 ) -> tuple[BrainBootstrapV1Service, list[dict]]:
     brain = _brain(tmp_path)
     apply_calls: list[dict] = []
@@ -121,6 +130,7 @@ def _service(
             mutation_probe=mutation_probe,
             question_generator=question_generator,
             registry_committer=registry_committer or (lambda _brain, _session, _root: {}),
+            source_resolver=source_resolver,
         ),
         apply_calls,
     )
@@ -128,10 +138,19 @@ def _service(
 
 def test_bootstrap_v1_registry_exposes_nine_bounded_core_tools() -> None:
     registry = build_mcp_contract_registry()
+    registered_names = [tool["name"] for tool in registry["tools"]]
+    expected_names = [
+        *GUIDE_MCP_TOOL_NAMES,
+        *REQUIRED_MCP_TOOL_NAMES,
+        *AGENT_MEMORY_MCP_TOOL_NAMES,
+    ]
     tools = {tool["name"]: tool for tool in registry["tools"]}
 
     assert registry["registry_validation"]["passed"] is True
-    assert len(registry["tools"]) == 55
+    assert len(BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES) == 9
+    assert registered_names == expected_names
+    assert len(tools) == len(registered_names)
+    assert registry["registry_validation"]["registered_tool_count"] == len(expected_names)
     assert set(BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES).issubset(tools)
     for name in BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES:
         tool = tools[name]
@@ -263,6 +282,100 @@ def test_bootstrap_v1_is_immutable_cas_guarded_and_writes_only_on_explicit_apply
     assert replay["idempotent_replay"] is True
     assert replay["revision"] == 6
     assert len(apply_calls) == 1
+
+
+def test_bootstrap_url_source_is_fetched_into_reviewed_foundation_text(tmp_path: Path) -> None:
+    requested_urls: list[str] = []
+
+    def resolve_source(source_uri: str) -> dict:
+        requested_urls.append(source_uri)
+        return {
+            "source_text": "Detwin builds reviewed memory systems from explicit public evidence.",
+            "source_uri": "https://example.com/about",
+            "source_kind": "website",
+            "title": "About Detwin",
+            "extraction": {
+                "schema_version": "agvm.brain_bootstrap_v1.source_extraction.v1",
+                "method": "public_core_static_html",
+                "provider_executed": False,
+            },
+        }
+
+    service, _ = _service(tmp_path, source_resolver=resolve_source)
+    service.execute(
+        "start",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "session-url",
+            "idempotency_key": "start-url",
+        },
+    )
+    added = service.execute(
+        "add_source",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "session-url",
+            "expected_revision": 1,
+            "idempotency_key": "source-url",
+            "source_uri": "https://example.com/about?tracking=discarded",
+        },
+    )
+
+    assert requested_urls == ["https://example.com/about?tracking=discarded"]
+    source = added["session"]["sources"][0]
+    assert source["label"] == "About Detwin"
+    assert source["kind"] == "website"
+    assert source["source_uri"] == "https://example.com/about"
+    assert source["trust"] == "verified_public"
+    assert source["source_text"].startswith("Detwin builds reviewed memory systems")
+    assert source["extraction"]["provider_executed"] is False
+
+
+def test_bootstrap_public_html_reader_extracts_visible_text_without_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Headers:
+        @staticmethod
+        def get(name: str):
+            return "text/html; charset=utf-8" if name.lower() == "content-type" else None
+
+        @staticmethod
+        def get_content_charset():
+            return "utf-8"
+
+    class Response:
+        headers = Headers()
+
+        def __init__(self) -> None:
+            self._body = b"<html><head><title>Foundation</title><script>ignore me</script></head><body><h1>Trusted profile</h1><p>Reviewed public evidence for the first brain.</p></body></html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def geturl(self):
+            return "https://example.com/about?tracking=discarded"
+
+        def read(self, size: int = -1):
+            if not self._body:
+                return b""
+            if size < 0:
+                result, self._body = self._body, b""
+                return result
+            result, self._body = self._body[:size], self._body[size:]
+            return result
+
+    monkeypatch.setattr(bootstrap_service, "validate_public_source_url", lambda value: value)
+    monkeypatch.setattr(bootstrap_service, "open_public_source_request", lambda *_args, **_kwargs: Response())
+
+    resolved = bootstrap_service._resolve_bootstrap_source_uri("https://example.com/about?token=secret")
+
+    assert resolved["title"] == "Foundation"
+    assert "Trusted profile" in resolved["source_text"]
+    assert "Reviewed public evidence" in resolved["source_text"]
+    assert "ignore me" not in resolved["source_text"]
+    assert resolved["source_uri"] == "https://example.com/about"
+    assert resolved["extraction"]["provider_executed"] is False
 
 
 def test_adaptive_bootstrap_generates_domain_questions_and_exposes_runtime_quality_gates(tmp_path: Path) -> None:
@@ -486,6 +599,82 @@ def test_guided_bootstrap_quality_enforces_inclusive_12_to_30_candidate_bounds()
     assert maximum["ready_to_apply"] is True
     assert too_many["ready_to_apply"] is False
     assert "too_many_atomic_candidates" in too_many["issues"]
+
+
+def test_guided_seed_compilation_is_provider_bounded_and_order_preserving(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} keeps its exact semantic routing contract.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+    lock = threading.Lock()
+    barrier = threading.Barrier(3, timeout=2.0)
+    active = 0
+    peak_active = 0
+    compiled_statements: list[str] = []
+
+    def fake_preview_bundle(statement: str, *_args, **_kwargs) -> dict:
+        nonlocal active, peak_active
+        assert current_brain_id() == "bounded-bootstrap"
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            compiled_statements.append(statement)
+        try:
+            barrier.wait()
+            time.sleep(0.01)
+            return {
+                "primary_node_preview": {
+                    "memory_type": "knowledge",
+                    "node_kind": "fact",
+                    "routing_semantic_scores": {"logic": len(statement)},
+                    "provenance": {"compiler_contract": statement},
+                }
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_provider_concurrency_limit", lambda: 3)
+    monkeypatch.setattr(bootstrap_service, "preview_bundle", fake_preview_bundle)
+
+    brain_record = {
+        "brain_id": "bounded-bootstrap",
+        "storage_path": str(tmp_path / "bounded-bootstrap"),
+    }
+    with use_runtime_brain(brain_record):
+        bundle = bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "bounded-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 12},
+        )
+
+    candidates = bundle["derived_nodes"]
+    assert peak_active == 3
+    assert len(compiled_statements) == 12
+    assert [candidate["preview_id"] for candidate in candidates] == [
+        f"bootstrap_seed_{index:03d}" for index in range(1, 13)
+    ]
+    assert [candidate["raw_text"] for candidate in candidates] == [
+        row["statement"] for row in statement_rows
+    ]
+    assert [candidate["routing_semantic_scores"]["logic"] for candidate in candidates] == [
+        len(row["statement"]) for row in statement_rows
+    ]
+    assert [candidate["provenance"]["compiler_contract"] for candidate in candidates] == [
+        row["statement"] for row in statement_rows
+    ]
 
 
 def test_guided_bootstrap_apply_rechecks_the_actual_selected_subset(tmp_path: Path) -> None:

@@ -21,6 +21,23 @@ ROOT = Path(__file__).resolve().parents[1]
 API_DIR = ROOT / "agvm_api"
 if str(API_DIR) not in sys.path:
     sys.path.insert(0, str(API_DIR))
+SDK_DIR = ROOT / "sdk" / "python"
+if str(SDK_DIR) not in sys.path:
+    sys.path.insert(0, str(SDK_DIR))
+
+MODEL_ENV_KEYS = [
+    "AGVM_LLM_MODEL",
+    "AGVM_COMPILER_MODEL",
+    "AGVM_RETRIEVAL_MODEL",
+    "AGVM_ANSWER_MODEL",
+    "AGVM_SLEEP_MODEL",
+    "AGVM_PLANNER_MODEL",
+    "AGVM_AI_SPATIAL_MODEL",
+    "AGVM_BRANCH_CONTROLLER_MODEL",
+    "AGVM_EVIDENCE_JUDGE_MODEL",
+    "AGVM_MASTER_MODEL",
+    "AGVM_GROW_SEMANTIC_MODEL",
+]
 
 
 def _setup_env_module():
@@ -144,6 +161,28 @@ def test_grow_preview_binding_secret_is_forwarded_without_a_compose_default() ->
     assert expected in core_compose
 
 
+def test_compose_defaults_keep_semantic_and_mechanical_models_separate() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    core_compose_path = ROOT / "docker-compose.core.yml"
+    core_compose = (core_compose_path if core_compose_path.exists() else ROOT / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    for source in (compose, core_compose):
+        assert "AGVM_PLANNER_MODEL: ${AGVM_PLANNER_MODEL:-gpt-5}" in source
+        assert "AGVM_AI_SPATIAL_MODEL: ${AGVM_AI_SPATIAL_MODEL:-gpt-5-mini}" in source
+        assert "AGVM_EVIDENCE_JUDGE_MODEL: ${AGVM_EVIDENCE_JUDGE_MODEL:-gpt-5}" in source
+        assert "AGVM_MASTER_MODEL: ${AGVM_MASTER_MODEL:-gpt-5}" in source
+        assert "AGVM_GROW_SEMANTIC_MODEL: ${AGVM_GROW_SEMANTIC_MODEL:-gpt-5}" in source
+        assert "AGVM_COMPILER_MODEL: ${AGVM_COMPILER_MODEL:-gpt-4o-mini}" in source
+
+    assert "AGVM_PLANNER_MODEL=gpt-5" in env_example
+    assert "AGVM_AI_SPATIAL_MODEL=gpt-5-mini" in env_example
+    assert "AGVM_GROW_SEMANTIC_MODEL=gpt-5" in env_example
+    assert "AGVM_COMPILER_MODEL=gpt-4o-mini" in env_example
+
+
 def test_managed_env_save_creates_backup_without_overwriting_host_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -204,6 +243,12 @@ def test_setup_env_router_accepts_clone_app_model_policy() -> None:
     from core_runtime_router import SetupEnvSaveRequest, _setup_env_updates_from_payload
 
     payload = SetupEnvSaveRequest(
+        agvm_planner_model="planner-model",
+        agvm_ai_spatial_model="ai-spatial-model",
+        agvm_branch_controller_model="branch-controller-model",
+        agvm_evidence_judge_model="evidence-judge-model",
+        agvm_master_model="master-model",
+        agvm_grow_semantic_model="grow-semantic-model",
         agvm_clone_app_arbiter_model="clone-arbiter-model",
         agvm_clone_app_sufficiency_model="clone-sufficiency-model",
         agvm_clone_app_speaker_model="clone-speaker-model",
@@ -213,11 +258,39 @@ def test_setup_env_router_accepts_clone_app_model_policy() -> None:
 
     updates = _setup_env_updates_from_payload(payload)
 
+    assert updates["AGVM_PLANNER_MODEL"] == "planner-model"
+    assert updates["AGVM_AI_SPATIAL_MODEL"] == "ai-spatial-model"
+    assert updates["AGVM_BRANCH_CONTROLLER_MODEL"] == "branch-controller-model"
+    assert updates["AGVM_EVIDENCE_JUDGE_MODEL"] == "evidence-judge-model"
+    assert updates["AGVM_MASTER_MODEL"] == "master-model"
+    assert updates["AGVM_GROW_SEMANTIC_MODEL"] == "grow-semantic-model"
     assert updates["AGVM_CLONE_APP_ARBITER_MODEL"] == "clone-arbiter-model"
     assert updates["AGVM_CLONE_APP_SUFFICIENCY_MODEL"] == "clone-sufficiency-model"
     assert updates["AGVM_CLONE_APP_SPEAKER_MODEL"] == "clone-speaker-model"
     assert updates["AGVM_CLONE_APP_PREFETCH_MODEL"] == "clone-prefetch-model"
     assert updates["AGVM_CLONE_APP_TEACH_MODEL"] == "clone-teach-model"
+
+
+def test_model_capability_targets_are_role_based_and_deduped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    for key in MODEL_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("AGVM_LLM_MODEL", "gpt-5")
+    monkeypatch.setenv("AGVM_COMPILER_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("AGVM_RETRIEVAL_MODEL", "gpt-5")
+    monkeypatch.setenv("AGVM_MASTER_MODEL", "gpt-4o")
+
+    targets = setup_env._configured_model_capability_targets()
+
+    assert {"role": "base", "model": "gpt-5"} in targets
+    assert {"role": "compiler", "model": "gpt-4o-mini"} in targets
+    assert {"role": "master", "model": "gpt-4o"} in targets
+    assert {"role": "planner", "model": "gpt-5"} in targets
+    assert {"role": "grow_semantic", "model": "gpt-5"} in targets
 
 
 def test_provider_key_test_is_bounded_non_persisting_and_redacted(
@@ -228,8 +301,10 @@ def test_provider_key_test_is_bounded_non_persisting_and_redacted(
     setup_env = _setup_env_module()
     monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    for key in MODEL_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
     candidate = "fixture-provider-key-non-persisting-1234567890"
-    observed: dict[str, object] = {}
+    observed: dict[str, object] = {"urls": []}
 
     class _Response:
         status = 200
@@ -243,7 +318,7 @@ def test_provider_key_test_is_bounded_non_persisting_and_redacted(
     def _urlopen(request, *, timeout):
         observed["authorization"] = request.get_header("Authorization")
         observed["timeout"] = timeout
-        observed["url"] = request.full_url
+        observed["urls"].append(request.full_url)
         return _Response()
 
     monkeypatch.setattr(setup_env.urllib.request, "urlopen", _urlopen)
@@ -256,11 +331,111 @@ def test_provider_key_test_is_bounded_non_persisting_and_redacted(
     assert response.json()["persisted"] is False
     assert observed["authorization"] == f"Bearer {candidate}"
     assert float(observed["timeout"]) <= setup_env.PROVIDER_KEY_TEST_TIMEOUT_MAX_SECONDS
-    assert str(observed["url"]).startswith("https://api.openai.com/v1/models/")
+    assert all(str(url).startswith("https://api.openai.com/v1/models/") for url in observed["urls"])
+    assert observed["urls"] == [
+        "https://api.openai.com/v1/models/gpt-5",
+        "https://api.openai.com/v1/models/gpt-4o-mini",
+    ]
+    assert response.json()["models"] == [
+        {"role": "base", "model": "gpt-5", "status": "valid"},
+        {"role": "compiler", "model": "gpt-4o-mini", "status": "valid"},
+        {"role": "retrieval", "model": "gpt-5", "status": "valid"},
+        {"role": "answer", "model": "gpt-5", "status": "valid"},
+        {"role": "planner", "model": "gpt-5", "status": "valid"},
+        {"role": "ai_spatial", "model": "gpt-5", "status": "valid"},
+        {"role": "branch_controller", "model": "gpt-5", "status": "valid"},
+        {"role": "evidence_judge", "model": "gpt-5", "status": "valid"},
+        {"role": "master", "model": "gpt-5", "status": "valid"},
+        {"role": "grow_semantic", "model": "gpt-5", "status": "valid"},
+    ]
     assert candidate not in response.text
     assert candidate not in caplog.text
     assert os.getenv("OPENAI_API_KEY") is None
     assert not (tmp_path / setup_env.MANAGED_ENV_FILENAME).exists()
+
+
+def test_provider_key_test_success_clears_stale_provider_auth_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    llm = importlib.reload(importlib.import_module("llm"))
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-configured-provider-key")
+    monkeypatch.setenv("AGVM_LLM_ENABLED", "true")
+    llm.record_llm_result(
+        "planner",
+        path="fallback",
+        error="http_error:401: invalid_api_key",
+        model="gpt-5",
+    )
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    monkeypatch.setattr(setup_env.urllib.request, "urlopen", lambda *_args, **_kwargs: _Response())
+    client = _setup_provider_client()
+
+    before = client.get("/health").json()["runtime_configuration"]
+    response = client.post("/setup/provider/test", json={"api_key": "fixture-provider-key-valid"})
+    after = client.get("/health").json()["runtime_configuration"]
+
+    assert before["state"] == "provider_auth_rejected"
+    assert before["ai_ready"] is False
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["cleared_provider_auth_errors"] == 1
+    assert after["state"] == "ready"
+    assert after["ai_ready"] is True
+    assert after["provider"]["execution"]["blocked"] is False
+
+
+def test_provider_key_test_success_does_not_clear_quota_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_env = _setup_env_module()
+    llm = importlib.reload(importlib.import_module("llm"))
+    monkeypatch.setenv("AGVM_LAB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-configured-provider-key")
+    monkeypatch.setenv("AGVM_LLM_ENABLED", "true")
+    llm.record_llm_result(
+        "planner",
+        path="fallback",
+        error="http_error:429: insufficient_quota credit_balance",
+        model="gpt-5",
+    )
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    monkeypatch.setattr(setup_env.urllib.request, "urlopen", lambda *_args, **_kwargs: _Response())
+    client = _setup_provider_client()
+
+    before = client.get("/health").json()["runtime_configuration"]
+    response = client.post("/setup/provider/test", json={"api_key": "fixture-provider-key-valid"})
+    after = client.get("/health").json()["runtime_configuration"]
+
+    assert before["state"] == "quota_exhausted"
+    assert before["ai_ready"] is False
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["cleared_provider_auth_errors"] == 0
+    assert after["state"] == "quota_exhausted"
+    assert after["ai_ready"] is False
+    assert after["provider"]["execution"]["blocked"] is True
 
 
 def test_provider_key_test_returns_structured_rejection_without_upstream_body(
@@ -290,7 +465,7 @@ def test_provider_key_test_returns_structured_rejection_without_upstream_body(
     assert payload["persisted"] is False
     assert payload["error"] == {
         "code": "provider_key_rejected",
-        "message": "The provider rejected this key. Check the key and organization access.",
+        "message": "The provider rejected this key or one configured model. Check the key, organization access and role model names.",
         "retryable": False,
     }
     assert candidate not in response.text

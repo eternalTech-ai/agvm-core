@@ -11,7 +11,11 @@ import re
 from typing import Any, Iterable
 
 from brain_feedback_ledger import build_brain_feedback_ledger
-from sqlite_store import append_brain_feedback_signals, fetch_brain_feedback_ledger_page
+from sqlite_store import (
+    append_brain_feedback_signal,
+    append_brain_feedback_signals,
+    fetch_brain_feedback_ledger_page,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -205,12 +209,22 @@ def record_feedback_event(
             )
             for signal in signals
         ]
-        records = append_brain_feedback_signals(
-            signals,
-            brain_id=event["brain_id"],
-            session_id=_text(event.get("search_id")),
-            event_ids=signal_event_ids,
-        )
+        if len(signals) == 1:
+            records = [
+                append_brain_feedback_signal(
+                    signals[0],
+                    brain_id=event["brain_id"],
+                    session_id=_text(event.get("search_id")),
+                    event_id=signal_event_ids[0],
+                )
+            ]
+        else:
+            records = append_brain_feedback_signals(
+                signals,
+                brain_id=event["brain_id"],
+                session_id=_text(event.get("search_id")),
+                event_ids=signal_event_ids,
+            )
         receipt_records = [
             {
                 "ledger_seq": int(record["ledger_seq"]),

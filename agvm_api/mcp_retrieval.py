@@ -552,9 +552,18 @@ def _projection_truth_stale_for_ai_materialization(result: dict[str, Any], proje
         or path.get("corridor_materialized")
         or semantic_contract.get("materialized")
     )
+    summary = _as_dict(projection.get("summary"))
+    projected_paths = _as_list(projection.get("paths"))
+    projected_events = _as_list(projection.get("events"))
+    if (
+        int(summary.get("planned_paths") or 0) > 0
+        and (not projected_paths or not projected_events)
+    ):
+        return True
+    if int(summary.get("route_edges") or 0) > 0 and not projected_events:
+        return True
     if not ai_route_materialized:
         return False
-    summary = _as_dict(projection.get("summary"))
     try:
         ai_landings = int(summary.get("ai_landings") or 0)
     except (TypeError, ValueError):
@@ -1910,6 +1919,138 @@ def _master_judgement_matches_ledger(master_judgement: dict[str, Any], ledger: d
         if count > 0:
             master_counts[state] = count
     return master_counts == expected_counts
+
+
+def _context_package_has_promoted_material_for_fast_terminal(context_package: dict[str, Any]) -> bool:
+    package = _as_dict(context_package)
+    metrics = _as_dict(package.get("metrics"))
+    try:
+        hot_item_count = int(metrics.get("hot_item_count") or 0)
+    except (TypeError, ValueError):
+        hot_item_count = 0
+    try:
+        document_ref_count = int(metrics.get("document_ref_count") or len(_as_list(package.get("document_refs"))) or 0)
+    except (TypeError, ValueError):
+        document_ref_count = 0
+    return bool(hot_item_count > 0 or document_ref_count > 0)
+
+
+def _fast_context_package_terminal_usable(
+    *,
+    result: dict[str, Any],
+    unresolved_sections: list[str],
+) -> bool:
+    package = _as_dict(result.get("context_package"))
+    metrics = _as_dict(package.get("metrics"))
+    planner_runtime = _as_dict(result.get("planner_runtime"))
+    mode = str(
+        result.get("retrieval_mode")
+        or planner_runtime.get("retrieval_mode")
+        or metrics.get("retrieval_mode")
+        or "balanced"
+    ).strip().lower()
+    if mode not in {"flash", "balanced"}:
+        return False
+    if str(result.get("status") or "").strip().lower() in {"blocked", "failed"}:
+        return False
+    materialization = _as_dict(result.get("context_package_materialization"))
+    runtime_boundary = _as_dict(planner_runtime.get("mcp_runtime_boundary"))
+    if (
+        bool(result.get("final_materialization_pending"))
+        or bool(materialization.get("final_materialization_pending"))
+        or bool(runtime_boundary.get("final_materialization_pending"))
+        or str(result.get("result_materialization_state") or materialization.get("state") or runtime_boundary.get("result_materialization_state") or "").strip().lower()
+        in {"first_package_ready_background_running", "first_useful_package_ready"}
+    ):
+        return False
+    if not _context_package_has_promoted_material_for_fast_terminal(package):
+        return False
+    fast_nonblocking_sections = {
+        "answer",
+        "answer_demo",
+        "path_truth",
+        "route_truth",
+        "master",
+        "master_judgement",
+        "master_audit",
+        "master_review",
+    }
+    return not any(
+        str(item).strip() and str(item).strip() not in fast_nonblocking_sections
+        for item in unresolved_sections
+    )
+
+
+def _context_terminal_contract_blockers(
+    *,
+    result: dict[str, Any],
+    master_judgement: dict[str, Any],
+    mission_evidence_ledger: dict[str, Any],
+    unresolved_sections: list[str],
+) -> list[str]:
+    if str(result.get("status") or "").strip().lower() == "no_match":
+        return []
+    blockers: list[str] = []
+    fast_package_terminal_usable = _fast_context_package_terminal_usable(
+        result=result,
+        unresolved_sections=unresolved_sections,
+    )
+    answerability_state = str(result.get("answerability_state") or "").strip().lower()
+    if answerability_state in {"partial", "insufficient"} and not fast_package_terminal_usable:
+        blockers.append(f"answerability_state:{answerability_state}")
+
+    nonblocking_unresolved = {"answer", "answer_demo", "path_truth", "route_truth"}
+    if fast_package_terminal_usable:
+        nonblocking_unresolved.update({"master", "master_judgement", "master_audit", "master_review"})
+    safety_unresolved = [
+        str(item).strip()
+        for item in unresolved_sections
+        if str(item).strip() not in nonblocking_unresolved
+    ]
+    blockers.extend(f"unresolved_section:{item}" for item in safety_unresolved)
+
+    if master_judgement and not fast_package_terminal_usable:
+        covered = {
+            str(item).strip()
+            for item in _as_list(master_judgement.get("covered_goals"))
+            if str(item).strip()
+        }
+        missing = {
+            str(item).strip()
+            for item in _as_list(master_judgement.get("missing_goals"))
+            if str(item).strip()
+        }
+        unresolved = {
+            str(item).strip()
+            for item in _as_list(master_judgement.get("unresolved_goals"))
+            if str(item).strip()
+        }
+        partial = {
+            str(item).strip()
+            for item in _as_list(master_judgement.get("partial_goals"))
+            if str(item).strip()
+        }
+        if missing:
+            blockers.append("master_missing_goals")
+        if unresolved:
+            blockers.append("master_unresolved_goals")
+        if partial:
+            blockers.append("master_partial_goals")
+        if covered & (missing | unresolved | partial):
+            blockers.append("master_goal_coverage_conflict")
+        if (
+            str(master_judgement.get("master_state") or "").strip().lower() == "terminal"
+            and "final_seal_allowed" in master_judgement
+            and not bool(master_judgement.get("final_seal_allowed"))
+        ):
+            blockers.append("master_final_seal_not_allowed")
+        if mission_evidence_ledger and not _master_judgement_matches_ledger(
+            master_judgement,
+            mission_evidence_ledger,
+        ):
+            blockers.append("master_ledger_snapshot_mismatch")
+
+    return _dedupe_contract_items(blockers, limit=24)
 
 
 def _package_render_contract_for_master(package_payload: Any, context_package: dict[str, Any]) -> dict[str, Any]:
@@ -5212,6 +5353,26 @@ def _mcp_delivery_contract(
         )
     )
     context_effective_passed = bool(context_passed or context_soft_unresolved_sections_allowed)
+    delivery_mission_ledger = _as_dict(
+        result.get("mission_evidence_ledger")
+        or planner_runtime.get("mission_evidence_ledger")
+        or context_package.get("mission_evidence_ledger")
+    )
+    fast_package_terminal_usable = _fast_context_package_terminal_usable(
+        result={**result, "status": status},
+        unresolved_sections=[] if context_soft_unresolved_sections_allowed else context_unresolved_sections,
+    )
+    context_terminal_blockers = _context_terminal_contract_blockers(
+        result={**result, "status": status},
+        master_judgement=master_judgement,
+        mission_evidence_ledger=delivery_mission_ledger,
+        unresolved_sections=[] if context_soft_unresolved_sections_allowed else context_unresolved_sections,
+    )
+    context_terminal_contract_blocked = bool(context_terminal_blockers)
+    master_terminal_certifiable = bool(
+        master_state == "terminal"
+        and not context_terminal_contract_blocked
+    )
     context_path_truth_required = bool(
         path_truth_contract.get("required")
         or context_metrics.get("path_truth_required")
@@ -5293,12 +5454,68 @@ def _mcp_delivery_contract(
         for item in semantic_required_slot_keys
         if canonical_answerability_slot(item)
     }
+    semantic_satisfied_slot_keys = {
+        canonical_answerability_slot(item)
+        for item in _as_list(
+            context_contract.get("semantic_satisfied_slot_keys")
+            or context_metrics.get("semantic_satisfied_slot_keys")
+        )
+        if canonical_answerability_slot(item)
+    }
+    semantic_slot_alignment_ready = bool(
+        semantic_required_slot_keys
+        and {
+            canonical_answerability_slot(item)
+            for item in semantic_required_slot_keys
+            if canonical_answerability_slot(item)
+        }.issubset(semantic_satisfied_slot_keys)
+    )
+    mission_coverage = _as_dict(
+        context_contract.get("mission_coverage")
+        or context_metrics.get("mission_coverage")
+        or context_package.get("mission_coverage")
+    )
+    mission_coverage_rows = [
+        _as_dict(item)
+        for item in _as_list(mission_coverage.get("rows"))
+        if isinstance(item, dict)
+    ]
+    mission_coverage_ready = bool(
+        mission_coverage.get("evaluated")
+        and mission_coverage.get("passed")
+        and any(str(row.get("state") or "").strip() != "not_declared" for row in mission_coverage_rows)
+        and all(
+            bool(row.get("passed"))
+            for row in mission_coverage_rows
+            if str(row.get("state") or "").strip() != "not_declared"
+        )
+    )
+    explicit_query_entities = {
+        str(item or "").strip().casefold()
+        for item in _as_list(
+            context_contract.get("explicit_query_entities")
+            or context_metrics.get("explicit_query_entities")
+        )
+        if str(item or "").strip()
+    }
+    missing_explicit_query_entities = {
+        str(item or "").strip().casefold()
+        for item in _as_list(
+            context_contract.get("missing_explicit_query_entities")
+            or context_metrics.get("missing_explicit_query_entities")
+        )
+        if str(item or "").strip()
+    }
     folded_query_text = re.sub(r"\s+", " ", str(result.get("query_text") or "").casefold()).strip()
     folded_agent_markdown = re.sub(
         r"\s+",
         " ",
         str(context_package.get("agent_markdown") or "").casefold(),
     ).strip()
+    explicit_entity_alignment_ready = bool(
+        not missing_explicit_query_entities
+        and all(entity in folded_agent_markdown for entity in explicit_query_entities)
+    )
     actionable_document_ref_count = metric_int(
         document_ref_contract.get("actionable_document_ref_count")
         or document_delivery_contract.get("actionable_document_ref_count")
@@ -5351,6 +5568,9 @@ def _mcp_delivery_contract(
         and context_effective_passed
         and package_present
         and positive_exact_slot_scope
+        and semantic_slot_alignment_ready
+        and mission_coverage_ready
+        and explicit_entity_alignment_ready
         and bool(ai_resilience.get("readiness_certifiable"))
         and bool(route_arbitration.get("certifiable_for_first_payload"))
         and not route_arbitration_blocked
@@ -5360,10 +5580,24 @@ def _mcp_delivery_contract(
     )
     positive_exact_terminal_certification_allowed = bool(
         positive_exact_sufficiency
-        and original_ai_spatial_materialized
-        and not original_ai_spatial_deferred
-        and not original_ai_spatial_missing
     )
+    positive_exact_supersedes_stale_master = bool(
+        positive_exact_terminal_certification_allowed
+        and context_terminal_blockers
+        and all(
+            str(blocker or "").strip()
+            in {
+                "master_missing_goals",
+                "master_unresolved_goals",
+                "master_partial_goals",
+                "master_goal_coverage_conflict",
+                "master_ledger_snapshot_mismatch",
+            }
+            for blocker in context_terminal_blockers
+        )
+    )
+    if positive_exact_supersedes_stale_master:
+        context_terminal_contract_blocked = False
     positive_exact_sufficiency_contract = {
         "schema_version": "agvm.positive_exact_sufficiency_contract.v1",
         "present": positive_exact_sufficiency,
@@ -5374,24 +5608,23 @@ def _mcp_delivery_contract(
         "answerability_covered_slot_count": answerability_covered_slot_count,
         "answerability_missing_slot_count": answerability_missing_slot_count,
         "semantic_required_slot_keys": sorted(semantic_required_slot_keys),
+        "semantic_satisfied_slot_keys": sorted(semantic_satisfied_slot_keys),
+        "semantic_slot_alignment_ready": semantic_slot_alignment_ready,
+        "mission_coverage_evaluated": bool(mission_coverage.get("evaluated")),
+        "mission_coverage_passed": bool(mission_coverage.get("passed")),
+        "mission_coverage_ready": mission_coverage_ready,
+        "explicit_query_entities": sorted(explicit_query_entities),
+        "missing_explicit_query_entities": sorted(missing_explicit_query_entities),
+        "explicit_entity_alignment_ready": explicit_entity_alignment_ready,
         "route_arbitration_certifiable": bool(route_arbitration.get("certifiable_for_first_payload")),
         "spatial_route_deferred_not_blocking_first_payload": bool(ai_spatial_deferred),
-        "spatial_route_deferred_blocks_terminal_certification": bool(
-            positive_exact_sufficiency and original_ai_spatial_deferred
-        ),
+        "spatial_route_deferred_blocks_terminal_certification": False,
         "terminal_certification_allowed": positive_exact_terminal_certification_allowed,
         "content_sufficiency_only": bool(
             positive_exact_sufficiency and not positive_exact_terminal_certification_allowed
         ),
-        "terminal_blocked_by": (
-            "ai_spatial_pending"
-            if positive_exact_sufficiency and original_ai_spatial_deferred
-            else "ai_spatial_missing"
-            if positive_exact_sufficiency and original_ai_spatial_missing
-            else "ai_spatial_unmaterialized"
-            if positive_exact_sufficiency and not original_ai_spatial_materialized
-            else None
-        ),
+        "stale_master_snapshot_superseded": positive_exact_supersedes_stale_master,
+        "terminal_blocked_by": None,
         "path_truth_required": context_path_truth_required,
     }
     public_fact_query = bool(
@@ -5773,9 +6006,11 @@ def _mcp_delivery_contract(
         and status not in {"failed", "blocked", "no_match"}
         and not master_override_blocked_by_snapshot_no_match
     ):
-        if master_state == "terminal":
+        if master_terminal_certifiable:
             client_payload_state = "usable_context"
             master_override_applied = True
+        elif master_state == "terminal":
+            client_payload_state = "partial_context"
         elif master_state == "no_match":
             client_payload_state = "no_match"
             master_override_applied = True
@@ -5803,16 +6038,27 @@ def _mcp_delivery_contract(
     if document_workspace_refs_terminal and client_payload_state != "document_refs_ready":
         client_payload_state = "document_refs_ready"
         master_override_applied = True
+    if (
+        normalized_tool in {"retrieve_context", "inspect_context_package"}
+        and not is_document_tool
+        and context_terminal_contract_blocked
+        and client_payload_state == "usable_context"
+    ):
+        client_payload_state = "partial_context"
 
     terminal_ai_spatial_content_sufficiency_present = bool(
         positive_exact_sufficiency
         or public_fact_sufficiency
         or answerability_sufficiency
+        or fast_package_terminal_usable
     )
     terminal_ai_spatial_ready = bool(
-        original_ai_spatial_materialized
-        and not original_ai_spatial_deferred
-        and not original_ai_spatial_missing
+        fast_package_terminal_usable
+        or (
+            original_ai_spatial_materialized
+            and not original_ai_spatial_deferred
+            and not original_ai_spatial_missing
+        )
     )
     terminal_ai_spatial_supervisor_before_state = client_payload_state
     terminal_ai_spatial_supervisor_applies = bool(
@@ -5824,15 +6070,19 @@ def _mcp_delivery_contract(
         and package_present
         and status not in {"blocked", "failed", "no_match"}
         and not exact_no_match_certifiable
+        and not (
+            positive_exact_terminal_certification_allowed
+            and not terminal_ai_spatial_ready
+        )
         and (
             terminal_ai_spatial_content_sufficiency_present
             or client_payload_state == "usable_context"
-            or master_state == "terminal"
+            or master_terminal_certifiable
         )
         and (
             original_ai_spatial_observed
             or terminal_ai_spatial_content_sufficiency_present
-            or master_state == "terminal"
+            or master_terminal_certifiable
         )
     )
     terminal_ai_spatial_supervisor_waiting = bool(
@@ -5869,7 +6119,7 @@ def _mcp_delivery_contract(
     selected_payload_client_sealed = bool(
         normalized_tool in {"retrieve_context", "inspect_context_package"}
         and not is_document_tool
-        and master_state == "terminal"
+        and master_terminal_certifiable
         and str(master_judgement.get("source") or "").strip() == "selected_context_package_contract"
         and context_effective_passed
         and package_present
@@ -5909,6 +6159,8 @@ def _mcp_delivery_contract(
 
     missing_reasons: list[Any] = []
     pending_reasons: list[Any] = []
+    if context_terminal_contract_blocked and not is_document_tool and not is_path_tool:
+        missing_reasons.extend(context_terminal_blockers)
     if status == "blocked":
         missing_reasons.append(stop_reason or "runtime_contract_blocked")
     if ai_missing and ai_state == "ai_pending":
@@ -5949,6 +6201,14 @@ def _mcp_delivery_contract(
         )
     if terminal_ai_spatial_supervisor_waiting:
         pending_reasons.append("terminal_supervisor_waiting_ai_spatial")
+    if positive_exact_client_sealed:
+        pending_reasons = [
+            item
+            for item in pending_reasons
+            if str(item or "").strip() not in {"ai_spatial_material_pending", "terminal_supervisor_waiting_ai_spatial"}
+            and "ai_spatial_contract_deferred" not in str(item or "")
+            and "inverse_answer_paths_missing" not in str(item or "")
+        ]
     if critical_path_blocked:
         missing_reasons.append("compact_ai_contract_incomplete")
         missing_reasons.extend(str(item) for item in _as_list(ai_critical_path.get("blockers")) if str(item).strip())
@@ -5973,6 +6233,13 @@ def _mcp_delivery_contract(
             if str(item or "").strip()
         )
     unresolved_sections = list(context_unresolved_sections)
+    if fast_package_terminal_usable:
+        fast_nonblocking_sections = {"master", "master_judgement", "master_audit", "master_review"}
+        unresolved_sections = [
+            item
+            for item in unresolved_sections
+            if str(item or "").strip() not in fast_nonblocking_sections
+        ]
     if bool(document_workspace_refs_terminality.get("pure_document_evidence")) and (
         document_workspace_refs_ready or document_workspace_refs_terminal
     ):
@@ -6151,12 +6418,18 @@ def _mcp_delivery_contract(
                 "no_match",
                 "document_refs_ready",
             }
-            and not ai_missing
-            and not metamemory_missing
-            and not ai_spatial_missing
-            and not ai_spatial_deferred
-            and not context_path_truth_pending
+            and (
+                positive_exact_client_sealed
+                or (
+                    not ai_missing
+                    and not metamemory_missing
+                    and not ai_spatial_missing
+                    and not ai_spatial_deferred
+                    and not context_path_truth_pending
+                )
+            )
             and status not in {"blocked", "failed"}
+            and not context_terminal_contract_blocked
         )
     )
     if (
@@ -6167,8 +6440,16 @@ def _mcp_delivery_contract(
         and not ai_spatial_missing
         and not ai_spatial_deferred
         and not context_path_truth_pending
+        and not context_terminal_contract_blocked
     ):
         terminal_for_client = True
+    if (
+        normalized_tool in {"retrieve_context", "inspect_context_package"}
+        and not is_document_tool
+        and not is_path_tool
+        and context_terminal_contract_blocked
+    ):
+        terminal_for_client = False
     run_finished = bool(
         completion_state
         in {
@@ -6273,7 +6554,14 @@ def _mcp_delivery_contract(
         "master_state": master_state or None,
         "master_next_recommended_call": master_next_action or None,
         "master_override_applied": master_override_applied,
-        "master_override_blocked_reason": "snapshot_context_contract_passed_while_master_no_match" if master_override_blocked_by_snapshot_no_match else None,
+        "master_override_blocked_reason": (
+            "snapshot_context_contract_passed_while_master_no_match"
+            if master_override_blocked_by_snapshot_no_match
+            else "context_terminal_contract_blocked"
+            if master_state == "terminal" and context_terminal_contract_blocked
+            else None
+        ),
+        "context_terminal_contract_blockers": context_terminal_blockers,
         "client_payload_state": client_payload_state,
         "completion_state": completion_state,
         "path_truth": {
@@ -6684,6 +6972,224 @@ def _answer_demo(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_SEARCH_SNAPSHOT_COUNTER_FIELDS = (
+    "visited_current",
+    "visited_total",
+    "hydrated_current",
+    "hydrated_total",
+    "promoted_current",
+    "promoted_total",
+    "package_current",
+    "package_total",
+    "hydrated",
+    "promoted",
+    "package",
+)
+
+
+def _canonical_search_snapshot_projection(result: dict[str, Any]) -> dict[str, Any]:
+    """Expose the persisted canonical snapshot without recomputing its counters."""
+
+    source = _as_dict(result)
+    explicit_counters = _as_dict(source.get("snapshot_counters"))
+    counters: dict[str, int] = {}
+    projection: dict[str, Any] = {}
+    for field in (
+        "result_snapshot_kind",
+        "snapshot_schema_version",
+        "snapshot_kind",
+        "parent_package_revision",
+        "package_revision",
+        "completion_state",
+        "canonical_search_state",
+        "terminal_for_client",
+        "review_required",
+        "more_evidence_needed",
+        "answer_surface_state",
+        "answerability_state",
+        "closure_state",
+        "final_closure_ready",
+        "final_materialization_pending",
+        "result_ready_terminal",
+        "result_materialization_state",
+    ):
+        value = source.get(field)
+        if value is not None:
+            projection[field] = value
+    for field in _SEARCH_SNAPSHOT_COUNTER_FIELDS:
+        value = source.get(field) if field in source else explicit_counters.get(field)
+        if value is None:
+            continue
+        try:
+            normalized_value = max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+        counters[field] = normalized_value
+        projection[field] = normalized_value
+    if explicit_counters or counters:
+        projection["snapshot_counters"] = counters
+    return projection
+
+
+def _persisted_terminal_inspection_authority(
+    tool_name: str,
+    result: dict[str, Any],
+) -> bool:
+    """True only for an already sealed Search result being reattached.
+
+    Inspect is a reader. Once the persisted Master and public lifecycle agree
+    that a result is terminal, stale first-package diagnostics must not run a
+    second sufficiency decision and reopen the same Search.
+    """
+
+    if str(tool_name or "").strip() != "inspect_context_package":
+        return False
+    master = _as_dict(
+        result.get("master_judgement")
+        or _as_dict(result.get("context_package")).get("master_judgement")
+        or _as_dict(result.get("planner_runtime")).get("master_judgement")
+    )
+    return bool(
+        str(result.get("status") or "").strip().lower() == "completed"
+        and str(result.get("canonical_search_state") or "").strip().lower() == "completed"
+        and bool(result.get("terminal_for_client"))
+        and bool(result.get("result_ready_terminal"))
+        and not bool(result.get("final_materialization_pending"))
+        and bool(result.get("final_closure_ready"))
+        and str(result.get("closure_state") or "").strip() == "final_sealed"
+        and str(result.get("answer_surface_state") or "").strip() == "final_sealed"
+        and str(master.get("master_state") or "").strip() == "terminal"
+        and not bool(master.get("review_required"))
+        and not _as_list(master.get("missing_goals"))
+        and not _as_list(master.get("unresolved_goals"))
+        and not _as_list(master.get("partial_goals"))
+    )
+
+
+def _apply_persisted_terminal_inspection_projection(
+    output: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    terminal_authority: bool | None = None,
+    persisted_master_judgement: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if terminal_authority is None:
+        terminal_authority = _persisted_terminal_inspection_authority(
+            "inspect_context_package", result
+        )
+    if not terminal_authority:
+        return output
+
+    projected = deepcopy(output)
+    projected.update(
+        {
+            "status": "ok",
+            "completion_state": "completed",
+            "canonical_search_state": "completed",
+            "terminal_for_client": True,
+            "review_required": False,
+            "more_evidence_needed": False,
+            "answer_surface_state": "final_sealed",
+            "answerability_state": "grounded",
+            "closure_state": "final_sealed",
+            "final_closure_ready": True,
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "result_materialization_state": "finalized",
+        }
+    )
+
+    context_package = _as_dict(projected.get("context_package"))
+    context_contract = _as_dict(context_package.get("contract"))
+    diagnostic_unresolved = _as_list(context_contract.get("unresolved_sections"))
+    if diagnostic_unresolved:
+        context_contract["diagnostic_unresolved_sections"] = diagnostic_unresolved
+        context_contract["unresolved_sections"] = []
+    context_contract["passed"] = True
+    context_contract["terminal_authority"] = "persisted_master_final_seal"
+    context_package["contract"] = context_contract
+    persisted_master = deepcopy(
+        _as_dict(persisted_master_judgement)
+        or _as_dict(
+            result.get("master_judgement")
+            or _as_dict(result.get("context_package")).get("master_judgement")
+        )
+    )
+    if persisted_master:
+        context_package["master_judgement"] = persisted_master
+        projected["master_judgement"] = persisted_master
+    projected["context_package"] = context_package
+
+    completion = _as_dict(projected.get("completion_contract"))
+    completion.update(
+        {
+            "state": "finalized",
+            "status": "ok",
+            "visible_reason": str(result.get("stop_reason") or "persisted_master_final_seal"),
+            "raw_result_materialization_state": "finalized",
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "operator_message": "Final MCP package is available.",
+        }
+    )
+    projected["completion_contract"] = completion
+
+    delivery = _as_dict(projected.get("mcp_delivery_contract"))
+    raw_follow_up = bool(
+        _as_dict(projected.get("document_delivery_contract")).get("raw_text_follow_up_required")
+    )
+    delivery.update(
+        {
+            "status_legacy": "ok",
+            "master_state": "terminal",
+            "master_override_applied": True,
+            "master_override_blocked_reason": None,
+            "context_terminal_contract_blockers": [],
+            "client_payload_state": "usable_context",
+            "completion_state": "finalized",
+            "run_finished": True,
+            "terminal_for_inspection": True,
+            "background_state": "stopped",
+            "terminal_for_client": True,
+            "final_materialization_pending": False,
+            "client_payload_finalized_over_background": True,
+            "partial_for_client": False,
+            "missing_reasons": [],
+            "pending_reasons": [],
+            "available_follow_up_reasons": ["raw_document_follow_up_available"] if raw_follow_up else [],
+        }
+    )
+    delivery_context = _as_dict(delivery.get("context_contract"))
+    delivery_context.update(
+        {
+            "passed": True,
+            "effective_passed": True,
+            "soft_unresolved_sections_allowed": True,
+            "unresolved_sections": [],
+        }
+    )
+    delivery["context_contract"] = delivery_context
+    delivery_path = _as_dict(delivery.get("path_truth"))
+    if delivery_path:
+        delivery_path["pending_reasons"] = []
+        delivery_path["missing_reasons"] = []
+        delivery["path_truth"] = delivery_path
+    projected["mcp_delivery_contract"] = delivery
+
+    lifecycle = _as_dict(projected.get("run_lifecycle_contract"))
+    lifecycle.update(
+        {
+            "status": "ok",
+            "terminal_state": "finalized",
+            "terminal": True,
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+        }
+    )
+    projected["run_lifecycle_contract"] = lifecycle
+    return projected
+
+
 _CONTEXT_PUBLIC_EVIDENCE_LIMIT = MAX_RETRIEVAL_MATCHES
 _CONTEXT_PUBLIC_SUMMARY_LIMIT = 1200
 _CONTEXT_PUBLIC_AGENT_MARKDOWN_LIMIT = 64000
@@ -6765,6 +7271,45 @@ def _selected_public_metadata(payload: Any, keys: tuple[str, ...], *, list_limit
     source = _as_dict(payload)
     selected = {key: source.get(key) for key in keys if source.get(key) is not None}
     return _as_dict(_public_metadata(selected, list_limit=list_limit))
+
+
+def _compact_public_mission_plan_v2(value: Any) -> dict[str, Any]:
+    """Keep the bounded semantic mission contract visible across MCP."""
+    source = _as_dict(value)
+    if not source:
+        return {}
+    missions: list[dict[str, Any]] = []
+    for item in _as_list(source.get("missions"))[:_CONTEXT_PUBLIC_EVIDENCE_LIMIT]:
+        mission = _as_dict(item)
+        if not mission:
+            continue
+        projected = _selected_public_metadata(
+            mission,
+            (
+                "mission_id",
+                "strand_id",
+                "semantic_goal",
+                "answer_field",
+                "answer_hypothesis",
+                "why_required",
+                "required_entities",
+                "expected_evidence",
+                "success_criteria",
+                "priority",
+                "planner_family",
+                "semantic_authority",
+            ),
+            list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
+        )
+        if projected:
+            missions.append(projected)
+    compact = _selected_public_metadata(
+        source,
+        ("schema_version", "semantic_authority", "query_text", "mission_count"),
+        list_limit=_CONTEXT_PUBLIC_EVIDENCE_LIMIT,
+    )
+    compact["missions"] = missions
+    return compact
 
 
 def _compact_retrieve_document_call(ref: dict[str, Any]) -> dict[str, Any]:
@@ -7193,16 +7738,101 @@ def _compact_projection_truth(projection: Any) -> dict[str, Any]:
     edges: list[dict[str, Any]] = []
     for item in _as_list(source.get("edges"))[: _CONTEXT_PUBLIC_EVIDENCE_LIMIT * 2]:
         edge = _as_dict(item)
-        compact = _selected_public_metadata(edge, ("id", "source", "target", "source_id", "target_id", "type", "weight"))
-        source_id = str(compact.get("source") or compact.get("source_id") or "").strip()
-        target_id = str(compact.get("target") or compact.get("target_id") or "").strip()
-        if compact and (not visible_node_ids or (source_id in visible_node_ids and target_id in visible_node_ids)):
-            edges.append(compact)
+        from_node_id = str(
+            edge.get("from_node_id")
+            or edge.get("source_node_id")
+            or edge.get("from")
+            or edge.get("source_id")
+            or ""
+        ).strip()
+        to_node_id = str(
+            edge.get("to_node_id")
+            or edge.get("target_node_id")
+            or edge.get("to")
+            or edge.get("target_id")
+            or edge.get("target")
+            or ""
+        ).strip()
+        if not from_node_id or not to_node_id:
+            continue
+        if visible_node_ids and (from_node_id not in visible_node_ids or to_node_id not in visible_node_ids):
+            continue
+        compact = _selected_public_metadata(
+            edge,
+            ("id", "kind", "type", "state", "path_id", "event_index", "strength", "weight"),
+        )
+        compact.update(
+            {
+                "from_node_id": from_node_id,
+                "to_node_id": to_node_id,
+                "event_source": str(edge.get("event_source") or edge.get("contract_source") or edge.get("source") or "").strip() or None,
+            }
+        )
+        edges.append(compact)
+    paths = [
+        _selected_public_metadata(
+            item,
+            (
+                "path_id", "origin_node_id", "origin_kind", "planned_node_ids",
+                "traversed_node_ids", "promoted_node_ids", "status", "reason",
+                "changed_context_package", "source",
+            ),
+        )
+        for item in _as_list(source.get("paths"))[:_CONTEXT_PUBLIC_EVIDENCE_LIMIT]
+        if isinstance(item, dict)
+    ]
+    events = [
+        _selected_public_metadata(
+            item,
+            (
+                "index", "time_ms", "type", "event_type", "node_id", "landing_id",
+                "edge_id", "path_id", "route_id", "from_node_id", "to_node_id",
+                "origin_kind", "branch_id", "kind",
+            ),
+        )
+        for item in _as_list(source.get("events"))[:160]
+        if isinstance(item, dict)
+    ]
     return {
         **_selected_public_metadata(source, ("schema_version", "search_id", "status", "summary", "invariants")),
         "nodes": nodes,
         "edges": edges,
+        "paths": [item for item in paths if item],
+        "events": [item for item in events if item],
     }
+
+
+def _compact_projection_event_stream_contract(value: Any) -> dict[str, Any]:
+    source = _as_dict(value)
+    compact = _selected_public_metadata(
+        source,
+        (
+            "schema_version", "projection_state", "selected_run_projection_available",
+            "event_source", "counts", "rendering_contract", "blank_fallback", "ui_contract",
+        ),
+    )
+    replay = _as_dict(source.get("replay"))
+    compact_replay = _selected_public_metadata(
+        replay,
+        (
+            "available", "sequence_count", "truncated", "replay_after_refresh_available",
+            "trace_endpoint", "query_result_endpoint", "stream_endpoint",
+        ),
+    )
+    compact_replay["sequence"] = [
+        _selected_public_metadata(
+            item,
+            (
+                "seq", "time_ms", "event_type", "render_instruction", "node_id",
+                "landing_id", "edge_id", "path_id", "from_node_id", "to_node_id",
+                "origin_kind", "source_truth",
+            ),
+        )
+        for item in _as_list(replay.get("sequence"))[:160]
+        if isinstance(item, dict)
+    ]
+    compact["replay"] = compact_replay
+    return compact
 
 
 def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -7282,6 +7912,7 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
         "tool_name": output.get("tool_name"),
         "search_id": output.get("search_id"),
         "status": output.get("status"),
+        **_canonical_search_snapshot_projection(output),
         "context_package": compact_package,
         "hot_working_memory": _selected_public_metadata(
             output.get("hot_working_memory"),
@@ -7345,6 +7976,9 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
             output.get("semantic_contract"),
             (
                 "schema_version",
+                "semantic_authority",
+                "semantic_authority_v2",
+                "mission_plan_v2",
                 "query_class",
                 "intent",
                 "response_mode",
@@ -7359,6 +7993,11 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
             output.get("semantic_contract_runtime"),
             (
                 "schema_version",
+                "semantic_authority",
+                "semantic_authority_v2",
+                "mission_plan_v2",
+                "mission_plan_v2_schema_version",
+                "mission_plan_v2_mission_count",
                 "status",
                 "source",
                 "material",
@@ -7596,11 +8235,15 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
                 "tool_role",
                 "endpoint",
                 "primary_response_field",
-                "receives_first",
+                "mcp_client_receives_first",
                 "starts_new_retrieval_run",
+                "inspects_existing_run",
+                "request_shape",
                 "explicit_id_policy",
-                "default_follow_up_tools",
+                "recommended_follow_up_tools",
                 "document_boundary",
+                "path_boundary",
+                "pure_mcp_lab",
             ),
         ),
         "ai_materialization_resilience_contract": _selected_public_metadata(
@@ -7619,26 +8262,22 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
             output.get("first_package_background_contract"),
             (
                 "schema_version",
-                "state",
+                "tool_name",
+                "search_id",
                 "status",
-                "first_package_terminal_for_client",
-                "background_state",
-                "final_materialization_pending",
-                "stream_endpoint",
-                "inspection",
-            ),
-        ),
-        "run_projection_event_stream_contract": _selected_public_metadata(
-            output.get("run_projection_event_stream_contract"),
-            (
-                "schema_version",
-                "projection_state",
-                "selected_run_projection_available",
-                "event_source",
-                "replay",
-                "blank_fallback",
+                "operator_state",
+                "first_response_payload_available",
+                "first_response_terminal",
+                "first_response_terminal_reason",
+                "first_package",
+                "background_completion",
+                "stream_vs_final",
+                "reattach",
                 "ui_contract",
             ),
+        ),
+        "run_projection_event_stream_contract": _compact_projection_event_stream_contract(
+            output.get("run_projection_event_stream_contract")
         ),
         "mcp_delivery_contract": delivery,
         "run_projection_truth": _compact_projection_truth(output.get("run_projection_truth")),
@@ -7656,6 +8295,15 @@ def _compact_context_public_output(output: dict[str, Any], result: dict[str, Any
         answer_demo.setdefault("answer_short", None)
         answer_demo.setdefault("answer_full", None)
         projected["answer_demo"] = answer_demo
+    for public_key, source_key in (
+        ("semantic_contract", "semantic_contract"),
+        ("semantic_contract_runtime", "semantic_contract_runtime"),
+    ):
+        mission_plan = _compact_public_mission_plan_v2(
+            _as_dict(output.get(source_key)).get("mission_plan_v2")
+        )
+        if mission_plan:
+            projected.setdefault(public_key, {})["mission_plan_v2"] = mission_plan
     return {key: value for key, value in projected.items() if value is not None}
 
 
@@ -7719,6 +8367,16 @@ def _enforce_nonterminal_first_package_output(
         completion["final_materialization_pending"] = True
         completion["result_ready_terminal"] = False
         output["completion_contract"] = completion
+    first_package_contract = _as_dict(output.get("first_package_background_contract"))
+    if first_package_contract:
+        if bool(first_package_contract.get("first_response_terminal")):
+            first_package_contract["first_response_terminal_reason"] = "final_materialization_pending"
+        first_package_contract["first_response_terminal"] = False
+        first_package = _as_dict(first_package_contract.get("first_package"))
+        if first_package:
+            first_package["terminal_for_mcp_client"] = False
+            first_package_contract["first_package"] = first_package
+        output["first_package_background_contract"] = first_package_contract
     return output
 
 
@@ -7732,6 +8390,16 @@ def build_mcp_retrieval_tool_output(
     if tool_name not in PR12J_B_RETRIEVAL_TOOL_NAMES - {"inspect_route", "inspect_memory_object"}:
         raise ValueError(f"unsupported_mcp_retrieval_tool:{tool_name}")
     normalized = normalize_retrieve_response_payload(deepcopy(dict(result or {})))
+    persisted_terminal_inspection = _persisted_terminal_inspection_authority(
+        tool_name, normalized
+    )
+    persisted_terminal_master = deepcopy(
+        _as_dict(
+            normalized.get("master_judgement")
+            or _as_dict(normalized.get("context_package")).get("master_judgement")
+            or _as_dict(normalized.get("planner_runtime")).get("master_judgement")
+        )
+    )
     fallback_document_workspace = _result_document_workspace(normalized)
     if fallback_document_workspace and not _document_workspace_has_documents(_as_dict(normalized.get("document_workspace"))):
         normalized["document_workspace"] = deepcopy(fallback_document_workspace)
@@ -8060,6 +8728,7 @@ def build_mcp_retrieval_tool_output(
         "tool_name": tool_name,
         "search_id": normalized.get("search_id"),
         "status": status,
+        **_canonical_search_snapshot_projection(normalized),
         package_field: package_payload,
         "context_package_materialization": _as_dict(normalized.get("context_package_materialization")),
         "hot_working_memory": _as_dict(normalized.get("hot_working_memory")),
@@ -8172,7 +8841,13 @@ def build_mcp_retrieval_tool_output(
         and not include_raw_text
     ):
         output = _compact_context_public_output(output, normalized)
-    return _enforce_nonterminal_first_package_output(output, normalized)
+    output = _enforce_nonterminal_first_package_output(output, normalized)
+    return _apply_persisted_terminal_inspection_projection(
+        output,
+        normalized,
+        terminal_authority=persisted_terminal_inspection,
+        persisted_master_judgement=persisted_terminal_master,
+    )
 
 
 def build_mcp_route_trace_output(

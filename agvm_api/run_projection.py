@@ -186,7 +186,10 @@ def build_run_projection_truth(
             return
         clean_path = _string(path_id)
         clean_source = _string(source)
-        key = f"{clean_from}->{clean_to}:{clean_path}:{clean_source}"
+        # One physical traversal has one identity even when both the live map
+        # and the finalized corridor project it.  Source is provenance, not
+        # part of edge identity.
+        key = f"{clean_from}->{clean_to}:{clean_path}"
         if key in edge_keys:
             return
         edge_keys.add(key)
@@ -335,6 +338,25 @@ def build_run_projection_truth(
             source="search_map_2d_truth.intermediate_nodes",
         )
 
+    corridor_path_ids = {
+        _string(item.get("path_id"))
+        for item in _as_list(path_corridors.get("paths"))
+        if isinstance(item, dict) and _string(item.get("path_id"))
+    }
+    canonical_path_id_by_route: dict[str, str] = {}
+    for plan_index, plan in enumerate(_as_list(map_truth.get("route_plans"))):
+        if not isinstance(plan, dict):
+            continue
+        route_id = _string(plan.get("route_id") or plan.get("branch_id"), f"route::{plan_index + 1}")
+        lifecycle_ids = [
+            _string(item.get("path_id"))
+            for item in _as_list(plan.get("path_lifecycle"))
+            if isinstance(item, dict) and _string(item.get("path_id"))
+        ]
+        canonical_path_id_by_route[route_id] = (
+            lifecycle_ids[0] if len(set(lifecycle_ids)) == 1 else route_id
+        )
+
     for segment_index, segment in enumerate(_as_list(map_truth.get("route_segments"))):
         if not isinstance(segment, dict):
             continue
@@ -346,7 +368,10 @@ def build_run_projection_truth(
             from_id,
             to_id,
             kind=_string(segment.get("edge_type"), "local"),
-            path_id=_string(segment.get("route_id") or segment.get("branch_id")) or None,
+            path_id=canonical_path_id_by_route.get(
+                _string(segment.get("route_id") or segment.get("branch_id")),
+                _string(segment.get("route_id") or segment.get("branch_id")),
+            ) or None,
             source="search_map_2d_truth.route_segments",
             edge_id=_string(segment.get("segment_id"), f"edge::{segment_index + 1}"),
         )
@@ -355,13 +380,18 @@ def build_run_projection_truth(
         if not isinstance(plan, dict):
             continue
         route_id = _string(plan.get("route_id") or plan.get("branch_id"), f"route::{plan_index + 1}")
+        canonical_path_id = canonical_path_id_by_route.get(route_id, route_id)
         branch_id = _string(plan.get("branch_id"))
         landing_id = _string(plan.get("landing_id") or landing_ids_by_branch.get(branch_id) or branch_id)
         path_rows = _as_list(plan.get("path_lifecycle"))
         state = _string(plan.get("path_lifecycle_state") or plan.get("route_state") or plan.get("status"), "planned")
+        # The finalized corridor owns the canonical path record when present;
+        # the live route plan still contributes its real traversed edges.
+        if canonical_path_id in corridor_path_ids:
+            continue
         paths.append(
             {
-                "path_id": route_id,
+                "path_id": canonical_path_id,
                 "origin_node_id": f"landing::{landing_id}" if landing_id else None,
                 "origin_kind": _string(plan.get("planner_family"), "unknown"),
                 "planned_node_ids": [],

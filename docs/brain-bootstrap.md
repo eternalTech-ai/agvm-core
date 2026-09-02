@@ -37,9 +37,30 @@ The MCP tools are `brain_bootstrap_start`, `brain_bootstrap_status`,
 `brain_bootstrap_cancel`.
 
 Interview answers and sources do not become memory before the explicit apply.
-Manual interview and local Grow review are Core operations. AI research,
-profile fitting, backfill and activation are cloud-backed paid capabilities and
-return a structured action contract when Detwin authority is absent.
+Manual interview and local Grow review are Core operations. The **AI interview**
+option is also a Local Core workflow: it uses the provider key saved in Local
+Settings to generate a bounded, attested question set, while the human still
+answers, reviews and explicitly applies the resulting memories. It uses the
+user's provider quota and does not consume Detwin credits.
+
+The reviewed guided-seed preview also uses that local provider to decide the
+semantic memory candidates and routing weights. Manual questions replace only
+question generation; they do not turn semantic candidate formation into a
+heuristic or provider-free process.
+
+The Bootstrap capability named `ai_research` is different from the local AI
+interview. `ai_research`, profile fitting, backfill and activation are
+cloud-backed paid capabilities and return a structured action contract when
+Detwin authority is absent.
+
+If AI interview start returns `bootstrap_question_generation_unavailable`, add
+and verify the provider key in Local Settings and retry. A
+`platform_memory_credit_unavailable` response belongs to a hosted/cloud action;
+it must not be required for local interview, local Grow review or local apply.
+The same is true of `platform_memory_outbox_worker_unavailable`: it reports a
+hosted persistence worker boundary, not a missing component of local Bootstrap.
+For either error during local onboarding, verify that the UI/MCP client targets
+the local API at `http://127.0.0.1:8010` and is not using Cloud runtime mode.
 
 ## Recommended First Brain
 

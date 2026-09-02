@@ -7,10 +7,12 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import uuid
@@ -44,7 +46,12 @@ from config import (
     ROUTING_FIELDS,
 )
 from graph_view import build_graph_view
-from memory_hygiene import build_hygiene_metadata
+from grow_source_authority import grow_source_sha256
+from memory_hygiene import (
+    build_hygiene_metadata,
+    lifecycle_eligibility,
+    normalized_lifecycle_scope,
+)
 from memory_learning import (
     COGNITIVE_JOB_SCHEMA_VERSION,
     MATRIX_REVISION_SCHEMA_VERSION,
@@ -58,6 +65,7 @@ from memory_learning import (
 )
 from projection import (
     color_from_brainhex,
+    normalize_unit_confidence,
     normalize_scores,
     position_to_bucket,
     position_to_topology_brainhex,
@@ -79,12 +87,24 @@ from storage import (
     ensure_data_dir,
     utc_timestamp,
 )
-from stream_contract import annotate_stream_event
+from stream_contract import (
+    advance_canonical_search_state,
+    annotate_stream_event,
+    canonical_search_state,
+    canonicalize_search_snapshot,
+    project_search_result_lifecycle,
+    search_result_has_current_seal_bindings,
+    search_result_explicitly_unsealed,
+    search_result_has_final_seal,
+    search_snapshot_counters,
+    search_snapshot_is_useful,
+)
 
 _BOOTSTRAP_LOCK = threading.Lock()
 _BOOTSTRAPPED_RUNTIME_STORE_PATHS: set[str] = set()
+_SEARCH_HEALTH_BACKFILL_BOOTSTRAPPED_PATHS: set[str] = set()
 RUNTIME_RETENTION_REPORT_SCHEMA_VERSION = "agvm.runtime_retention_report.v1"
-_RUNTIME_RETENTION_ACTIVE_STATUSES = {"created", "running"}
+_RUNTIME_RETENTION_ACTIVE_STATUSES = {"created", "planning", "running", "finalizing"}
 _RUNTIME_RETENTION_PINNED_EVENT_TYPES = {
     "answer_final",
     "context_package_materialized",
@@ -105,7 +125,14 @@ BRAIN_PROFILE_V2_OPERATION_STORE_SCHEMA_VERSION = "agvm.brain_profile_operation_
 BRAIN_PROFILE_V2_SNAPSHOT_STORE_SCHEMA_VERSION = "agvm.brain_profile_snapshot_store.v2"
 LOCAL_GROW_V2_BINDING_SCHEMA_VERSION = "agvm.local_grow_preview_binding.v2"
 LOCAL_GROW_V2_APPLY_RECEIPT_SCHEMA_VERSION = "agvm.local_grow_apply_receipt.v2"
+LOCAL_GROW_V2_ROLLBACK_RECEIPT_SCHEMA_VERSION = "agvm.local_grow_rollback_receipt.v1"
+DETERMINISTIC_DOCUMENT_SOURCE_ATTESTATION_SCHEMA_VERSION = (
+    "agvm.deterministic_document_source_attestation.v1"
+)
 LOCAL_GROW_V2_OPERATION_FAMILY = "grow_v2"
+GROW_INVESTIGATION_V3_SCHEMA_VERSION = "agvm.grow_investigation.v3"
+GROW_INVESTIGATION_V3_BINDING_SCHEMA_VERSION = "agvm.local_grow_investigation_binding.v3"
+LOCAL_GROW_V2_TRANSACTION_BUSY_TIMEOUT_MS = 300_000
 _GEOMETRY_CALIBRATION_AUTHORITY_CYCLE_MARKER = "::authority_cycle::"
 _MAINTENANCE_PREVIEW_AUTHORITY_CYCLE_MARKER = "::authority_cycle::"
 _GEOMETRY_NODE_STATE_COLUMNS = (
@@ -457,6 +484,25 @@ def _backfill_recent_search_result_health(conn: sqlite3.Connection, *, limit: in
     return updated
 
 
+def _bootstrap_search_health_backfill_enabled() -> bool:
+    return str(os.environ.get("AGVM_BOOTSTRAP_SEARCH_HEALTH_BACKFILL") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _maybe_backfill_search_health_on_bootstrap(conn: sqlite3.Connection, sqlite_path_key: str) -> None:
+    if not _bootstrap_search_health_backfill_enabled():
+        return
+    if sqlite_path_key in _SEARCH_HEALTH_BACKFILL_BOOTSTRAPPED_PATHS:
+        return
+    _backfill_recent_search_plan_health(conn, limit=200)
+    _backfill_recent_search_result_health(conn, limit=50)
+    _SEARCH_HEALTH_BACKFILL_BOOTSTRAPPED_PATHS.add(sqlite_path_key)
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -504,7 +550,14 @@ def connect(
     conn = sqlite3.connect(sqlite_path, timeout=max(0.001, float(timeout_seconds)))
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={max(1, int(busy_timeout_ms))};")
-    conn.execute("PRAGMA journal_mode=WAL;")
+    # Setting journal_mode is a database-wide write operation. Reissuing it on
+    # every connection can fail with `database is locked` while a Search worker
+    # is persisting a progressive snapshot. Read the current mode first and
+    # only migrate older/new databases when necessary.
+    journal_mode_row = conn.execute("PRAGMA journal_mode;").fetchone()
+    journal_mode = str(journal_mode_row[0] if journal_mode_row else "").strip().lower()
+    if journal_mode != "wal":
+        conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     try:
@@ -671,6 +724,11 @@ def bootstrap_runtime_store() -> None:
                 valid_from TEXT,
                 valid_to TEXT,
                 observed_at TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                ingested_at TEXT,
+                superseded_at TEXT,
+                node_revision INTEGER,
                 superseded_by TEXT,
                 obsoletes_json TEXT NOT NULL DEFAULT '[]',
                 temporal_confidence REAL,
@@ -783,6 +841,9 @@ def bootstrap_runtime_store() -> None:
                 plan_json TEXT,
                 plan_health_json TEXT,
                 result_json TEXT,
+                first_useful_result_json TEXT,
+                latest_useful_result_json TEXT,
+                final_result_json TEXT,
                 result_health_json TEXT,
                 stop_reason TEXT,
                 answerability_state TEXT,
@@ -908,6 +969,14 @@ def bootstrap_runtime_store() -> None:
                 tool_name TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'active',
                 apply_result_json TEXT NOT NULL DEFAULT '{}',
+                before_graph_json TEXT NOT NULL DEFAULT '{}',
+                rollback_result_json TEXT NOT NULL DEFAULT '{}',
+                investigation_json TEXT NOT NULL DEFAULT '{}',
+                resume_token_sha256 TEXT NOT NULL DEFAULT '',
+                investigation_version INTEGER NOT NULL DEFAULT 0,
+                investigation_sha256 TEXT NOT NULL DEFAULT '',
+                evidence_sha256 TEXT NOT NULL DEFAULT '',
+                source_content_sha256 TEXT NOT NULL DEFAULT '',
                 issued_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 state_updated_at INTEGER NOT NULL,
@@ -1324,8 +1393,18 @@ def bootstrap_runtime_store() -> None:
             _ensure_column(conn, "search_sessions", "thread_id", "TEXT")
             _ensure_column(conn, "search_sessions", "plan_health_json", "TEXT")
             _ensure_column(conn, "search_sessions", "result_health_json", "TEXT")
-            _backfill_recent_search_plan_health(conn, limit=200)
-            _backfill_recent_search_result_health(conn, limit=50)
+            _ensure_column(conn, "search_sessions", "first_useful_result_json", "TEXT")
+            _ensure_column(conn, "search_sessions", "latest_useful_result_json", "TEXT")
+            _ensure_column(conn, "search_sessions", "final_result_json", "TEXT")
+            _ensure_column(conn, "grow_preview_bindings", "before_graph_json", "TEXT NOT NULL DEFAULT '{}'")
+            _ensure_column(conn, "grow_preview_bindings", "rollback_result_json", "TEXT NOT NULL DEFAULT '{}'")
+            _ensure_column(conn, "grow_preview_bindings", "investigation_json", "TEXT NOT NULL DEFAULT '{}'")
+            _ensure_column(conn, "grow_preview_bindings", "resume_token_sha256", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "grow_preview_bindings", "investigation_version", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "grow_preview_bindings", "investigation_sha256", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "grow_preview_bindings", "evidence_sha256", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "grow_preview_bindings", "source_content_sha256", "TEXT NOT NULL DEFAULT ''")
+            _maybe_backfill_search_health_on_bootstrap(conn, sqlite_path_key)
             conn.execute(
                 """
             CREATE INDEX IF NOT EXISTS idx_search_sessions_thread_status
@@ -1348,6 +1427,11 @@ def bootstrap_runtime_store() -> None:
             _ensure_column(conn, "nodes_nav", "valid_from", "TEXT")
             _ensure_column(conn, "nodes_nav", "valid_to", "TEXT")
             _ensure_column(conn, "nodes_nav", "observed_at", "TEXT")
+            _ensure_column(conn, "nodes_nav", "created_at", "TEXT")
+            _ensure_column(conn, "nodes_nav", "updated_at", "TEXT")
+            _ensure_column(conn, "nodes_nav", "ingested_at", "TEXT")
+            _ensure_column(conn, "nodes_nav", "superseded_at", "TEXT")
+            _ensure_column(conn, "nodes_nav", "node_revision", "INTEGER")
             _ensure_column(conn, "nodes_nav", "superseded_by", "TEXT")
             _ensure_column(conn, "nodes_nav", "obsoletes_json", "TEXT NOT NULL DEFAULT '[]'")
             _ensure_column(conn, "nodes_nav", "temporal_confidence", "REAL")
@@ -1494,6 +1578,48 @@ def _memory_learning_event_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _memory_learning_event_idempotency_digest(event: dict[str, Any]) -> str:
+    stable = {
+        key: event.get(key)
+        for key in (
+            "schema_version",
+            "event_id",
+            "brain_id",
+            "thread_id",
+            "operation_id",
+            "event_kind",
+            "event_source",
+            "source_unit_id",
+            "source_asset_id",
+            "preview_id",
+            "persisted_node_id",
+            "related_node_ids",
+            "memory_act_type",
+            "claim_status",
+            "source_trust",
+            "confidence",
+            "duplicate_targets",
+            "contradiction_targets",
+            "clarification_questions",
+            "clarification_answers",
+            "human_decision",
+            "apply_decision",
+            "sleep_evolve_priority",
+            "matrix_hint",
+            "topology_hint",
+            "payload",
+        )
+    }
+    encoded = json.dumps(
+        stable,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def append_memory_learning_event(event: dict[str, Any] | None = None, **overrides: Any) -> dict[str, Any]:
     payload = {**_json_dict(event), **dict(overrides)}
     event_kind = str(payload.get("event_kind") or "").strip()
@@ -1502,7 +1628,44 @@ def append_memory_learning_event(event: dict[str, Any] | None = None, **override
     event_id = str(payload.get("event_id") or f"memory_learning_event::{uuid.uuid4()}").strip()
     brain_id = _active_brain_id(_text_or_none(payload.get("brain_id")))
     created_at = str(payload.get("created_at") or utc_timestamp())
+    normalized = {
+        "schema_version": str(payload.get("schema_version") or MEMORY_LEARNING_EVENT_SCHEMA_VERSION),
+        "event_id": event_id,
+        "brain_id": brain_id,
+        "thread_id": _text_or_none(payload.get("thread_id")),
+        "operation_id": _text_or_none(payload.get("operation_id")),
+        "event_kind": event_kind,
+        "event_source": str(payload.get("event_source") or "core"),
+        "source_unit_id": _text_or_none(payload.get("source_unit_id")),
+        "source_asset_id": _text_or_none(payload.get("source_asset_id")),
+        "preview_id": _text_or_none(payload.get("preview_id")),
+        "persisted_node_id": _text_or_none(payload.get("persisted_node_id")),
+        "related_node_ids": _json_list(payload.get("related_node_ids")),
+        "memory_act_type": _text_or_none(payload.get("memory_act_type")),
+        "claim_status": _text_or_none(payload.get("claim_status")),
+        "source_trust": _text_or_none(payload.get("source_trust")),
+        "confidence": _float_or_none(payload.get("confidence")),
+        "duplicate_targets": _json_list(payload.get("duplicate_targets")),
+        "contradiction_targets": _json_list(payload.get("contradiction_targets")),
+        "clarification_questions": _json_list(payload.get("clarification_questions")),
+        "clarification_answers": _json_dict(payload.get("clarification_answers")),
+        "human_decision": _text_or_none(payload.get("human_decision")),
+        "apply_decision": _text_or_none(payload.get("apply_decision")),
+        "sleep_evolve_priority": _float_or_none(payload.get("sleep_evolve_priority")),
+        "matrix_hint": _json_dict(payload.get("matrix_hint")),
+        "topology_hint": _json_dict(payload.get("topology_hint")),
+        "payload": _json_dict(payload.get("payload")),
+    }
     with connect() as conn:
+        existing_row = conn.execute(
+            "SELECT * FROM memory_learning_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _memory_learning_event_from_row(existing_row)
+            if _memory_learning_event_idempotency_digest(existing) == _memory_learning_event_idempotency_digest(normalized):
+                return existing
+            raise ValueError(f"memory_learning_event_id_payload_mismatch:{event_id}")
         conn.execute(
             """
             INSERT INTO memory_learning_events (
@@ -1517,32 +1680,32 @@ def append_memory_learning_event(event: dict[str, Any] | None = None, **override
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                event_id,
-                str(payload.get("schema_version") or MEMORY_LEARNING_EVENT_SCHEMA_VERSION),
-                brain_id,
-                _text_or_none(payload.get("thread_id")),
-                _text_or_none(payload.get("operation_id")),
-                event_kind,
-                str(payload.get("event_source") or "core"),
-                _text_or_none(payload.get("source_unit_id")),
-                _text_or_none(payload.get("source_asset_id")),
-                _text_or_none(payload.get("preview_id")),
-                _text_or_none(payload.get("persisted_node_id")),
-                _json_dump(_json_list(payload.get("related_node_ids"))),
-                _text_or_none(payload.get("memory_act_type")),
-                _text_or_none(payload.get("claim_status")),
-                _text_or_none(payload.get("source_trust")),
-                _float_or_none(payload.get("confidence")),
-                _json_dump(_json_list(payload.get("duplicate_targets"))),
-                _json_dump(_json_list(payload.get("contradiction_targets"))),
-                _json_dump(_json_list(payload.get("clarification_questions"))),
-                _json_dump(_json_dict(payload.get("clarification_answers"))),
-                _text_or_none(payload.get("human_decision")),
-                _text_or_none(payload.get("apply_decision")),
-                _float_or_none(payload.get("sleep_evolve_priority")),
-                _json_dump(_json_dict(payload.get("matrix_hint"))),
-                _json_dump(_json_dict(payload.get("topology_hint"))),
-                _json_dump(_json_dict(payload.get("payload"))),
+                normalized["event_id"],
+                normalized["schema_version"],
+                normalized["brain_id"],
+                normalized["thread_id"],
+                normalized["operation_id"],
+                normalized["event_kind"],
+                normalized["event_source"],
+                normalized["source_unit_id"],
+                normalized["source_asset_id"],
+                normalized["preview_id"],
+                normalized["persisted_node_id"],
+                _json_dump(normalized["related_node_ids"]),
+                normalized["memory_act_type"],
+                normalized["claim_status"],
+                normalized["source_trust"],
+                normalized["confidence"],
+                _json_dump(normalized["duplicate_targets"]),
+                _json_dump(normalized["contradiction_targets"]),
+                _json_dump(normalized["clarification_questions"]),
+                _json_dump(normalized["clarification_answers"]),
+                normalized["human_decision"],
+                normalized["apply_decision"],
+                normalized["sleep_evolve_priority"],
+                _json_dump(normalized["matrix_hint"]),
+                _json_dump(normalized["topology_hint"]),
+                _json_dump(normalized["payload"]),
                 created_at,
             ),
         )
@@ -2954,7 +3117,9 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             memory_confidence, identity_resolution_confidence, evidence_confidence, stability_confidence,
             is_document_anchor, is_summary, granularity, novelty,
             sleep_revision_count, last_sleep_review_at,
-            temporal_role, valid_from, valid_to, observed_at, superseded_by, obsoletes_json, temporal_confidence, lifecycle_status,
+            temporal_role, valid_from, valid_to, observed_at,
+            created_at, updated_at, ingested_at, superseded_at, node_revision,
+            superseded_by, obsoletes_json, temporal_confidence, lifecycle_status,
             source_trust, claim_status, answer_eligible, profile_eligible, document_eligible,
             matrix_revision_id, topology_revision_id, matrix_calibration_plan_signature, matrix_calibrated_at
         ) VALUES (
@@ -2967,7 +3132,9 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?
         )
@@ -3003,6 +3170,11 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             valid_from=excluded.valid_from,
             valid_to=excluded.valid_to,
             observed_at=excluded.observed_at,
+            created_at=excluded.created_at,
+            updated_at=excluded.updated_at,
+            ingested_at=excluded.ingested_at,
+            superseded_at=excluded.superseded_at,
+            node_revision=excluded.node_revision,
             superseded_by=excluded.superseded_by,
             obsoletes_json=excluded.obsoletes_json,
             temporal_confidence=excluded.temporal_confidence,
@@ -3052,6 +3224,11 @@ def _upsert_node(conn: sqlite3.Connection, node: dict[str, Any]) -> None:
             node.get("valid_from"),
             node.get("valid_to"),
             node.get("observed_at"),
+            node.get("created_at"),
+            node.get("updated_at"),
+            node.get("ingested_at"),
+            node.get("superseded_at"),
+            node.get("node_revision"),
             node.get("superseded_by"),
             _json_dump(list(node.get("obsoletes") or [])),
             node.get("temporal_confidence"),
@@ -3349,6 +3526,15 @@ def _row_to_node(
         if "brain_profile_revision_json" in available
         else {}
     )
+    lifecycle = lifecycle_eligibility(
+        {
+            "lifecycle_status": (
+                str(row["lifecycle_status"] or "active")
+                if "lifecycle_status" in available
+                else "active"
+            )
+        }
+    )
     return {
         "id": str(row["id"]),
         "node_kind": str(row["node_kind"]),
@@ -3378,7 +3564,7 @@ def _row_to_node(
         "provenance": provenance,
         "debug": None,
         "derivation_role": row["derivation_role"],
-        "derivation_confidence": row["derivation_confidence"],
+        "derivation_confidence": normalize_unit_confidence(row["derivation_confidence"]),
         "derived_from_preview_id": row["derived_from_preview_id"],
         "document_role": document_role,
         "document_anchor_id": document_anchor_id,
@@ -3391,25 +3577,36 @@ def _row_to_node(
         "source_unit_formation_strategy": row["source_unit_formation_strategy"] if "source_unit_formation_strategy" in available else None,
         "source_span_start": source_span_start,
         "source_span_end": source_span_end,
-        "memory_confidence": row["memory_confidence"],
-        "identity_resolution_confidence": row["identity_resolution_confidence"],
-        "evidence_confidence": row["evidence_confidence"],
-        "stability_confidence": row["stability_confidence"],
+        "memory_confidence": normalize_unit_confidence(row["memory_confidence"]),
+        "identity_resolution_confidence": normalize_unit_confidence(row["identity_resolution_confidence"]),
+        "evidence_confidence": normalize_unit_confidence(row["evidence_confidence"]),
+        "stability_confidence": normalize_unit_confidence(row["stability_confidence"]),
         "sleep_revision_count": int(row["sleep_revision_count"] or 0),
         "last_sleep_review_at": row["last_sleep_review_at"],
         "temporal_role": row["temporal_role"] if "temporal_role" in available else None,
         "valid_from": row["valid_from"] if "valid_from" in available else None,
         "valid_to": row["valid_to"] if "valid_to" in available else None,
         "observed_at": row["observed_at"] if "observed_at" in available else None,
+        "created_at": row["created_at"] if "created_at" in available else None,
+        "updated_at": row["updated_at"] if "updated_at" in available else None,
+        "ingested_at": row["ingested_at"] if "ingested_at" in available else None,
+        "superseded_at": row["superseded_at"] if "superseded_at" in available else None,
+        "node_revision": int(row["node_revision"]) if "node_revision" in available and row["node_revision"] is not None else None,
         "superseded_by": row["superseded_by"] if "superseded_by" in available else None,
         "obsoletes": _json_load(row["obsoletes_json"], []) if "obsoletes_json" in available else [],
-        "temporal_confidence": row["temporal_confidence"] if "temporal_confidence" in available else None,
-        "lifecycle_status": str(row["lifecycle_status"] or "active") if "lifecycle_status" in available else "active",
+        "temporal_confidence": normalize_unit_confidence(
+            row["temporal_confidence"] if "temporal_confidence" in available else None
+        ),
+        "lifecycle_status": lifecycle["lifecycle_status"],
+        "lifecycle_eligibility": lifecycle,
         "source_trust": str(row["source_trust"] or "user_asserted") if "source_trust" in available else "user_asserted",
         "claim_status": str(row["claim_status"] or "fact") if "claim_status" in available else "fact",
-        "answer_eligible": bool(row["answer_eligible"]) if "answer_eligible" in available else True,
-        "profile_eligible": bool(row["profile_eligible"]) if "profile_eligible" in available else True,
-        "document_eligible": bool(row["document_eligible"]) if "document_eligible" in available else True,
+        "answer_eligible": (bool(row["answer_eligible"]) if "answer_eligible" in available else True)
+        and lifecycle["current_eligible"],
+        "profile_eligible": (bool(row["profile_eligible"]) if "profile_eligible" in available else True)
+        and lifecycle["current_eligible"],
+        "document_eligible": (bool(row["document_eligible"]) if "document_eligible" in available else True)
+        and lifecycle["current_eligible"],
         "retrieval_affordance": _json_load(row["retrieval_affordance_json"], {}) if "retrieval_affordance_json" in available else {},
         "retrieval_aliases": _json_load(row["retrieval_aliases_json"], []) if "retrieval_aliases_json" in available else [],
         "matrix_revision_id": row["matrix_revision_id"] if "matrix_revision_id" in available else None,
@@ -3424,7 +3621,24 @@ def _mapping_has_keys(value: Any, keys: tuple[str, ...]) -> bool:
     return isinstance(value, dict) and all(value.get(key) is not None for key in keys)
 
 
-def _fetch_node_rows(conn: sqlite3.Connection, *, node_ids: list[str] | None = None) -> list[sqlite3.Row]:
+def _lifecycle_scope_sql(scope: str, *, column: str = "n.lifecycle_status") -> str:
+    """Return the single canonical SQL predicate for memory lifecycle views."""
+
+    normalized_scope = normalized_lifecycle_scope(scope)
+    status_sql = f"LOWER(COALESCE(NULLIF(TRIM({column}), ''), 'active'))"
+    if normalized_scope == "current":
+        return f"{status_sql} = 'active'"
+    if normalized_scope == "history":
+        return f"{status_sql} IN ('active', 'superseded')"
+    return "1 = 1"
+
+
+def _fetch_node_rows(
+    conn: sqlite3.Connection,
+    *,
+    node_ids: list[str] | None = None,
+    lifecycle_scope: str = "audit",
+) -> list[sqlite3.Row]:
     semantic_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(node_semantics)").fetchall()}
 
     def semantic_column(name: str) -> str:
@@ -3474,10 +3688,12 @@ def _fetch_node_rows(conn: sqlite3.Connection, *, node_ids: list[str] | None = N
         brain_profile_revision_json=semantic_column("brain_profile_revision_json"),
     )
     params: list[Any] = []
+    filters = [_lifecycle_scope_sql(lifecycle_scope)]
     if node_ids:
         placeholders = ",".join("?" for _ in node_ids)
-        sql += f" WHERE n.id IN ({placeholders})"
+        filters.append(f"n.id IN ({placeholders})")
         params.extend(node_ids)
+    sql += f" WHERE {' AND '.join(filters)}"
     sql += " ORDER BY n.id"
     return conn.execute(sql, params).fetchall()
 
@@ -3574,6 +3790,14 @@ def maintenance_graph_revision(graph: dict[str, Any]) -> str:
         if not isinstance(source_node, dict):
             continue
         node = canonical(dict(source_node))
+        # ``lifecycle_eligibility`` is a read-model projection populated by
+        # ``_row_to_node`` rather than a separately persisted node property.
+        # Maintenance candidates created in memory may therefore omit it even
+        # though the exact same node gains the projection after the SQLite
+        # round trip.  Canonicalizing the projection from the authoritative
+        # lifecycle status keeps the revision content-sensitive without making
+        # a derived field look like graph drift.
+        node["lifecycle_eligibility"] = canonical(lifecycle_eligibility(source_node))
         node["routing_semantic_scores"] = _maintenance_canonical_distribution(
             source_node.get("routing_semantic_scores"),
             ROUTING_FIELDS,
@@ -3609,12 +3833,13 @@ def fetch_nodes_by_ids(
     *,
     include_raw_text: bool = True,
     busy_timeout_ms: int | None = None,
+    lifecycle_scope: str = "current",
 ) -> list[dict[str, Any]]:
     if not node_ids:
         return []
     timeout_ms = 30000 if busy_timeout_ms is None else max(1, int(busy_timeout_ms))
     with connect(timeout_seconds=timeout_ms / 1000.0, busy_timeout_ms=timeout_ms) as conn:
-        rows = _fetch_node_rows(conn, node_ids=node_ids)
+        rows = _fetch_node_rows(conn, node_ids=node_ids, lifecycle_scope=lifecycle_scope)
         links_map = _fetch_links_map(conn, node_ids, "links")
         highways_map = _fetch_links_map(conn, node_ids, "highways")
         node_map = {}
@@ -3633,6 +3858,7 @@ def fetch_document_child_nodes(
     *,
     limit_per_anchor: int = 24,
     include_raw_text: bool = True,
+    lifecycle_scope: str = "current",
 ) -> list[dict[str, Any]]:
     cleaned_anchor_ids = list(dict.fromkeys(str(item or "").strip() for item in list(anchor_ids or []) if str(item or "").strip()))
     if not cleaned_anchor_ids:
@@ -3664,6 +3890,7 @@ def fetch_document_child_nodes(
             LEFT JOIN node_semantics s ON s.node_id = n.id
             WHERE ({" OR ".join(clauses)})
               AND n.id NOT IN ({excluded_placeholders})
+              AND {_lifecycle_scope_sql(lifecycle_scope)}
             ORDER BY
                 CASE COALESCE(s.document_role, '')
                     WHEN 'fact' THEN 0
@@ -3693,7 +3920,7 @@ def fetch_document_child_nodes(
             selected_ids.append(node_id)
         if not selected_ids:
             return []
-        rows = _fetch_node_rows(conn, node_ids=selected_ids)
+        rows = _fetch_node_rows(conn, node_ids=selected_ids, lifecycle_scope=lifecycle_scope)
         links_map = _fetch_links_map(conn, selected_ids, "links")
         highways_map = _fetch_links_map(conn, selected_ids, "highways")
         node_map = {}
@@ -3716,6 +3943,7 @@ def fetch_document_source_sibling_nodes(
     *,
     limit_per_source: int = 24,
     include_raw_text: bool = True,
+    lifecycle_scope: str = "current",
 ) -> list[dict[str, Any]]:
     cleaned_refs: list[dict[str, str]] = []
     seen_ref_keys: set[tuple[str, str, str]] = set()
@@ -3762,7 +3990,8 @@ def fetch_document_source_sibling_nodes(
             FROM nodes_nav n
             LEFT JOIN node_text t ON t.node_id = n.id
             LEFT JOIN node_semantics s ON s.node_id = n.id
-            WHERE {" OR ".join(clauses)}
+            WHERE ({" OR ".join(clauses)})
+              AND {_lifecycle_scope_sql(lifecycle_scope)}
             ORDER BY
                 CASE COALESCE(s.document_role, '')
                     WHEN 'fact' THEN 0
@@ -3823,7 +4052,11 @@ def fetch_document_source_sibling_nodes(
     return selected
 
 
-def fetch_document_anchor_ids_by_source_refs(source_refs: list[dict[str, Any]]) -> dict[str, str]:
+def fetch_document_anchor_ids_by_source_refs(
+    source_refs: list[dict[str, Any]],
+    *,
+    lifecycle_scope: str = "current",
+) -> dict[str, str]:
     cleaned_refs: list[dict[str, str]] = []
     seen_ref_keys: set[tuple[str, str]] = set()
     for ref in list(source_refs or []):
@@ -3860,6 +4093,7 @@ def fetch_document_anchor_ids_by_source_refs(source_refs: list[dict[str, Any]]) 
             LEFT JOIN node_text t ON t.node_id = n.id
             LEFT JOIN node_semantics s ON s.node_id = n.id
             WHERE ({" OR ".join(clauses)})
+              AND {_lifecycle_scope_sql(lifecycle_scope)}
               AND (
                     COALESCE(s.document_role, '') = 'anchor'
                  OR COALESCE(n.is_document_anchor, 0) = 1
@@ -4063,6 +4297,7 @@ def fetch_document_nodes_by_claim_terms(
     include_raw_text: bool = False,
     busy_timeout_ms: int | None = None,
     max_scan_rows: int = 50000,
+    lifecycle_scope: str = "current",
 ) -> list[dict[str, Any]]:
     """Return document anchors ranked by a bounded BM25/IDF claim scorer.
 
@@ -4126,6 +4361,7 @@ def fetch_document_nodes_by_claim_terms(
         LEFT JOIN node_text t ON t.node_id = n.id
         LEFT JOIN node_semantics s ON s.node_id = n.id
         WHERE {document_anchor_filter}
+          AND {_lifecycle_scope_sql(lifecycle_scope)}
           AND ({" OR ".join(clauses)})
         LIMIT ?
     """
@@ -4272,6 +4508,7 @@ def fetch_nodes_by_text_terms(
     limit: int = 24,
     include_raw_text: bool = False,
     busy_timeout_ms: int | None = None,
+    lifecycle_scope: str = "current",
 ) -> list[dict[str, Any]]:
     cleaned_terms = [str(term or "").strip() for term in list(terms or []) if str(term or "").strip()]
     if not cleaned_terms:
@@ -4310,7 +4547,8 @@ def fetch_nodes_by_text_terms(
         FROM nodes_nav n
         LEFT JOIN node_text t ON t.node_id = n.id
         LEFT JOIN node_semantics s ON s.node_id = n.id
-        WHERE {" OR ".join(clauses)}
+        WHERE {_lifecycle_scope_sql(lifecycle_scope)}
+          AND ({" OR ".join(clauses)})
         LIMIT ?
     """
     # The SQL filter is intentionally broad (OR over source text, summary and label);
@@ -4344,6 +4582,7 @@ def fetch_nodes_by_ids_summary(
     node_ids: list[str],
     *,
     busy_timeout_ms: int | None = None,
+    lifecycle_scope: str = "current",
 ) -> list[dict[str, Any]]:
     cleaned_ids = list(dict.fromkeys(str(node_id or "").strip() for node_id in list(node_ids or []) if str(node_id or "").strip()))
     if not cleaned_ids:
@@ -4377,6 +4616,7 @@ def fetch_nodes_by_ids_summary(
         FROM nodes_nav n
         LEFT JOIN node_semantics s ON s.node_id = n.id
         WHERE n.id IN ({placeholders})
+          AND {_lifecycle_scope_sql(lifecycle_scope)}
     """
     with connect(timeout_seconds=timeout_ms / 1000.0, busy_timeout_ms=timeout_ms) as conn:
         rows = conn.execute(sql, cleaned_ids).fetchall()
@@ -4398,6 +4638,7 @@ def fetch_nodes_by_summary_terms(
     *,
     limit: int = 24,
     busy_timeout_ms: int | None = None,
+    lifecycle_scope: str = "current",
 ) -> list[dict[str, Any]]:
     cleaned_terms = list(dict.fromkeys(str(term or "").strip() for term in list(terms or []) if str(term or "").strip()))[:48]
     if not cleaned_terms:
@@ -4419,7 +4660,7 @@ def fetch_nodes_by_summary_terms(
         )
         params.extend([pattern, pattern, pattern, pattern, pattern, pattern])
     prefetch_limit = min(max(int(limit) * 24, 240), 1800)
-    sql = """
+    sql = f"""
         SELECT
             n.*,
             '' AS raw_text,
@@ -4445,7 +4686,7 @@ def fetch_nodes_by_summary_terms(
             s.retrieval_aliases_json
         FROM nodes_nav n
         LEFT JOIN node_semantics s ON s.node_id = n.id
-        WHERE COALESCE(n.lifecycle_status, 'active') = 'active'
+        WHERE {_lifecycle_scope_sql(lifecycle_scope)}
           AND (
     """
     sql += " OR ".join(clauses)
@@ -4724,8 +4965,9 @@ def fetch_graph_view(
     guide_area: str | None = None,
     bucket_window: dict[str, int] | None = None,
     confidence_floor: float | None = None,
+    lifecycle_scope: str = "current",
 ) -> dict[str, Any]:
-    filters = []
+    filters = [_lifecycle_scope_sql(lifecycle_scope, column="lifecycle_status")]
     params: list[Any] = []
     if memory_type:
         filters.append("memory_type = ?")
@@ -4767,7 +5009,11 @@ def fetch_graph_view(
         ).fetchall()
         total_nodes = len(rows)
         selected_ids = _sample_node_ids_by_bucket(rows, max_nodes=max_nodes)
-        nodes = fetch_nodes_by_ids(selected_ids, include_raw_text=False)
+        nodes = fetch_nodes_by_ids(
+            selected_ids,
+            include_raw_text=False,
+            lifecycle_scope=lifecycle_scope,
+        )
         visible = set(selected_ids)
         edges = _fetch_edge_rows(conn, selected_ids)
         edges = [edge for edge in edges if edge["source_node_id"] in visible and edge["target_node_id"] in visible]
@@ -4873,9 +5119,10 @@ def fetch_identity_nucleus() -> dict[str, Any]:
 def rebuild_atlas_cache() -> dict[str, Any]:
     with connect() as conn:
         nav_rows = conn.execute(
-            """
+            f"""
             SELECT id, x, y, z, coarse_bucket_key, guide_area, is_document_anchor
             FROM nodes_nav
+            WHERE {_lifecycle_scope_sql("current", column="lifecycle_status")}
             """
         ).fetchall()
         highway_rows = conn.execute("SELECT source_id, target_id, strength FROM highways").fetchall()
@@ -4962,7 +5209,9 @@ def fetch_atlas() -> dict[str, Any]:
             ORDER BY bucket_key
             """
         ).fetchall()
-        node_count = conn.execute("SELECT COUNT(*) FROM nodes_nav").fetchone()[0]
+        node_count = conn.execute(
+            f"SELECT COUNT(*) FROM nodes_nav WHERE {_lifecycle_scope_sql('current', column='lifecycle_status')}"
+        ).fetchone()[0]
     if not rows and node_count:
         return rebuild_atlas_cache()
     return {
@@ -5024,7 +5273,13 @@ def compute_bucket_window(center: dict[str, float], radius: float, *, bucket_siz
     }
 
 
-def query_nearby_navigation(center: dict[str, float], *, radius: float, limit: int = 24) -> list[dict[str, Any]]:
+def query_nearby_navigation(
+    center: dict[str, float],
+    *,
+    radius: float,
+    limit: int = 24,
+    lifecycle_scope: str = "current",
+) -> list[dict[str, Any]]:
     window = compute_bucket_window(center, radius, bucket_size=FINE_BUCKET_SIZE)
     qx = float(center["x"])
     qy = float(center["y"])
@@ -5032,7 +5287,7 @@ def query_nearby_navigation(center: dict[str, float], *, radius: float, limit: i
     r2 = float(radius) ** 2
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 n.*,
                 s.routing_brainhex_json,
@@ -5048,6 +5303,7 @@ def query_nearby_navigation(center: dict[str, float], *, radius: float, limit: i
             WHERE n.fine_bucket_x BETWEEN ? AND ?
               AND n.fine_bucket_y BETWEEN ? AND ?
               AND n.fine_bucket_z BETWEEN ? AND ?
+              AND {_lifecycle_scope_sql(lifecycle_scope)}
               AND ((n.x - ?) * (n.x - ?) + (n.y - ?) * (n.y - ?) + (n.z - ?) * (n.z - ?)) <= ?
             ORDER BY ((n.x - ?) * (n.x - ?) + (n.y - ?) * (n.y - ?) + (n.z - ?) * (n.z - ?)) ASC, n.id ASC
             LIMIT ?
@@ -5088,7 +5344,13 @@ def query_nearby_navigation(center: dict[str, float], *, radius: float, limit: i
     return nodes
 
 
-def fetch_nav_by_coarse_bucket_keys(bucket_keys: list[str], *, limit: int = 32, document_anchor_only: bool = False) -> list[dict[str, Any]]:
+def fetch_nav_by_coarse_bucket_keys(
+    bucket_keys: list[str],
+    *,
+    limit: int = 32,
+    document_anchor_only: bool = False,
+    lifecycle_scope: str = "current",
+) -> list[dict[str, Any]]:
     if not bucket_keys:
         return []
     placeholders = ",".join("?" for _ in bucket_keys)
@@ -5106,6 +5368,7 @@ def fetch_nav_by_coarse_bucket_keys(bucket_keys: list[str], *, limit: int = 32, 
         FROM nodes_nav n
         LEFT JOIN node_semantics s ON s.node_id = n.id
         WHERE n.coarse_bucket_key IN ({placeholders})
+          AND {_lifecycle_scope_sql(lifecycle_scope)}
     """
     params: list[Any] = list(bucket_keys)
     if document_anchor_only:
@@ -5212,6 +5475,9 @@ def create_search_session(search_id: str, request_payload: dict[str, Any]) -> No
                 plan_json=NULL,
                 plan_health_json=NULL,
                 result_json=NULL,
+                first_useful_result_json=NULL,
+                latest_useful_result_json=NULL,
+                final_result_json=NULL,
                 result_health_json=NULL,
                 stop_reason=NULL,
                 answerability_state=NULL,
@@ -5236,7 +5502,9 @@ def save_search_plan(search_id: str, plan_payload: dict[str, Any]) -> None:
         conn.execute(
             """
             UPDATE search_sessions
-            SET plan_json = ?, plan_health_json = ?, updated_at = ?
+            SET plan_json = ?, plan_health_json = ?,
+                status = CASE WHEN status = 'created' THEN 'planning' ELSE status END,
+                updated_at = ?
             WHERE search_id = ?
             """,
             (_json_dump(plan_payload), plan_health_json, utc_timestamp(), str(search_id)),
@@ -5246,10 +5514,13 @@ def save_search_plan(search_id: str, plan_payload: dict[str, Any]) -> None:
 
 def mark_search_running(search_id: str) -> None:
     with connect() as conn:
-        conn.execute(
-            "UPDATE search_sessions SET status = 'running', updated_at = ? WHERE search_id = ?",
-            (utc_timestamp(), str(search_id)),
-        )
+        row = conn.execute("SELECT status FROM search_sessions WHERE search_id = ?", (str(search_id),)).fetchone()
+        if row:
+            next_status = advance_canonical_search_state(str(row["status"]), "running")
+            conn.execute(
+                "UPDATE search_sessions SET status = ?, updated_at = ? WHERE search_id = ?",
+                (next_status, utc_timestamp(), str(search_id)),
+            )
         conn.commit()
 
 
@@ -5265,11 +5536,11 @@ def append_search_event(search_id: str, event_type: str, payload: dict[str, Any]
     )
     annotated_payload = dict(preview_event.get("payload") or payload or {})
     with connect() as conn:
-        session_exists = conn.execute(
-            "SELECT 1 FROM search_sessions WHERE search_id = ? LIMIT 1",
+        session_row = conn.execute(
+            "SELECT status FROM search_sessions WHERE search_id = ? LIMIT 1",
             (str(search_id),),
         ).fetchone()
-        if not session_exists:
+        if not session_row:
             return annotate_stream_event(
                 {
                     "seq": 0,
@@ -5278,6 +5549,19 @@ def append_search_event(search_id: str, event_type: str, payload: dict[str, Any]
                         **annotated_payload,
                         "event_store_status": "skipped_missing_search_session",
                         "event_store_reason": "search_session_not_found",
+                    },
+                    "created_at": created_at,
+                }
+            )
+        if str(session_row["status"] or "").strip().lower() == "cancelled" and str(event_type) != "search_cancelled":
+            return annotate_stream_event(
+                {
+                    "seq": 0,
+                    "event_type": str(event_type),
+                    "payload": {
+                        **annotated_payload,
+                        "event_store_status": "skipped_cancelled_search_session",
+                        "event_store_reason": "search_session_cancelled",
                     },
                     "created_at": created_at,
                 }
@@ -5314,6 +5598,145 @@ def append_search_event(search_id: str, event_type: str, payload: dict[str, Any]
             "created_at": created_at,
         }
     )
+
+
+def cancel_search_session(
+    search_id: str,
+    *,
+    expected_state_revision: int | None = None,
+    idempotency_key: str | None = None,
+    reason: str = "user_cancelled",
+) -> dict[str, Any] | None:
+    resolved_search_id = str(search_id or "").strip()
+    if not resolved_search_id:
+        return None
+    now = utc_timestamp()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT search_id, status, result_json, final_result_json, stop_reason
+            FROM search_sessions
+            WHERE search_id = ?
+            """,
+            (resolved_search_id,),
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        latest_seq_row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS state_revision FROM search_events WHERE search_id = ?",
+            (resolved_search_id,),
+        ).fetchone()
+        state_revision = int((latest_seq_row or {})["state_revision"] or 0)
+        existing_cancel = None
+        if idempotency_key:
+            existing_cancel = conn.execute(
+                """
+                SELECT seq, payload_json, created_at
+                FROM search_events
+                WHERE search_id = ?
+                  AND event_type = 'search_cancelled'
+                  AND json_extract(payload_json, '$.idempotency_key') = ?
+                ORDER BY seq ASC
+                LIMIT 1
+                """,
+                (resolved_search_id, str(idempotency_key)),
+            ).fetchone()
+        if existing_cancel:
+            conn.commit()
+            payload = _json_load(existing_cancel["payload_json"], {})
+            return {
+                "search_id": resolved_search_id,
+                "status": "cancelled",
+                "cancelled": True,
+                "already_cancelled": True,
+                "idempotent_replay": True,
+                "state_revision": int(existing_cancel["seq"]),
+                "previous_state_revision": int(payload.get("previous_state_revision") or 0),
+                "event": annotate_stream_event(
+                    {
+                        "seq": int(existing_cancel["seq"]),
+                        "event_type": "search_cancelled",
+                        "payload": payload,
+                        "created_at": str(existing_cancel["created_at"]),
+                    }
+                ),
+            }
+        if expected_state_revision is not None and int(expected_state_revision) != state_revision:
+            conn.rollback()
+            raise ValueError("stale_search_cancel_revision")
+        previous_status = str(row["status"] or "").strip().lower()
+        if previous_status == "cancelled":
+            conn.commit()
+            return {
+                "search_id": resolved_search_id,
+                "status": "cancelled",
+                "cancelled": True,
+                "already_cancelled": True,
+                "idempotent_replay": False,
+                "state_revision": state_revision,
+                "previous_state_revision": state_revision,
+            }
+        payload = {
+            "search_id": resolved_search_id,
+            "previous_status": previous_status or None,
+            "canonical_search_state": "cancelled",
+            "status": "cancelled",
+            "reason": str(reason or "user_cancelled"),
+            "idempotency_key": str(idempotency_key or ""),
+            "previous_state_revision": state_revision,
+            "cancelled_at": now,
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "terminal_for_client": True,
+        }
+        preview = annotate_stream_event(
+            {
+                "seq": 0,
+                "event_type": "search_cancelled",
+                "payload": payload,
+                "created_at": now,
+            }
+        )
+        annotated_payload = dict(preview.get("payload") or payload)
+        cursor = conn.execute(
+            """
+            INSERT INTO search_events (search_id, event_type, payload_json, created_at)
+            VALUES (?, 'search_cancelled', ?, ?)
+            """,
+            (resolved_search_id, _json_dump(annotated_payload), now),
+        )
+        next_revision = int(cursor.lastrowid or state_revision)
+        conn.execute(
+            """
+            UPDATE search_sessions
+            SET status = 'cancelled',
+                stop_reason = ?,
+                result_health_json = NULL,
+                updated_at = ?
+            WHERE search_id = ?
+            """,
+            (str(reason or "user_cancelled"), now, resolved_search_id),
+        )
+        conn.commit()
+    return {
+        "search_id": resolved_search_id,
+        "status": "cancelled",
+        "cancelled": True,
+        "already_cancelled": False,
+        "idempotent_replay": False,
+        "state_revision": next_revision,
+        "previous_state_revision": state_revision,
+        "event": annotate_stream_event(
+            {
+                "seq": next_revision,
+                "event_type": "search_cancelled",
+                "payload": annotated_payload,
+                "created_at": now,
+            }
+        ),
+    }
 
 
 def fetch_search_events(
@@ -5385,15 +5808,328 @@ def fetch_search_events_by_type(
     ]
 
 
-def finalize_search_session(search_id: str, result_payload: dict[str, Any]) -> None:
-    result_json = _json_dump(result_payload)
-    result_health_json = _json_dump(_search_result_health_summary(result_payload, result_json_length=len(result_json)))
+_SEARCH_SNAPSHOT_ID_KEYS = (
+    "id",
+    "node_id",
+    "document_id",
+    "source_id",
+    "source_unit_id",
+    "section_id",
+    "event_id",
+    "trace_id",
+    "path_id",
+    "key",
+    "digest",
+    "content_digest",
+    "content_hash",
+    "checksum",
+)
+
+
+def _search_snapshot_item_identity(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in _SEARCH_SNAPSHOT_ID_KEYS:
+            marker = str(value.get(key) or "").strip()
+            if marker:
+                return f"{key}:{marker}"
+        source = str(value.get("source") or value.get("source_id") or "").strip()
+        target = str(value.get("target") or value.get("target_id") or "").strip()
+        kind = str(value.get("kind") or value.get("type") or "").strip()
+        if source or target:
+            return f"edge:{source}:{target}:{kind}"
+    canonical = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return f"digest:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _merge_search_snapshot_value(previous: Any, incoming: Any) -> Any:
+    if isinstance(previous, dict) and isinstance(incoming, dict):
+        merged = deepcopy(previous)
+        for key, value in incoming.items():
+            if key not in previous:
+                merged[key] = deepcopy(value)
+            elif value is not None:
+                merged[key] = _merge_search_snapshot_value(previous[key], value)
+        return merged
+    if isinstance(previous, list) and isinstance(incoming, list):
+        merged = [deepcopy(item) for item in previous]
+        positions = {_search_snapshot_item_identity(item): index for index, item in enumerate(merged)}
+        for item in incoming:
+            identity = _search_snapshot_item_identity(item)
+            if identity in positions:
+                index = positions[identity]
+                merged[index] = _merge_search_snapshot_value(merged[index], item)
+            else:
+                positions[identity] = len(merged)
+                merged.append(deepcopy(item))
+        return merged
+    if incoming is None:
+        return deepcopy(previous)
+    return deepcopy(incoming)
+
+
+_SEARCH_SNAPSHOT_SEAL_CONTRACT_KEYS = {
+    "completion_contract",
+    "mcp_delivery_contract",
+    "sufficiency_judge",
+    "master_sufficiency",
+}
+_SEARCH_SNAPSHOT_SEAL_BINDING_KEYS = (
+    "package_revision",
+    "brain_id",
+    "brain_revision",
+    "graph_revision",
+    "ledger_digest",
+    "mission_ledger_digest",
+    "evidence_ledger_digest",
+    "feedback_ledger_digest",
+)
+_SEARCH_SNAPSHOT_STALE_SEAL_KEYS = {
+    "final_closure_ready",
+    "final_seal_allowed",
+    "closure_state",
+    "answer_surface_state",
+    "sufficiency_status",
+}
+
+
+def _search_snapshot_binding_changed(previous: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    for key in _SEARCH_SNAPSHOT_SEAL_BINDING_KEYS:
+        previous_value = str(previous.get(key) or "").strip()
+        incoming_value = str(incoming.get(key) or "").strip()
+        if incoming_value and previous_value and incoming_value != previous_value:
+            return True
+    return False
+
+
+def _strip_stale_nested_search_seals(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = deepcopy(payload)
+    for contract_key in _SEARCH_SNAPSHOT_SEAL_CONTRACT_KEYS:
+        contract = sanitized.get(contract_key)
+        if not isinstance(contract, dict):
+            continue
+        sanitized_contract = {
+            key: deepcopy(value)
+            for key, value in contract.items()
+            if key not in _SEARCH_SNAPSHOT_STALE_SEAL_KEYS
+        }
+        stop_reason = str(sanitized_contract.get("stop_reason") or "").strip().lower()
+        if stop_reason.endswith("contract_satisfied") or stop_reason in {"final_closure_ready", "sufficiency_satisfied"}:
+            sanitized_contract.pop("stop_reason", None)
+        sanitized[contract_key] = sanitized_contract
+    return sanitized
+
+
+def _strip_stale_search_nonfinal_markers(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = deepcopy(payload)
+    if sanitized.get("final_materialization_pending") is True:
+        sanitized.pop("final_materialization_pending", None)
+    if sanitized.get("final_closure_ready") is False:
+        sanitized.pop("final_closure_ready", None)
+    if sanitized.get("final_seal_allowed") is False:
+        sanitized.pop("final_seal_allowed", None)
+    for key in ("status", "canonical_search_state", "closure_state", "answer_surface_state"):
+        value = str(sanitized.get(key) or "").strip().lower()
+        if value in {
+            "created",
+            "planning",
+            "running",
+            "review_required",
+            "finalizing",
+            "incomplete",
+            "insufficient",
+            "partial",
+            "timeout",
+            "timed_out",
+            "open",
+        }:
+            sanitized.pop(key, None)
+    stop_reason = str(sanitized.get("stop_reason") or "").strip().lower()
+    if any(token in stop_reason for token in ("timeout", "deadline", "incomplete", "insufficient", "review_required")):
+        sanitized.pop("stop_reason", None)
+    sanitized.pop("final_closure_blockers", None)
+    for key in ("unresolved_destination_count", "unresolved_mission_count", "pending_path_count"):
+        sanitized.pop(key, None)
+    return sanitized
+
+
+def _search_snapshot_is_explicitly_pending(payload: dict[str, Any]) -> bool:
+    """Return true when the current snapshot explicitly denies terminal readiness."""
+
+    current = dict(payload or {})
+    completion = current.get("completion_contract")
+    completion = dict(completion) if isinstance(completion, dict) else {}
+    delivery = current.get("mcp_delivery_contract")
+    delivery = dict(delivery) if isinstance(delivery, dict) else {}
+    if "final_materialization_pending" in current or "result_ready_terminal" in current:
+        return current.get("final_materialization_pending") is True and current.get("result_ready_terminal") is not True
+    if "final_materialization_pending" in completion or "result_ready_terminal" in completion:
+        return completion.get("final_materialization_pending") is True and completion.get("result_ready_terminal") is not True
+    return delivery.get("final_materialization_pending") is True and delivery.get("terminal_for_client") is not True
+
+
+def _merge_search_snapshot_payload(previous: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    previous_counts = search_snapshot_counters(previous)
+    incoming_counts = search_snapshot_counters(incoming)
+    incoming_has_final_seal = search_result_has_final_seal(incoming)
+    invalidate_stale_seal = bool(
+        search_result_explicitly_unsealed(incoming)
+        or not search_result_has_current_seal_bindings(incoming)
+        or (_search_snapshot_binding_changed(previous, incoming) and not incoming_has_final_seal)
+    )
+    merge_base = _strip_stale_search_nonfinal_markers(previous) if incoming_has_final_seal else dict(previous or {})
+    if invalidate_stale_seal:
+        merge_base = _strip_stale_nested_search_seals(merge_base)
+    merged = _merge_search_snapshot_value(merge_base, dict(incoming or {}))
+    # Evidence lists are monotonic across snapshots, but mission/master state is
+    # not.  A final judgement replaces an earlier partial judgement atomically;
+    # recursively merging their lists can otherwise leave the same goal both
+    # covered and missing.  Keep every mirrored surface bound to the newest
+    # authoritative ledger and judgement from this snapshot.
+    incoming_master = incoming.get("master_judgement")
+    incoming_ledger = incoming.get("mission_evidence_ledger")
+    incoming_learning = incoming.get("mission_learning_rollup")
+    authoritative_fields = {
+        "master_judgement": incoming_master,
+        "mission_evidence_ledger": incoming_ledger,
+        "mission_learning_rollup": incoming_learning,
+    }
+    for key, value in authoritative_fields.items():
+        if isinstance(value, dict):
+            merged[key] = deepcopy(value)
+
+    for container_key in ("planner_runtime", "context_package", "context_structured"):
+        incoming_container = incoming.get(container_key)
+        if not isinstance(incoming_container, dict):
+            continue
+        merged_container = deepcopy(merged.get(container_key)) if isinstance(merged.get(container_key), dict) else {}
+        for key, value in authoritative_fields.items():
+            if isinstance(value, dict):
+                merged_container[key] = deepcopy(value)
+            elif isinstance(incoming_container.get(key), dict):
+                merged_container[key] = deepcopy(incoming_container[key])
+        if container_key == "context_structured" and isinstance(merged_container.get("context_package"), dict):
+            structured_package = deepcopy(merged_container["context_package"])
+            for key, value in authoritative_fields.items():
+                if isinstance(value, dict):
+                    structured_package[key] = deepcopy(value)
+            merged_container["context_package"] = structured_package
+        merged[container_key] = merged_container
+    if invalidate_stale_seal:
+        merged = _strip_stale_nested_search_seals(merged)
+    merged_counts = search_snapshot_counters(merged)
+    merged["snapshot_counters"] = {
+        "visited_current": incoming_counts["visited_current"],
+        "visited_total": max(previous_counts["visited_total"], incoming_counts["visited_total"], merged_counts["visited_total"]),
+        "promoted": max(previous_counts["promoted"], incoming_counts["promoted"], merged_counts["promoted"]),
+        "hydrated": max(previous_counts["hydrated"], incoming_counts["hydrated"], merged_counts["hydrated"]),
+        "package": max(previous_counts["package"], incoming_counts["package"], merged_counts["package"]),
+    }
+    return merged
+
+
+def _canonical_persisted_search_snapshot(
+    search_id: str,
+    payload: dict[str, Any],
+    *,
+    snapshot_kind: str,
+    brain_id: str,
+    parent: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return canonicalize_search_snapshot(
+        search_id,
+        payload,
+        snapshot_kind=snapshot_kind,
+        brain_id=brain_id or None,
+        parent_package_revision=str(dict(parent or {}).get("package_revision") or "") or None,
+    )
+
+
+def _terminal_review_required_status(result: dict[str, Any] | None) -> bool:
+    """Allow a useful final review surface to replace a stale blocked checkpoint."""
+
+    current = dict(result or {})
+    canonical = str(current.get("canonical_search_state") or "").strip().lower()
+    completion = str(current.get("completion_state") or "").strip().lower()
+    stop_reason = str(current.get("stop_reason") or "").strip().lower()
+    materialization = str(current.get("result_materialization_state") or "").strip().lower()
+    review_marker = (
+        current.get("review_required") is True
+        or completion == "review_required"
+        or materialization == "partial_review_required"
+    )
+    return bool(
+        canonical == "review_required"
+        and current.get("terminal_for_client") is True
+        and current.get("final_materialization_pending") is False
+        and review_marker
+        and (
+            completion == "review_required"
+            or materialization == "partial_review_required"
+            or stop_reason.startswith("review_required_")
+            or stop_reason.startswith("flash_public_partial")
+        )
+        and search_snapshot_is_useful(current)
+    )
+
+
+def finalize_search_session(search_id: str, result_payload: dict[str, Any]) -> dict[str, Any]:
+    if _search_snapshot_is_explicitly_pending(result_payload):
+        # Some streaming call sites publish an answer/materialization checkpoint
+        # through the final-writer facade before the worker has stopped.  The
+        # payload contract, not the function name, decides whether finalization
+        # is legal.
+        return save_search_result_snapshot(search_id, result_payload)
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT request_json, status, result_json, first_useful_result_json, latest_useful_result_json
+            FROM search_sessions
+            WHERE search_id = ?
+            """,
+            (str(search_id),),
+        ).fetchone()
+        if not row or str(row["status"] or "").strip().lower() == "cancelled":
+            return {}
+        request_payload = _json_load(row["request_json"], {})
+        first = _json_load(row["first_useful_result_json"], {}) if row["first_useful_result_json"] else {}
+        latest = _json_load(row["latest_useful_result_json"], {}) if row["latest_useful_result_json"] else {}
+        legacy = _json_load(row["result_json"], {}) if row["result_json"] else {}
+        parent = latest or first or legacy
+        merged = _merge_search_snapshot_payload(parent, result_payload) if parent else dict(result_payload or {})
+        brain_id = str(merged.get("brain_id") or request_payload.get("brain_id") or current_brain_id() or "").strip()
+        final = _canonical_persisted_search_snapshot(
+            search_id,
+            merged,
+            snapshot_kind="final",
+            brain_id=brain_id,
+            parent=parent,
+        )
+        if str(final.get("canonical_search_state") or "").strip().lower() == "completed" and search_result_has_final_seal(final):
+            persisted_status = "completed"
+        elif _terminal_review_required_status(final):
+            persisted_status = "review_required"
+        else:
+            persisted_status = advance_canonical_search_state(str(row["status"]), str(final["canonical_search_state"]))
+        if not first and search_snapshot_is_useful(final):
+            first = _canonical_persisted_search_snapshot(
+                search_id,
+                result_payload,
+                snapshot_kind="first_useful",
+                brain_id=brain_id,
+                parent=None,
+            )
+        latest = final if search_snapshot_is_useful(final) else latest
+        result_json = _json_dump(final)
+        result_health_json = _json_dump(_search_result_health_summary(final, result_json_length=len(result_json)))
         conn.execute(
             """
             UPDATE search_sessions
-            SET status = 'completed',
+            SET status = ?,
                 result_json = ?,
+                first_useful_result_json = ?,
+                latest_useful_result_json = ?,
+                final_result_json = ?,
                 result_health_json = ?,
                 stop_reason = ?,
                 answerability_state = ?,
@@ -5401,41 +6137,111 @@ def finalize_search_session(search_id: str, result_payload: dict[str, Any]) -> N
             WHERE search_id = ?
             """,
             (
+                persisted_status,
+                result_json,
+                _json_dump(first) if first else None,
+                _json_dump(latest) if latest else None,
                 result_json,
                 result_health_json,
-                str(result_payload.get("stop_reason") or ""),
-                str(result_payload.get("answerability_state") or ""),
+                str(final.get("stop_reason") or ""),
+                str(final.get("answerability_state") or ""),
                 utc_timestamp(),
                 str(search_id),
             ),
         )
         conn.commit()
+    return final
 
 
-def save_search_result_snapshot(search_id: str, result_payload: dict[str, Any]) -> None:
-    result_json = _json_dump(result_payload)
-    result_health_json = _json_dump(_search_result_health_summary(result_payload, result_json_length=len(result_json)))
+def save_search_result_snapshot(search_id: str, result_payload: dict[str, Any]) -> dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT request_json, status, result_json, first_useful_result_json, latest_useful_result_json
+            FROM search_sessions
+            WHERE search_id = ?
+            """,
+            (str(search_id),),
+        ).fetchone()
+        if not row or str(row["status"]) in {"cancelled", "completed", "failed"}:
+            return {}
+        request_payload = _json_load(row["request_json"], {})
+        first = _json_load(row["first_useful_result_json"], {}) if row["first_useful_result_json"] else {}
+        latest = _json_load(row["latest_useful_result_json"], {}) if row["latest_useful_result_json"] else {}
+        legacy = _json_load(row["result_json"], {}) if row["result_json"] else {}
+        parent = latest or first or legacy
+        merged = _merge_search_snapshot_payload(parent, result_payload) if parent else dict(result_payload or {})
+        brain_id = str(merged.get("brain_id") or request_payload.get("brain_id") or current_brain_id() or "").strip()
+        snapshot_kind = "latest_useful" if parent else "first_useful"
+        snapshot_explicitly_pending = _search_snapshot_is_explicitly_pending(result_payload)
+        proposed_status = canonical_search_state({"result": result_payload}, "result_snapshot_ready")
+        pending_would_terminalize = bool(
+            snapshot_explicitly_pending
+            and proposed_status in {"blocked", "completed", "failed", "review_required", "superseded"}
+        )
+        latest_candidate = _canonical_persisted_search_snapshot(
+            search_id,
+            merged,
+            snapshot_kind=snapshot_kind,
+            brain_id=brain_id,
+            parent=parent,
+        )
+        if pending_would_terminalize:
+            latest_candidate = project_search_result_lifecycle(latest_candidate, "running")
+        if not first and search_snapshot_is_useful(result_payload):
+            first = _canonical_persisted_search_snapshot(
+                search_id,
+                result_payload,
+                snapshot_kind="first_useful",
+                brain_id=brain_id,
+                parent=None,
+            )
+            if pending_would_terminalize:
+                first = project_search_result_lifecycle(first, "running")
+        if search_snapshot_is_useful(latest_candidate):
+            latest = latest_candidate
+        persisted = latest or latest_candidate
+        if pending_would_terminalize:
+            # An explicitly pending snapshot is a checkpoint, never a terminal
+            # decision. Only a later non-pending final writer may close it.
+            proposed_status = "running"
+        explicit_snapshot_state = str(result_payload.get("canonical_search_state") or "").strip().lower()
+        if proposed_status == "finalizing" and not (
+            explicit_snapshot_state == "finalizing"
+            or result_payload.get("final_materialization_pending") is True
+        ):
+            proposed_status = str(row["status"])
+        persisted_status = advance_canonical_search_state(str(row["status"]), proposed_status)
+        result_json = _json_dump(persisted)
+        result_health_json = _json_dump(_search_result_health_summary(persisted, result_json_length=len(result_json)))
         conn.execute(
             """
             UPDATE search_sessions
-            SET result_json = ?,
+            SET status = ?,
+                result_json = ?,
+                first_useful_result_json = ?,
+                latest_useful_result_json = ?,
                 result_health_json = ?,
                 stop_reason = ?,
                 answerability_state = ?,
                 updated_at = ?
-            WHERE search_id = ? AND status NOT IN ('completed', 'failed')
+            WHERE search_id = ? AND status NOT IN ('cancelled', 'completed', 'failed')
             """,
             (
+                persisted_status,
                 result_json,
+                _json_dump(first) if first else None,
+                _json_dump(latest) if latest else None,
                 result_health_json,
-                str(result_payload.get("stop_reason") or ""),
-                str(result_payload.get("answerability_state") or ""),
+                str(persisted.get("stop_reason") or ""),
+                str(persisted.get("answerability_state") or ""),
                 utc_timestamp(),
                 str(search_id),
             ),
         )
         conn.commit()
+    return persisted
 
 
 def fail_search_session(search_id: str, error_message: str) -> None:
@@ -5447,7 +6253,7 @@ def fail_search_session(search_id: str, error_message: str) -> None:
                 stop_reason = ?,
                 result_health_json = NULL,
                 updated_at = ?
-            WHERE search_id = ?
+            WHERE search_id = ? AND status != 'cancelled'
             """,
             (str(error_message), utc_timestamp(), str(search_id)),
         )
@@ -5462,14 +6268,30 @@ def fetch_search_session(
     include_result: bool = True,
 ) -> dict[str, Any] | None:
     timeout_ms = 30000 if busy_timeout_ms is None else max(1, int(busy_timeout_ms))
-    result_select = "result_json" if include_result else "result_health_json AS result_json"
-    result_length_select = "length(result_json)" if include_result else "COALESCE(json_extract(result_health_json, '$.result_json_length'), 0)"
     try:
-        with connect(timeout_seconds=timeout_ms / 1000.0, busy_timeout_ms=timeout_ms) as conn:
+        # Search status/result polling is read-only and must remain available
+        # while the background Search transaction writes progressive evidence.
+        # A normal connection used to repeat `PRAGMA journal_mode=WAL` here and
+        # could turn harmless polling into a 500 under concurrent Search load.
+        with connect_readonly(timeout_seconds=timeout_ms / 1000.0, busy_timeout_ms=timeout_ms) as conn:
+            columns = _table_columns(conn, "search_sessions")
+            if include_result:
+                final_select = _select_column_or_sql(columns, "final_result_json", "NULL")
+                first_select = _select_column_or_sql(columns, "first_useful_result_json", "NULL")
+                latest_select = _select_column_or_sql(columns, "latest_useful_result_json", "NULL")
+                result_select = "COALESCE(final_result_json, result_json) AS result_json" if "final_result_json" in columns else "result_json"
+                result_length_select = "length(COALESCE(final_result_json, result_json))" if "final_result_json" in columns else "length(result_json)"
+            else:
+                final_select = "NULL AS final_result_json"
+                first_select = "NULL AS first_useful_result_json"
+                latest_select = "NULL AS latest_useful_result_json"
+                result_select = "result_health_json AS result_json"
+                result_length_select = "COALESCE(json_extract(result_health_json, '$.result_json_length'), 0)"
             row = conn.execute(
                 f"""
                 SELECT search_id, thread_id, query_text, response_mode, status, request_json, plan_json,
                        {result_select}, {result_length_select} AS result_json_length,
+                       {first_select}, {latest_select}, {final_select},
                        stop_reason, answerability_state, created_at, updated_at
                 FROM search_sessions
                 WHERE search_id = ?
@@ -5557,6 +6379,10 @@ def _search_session_health_plan_projection_sql() -> str:
 
 
 def _search_session_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+    first = _json_load(row["first_useful_result_json"], {}) if "first_useful_result_json" in keys and row["first_useful_result_json"] else None
+    latest = _json_load(row["latest_useful_result_json"], {}) if "latest_useful_result_json" in keys and row["latest_useful_result_json"] else None
+    final = _json_load(row["final_result_json"], {}) if "final_result_json" in keys and row["final_result_json"] else None
     return {
         "search_id": str(row["search_id"]),
         "thread_id": str(row["thread_id"]) if row["thread_id"] else None,
@@ -5566,6 +6392,11 @@ def _search_session_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "request": _json_load(row["request_json"], {}),
         "plan": _json_load(row["plan_json"], {}) if row["plan_json"] else None,
         "result": _json_load(row["result_json"], {}) if row["result_json"] else None,
+        "result_snapshots": {
+            "first_useful": first,
+            "latest_useful": latest,
+            "final": final,
+        },
         "result_json_length": int(row["result_json_length"] or 0),
         "stop_reason": row["stop_reason"],
         "answerability_state": row["answerability_state"],
@@ -5592,8 +6423,16 @@ def fetch_recent_search_sessions(
         plan_projection = _search_session_health_plan_projection_sql() if "plan_json" in columns else "NULL"
         if include_result:
             plan_select = "plan_json" if "plan_json" in columns else "NULL"
-            result_select = _select_column_or_sql(columns, "result_json", "NULL", alias="result_json")
-            result_length_select = "length(result_json)" if "result_json" in columns else "0"
+            if "final_result_json" in columns and "result_json" in columns:
+                result_expr = "COALESCE(final_result_json, result_json)"
+            elif "final_result_json" in columns:
+                result_expr = "final_result_json"
+            elif "result_json" in columns:
+                result_expr = "result_json"
+            else:
+                result_expr = "NULL"
+            result_select = f"{result_expr} AS result_json"
+            result_length_select = f"COALESCE(length({result_expr}), 0)"
         else:
             if "plan_health_json" in columns:
                 plan_select = f"COALESCE(plan_health_json, {plan_projection})"
@@ -5787,7 +6626,7 @@ def _runtime_retention_build_plan(
             """
             SELECT search_id
             FROM search_sessions
-            WHERE status IN ('created', 'running')
+            WHERE status IN ('created', 'planning', 'running', 'finalizing')
               AND julianday(updated_at) >= julianday('now') - (? / 1440.0)
             """,
             (int(active_session_grace_minutes),),
@@ -6616,6 +7455,7 @@ def _grow_preview_binding_error(
 
 
 def _grow_preview_binding_row(row: sqlite3.Row) -> dict[str, Any]:
+    available_columns = set(row.keys())
     return {
         "binding": dict(_json_load(row["binding_json"], {})),
         "source_sha256": str(row["source_sha256"]),
@@ -6626,6 +7466,28 @@ def _grow_preview_binding_row(row: sqlite3.Row) -> dict[str, Any]:
         "state": str(row["state"]),
         "state_updated_at": int(row["state_updated_at"]),
         "apply_result": dict(_json_load(row["apply_result_json"], {})),
+        "before_graph": dict(_json_load(row["before_graph_json"], {})),
+        "rollback_result": dict(_json_load(row["rollback_result_json"], {})),
+        "investigation": dict(
+            _json_load(row["investigation_json"], {})
+            if "investigation_json" in available_columns
+            else {}
+        ),
+        "resume_token_sha256": str(row["resume_token_sha256"] or "")
+        if "resume_token_sha256" in available_columns
+        else "",
+        "investigation_version": int(row["investigation_version"] or 0)
+        if "investigation_version" in available_columns
+        else 0,
+        "investigation_sha256": str(row["investigation_sha256"] or "")
+        if "investigation_sha256" in available_columns
+        else "",
+        "evidence_sha256": str(row["evidence_sha256"] or "")
+        if "evidence_sha256" in available_columns
+        else "",
+        "source_content_sha256": str(row["source_content_sha256"] or "")
+        if "source_content_sha256" in available_columns
+        else "",
         "created_at": str(row["created_at"]),
     }
 
@@ -6916,6 +7778,993 @@ def finish_grow_preview_binding(
     return _grow_preview_binding_row(finalized)
 
 
+def _grow_resume_token_digest(resume_token: str) -> str:
+    token = str(resume_token or "").strip()
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+
+
+def _grow_investigator_source_sha256(source_investigation: dict[str, Any]) -> str:
+    return grow_source_sha256(source_investigation)
+
+
+def _grow_investigation_evidence_digest(investigation: dict[str, Any]) -> str:
+    evidence_material = {
+        "search_receipts": list(investigation.get("search_receipts") or []),
+        "hydrated_evidence": investigation.get("hydrated_evidence") or {},
+        "decisions": list(investigation.get("decisions") or []),
+        "ai_execution_ledger": list(investigation.get("ai_execution_ledger") or []),
+    }
+    return canonical_sha256(evidence_material)
+
+
+def _grow_stable_digest(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _grow_execution_ledger_attested(investigation: dict[str, Any]) -> bool:
+    ledger = [
+        _dict_value(item)
+        for item in list(investigation.get("ai_execution_ledger") or [])
+        if isinstance(item, dict)
+    ]
+    aggregate = _dict_value(investigation.get("ai_execution_attestation"))
+    if (
+        not ledger
+        or not any(str(item.get("role") or "") == "compiler" for item in ledger)
+        or str(aggregate.get("schema_version") or "") != "agvm.ai_execution_ledger_aggregate.v1"
+        or str(aggregate.get("status") or "") != "completed"
+        or not bool(aggregate.get("provider_executed"))
+        or not bool(aggregate.get("complete"))
+        or not bool(aggregate.get("applicable"))
+    ):
+        return False
+    entry_digests: list[str] = []
+    for entry in ledger:
+        persisted_entry_digest = str(entry.get("entry_sha256") or "")
+        unsigned_entry = {key: value for key, value in entry.items() if key != "entry_sha256"}
+        if not persisted_entry_digest or persisted_entry_digest != _grow_stable_digest(unsigned_entry):
+            return False
+        entry_digests.append(persisted_entry_digest)
+    return hmac.compare_digest(
+        str(aggregate.get("ledger_sha256") or ""),
+        _grow_stable_digest(entry_digests),
+    )
+
+
+def _grow_investigator_execution_attested(investigation: dict[str, Any]) -> bool:
+    ledger = [
+        _dict_value(item)
+        for item in list(investigation.get("ai_execution_ledger") or [])
+        if isinstance(item, dict)
+    ]
+    aggregate = _dict_value(investigation.get("ai_execution_attestation"))
+    if (
+        not ledger
+        or any(str(item.get("role") or "") == "compiler" for item in ledger)
+        or str(aggregate.get("schema_version") or "") != "agvm.ai_execution_ledger_aggregate.v1"
+        or str(aggregate.get("status") or "") != "completed"
+        or not bool(aggregate.get("provider_executed"))
+        or not bool(aggregate.get("complete"))
+        or not bool(aggregate.get("applicable"))
+    ):
+        return False
+    entry_digests: list[str] = []
+    provider_entry_seen = False
+    for entry in ledger:
+        persisted_entry_digest = str(entry.get("entry_sha256") or "")
+        unsigned_entry = {key: value for key, value in entry.items() if key != "entry_sha256"}
+        if not persisted_entry_digest or persisted_entry_digest != _grow_stable_digest(unsigned_entry):
+            return False
+        if bool(_dict_value(entry.get("attestation")).get("provider_executed")):
+            provider_entry_seen = True
+        entry_digests.append(persisted_entry_digest)
+    if not provider_entry_seen:
+        return False
+    return hmac.compare_digest(
+        str(aggregate.get("ledger_sha256") or ""),
+        _grow_stable_digest(entry_digests),
+    )
+
+
+def _grow_required_questions_pending(investigation: dict[str, Any]) -> list[str]:
+    pending: list[str] = []
+    answers = _dict_value(
+        investigation.get("clarification_answers") or investigation.get("answers")
+    )
+    raw_questions = investigation.get("pending_questions")
+    if raw_questions is None:
+        raw_questions = investigation.get("questions")
+    questions = list(raw_questions or []) if not isinstance(raw_questions, dict) else list(raw_questions.values())
+    for raw_question in questions:
+        question = _dict_value(raw_question)
+        question_id = str(question.get("question_id") or "").strip()
+        if not question_id or not bool(question.get("required_for_preview", True)):
+            continue
+        status = str(question.get("status") or "unanswered").strip().lower()
+        if status == "answered" or question_id in answers:
+            continue
+        pending.append(question_id)
+    return pending
+
+
+def _grow_maintenance_feedback_packets_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    packets = payload.get("maintenance_feedback_packets")
+    return [
+        deepcopy(_dict_value(item))
+        for item in list(packets or [])
+        if isinstance(item, dict)
+    ]
+
+
+def _validated_grow_investigation_row(
+    row: sqlite3.Row,
+    *,
+    resume_token: str | None = None,
+) -> dict[str, Any]:
+    record = _grow_preview_binding_row(row)
+    investigation = deepcopy(_dict_value(record.get("investigation")))
+    binding = _dict_value(record.get("binding"))
+    investigation_id = str(row["token_id"] or "").strip()
+    brain_id = str(row["brain_id"] or "").strip()
+    source_investigation = _dict_value(
+        _dict_value(record.get("source_payload")).get("source_investigation")
+    )
+    expected_source_sha256 = str(record.get("source_content_sha256") or "").strip()
+    expected_source_payload_sha256 = str(binding.get("source_payload_sha256") or "").strip()
+    expected_investigation_sha256 = str(record.get("investigation_sha256") or "").strip()
+    expected_evidence_sha256 = str(record.get("evidence_sha256") or "").strip()
+    preview_payload = _dict_value(record.get("preview_payload"))
+    maintenance_feedback_packets = _grow_maintenance_feedback_packets_from_payload(preview_payload)
+    expected_maintenance_feedback_sha256 = str(
+        binding.get("maintenance_feedback_packets_sha256")
+        or preview_payload.get("maintenance_feedback_packets_sha256")
+        or ""
+    ).strip()
+    if (
+        not investigation_id
+        or not brain_id
+        or not investigation
+        or str(investigation.get("schema_version") or "") != GROW_INVESTIGATION_V3_SCHEMA_VERSION
+        or str(investigation.get("investigation_id") or "") != investigation_id
+        or str(investigation.get("brain_id") or "") != brain_id
+        or int(investigation.get("version") or 0) != int(record.get("investigation_version") or 0)
+        or canonical_sha256(investigation) != expected_investigation_sha256
+        or canonical_sha256(source_investigation) != expected_source_payload_sha256
+        or _grow_investigator_source_sha256(source_investigation) != expected_source_sha256
+        or str(investigation.get("source_sha256") or "") != expected_source_sha256
+        or _grow_investigation_evidence_digest(investigation) != expected_evidence_sha256
+        or str(binding.get("brain_revision") or "") != str(investigation.get("brain_revision") or "")
+        or (
+            expected_maintenance_feedback_sha256
+            and canonical_sha256(maintenance_feedback_packets) != expected_maintenance_feedback_sha256
+        )
+    ):
+        raise _grow_preview_binding_error("grow_investigation_integrity_invalid")
+    if resume_token is not None and not hmac.compare_digest(
+        str(record.get("resume_token_sha256") or ""),
+        _grow_resume_token_digest(resume_token),
+    ):
+        raise _grow_preview_binding_error("grow_investigation_resume_token_invalid", status_code=403)
+    return {
+        **record,
+        "investigation_id": investigation_id,
+        "brain_id": brain_id,
+        "brain_revision": str(investigation.get("brain_revision") or ""),
+        "source_investigation": deepcopy(source_investigation),
+        "source_formation_contract": deepcopy(
+            _dict_value(_dict_value(record.get("source_payload")).get("source_formation_contract"))
+        ),
+        "maintenance_feedback_packets": maintenance_feedback_packets,
+        "maintenance_feedback_packets_sha256": expected_maintenance_feedback_sha256,
+        "investigation_session": deepcopy(
+            _dict_value(preview_payload.get("investigation_session"))
+        ),
+        "investigation": investigation,
+        "version": int(record.get("investigation_version") or 0),
+        "source_sha256": expected_source_sha256,
+        "evidence_sha256": expected_evidence_sha256,
+        "expires_at": int(binding.get("expires_at") or row["expires_at"] or 0),
+    }
+
+
+def reserve_grow_investigation(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    source_investigation: dict[str, Any],
+    brain_revision: str,
+    investigation: dict[str, Any] | None = None,
+    resume_token: str | None = None,
+    issued_at: int | None = None,
+    ttl_seconds: int = 86_400,
+) -> dict[str, Any]:
+    """Reserve the canonical server-side Grow V3 investigation before AI work."""
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    normalized_brain_revision = str(brain_revision or "").strip()
+    canonical_source = deepcopy(_dict_value(source_investigation))
+    if not normalized_investigation_id or not normalized_brain_revision or not canonical_source:
+        raise _grow_preview_binding_error("grow_investigation_reservation_invalid", status_code=400)
+    source_investigation_id = str(canonical_source.get("investigation_id") or "").strip()
+    if source_investigation_id and source_investigation_id != normalized_investigation_id:
+        raise _grow_preview_binding_error("grow_investigation_source_id_mismatch", status_code=400)
+    canonical_source["investigation_id"] = normalized_investigation_id
+    canonical_source["brain_id"] = normalized_brain_id
+    source_sha256 = _grow_investigator_source_sha256(canonical_source)
+    source_payload_sha256 = canonical_sha256(canonical_source)
+    issued = int(issued_at if issued_at is not None else datetime.now(timezone.utc).timestamp())
+    expires = issued + max(60, int(ttl_seconds))
+    plain_resume_token = str(resume_token or secrets.token_urlsafe(32)).strip()
+    if len(plain_resume_token) < 24:
+        raise _grow_preview_binding_error("grow_investigation_resume_token_invalid", status_code=400)
+    version = 1
+    canonical_investigation = deepcopy(_dict_value(investigation))
+    canonical_investigation.update(
+        {
+            "schema_version": GROW_INVESTIGATION_V3_SCHEMA_VERSION,
+            "investigation_id": normalized_investigation_id,
+            "source_investigation_id": normalized_investigation_id,
+            "brain_id": normalized_brain_id,
+            "brain_revision": normalized_brain_revision,
+            "source_sha256": source_sha256,
+            "version": version,
+            "persistence_state": "investigating",
+        }
+    )
+    canonical_investigation.setdefault("state", "SOURCE_READY")
+    canonical_investigation.setdefault("status", "investigating")
+    canonical_investigation.setdefault("complete", False)
+    canonical_investigation.setdefault("applicable", False)
+    investigation_sha256 = canonical_sha256(canonical_investigation)
+    evidence_sha256 = _grow_investigation_evidence_digest(canonical_investigation)
+    source_units = [
+        _dict_value(item)
+        for item in list(canonical_source.get("source_units") or [])
+        if isinstance(item, dict)
+    ]
+    compiler_handoff = _dict_value(canonical_source.get("compiler_handoff"))
+    structured_sections = [
+        _dict_value(item)
+        for item in list(compiler_handoff.get("structured_sections") or [])
+        if isinstance(item, dict)
+    ]
+    primary_source = source_units[0] if source_units else (structured_sections[0] if structured_sections else {})
+    source_id = str(
+        primary_source.get("unit_id")
+        or primary_source.get("section_id")
+        or normalized_investigation_id
+    ).strip()
+    binding = {
+        "schema_version": GROW_INVESTIGATION_V3_BINDING_SCHEMA_VERSION,
+        "token_id": normalized_investigation_id,
+        "revision": f"grow-investigation-v3:{investigation_sha256[:24]}",
+        "brain_id": normalized_brain_id,
+        "source_id": source_id,
+        "operation_family": LOCAL_GROW_V2_OPERATION_FAMILY,
+        "brain_revision": normalized_brain_revision,
+        "source_content_sha256": source_sha256,
+        "source_payload_sha256": source_payload_sha256,
+        "investigation_sha256": investigation_sha256,
+        "evidence_sha256": evidence_sha256,
+        "status": "investigating",
+        "issued_at": issued,
+        "expires_at": expires,
+    }
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != normalized_brain_revision:
+            raise _grow_preview_binding_error(
+                "grow_investigation_brain_revision_mismatch",
+                expected_brain_revision=normalized_brain_revision,
+                current_brain_revision=current_revision,
+            )
+        existing = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            if resume_token is None:
+                raise _grow_preview_binding_error("grow_investigation_id_conflict")
+            replay = _validated_grow_investigation_row(existing, resume_token=plain_resume_token)
+            if replay["source_sha256"] != source_sha256 or replay["brain_revision"] != normalized_brain_revision:
+                raise _grow_preview_binding_error("grow_investigation_id_conflict")
+            return {**replay, "resume_token": plain_resume_token, "idempotent_replay": True}
+        conn.execute(
+            """
+            INSERT INTO grow_preview_bindings (
+                token_id, preview_revision, brain_id, source_id, operation_family,
+                brain_revision, source_sha256, preview_sha256, binding_json,
+                source_payload_json, preview_payload_json, tool_name, state,
+                apply_result_json, before_graph_json, rollback_result_json,
+                investigation_json, resume_token_sha256, investigation_version,
+                investigation_sha256, evidence_sha256, source_content_sha256,
+                issued_at, expires_at, state_updated_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'investigating', '{}', '{}', '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_investigation_id,
+                str(binding["revision"]),
+                normalized_brain_id,
+                source_id,
+                LOCAL_GROW_V2_OPERATION_FAMILY,
+                normalized_brain_revision,
+                source_payload_sha256,
+                canonical_sha256({}),
+                _json_dump(binding),
+                _json_dump({"source_investigation": canonical_source}),
+                _json_dump({}),
+                "grow_source_preview",
+                _json_dump(canonical_investigation),
+                _grow_resume_token_digest(plain_resume_token),
+                version,
+                investigation_sha256,
+                evidence_sha256,
+                source_sha256,
+                issued,
+                expires,
+                issued,
+                utc_timestamp(),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise _grow_preview_binding_error("grow_investigation_store_unavailable", status_code=503)
+    return {
+        **_validated_grow_investigation_row(row, resume_token=plain_resume_token),
+        "resume_token": plain_resume_token,
+        "idempotent_replay": False,
+    }
+
+
+def fetch_grow_investigation(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    resume_token: str | None = None,
+) -> dict[str, Any] | None:
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    if not normalized_investigation_id:
+        return None
+    with connect_readonly() as conn:
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ? AND brain_id = ? AND operation_family = ?",
+            (normalized_investigation_id, normalized_brain_id, LOCAL_GROW_V2_OPERATION_FAMILY),
+        ).fetchone()
+    if row is None:
+        return None
+    if str(row["state"] or "") in {"investigating", "awaiting_clarification", "maintenance_deferred"}:
+        return _validated_grow_investigation_row(row, resume_token=resume_token)
+    validated = _validated_local_grow_v2_row(row)
+    if resume_token is not None and not hmac.compare_digest(
+        str(validated.get("resume_token_sha256") or ""),
+        _grow_resume_token_digest(resume_token),
+    ):
+        raise _grow_preview_binding_error("grow_investigation_resume_token_invalid", status_code=403)
+    return validated
+
+
+def discard_grow_investigation_reservation(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    resume_token: str,
+) -> bool:
+    """Remove only a pristine V3 reservation after its first provider call fails.
+
+    Resumed or evidence-bearing investigations are never discarded: they remain
+    server-authoritative and recoverable.  This cleanup prevents an initial
+    provider outage from leaving a phantom investigation that the client never
+    received enough authority to resume.
+    """
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    if not normalized_investigation_id:
+        return False
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ? AND brain_id = ? AND operation_family = ?",
+            (normalized_investigation_id, normalized_brain_id, LOCAL_GROW_V2_OPERATION_FAMILY),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+        stored = _validated_grow_investigation_row(row, resume_token=resume_token)
+        investigation = _dict_value(stored.get("investigation"))
+        if (
+            str(stored.get("state") or "") != "investigating"
+            or int(stored.get("version") or 0) != 1
+            or list(investigation.get("search_receipts") or [])
+            or list(investigation.get("decisions") or [])
+            or list(investigation.get("pending_questions") or investigation.get("questions") or [])
+        ):
+            conn.rollback()
+            return False
+        deleted = conn.execute(
+            "DELETE FROM grow_preview_bindings WHERE token_id = ? AND brain_id = ? AND state = 'investigating' AND investigation_version = 1",
+            (normalized_investigation_id, normalized_brain_id),
+        )
+        conn.commit()
+        return deleted.rowcount == 1
+
+
+def update_grow_investigation(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    resume_token: str,
+    expected_version: int,
+    investigation: dict[str, Any],
+    state: str,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Persist investigator progress with an explicit compare-and-swap version."""
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    normalized_state = str(state or "").strip()
+    if normalized_state not in {"investigating", "awaiting_clarification"}:
+        raise _grow_preview_binding_error("grow_investigation_state_invalid", status_code=400)
+    epoch = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ? AND brain_id = ?",
+            (normalized_investigation_id, normalized_brain_id),
+        ).fetchone()
+        if row is None:
+            raise _grow_preview_binding_error("grow_investigation_not_found", status_code=404)
+        stored = _validated_grow_investigation_row(row, resume_token=resume_token)
+        current_state = str(stored.get("state") or "")
+        allowed = {
+            ("investigating", "investigating"),
+            ("investigating", "awaiting_clarification"),
+            ("awaiting_clarification", "awaiting_clarification"),
+        }
+        if (current_state, normalized_state) not in allowed:
+            raise _grow_preview_binding_error("grow_investigation_transition_invalid")
+        if int(stored.get("version") or 0) != int(expected_version):
+            raise _grow_preview_binding_error(
+                "grow_investigation_version_conflict",
+                expected_version=int(expected_version),
+                current_version=int(stored.get("version") or 0),
+            )
+        if epoch >= int(stored.get("expires_at") or 0):
+            raise _grow_preview_binding_error("grow_investigation_expired")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != stored["brain_revision"]:
+            raise _grow_preview_binding_error("grow_investigation_brain_revision_changed")
+        canonical = deepcopy(_dict_value(investigation))
+        version = int(expected_version) + 1
+        canonical.update(
+            {
+                "schema_version": GROW_INVESTIGATION_V3_SCHEMA_VERSION,
+                "investigation_id": normalized_investigation_id,
+                "source_investigation_id": normalized_investigation_id,
+                "brain_id": normalized_brain_id,
+                "brain_revision": stored["brain_revision"],
+                "source_sha256": stored["source_sha256"],
+                "version": version,
+                "persistence_state": normalized_state,
+            }
+        )
+        investigation_sha256 = canonical_sha256(canonical)
+        evidence_sha256 = _grow_investigation_evidence_digest(canonical)
+        binding = deepcopy(_dict_value(stored.get("binding")))
+        binding.update(
+            {
+                "revision": f"grow-investigation-v3:{investigation_sha256[:24]}",
+                "investigation_sha256": investigation_sha256,
+                "evidence_sha256": evidence_sha256,
+                "status": normalized_state,
+            }
+        )
+        updated = conn.execute(
+            """
+            UPDATE grow_preview_bindings
+            SET preview_revision = ?, binding_json = ?, state = ?, state_updated_at = ?,
+                investigation_json = ?, investigation_version = ?, investigation_sha256 = ?, evidence_sha256 = ?
+            WHERE token_id = ? AND brain_id = ? AND state = ? AND investigation_version = ?
+            """,
+            (
+                str(binding["revision"]),
+                _json_dump(binding),
+                normalized_state,
+                epoch,
+                _json_dump(canonical),
+                version,
+                investigation_sha256,
+                evidence_sha256,
+                normalized_investigation_id,
+                normalized_brain_id,
+                current_state,
+                int(expected_version),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise _grow_preview_binding_error("grow_investigation_version_conflict")
+        finalized = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        conn.commit()
+    if finalized is None:
+        raise _grow_preview_binding_error("grow_investigation_store_unavailable", status_code=503)
+    return _validated_grow_investigation_row(finalized, resume_token=resume_token)
+
+
+def resume_grow_investigation(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    resume_token: str,
+    clarification_answers: dict[str, Any],
+    expected_version: int | None = None,
+    expected_brain_revision: str | None = None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Resolve canonical source/evidence and CAS-merge answers by question_id."""
+
+    normalized_answers = {
+        str(question_id).strip(): deepcopy(answer)
+        for question_id, answer in _dict_value(clarification_answers).items()
+        if str(question_id).strip()
+    }
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    epoch = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ? AND brain_id = ?",
+            (normalized_investigation_id, normalized_brain_id),
+        ).fetchone()
+        if row is None:
+            raise _grow_preview_binding_error("grow_investigation_not_found", status_code=404)
+        stored = _validated_grow_investigation_row(row, resume_token=resume_token)
+        stored_version = int(stored.get("version") or 0)
+        if expected_version is not None and stored_version != int(expected_version):
+            raise _grow_preview_binding_error(
+                "grow_investigation_version_conflict",
+                expected_version=int(expected_version),
+                current_version=stored_version,
+            )
+        if expected_brain_revision and str(expected_brain_revision) != stored["brain_revision"]:
+            raise _grow_preview_binding_error("grow_investigation_brain_revision_mismatch")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != stored["brain_revision"]:
+            raise _grow_preview_binding_error("grow_investigation_brain_revision_changed")
+        if epoch >= int(stored.get("expires_at") or 0):
+            raise _grow_preview_binding_error("grow_investigation_expired")
+        investigation = deepcopy(_dict_value(stored.get("investigation")))
+        questions = list(investigation.get("pending_questions") or investigation.get("questions") or [])
+        question_ids = {
+            str(_dict_value(question).get("question_id") or "").strip()
+            for question in questions
+            if str(_dict_value(question).get("question_id") or "").strip()
+        }
+        unknown_question_ids = sorted(set(normalized_answers) - question_ids)
+        if unknown_question_ids:
+            raise _grow_preview_binding_error(
+                "grow_investigation_answer_question_unknown",
+                unknown_question_ids=unknown_question_ids,
+            )
+        existing_answers = deepcopy(
+            _dict_value(investigation.get("clarification_answers") or investigation.get("answers"))
+        )
+        merged_answers = {**existing_answers, **normalized_answers}
+        if str(stored.get("state") or "") == "investigating":
+            if all(existing_answers.get(key) == value for key, value in normalized_answers.items()):
+                conn.rollback()
+                return {**stored, "idempotent_replay": True}
+            raise _grow_preview_binding_error("grow_investigation_transition_invalid")
+        if str(stored.get("state") or "") != "awaiting_clarification":
+            raise _grow_preview_binding_error("grow_investigation_not_resumable")
+        version = stored_version + 1
+        investigation["clarification_answers"] = merged_answers
+        investigation["answers"] = merged_answers
+        investigation["version"] = version
+        investigation["persistence_state"] = "investigating"
+        investigation_sha256 = canonical_sha256(investigation)
+        evidence_sha256 = _grow_investigation_evidence_digest(investigation)
+        binding = deepcopy(_dict_value(stored.get("binding")))
+        binding.update(
+            {
+                "revision": f"grow-investigation-v3:{investigation_sha256[:24]}",
+                "investigation_sha256": investigation_sha256,
+                "evidence_sha256": evidence_sha256,
+                "status": "investigating",
+            }
+        )
+        updated = conn.execute(
+            """
+            UPDATE grow_preview_bindings
+            SET preview_revision = ?, binding_json = ?, state = 'investigating', state_updated_at = ?,
+                investigation_json = ?, investigation_version = ?, investigation_sha256 = ?, evidence_sha256 = ?
+            WHERE token_id = ? AND brain_id = ? AND state = 'awaiting_clarification' AND investigation_version = ?
+            """,
+            (
+                str(binding["revision"]),
+                _json_dump(binding),
+                epoch,
+                _json_dump(investigation),
+                version,
+                investigation_sha256,
+                evidence_sha256,
+                normalized_investigation_id,
+                normalized_brain_id,
+                stored_version,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise _grow_preview_binding_error("grow_investigation_version_conflict")
+        finalized = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        conn.commit()
+    if finalized is None:
+        raise _grow_preview_binding_error("grow_investigation_store_unavailable", status_code=503)
+    return {
+        **_validated_grow_investigation_row(finalized, resume_token=resume_token),
+        "idempotent_replay": False,
+    }
+
+
+def finalize_grow_maintenance_feedback(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    resume_token: str,
+    expected_version: int,
+    tool_name: str,
+    source_investigation: dict[str, Any],
+    source_formation_contract: dict[str, Any],
+    investigation: dict[str, Any],
+    investigation_session: dict[str, Any],
+    expected_brain_revision: str,
+    maintenance_feedback_packets: list[dict[str, Any]],
+    issued_at: int | None = None,
+    ttl_seconds: int = 86_400,
+) -> dict[str, Any]:
+    """CAS a complete structural-only Grow investigation into no-apply review state."""
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    normalized_expected_revision = str(expected_brain_revision or "").strip()
+    canonical_feedback = [
+        deepcopy(_dict_value(item))
+        for item in list(maintenance_feedback_packets or [])
+        if isinstance(item, dict)
+    ]
+    canonical_investigation = deepcopy(_dict_value(investigation))
+    pending_required = _grow_required_questions_pending(canonical_investigation)
+    if (
+        not normalized_investigation_id
+        or not normalized_expected_revision
+        or not canonical_feedback
+        or not bool(canonical_investigation.get("complete"))
+        or not bool(canonical_investigation.get("applicable"))
+        or pending_required
+        or not _grow_investigator_execution_attested(canonical_investigation)
+    ):
+        raise _grow_preview_binding_error(
+            "grow_investigation_not_maintenance_ready",
+            pending_question_ids=pending_required,
+        )
+    canonical_source = deepcopy(_dict_value(source_investigation))
+    source_content_sha256 = _grow_investigator_source_sha256(canonical_source)
+    source_payload_sha256 = canonical_sha256(canonical_source)
+    if str(canonical_investigation.get("source_sha256") or "") != source_content_sha256:
+        raise _grow_preview_binding_error("grow_investigation_source_hash_mismatch")
+    maintenance_feedback_packets_sha256 = canonical_sha256(canonical_feedback)
+    source_payload = {
+        "source_investigation": canonical_source,
+        "source_formation_contract": deepcopy(_dict_value(source_formation_contract)),
+    }
+    preview_payload = {
+        "maintenance_feedback_packets": canonical_feedback,
+        "maintenance_feedback_packets_sha256": maintenance_feedback_packets_sha256,
+        "investigation_session": deepcopy(_dict_value(investigation_session)),
+    }
+    preview_sha256 = canonical_sha256({})
+    source_binding_sha256 = canonical_sha256(source_payload)
+    epoch = int(issued_at if issued_at is not None else datetime.now(timezone.utc).timestamp())
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ? AND brain_id = ?",
+            (normalized_investigation_id, normalized_brain_id),
+        ).fetchone()
+        if row is None:
+            raise _grow_preview_binding_error("grow_investigation_not_found", status_code=404)
+        stored = _validated_grow_investigation_row(row, resume_token=resume_token)
+        if str(stored.get("state") or "") != "investigating":
+            raise _grow_preview_binding_error("grow_investigation_transition_invalid")
+        if int(stored.get("version") or 0) != int(expected_version):
+            raise _grow_preview_binding_error("grow_investigation_version_conflict")
+        if stored["brain_revision"] != normalized_expected_revision:
+            raise _grow_preview_binding_error("grow_investigation_brain_revision_mismatch")
+        if stored["source_sha256"] != source_content_sha256:
+            raise _grow_preview_binding_error("grow_investigation_source_hash_mismatch")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != normalized_expected_revision:
+            raise _grow_preview_binding_error("grow_investigation_brain_revision_changed")
+        version = int(expected_version) + 1
+        canonical_investigation.update(
+            {
+                "schema_version": GROW_INVESTIGATION_V3_SCHEMA_VERSION,
+                "investigation_id": normalized_investigation_id,
+                "source_investigation_id": normalized_investigation_id,
+                "brain_id": normalized_brain_id,
+                "brain_revision": normalized_expected_revision,
+                "source_sha256": source_content_sha256,
+                "version": version,
+                "persistence_state": "maintenance_deferred",
+            }
+        )
+        investigation_sha256 = canonical_sha256(canonical_investigation)
+        evidence_sha256 = _grow_investigation_evidence_digest(canonical_investigation)
+        binding = {
+            "schema_version": LOCAL_GROW_V2_BINDING_SCHEMA_VERSION,
+            "token_id": normalized_investigation_id,
+            "revision": f"grow-maintenance-v3:{investigation_sha256[:24]}",
+            "brain_id": normalized_brain_id,
+            "source_id": str(_dict_value(list(canonical_source.get("source_units") or [{}])[0]).get("unit_id") or normalized_investigation_id),
+            "operation_family": LOCAL_GROW_V2_OPERATION_FAMILY,
+            "brain_revision": normalized_expected_revision,
+            "source_sha256": source_binding_sha256,
+            "source_content_sha256": source_content_sha256,
+            "source_payload_sha256": source_payload_sha256,
+            "preview_sha256": preview_sha256,
+            "attestation_sha256": "",
+            "investigation_sha256": investigation_sha256,
+            "evidence_sha256": evidence_sha256,
+            "maintenance_feedback_packets_sha256": maintenance_feedback_packets_sha256,
+            "server_issued_preview_ids": [],
+            "status": "needs_review",
+            "issued_at": int(_dict_value(stored.get("binding")).get("issued_at") or epoch),
+            "expires_at": max(epoch + 60, int(_dict_value(stored.get("binding")).get("expires_at") or epoch + ttl_seconds)),
+        }
+        updated = conn.execute(
+            """
+            UPDATE grow_preview_bindings
+            SET preview_revision = ?, brain_revision = ?, source_sha256 = ?, preview_sha256 = ?,
+                binding_json = ?, source_payload_json = ?, preview_payload_json = ?, tool_name = ?,
+                state = 'maintenance_deferred', state_updated_at = ?, investigation_json = ?,
+                investigation_version = ?, investigation_sha256 = ?, evidence_sha256 = ?,
+                source_content_sha256 = ?, expires_at = ?
+            WHERE token_id = ? AND brain_id = ? AND state = 'investigating' AND investigation_version = ?
+            """,
+            (
+                str(binding["revision"]),
+                normalized_expected_revision,
+                source_binding_sha256,
+                preview_sha256,
+                _json_dump(binding),
+                _json_dump(source_payload),
+                _json_dump(preview_payload),
+                str(tool_name or "grow_source_preview"),
+                epoch,
+                _json_dump(canonical_investigation),
+                version,
+                investigation_sha256,
+                evidence_sha256,
+                source_content_sha256,
+                int(binding["expires_at"]),
+                normalized_investigation_id,
+                normalized_brain_id,
+                int(expected_version),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise _grow_preview_binding_error("grow_investigation_version_conflict")
+        finalized = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        conn.commit()
+    if finalized is None:
+        raise _grow_preview_binding_error("grow_investigation_store_unavailable", status_code=503)
+    return _validated_grow_investigation_row(finalized, resume_token=resume_token)
+
+
+def finalize_grow_preview(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    resume_token: str,
+    expected_version: int,
+    tool_name: str,
+    source_investigation: dict[str, Any],
+    source_formation_contract: dict[str, Any],
+    investigation: dict[str, Any],
+    preview_bundle: dict[str, Any],
+    ai_execution_attestation: dict[str, Any],
+    investigation_session: dict[str, Any],
+    expected_brain_revision: str,
+    maintenance_feedback_packets: list[dict[str, Any]] | None = None,
+    issued_at: int | None = None,
+    ttl_seconds: int = 86_400,
+) -> dict[str, Any]:
+    """CAS a complete investigation and compiler output into active apply authority."""
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    normalized_expected_revision = str(expected_brain_revision or "").strip()
+    bundle = deepcopy(_dict_value(preview_bundle))
+    compiler_attestation = validate_ai_execution_attestation(ai_execution_attestation)
+    canonical_investigation = deepcopy(_dict_value(investigation))
+    available_preview_ids = _local_grow_v2_preview_ids(bundle)
+    pending_required = _grow_required_questions_pending(canonical_investigation)
+    if (
+        not bool(canonical_investigation.get("complete"))
+        or not bool(canonical_investigation.get("applicable"))
+        or pending_required
+        or not _grow_execution_ledger_attested(canonical_investigation)
+        or not available_preview_ids
+    ):
+        raise _grow_preview_binding_error(
+            "grow_investigation_not_preview_ready",
+            pending_question_ids=pending_required,
+        )
+    preview_nodes = [
+        _dict_value(bundle.get("primary_node_preview")),
+        *[_dict_value(item) for item in list(bundle.get("derived_nodes") or [])],
+    ]
+    if any(
+        not str(node.get("claim_id") or "").strip()
+        or not str(node.get("decision_id") or "").strip()
+        for node in preview_nodes
+    ):
+        raise _grow_preview_binding_error("grow_preview_claim_decision_binding_invalid")
+    source_payload = {
+        "source_investigation": deepcopy(_dict_value(source_investigation)),
+        "source_formation_contract": deepcopy(_dict_value(source_formation_contract)),
+    }
+    source_content_sha256 = _grow_investigator_source_sha256(
+        _dict_value(source_investigation)
+    )
+    source_investigation_payload_sha256 = canonical_sha256(
+        _dict_value(source_investigation)
+    )
+    if str(canonical_investigation.get("source_sha256") or "") != source_content_sha256:
+        raise _grow_preview_binding_error("grow_investigation_source_hash_mismatch")
+    preview_payload = {
+        "preview_bundle": bundle,
+        "ai_execution_attestation": compiler_attestation,
+        "investigation_session": deepcopy(_dict_value(investigation_session)),
+        "maintenance_feedback_packets": [
+            deepcopy(_dict_value(item))
+            for item in list(maintenance_feedback_packets or [])
+            if isinstance(item, dict)
+        ],
+    }
+    maintenance_feedback_packets_sha256 = canonical_sha256(
+        _grow_maintenance_feedback_packets_from_payload(preview_payload)
+    )
+    preview_payload["maintenance_feedback_packets_sha256"] = maintenance_feedback_packets_sha256
+    preview_sha256 = canonical_sha256(bundle)
+    attestation_sha256 = canonical_sha256(compiler_attestation)
+    source_payload_sha256 = canonical_sha256(source_payload)
+    epoch = int(issued_at if issued_at is not None else datetime.now(timezone.utc).timestamp())
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ? AND brain_id = ?",
+            (normalized_investigation_id, normalized_brain_id),
+        ).fetchone()
+        if row is None:
+            raise _grow_preview_binding_error("grow_investigation_not_found", status_code=404)
+        stored = _validated_grow_investigation_row(row, resume_token=resume_token)
+        if str(stored.get("state") or "") != "investigating":
+            raise _grow_preview_binding_error("grow_investigation_transition_invalid")
+        if int(stored.get("version") or 0) != int(expected_version):
+            raise _grow_preview_binding_error("grow_investigation_version_conflict")
+        if stored["brain_revision"] != normalized_expected_revision:
+            raise _grow_preview_binding_error("grow_investigation_brain_revision_mismatch")
+        if stored["source_sha256"] != source_content_sha256:
+            raise _grow_preview_binding_error("grow_investigation_source_hash_mismatch")
+        current_revision = maintenance_graph_revision(_fetch_graph_snapshot_conn(conn))
+        if current_revision != normalized_expected_revision:
+            raise _grow_preview_binding_error("grow_investigation_brain_revision_changed")
+        version = int(expected_version) + 1
+        canonical_investigation.update(
+            {
+                "schema_version": GROW_INVESTIGATION_V3_SCHEMA_VERSION,
+                "investigation_id": normalized_investigation_id,
+                "source_investigation_id": normalized_investigation_id,
+                "brain_id": normalized_brain_id,
+                "brain_revision": normalized_expected_revision,
+                "source_sha256": source_content_sha256,
+                "version": version,
+                "persistence_state": "active",
+                "preview_sha256": preview_sha256,
+                "compiler_attestation_sha256": attestation_sha256,
+            }
+        )
+        investigation_sha256 = canonical_sha256(canonical_investigation)
+        evidence_sha256 = _grow_investigation_evidence_digest(canonical_investigation)
+        binding = {
+            "schema_version": LOCAL_GROW_V2_BINDING_SCHEMA_VERSION,
+            "token_id": normalized_investigation_id,
+            "revision": f"grow-v3:{preview_sha256[:24]}",
+            "brain_id": normalized_brain_id,
+            "source_id": str(_dict_value(list(_dict_value(source_investigation).get("source_units") or [{}])[0]).get("unit_id") or normalized_investigation_id),
+            "operation_family": LOCAL_GROW_V2_OPERATION_FAMILY,
+            "brain_revision": normalized_expected_revision,
+            "source_sha256": source_payload_sha256,
+            "source_content_sha256": source_content_sha256,
+            "source_payload_sha256": source_investigation_payload_sha256,
+            "preview_sha256": preview_sha256,
+            "attestation_sha256": attestation_sha256,
+            "investigation_sha256": investigation_sha256,
+            "evidence_sha256": evidence_sha256,
+            "maintenance_feedback_packets_sha256": maintenance_feedback_packets_sha256,
+            "server_issued_preview_ids": available_preview_ids,
+            "status": "preview_ready",
+            "issued_at": int(_dict_value(stored.get("binding")).get("issued_at") or epoch),
+            "expires_at": max(epoch + 60, int(_dict_value(stored.get("binding")).get("expires_at") or epoch + ttl_seconds)),
+        }
+        updated = conn.execute(
+            """
+            UPDATE grow_preview_bindings
+            SET preview_revision = ?, brain_revision = ?, source_sha256 = ?, preview_sha256 = ?,
+                binding_json = ?, source_payload_json = ?, preview_payload_json = ?, tool_name = ?,
+                state = 'active', state_updated_at = ?, investigation_json = ?, investigation_version = ?,
+                investigation_sha256 = ?, evidence_sha256 = ?, source_content_sha256 = ?, expires_at = ?
+            WHERE token_id = ? AND brain_id = ? AND state = 'investigating' AND investigation_version = ?
+            """,
+            (
+                str(binding["revision"]),
+                normalized_expected_revision,
+                source_payload_sha256,
+                preview_sha256,
+                _json_dump(binding),
+                _json_dump(source_payload),
+                _json_dump(preview_payload),
+                str(tool_name or "grow_source_preview"),
+                epoch,
+                _json_dump(canonical_investigation),
+                version,
+                investigation_sha256,
+                evidence_sha256,
+                source_content_sha256,
+                int(binding["expires_at"]),
+                normalized_investigation_id,
+                normalized_brain_id,
+                int(expected_version),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise _grow_preview_binding_error("grow_investigation_version_conflict")
+        finalized = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        conn.commit()
+    if finalized is None:
+        raise _grow_preview_binding_error("grow_v2_preview_store_unavailable", status_code=503)
+    return _validated_local_grow_v2_row(finalized)
+
+
 def _normalized_local_grow_v2_ids(values: Any) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -6926,6 +8775,82 @@ def _normalized_local_grow_v2_ids(values: Any) -> list[str]:
         seen.add(node_id)
         normalized.append(node_id)
     return normalized
+
+
+_GROW_MUTABLE_CONTENT_FIELDS = (
+    "raw_text",
+    "summary",
+    "node_kind",
+    "memory_type",
+    "temporal_role",
+    "observed_at",
+    "valid_from",
+    "valid_to",
+    "temporal_confidence",
+    "source_trust",
+    "claim_status",
+    "source_unit_id",
+    "source_unit_title",
+    "source_unit_kind",
+    "source_unit_role",
+    "source_span_start",
+    "source_span_end",
+)
+
+
+def _grow_node_content_proof(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: node.get(field)
+        for field in _GROW_MUTABLE_CONTENT_FIELDS
+    }
+
+
+def _grow_existing_mutation_kind(
+    before_node: dict[str, Any],
+    after_node: dict[str, Any],
+) -> str | None:
+    before_revision = max(1, int(before_node.get("node_revision") or 1))
+    after_revision = max(1, int(after_node.get("node_revision") or 1))
+    if after_revision <= before_revision:
+        return None
+    provenance = _dict_value(after_node.get("provenance"))
+    history = [
+        _dict_value(item)
+        for item in list(provenance.get("grow_mutation_history") or [])
+        if isinstance(item, dict)
+    ]
+    if not history:
+        return None
+    latest = history[-1]
+    action = str(latest.get("action") or "").strip()
+    if action not in {"evolve_existing", "delete_existing"}:
+        return None
+    prior_snapshot = _dict_value(latest.get("prior_snapshot"))
+    if (
+        str(prior_snapshot.get("id") or "") != str(before_node.get("id") or "")
+        or max(1, int(latest.get("prior_node_revision") or 1)) != before_revision
+        or max(1, int(prior_snapshot.get("node_revision") or 1)) != before_revision
+        or str(latest.get("prior_state_sha256") or "") != canonical_sha256(prior_snapshot)
+        or _grow_node_content_proof(prior_snapshot) != _grow_node_content_proof(before_node)
+        or str(prior_snapshot.get("lifecycle_status") or "active")
+        != str(before_node.get("lifecycle_status") or "active")
+    ):
+        return None
+    before_content = _grow_node_content_proof(before_node)
+    after_content = _grow_node_content_proof(after_node)
+    if action == "evolve_existing":
+        if str(after_node.get("lifecycle_status") or "active") == "deleted":
+            return None
+        if after_content == before_content:
+            return None
+    else:
+        if str(before_node.get("lifecycle_status") or "active") == "deleted":
+            return None
+        if str(after_node.get("lifecycle_status") or "active") != "deleted":
+            return None
+        if after_content != before_content:
+            return None
+    return action
 
 
 def _local_grow_v2_preview_ids(preview_bundle: dict[str, Any]) -> list[str]:
@@ -6939,6 +8864,305 @@ def _local_grow_v2_preview_ids(preview_bundle: dict[str, Any]) -> list[str]:
 
 def _local_grow_v2_receipt_signature(receipt: dict[str, Any]) -> str:
     unsigned = {key: value for key, value in receipt.items() if key != "signature"}
+    secret = str(os.getenv("AGVM_GROW_PREVIEW_BINDING_SECRET") or "").encode("utf-8")
+    if len(secret) < 32:
+        raise _grow_preview_binding_error("grow_v2_receipt_signing_secret_unavailable", status_code=503)
+    material = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return f"hmac-sha256:{hmac.new(secret, material, hashlib.sha256).hexdigest()}"
+
+
+def _validate_deterministic_document_source_attestation(
+    value: dict[str, Any] | None,
+    *,
+    source_investigation: dict[str, Any],
+    preview_bundle: dict[str, Any],
+    allow_legacy_document_edges: bool = False,
+) -> dict[str, Any]:
+    """Validate verbatim deterministic source authority without pretending AI ran.
+
+    This authority is intentionally narrower than the AI compiler authority: it
+    may issue a verbatim document anchor, verbatim document chunks, exact
+    source-bound section excerpts, and exact source-bound fact sentences whose
+    hashes bind to the parser-backed source units.  It cannot issue inferred
+    facts, relations, target mutations, or semantic decisions.
+    """
+
+    payload = _dict_value(value)
+    authority_kind = str(payload.get("authority_kind") or "").strip()
+    if (
+        payload.get("schema_version")
+        != DETERMINISTIC_DOCUMENT_SOURCE_ATTESTATION_SCHEMA_VERSION
+        or payload.get("status") != "completed"
+        or authority_kind
+        not in {
+            "parser_backed_document",
+            "operator_bound_public_text",
+            "operator_bound_manual_text",
+        }
+        or payload.get("provider_executed") is not False
+        or payload.get("semantic_claims_emitted") is not False
+    ):
+        raise _grow_preview_binding_error(
+            "deterministic_document_source_attestation_invalid",
+            status_code=400,
+        )
+
+    source_request = _dict_value(source_investigation.get("source_request"))
+    source_provenance = _dict_value(source_investigation.get("provenance"))
+    canonical_text = str(_dict_value(source_investigation.get("compiler_handoff")).get("mega_text") or "")
+    canonical_text_sha256 = f"sha256:{hashlib.sha256(canonical_text.encode('utf-8')).hexdigest()}"
+    requested_file_sha256 = str(
+        source_request.get("file_hash") or payload.get("source_sha256") or ""
+    ).strip().removeprefix("sha256:")
+    attested_source_sha256 = str(payload.get("source_sha256") or "").strip().removeprefix("sha256:")
+    if (
+        len(attested_source_sha256) != 64
+        or not re.fullmatch(r"[0-9a-f]{64}", attested_source_sha256.lower())
+        or (
+            authority_kind == "parser_backed_document"
+            and requested_file_sha256
+            and requested_file_sha256.lower() != attested_source_sha256.lower()
+        )
+        or (
+            authority_kind in {"operator_bound_public_text", "operator_bound_manual_text"}
+            and attested_source_sha256.lower()
+            != canonical_text_sha256.removeprefix("sha256:").lower()
+        )
+    ):
+        raise _grow_preview_binding_error(
+            "deterministic_document_source_hash_invalid",
+            status_code=400,
+        )
+
+    units = {
+        str(unit.get("unit_id") or "").strip(): _dict_value(unit)
+        for unit in list(source_investigation.get("source_units") or [])
+        if isinstance(unit, dict) and str(unit.get("unit_id") or "").strip()
+    }
+    attested_unit_hashes = _dict_value(payload.get("source_unit_sha256"))
+    if not units or set(attested_unit_hashes) != set(units):
+        raise _grow_preview_binding_error(
+            "deterministic_document_source_units_invalid",
+            status_code=400,
+        )
+    for unit_id, unit in units.items():
+        raw_text = str(unit.get("raw_text") or unit.get("text") or "")
+        actual_digest = f"sha256:{hashlib.sha256(raw_text.encode('utf-8')).hexdigest()}"
+        unit_digest = str(
+            unit.get("content_digest") or _dict_value(unit.get("provenance")).get("hash") or ""
+        ).strip()
+        if (
+            not raw_text.strip()
+            or unit_digest.removeprefix("sha256:") != actual_digest.removeprefix("sha256:")
+            or str(attested_unit_hashes.get(unit_id) or "").removeprefix("sha256:")
+            != actual_digest.removeprefix("sha256:")
+        ):
+            raise _grow_preview_binding_error(
+                "deterministic_document_source_unit_hash_invalid",
+                status_code=400,
+            )
+
+    primary = _dict_value(preview_bundle.get("primary_node_preview"))
+    derived = [
+        _dict_value(item)
+        for item in list(preview_bundle.get("derived_nodes") or [])
+        if isinstance(item, dict)
+    ]
+    def child_node_is_source_bound(node: dict[str, Any]) -> bool:
+        memory_type = str(node.get("memory_type") or "")
+        document_role = str(node.get("document_role") or "")
+        source_unit_id = str(node.get("source_unit_id") or "")
+        if source_unit_id not in units or node.get("target_node_ids") or node.get("claim_id") or node.get("decision_id"):
+            return False
+        unit_text = str(units[source_unit_id].get("raw_text") or units[source_unit_id].get("text") or "")
+        node_text = str(node.get("raw_text") or "")
+        if not node_text.strip() or not unit_text.strip():
+            return False
+        if document_role == "chunk":
+            return memory_type == "document_chunk" and node_text == unit_text
+        if document_role == "summary":
+            return (
+                memory_type == "document_summary"
+                and len(node_text.strip()) >= 80
+                and node_text in unit_text
+            )
+        if document_role == "fact":
+            return (
+                memory_type == "document_fact"
+                and 28 <= len(node_text.strip()) <= 900
+                and node_text in unit_text
+            )
+        return False
+
+    if (
+        str(primary.get("memory_type") or "") != "document_anchor"
+        or str(primary.get("document_role") or "") != "anchor"
+        or not primary.get("is_document_anchor")
+        or any(not child_node_is_source_bound(node) for node in derived)
+    ):
+        raise _grow_preview_binding_error(
+            "deterministic_document_preview_scope_invalid",
+            status_code=400,
+        )
+
+    if (
+        not canonical_text.strip()
+        or str(primary.get("raw_text") or "") != canonical_text
+        or str(payload.get("canonical_text_sha256") or "").removeprefix("sha256:")
+        != canonical_text_sha256.removeprefix("sha256:")
+    ):
+        raise _grow_preview_binding_error(
+            "deterministic_document_canonical_text_invalid",
+            status_code=400,
+        )
+
+    derived_edges = [
+        _dict_value(item)
+        for item in list(preview_bundle.get("derived_edges") or [])
+        if isinstance(item, dict)
+    ]
+    derived_ids = {str(node.get("id") or "") for node in derived}
+    primary_id = str(primary.get("id") or "")
+    if len(derived_edges) != len(derived) or any(
+        str(edge.get("source_preview_id") or "") != primary_id
+        or str(edge.get("target_preview_id") or "") not in derived_ids
+        or (
+            str(edge.get("edge_type") or "") != "derives_from"
+            and not (
+                allow_legacy_document_edges
+                and authority_kind == "parser_backed_document"
+                and str(edge.get("edge_type") or "") == "contains"
+            )
+        )
+        for edge in derived_edges
+    ):
+        raise _grow_preview_binding_error(
+            "deterministic_document_preview_edges_invalid",
+            status_code=400,
+        )
+
+    if authority_kind == "operator_bound_public_text":
+        source_uri = str(
+            source_request.get("source_uri")
+            or source_provenance.get("source_uri")
+            or payload.get("source_uri")
+            or ""
+        ).strip()
+        source_trust = str(
+            source_request.get("source_trust")
+            or source_provenance.get("source_trust")
+            or payload.get("source_trust")
+            or ""
+        ).strip()
+        graph_source_trust = (
+            "verified_public"
+            if source_trust in {"public_web", "verified_public_source"}
+            else source_trust
+        )
+
+        def public_text_unit_source_uri(unit_id: str) -> str:
+            unit = _dict_value(units.get(unit_id))
+            provenance = _dict_value(unit.get("provenance"))
+            unit_source_uri = str(unit.get("source_uri") or provenance.get("source_uri") or "").strip()
+            if unit_source_uri.startswith(("http://", "https://")):
+                return unit_source_uri
+            return source_uri
+
+        def public_text_node_source_is_attested(node: dict[str, Any]) -> bool:
+            source_unit_id = str(node.get("source_unit_id") or "").strip()
+            expected_source_uri = public_text_unit_source_uri(source_unit_id)
+            return (
+                bool(expected_source_uri)
+                and str(node.get("source_uri") or "").strip() == expected_source_uri
+                and str(node.get("source_trust") or "").strip() == graph_source_trust
+            )
+
+        if (
+            not source_uri.startswith(("http://", "https://"))
+            or source_trust not in {"public_web", "verified_public_source", "user_asserted"}
+            or str(payload.get("source_uri") or "").strip() != source_uri
+            or str(payload.get("source_trust") or "").strip() != source_trust
+            or str(primary.get("source_uri") or "").strip() != source_uri
+            or str(primary.get("source_trust") or "").strip() != graph_source_trust
+            or any(not public_text_node_source_is_attested(node) for node in derived)
+        ):
+            raise _grow_preview_binding_error(
+                "deterministic_public_text_provenance_invalid",
+                status_code=400,
+            )
+    if authority_kind == "operator_bound_manual_text":
+        source_uri = str(
+            source_request.get("source_uri")
+            or source_provenance.get("source_uri")
+            or payload.get("source_uri")
+            or ""
+        ).strip()
+        source_trust = str(
+            source_request.get("source_trust")
+            or source_provenance.get("source_trust")
+            or payload.get("source_trust")
+            or ""
+        ).strip()
+        graph_source_trust = source_trust or "unknown"
+        if (
+            not source_uri.startswith("urn:agvm:manual-source:sha256:")
+            or source_trust not in {"", "unknown", "user_asserted"}
+            or str(payload.get("source_uri") or "").strip() != source_uri
+            or str(primary.get("source_uri") or "").strip() != source_uri
+            or str(primary.get("source_trust") or "").strip() != graph_source_trust
+            or any(
+                str(node.get("source_uri") or "").strip() != source_uri
+                or str(node.get("source_trust") or "").strip() != graph_source_trust
+                for node in derived
+            )
+        ):
+            raise _grow_preview_binding_error(
+                "deterministic_manual_text_provenance_invalid",
+                status_code=400,
+            )
+
+    return {
+        **payload,
+        "source_sha256": f"sha256:{attested_source_sha256.lower()}",
+        "canonical_text_sha256": canonical_text_sha256,
+        "source_unit_sha256": {
+            unit_id: f"sha256:{str(attested_unit_hashes[unit_id]).removeprefix('sha256:').lower()}"
+            for unit_id in sorted(attested_unit_hashes)
+        },
+    }
+
+
+def _validated_grow_preview_authority(
+    preview_payload: dict[str, Any],
+    *,
+    source_investigation: dict[str, Any],
+    preview_bundle: dict[str, Any],
+    allow_legacy_document_edges: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    deterministic = _dict_value(preview_payload.get("deterministic_source_attestation"))
+    ai_attestation = _dict_value(preview_payload.get("ai_execution_attestation"))
+    if deterministic:
+        if ai_attestation:
+            raise _grow_preview_binding_error("grow_preview_authority_ambiguous", status_code=400)
+        deterministic_authority = str(deterministic.get("authority_kind") or "").strip()
+        return (
+            (
+                "deterministic_public_text"
+                if deterministic_authority == "operator_bound_public_text"
+                else "deterministic_document"
+            ),
+            _validate_deterministic_document_source_attestation(
+                deterministic,
+                source_investigation=source_investigation,
+                preview_bundle=preview_bundle,
+                allow_legacy_document_edges=allow_legacy_document_edges,
+            ),
+        )
+    return "ai_execution", validate_ai_execution_attestation(ai_attestation)
+
+
+def _legacy_local_grow_v2_receipt_checksum(receipt: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in receipt.items() if key != "signature"}
     return f"sha256:{canonical_sha256(unsigned)}"
 
 
@@ -6948,10 +9172,21 @@ def _validated_local_grow_v2_row(row: sqlite3.Row) -> dict[str, Any]:
     source_payload = _dict_value(record.get("source_payload"))
     preview_payload = _dict_value(record.get("preview_payload"))
     preview_bundle = _dict_value(preview_payload.get("preview_bundle"))
-    attestation = validate_ai_execution_attestation(
-        _dict_value(preview_payload.get("ai_execution_attestation"))
+    source_investigation = _dict_value(source_payload.get("source_investigation"))
+    authority_kind, attestation = _validated_grow_preview_authority(
+        preview_payload,
+        source_investigation=source_investigation,
+        preview_bundle=preview_bundle,
+        allow_legacy_document_edges=str(record.get("state") or "")
+        in {"consumed", "invalidated", "rolled_back"},
     )
     investigation_session = _dict_value(preview_payload.get("investigation_session"))
+    maintenance_feedback_packets = _grow_maintenance_feedback_packets_from_payload(preview_payload)
+    expected_maintenance_feedback_sha256 = str(
+        binding.get("maintenance_feedback_packets_sha256")
+        or preview_payload.get("maintenance_feedback_packets_sha256")
+        or ""
+    ).strip()
     investigation_id = str(binding.get("token_id") or "").strip()
     brain_id = str(binding.get("brain_id") or "").strip()
     if (
@@ -6972,8 +9207,28 @@ def _validated_local_grow_v2_row(row: sqlite3.Row) -> dict[str, Any]:
         or preview_sha256 != str(row["preview_sha256"])
         or preview_sha256 != str(binding.get("preview_sha256") or "")
         or attestation_sha256 != str(binding.get("attestation_sha256") or "")
+        or (
+            expected_maintenance_feedback_sha256
+            and canonical_sha256(maintenance_feedback_packets) != expected_maintenance_feedback_sha256
+        )
     ):
         raise _grow_preview_binding_error("grow_v2_preview_integrity_invalid")
+    investigation = deepcopy(_dict_value(record.get("investigation")))
+    if investigation:
+        if (
+            str(investigation.get("schema_version") or "") != GROW_INVESTIGATION_V3_SCHEMA_VERSION
+            or str(investigation.get("investigation_id") or "") != investigation_id
+            or str(investigation.get("brain_id") or "") != brain_id
+            or int(investigation.get("version") or 0) != int(record.get("investigation_version") or 0)
+            or canonical_sha256(investigation) != str(record.get("investigation_sha256") or "")
+            or _grow_investigator_source_sha256(source_investigation) != str(record.get("source_content_sha256") or "")
+            or canonical_sha256(source_investigation) != str(binding.get("source_payload_sha256") or "")
+            or str(investigation.get("source_sha256") or "") != str(record.get("source_content_sha256") or "")
+            or _grow_investigation_evidence_digest(investigation) != str(record.get("evidence_sha256") or "")
+            or str(investigation.get("preview_sha256") or "") != preview_sha256
+            or str(investigation.get("compiler_attestation_sha256") or "") != attestation_sha256
+        ):
+            raise _grow_preview_binding_error("grow_investigation_integrity_invalid")
     available_preview_ids = _local_grow_v2_preview_ids(preview_bundle)
     if not available_preview_ids or available_preview_ids != _normalized_local_grow_v2_ids(
         binding.get("server_issued_preview_ids")
@@ -6981,16 +9236,51 @@ def _validated_local_grow_v2_row(row: sqlite3.Row) -> dict[str, Any]:
         raise _grow_preview_binding_error("grow_v2_preview_selection_binding_invalid")
     apply_result = _dict_value(record.get("apply_result"))
     signed_receipt = _dict_value(apply_result.get("signed_apply_receipt"))
-    if str(record.get("state") or "") == "consumed":
+    if str(record.get("state") or "") in {"consumed", "rolled_back"}:
+        signature_algorithm = str(signed_receipt.get("signature_algorithm") or "").upper()
+        modern_receipt_valid = signature_algorithm == "HMAC-SHA256" and hmac.compare_digest(
+            str(signed_receipt.get("signature") or ""),
+            _local_grow_v2_receipt_signature(signed_receipt),
+        )
+        legacy_receipt_valid = signature_algorithm == "SHA-256" and hmac.compare_digest(
+            str(signed_receipt.get("signature") or ""),
+            _legacy_local_grow_v2_receipt_checksum(signed_receipt),
+        )
         if (
             signed_receipt.get("schema_version") != LOCAL_GROW_V2_APPLY_RECEIPT_SCHEMA_VERSION
             or str(signed_receipt.get("investigation_id") or "") != investigation_id
             or str(signed_receipt.get("brain_id") or "") != brain_id
             or str(signed_receipt.get("preview_sha256") or "") != preview_sha256
             or str(signed_receipt.get("attestation_sha256") or "") != attestation_sha256
-            or str(signed_receipt.get("signature") or "") != _local_grow_v2_receipt_signature(signed_receipt)
+            or not (modern_receipt_valid or legacy_receipt_valid)
         ):
             raise _grow_preview_binding_error("grow_v2_apply_receipt_integrity_invalid")
+        if legacy_receipt_valid:
+            signed_receipt = {
+                **signed_receipt,
+                "authenticity": "legacy_checksum_only",
+                "authenticated_signature": False,
+            }
+            apply_result = {
+                **apply_result,
+                "signed_apply_receipt": signed_receipt,
+            }
+    rollback_result = _dict_value(record.get("rollback_result"))
+    signed_rollback_receipt = _dict_value(rollback_result.get("signed_rollback_receipt"))
+    if str(record.get("state") or "") == "rolled_back":
+        rollback_receipt_valid = hmac.compare_digest(
+            str(signed_rollback_receipt.get("signature") or ""),
+            _local_grow_v2_receipt_signature(signed_rollback_receipt),
+        )
+        if (
+            signed_rollback_receipt.get("schema_version") != LOCAL_GROW_V2_ROLLBACK_RECEIPT_SCHEMA_VERSION
+            or str(signed_rollback_receipt.get("investigation_id") or "") != investigation_id
+            or str(signed_rollback_receipt.get("brain_id") or "") != brain_id
+            or str(signed_rollback_receipt.get("apply_receipt_id") or "")
+            != str(signed_receipt.get("receipt_id") or "")
+            or not rollback_receipt_valid
+        ):
+            raise _grow_preview_binding_error("grow_v2_rollback_receipt_integrity_invalid")
     return {
         **record,
         "investigation_id": investigation_id,
@@ -6999,15 +9289,35 @@ def _validated_local_grow_v2_row(row: sqlite3.Row) -> dict[str, Any]:
         "source_investigation": _dict_value(source_payload.get("source_investigation")),
         "source_formation_contract": _dict_value(source_payload.get("source_formation_contract")),
         "preview_bundle": preview_bundle,
-        "ai_execution_attestation": attestation,
+        "ai_execution_attestation": attestation if authority_kind == "ai_execution" else {},
+        "deterministic_source_attestation": (
+            attestation if authority_kind.startswith("deterministic_") else {}
+        ),
+        "preview_authority_kind": authority_kind,
         "investigation_session": investigation_session,
+        "maintenance_feedback_packets": maintenance_feedback_packets,
+        "maintenance_feedback_packets_sha256": expected_maintenance_feedback_sha256,
+        "investigation": investigation,
+        "version": int(record.get("investigation_version") or 0),
+        "source_content_sha256": str(record.get("source_content_sha256") or ""),
+        "evidence_sha256": str(record.get("evidence_sha256") or ""),
         "server_issued_preview_ids": available_preview_ids,
         "preview_sha256": preview_sha256,
         "preview_fingerprint": preview_sha256,
         "attestation_sha256": attestation_sha256,
         "attestation_fingerprint": attestation_sha256,
-        "status": "applied" if str(record.get("state") or "") == "consumed" else str(binding.get("status") or "preview_ready"),
+        "status": (
+            "applied"
+            if str(record.get("state") or "") == "consumed"
+            else "rolled_back"
+            if str(record.get("state") or "") == "rolled_back"
+            else str(binding.get("status") or "preview_ready")
+        ),
+        "apply_result": apply_result,
         "signed_apply_receipt": signed_receipt,
+        "before_graph": _dict_value(record.get("before_graph")),
+        "rollback_result": rollback_result,
+        "signed_rollback_receipt": signed_rollback_receipt,
     }
 
 
@@ -7019,13 +9329,14 @@ def store_local_grow_v2_preview(
     source_investigation: dict[str, Any],
     source_formation_contract: dict[str, Any],
     preview_bundle: dict[str, Any],
-    ai_execution_attestation: dict[str, Any],
+    ai_execution_attestation: dict[str, Any] | None,
     investigation_session: dict[str, Any],
     expected_brain_revision: str,
+    deterministic_source_attestation: dict[str, Any] | None = None,
     issued_at: int | None = None,
     ttl_seconds: int = 86_400,
 ) -> dict[str, Any]:
-    """Persist one provider-attested local Grow V2 preview as apply authority."""
+    """Persist one provider- or deterministic-source-attested Grow preview."""
 
     bootstrap_runtime_store()
     normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
@@ -7033,18 +9344,31 @@ def store_local_grow_v2_preview(
     normalized_tool_name = str(tool_name or "grow_source_preview").strip()
     normalized_expected_revision = str(expected_brain_revision or "").strip()
     bundle = deepcopy(_dict_value(preview_bundle))
-    attestation = validate_ai_execution_attestation(ai_execution_attestation)
-    session = deepcopy(_dict_value(investigation_session))
-    available_preview_ids = _local_grow_v2_preview_ids(bundle)
-    if not normalized_investigation_id or not normalized_expected_revision or not available_preview_ids:
-        raise _grow_preview_binding_error("grow_v2_preview_binding_invalid", status_code=400)
     source_payload = {
         "source_investigation": deepcopy(_dict_value(source_investigation)),
         "source_formation_contract": deepcopy(_dict_value(source_formation_contract)),
     }
+    authority_payload = {
+        "ai_execution_attestation": deepcopy(_dict_value(ai_execution_attestation)),
+        "deterministic_source_attestation": deepcopy(
+            _dict_value(deterministic_source_attestation)
+        ),
+    }
+    authority_kind, attestation = _validated_grow_preview_authority(
+        authority_payload,
+        source_investigation=source_payload["source_investigation"],
+        preview_bundle=bundle,
+    )
+    session = deepcopy(_dict_value(investigation_session))
+    available_preview_ids = _local_grow_v2_preview_ids(bundle)
+    if not normalized_investigation_id or not normalized_expected_revision or not available_preview_ids:
+        raise _grow_preview_binding_error("grow_v2_preview_binding_invalid", status_code=400)
     preview_payload = {
         "preview_bundle": bundle,
-        "ai_execution_attestation": attestation,
+        "ai_execution_attestation": attestation if authority_kind == "ai_execution" else {},
+        "deterministic_source_attestation": (
+            attestation if authority_kind.startswith("deterministic_") else {}
+        ),
         "investigation_session": session,
     }
     source_sha256 = canonical_sha256(source_payload)
@@ -7136,7 +9460,11 @@ def fetch_local_grow_v2_preview(*, brain_id: str, investigation_id: str) -> dict
             """,
             (normalized_investigation_id, normalized_brain_id, LOCAL_GROW_V2_OPERATION_FAMILY),
         ).fetchone()
-    return _validated_local_grow_v2_row(row) if row is not None else None
+    if row is None:
+        return None
+    if str(row["state"] or "") in {"investigating", "awaiting_clarification", "maintenance_deferred"}:
+        return _validated_grow_investigation_row(row)
+    return _validated_local_grow_v2_row(row)
 
 
 def apply_local_grow_v2_preview_transaction(
@@ -7149,6 +9477,8 @@ def apply_local_grow_v2_preview_transaction(
     preview_sha256: str,
     attestation_sha256: str,
     mutate_graph: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+    investigation_sha256: str = "",
+    expected_investigation_version: int | None = None,
     now: int | None = None,
 ) -> dict[str, Any]:
     """Validate and apply a local Grow V2 preview in one SQLite transaction."""
@@ -7160,6 +9490,7 @@ def apply_local_grow_v2_preview_transaction(
     normalized_apply_fingerprint = str(apply_fingerprint or "").strip()
     normalized_preview_sha256 = str(preview_sha256 or "").strip()
     normalized_attestation_sha256 = str(attestation_sha256 or "").strip()
+    normalized_investigation_sha256 = str(investigation_sha256 or "").strip()
     applied_epoch = int(now if now is not None else datetime.now(timezone.utc).timestamp())
     if (
         not normalized_investigation_id
@@ -7170,7 +9501,10 @@ def apply_local_grow_v2_preview_transaction(
 
     committed: dict[str, Any] | None = None
     replayed = False
-    with connect() as conn:
+    with connect(
+        timeout_seconds=LOCAL_GROW_V2_TRANSACTION_BUSY_TIMEOUT_MS / 1000.0,
+        busy_timeout_ms=LOCAL_GROW_V2_TRANSACTION_BUSY_TIMEOUT_MS,
+    ) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
@@ -7178,14 +9512,32 @@ def apply_local_grow_v2_preview_transaction(
         ).fetchone()
         if row is None:
             raise _grow_preview_binding_error("server_preview_not_found", status_code=404)
+        if str(row["state"] or "") in {"investigating", "awaiting_clarification", "maintenance_deferred"}:
+            raise _grow_preview_binding_error("server_preview_not_ready")
         stored = _validated_local_grow_v2_row(row)
         if stored["brain_id"] != normalized_brain_id:
             raise _grow_preview_binding_error("server_preview_brain_mismatch")
+        investigation = _dict_value(stored.get("investigation"))
+        if (
+            str(investigation.get("schema_version") or "")
+            == GROW_INVESTIGATION_V3_SCHEMA_VERSION
+        ):
+            if expected_investigation_version is None:
+                raise _grow_preview_binding_error(
+                    "grow_investigation_version_required",
+                    status_code=400,
+                )
+            if int(stored.get("version") or 0) != int(expected_investigation_version):
+                raise _grow_preview_binding_error("grow_investigation_version_conflict")
         if (
             stored["preview_sha256"] != normalized_preview_sha256
             or stored["attestation_sha256"] != normalized_attestation_sha256
         ):
             raise _grow_preview_binding_error("server_preview_hash_mismatch")
+        if normalized_investigation_sha256 and (
+            str(stored.get("investigation_sha256") or "") != normalized_investigation_sha256
+        ):
+            raise _grow_preview_binding_error("grow_investigation_hash_mismatch")
         if any(node_id not in set(stored["server_issued_preview_ids"]) for node_id in normalized_selected_ids):
             raise _grow_preview_binding_error("selected_preview_ids_not_server_issued")
         if str(stored.get("state") or "") == "consumed":
@@ -7202,6 +9554,13 @@ def apply_local_grow_v2_preview_transaction(
         else:
             if str(stored.get("state") or "") != "active":
                 raise _grow_preview_binding_error("server_preview_not_applyable")
+            if investigation and (
+                not bool(investigation.get("complete"))
+                or not bool(investigation.get("applicable"))
+                or _grow_required_questions_pending(investigation)
+                or not _grow_execution_ledger_attested(investigation)
+            ):
+                raise _grow_preview_binding_error("grow_investigation_not_applyable")
             binding = _dict_value(stored.get("binding"))
             if applied_epoch >= int(binding.get("expires_at") or 0):
                 conn.execute(
@@ -7234,28 +9593,61 @@ def apply_local_grow_v2_preview_transaction(
             persisted_node_ids = _normalized_local_grow_v2_ids(mutation.get("persisted_node_ids"))
             if not updated_graph or not persisted_node_ids:
                 raise _grow_preview_binding_error("zero_persisted_nodes")
-            before_node_ids = {
-                str(_dict_value(node).get("id") or "").strip()
+            before_nodes_by_id = {
+                str(_dict_value(node).get("id") or "").strip(): _dict_value(node)
                 for node in list(before_graph.get("nodes") or [])
                 if str(_dict_value(node).get("id") or "").strip()
             }
-            updated_node_ids = {
-                str(_dict_value(node).get("id") or "").strip()
+            updated_nodes_by_id = {
+                str(_dict_value(node).get("id") or "").strip(): _dict_value(node)
                 for node in list(updated_graph.get("nodes") or [])
                 if str(_dict_value(node).get("id") or "").strip()
             }
-            if any(node_id in before_node_ids or node_id not in updated_node_ids for node_id in persisted_node_ids):
+            before_node_ids = set(before_nodes_by_id)
+            updated_node_ids = set(updated_nodes_by_id)
+            if any(node_id not in updated_node_ids for node_id in persisted_node_ids):
                 raise _grow_preview_binding_error("persisted_node_proof_invalid")
+            new_persisted_ids = [
+                node_id for node_id in persisted_node_ids if node_id not in before_node_ids
+            ]
+            existing_persisted_ids = [
+                node_id for node_id in persisted_node_ids if node_id in before_node_ids
+            ]
+            existing_mutation_kinds = {
+                node_id: _grow_existing_mutation_kind(
+                    before_nodes_by_id[node_id],
+                    updated_nodes_by_id[node_id],
+                )
+                for node_id in existing_persisted_ids
+            }
+            if any(kind is None for kind in existing_mutation_kinds.values()):
+                raise _grow_preview_binding_error("persisted_node_proof_invalid")
+            expected_node_count = len(before_node_ids) + len(new_persisted_ids)
+            if (
+                not before_node_ids.issubset(updated_node_ids)
+                or len(updated_node_ids) != expected_node_count
+            ):
+                raise _grow_preview_binding_error("persistence_mutation_not_verified")
             _replace_runtime_graph_conn(conn, updated_graph)
             committed_graph = _fetch_graph_snapshot_conn(conn)
-            committed_node_ids = {
-                str(_dict_value(node).get("id") or "").strip()
+            committed_nodes_by_id = {
+                str(_dict_value(node).get("id") or "").strip(): _dict_value(node)
                 for node in list(committed_graph.get("nodes") or [])
                 if str(_dict_value(node).get("id") or "").strip()
             }
+            committed_node_ids = set(committed_nodes_by_id)
             if (
-                len(committed_node_ids) <= len(before_node_ids)
+                not before_node_ids.issubset(committed_node_ids)
+                or len(committed_node_ids) != expected_node_count
                 or any(node_id not in committed_node_ids for node_id in persisted_node_ids)
+                or any(
+                    _grow_existing_mutation_kind(
+                        before_nodes_by_id[node_id],
+                        committed_nodes_by_id[node_id],
+                    )
+                    != mutation_kind
+                    for node_id, mutation_kind in existing_mutation_kinds.items()
+                )
             ):
                 raise _grow_preview_binding_error("persistence_mutation_not_verified")
             after_revision = maintenance_graph_revision(committed_graph)
@@ -7272,11 +9664,13 @@ def apply_local_grow_v2_preview_transaction(
                 "after_brain_revision": after_revision,
                 "preview_sha256": normalized_preview_sha256,
                 "attestation_sha256": normalized_attestation_sha256,
+                "investigation_sha256": normalized_investigation_sha256,
                 "apply_fingerprint": normalized_apply_fingerprint,
                 "selected_preview_ids": normalized_selected_ids,
                 "persisted_node_ids": persisted_node_ids,
                 "applied_at": applied_at,
-                "signature_algorithm": "SHA-256",
+                "signature_algorithm": "HMAC-SHA256",
+                "signature_key_id": "local-managed-grow-v1",
             }
             signed_receipt["signature"] = _local_grow_v2_receipt_signature(signed_receipt)
             committed = {
@@ -7298,12 +9692,13 @@ def apply_local_grow_v2_preview_transaction(
             updated = conn.execute(
                 """
                 UPDATE grow_preview_bindings
-                SET state = 'consumed', state_updated_at = ?, apply_result_json = ?
+                SET state = 'consumed', state_updated_at = ?, apply_result_json = ?, before_graph_json = ?
                 WHERE token_id = ? AND brain_id = ? AND operation_family = ? AND state = 'active'
                 """,
                 (
                     applied_epoch,
                     _json_dump(committed),
+                    _json_dump(before_graph),
                     normalized_investigation_id,
                     normalized_brain_id,
                     LOCAL_GROW_V2_OPERATION_FAMILY,
@@ -7333,6 +9728,117 @@ def apply_local_grow_v2_preview_transaction(
     except Exception as exc:  # pragma: no cover - SQLite is authoritative; replay retries exports.
         export_refresh = {"status": "pending", "reason": type(exc).__name__}
     return {**deepcopy(committed), "idempotent_replay": replayed, "export_refresh": export_refresh}
+
+
+def rollback_local_grow_v2_preview_transaction(
+    *,
+    brain_id: str,
+    investigation_id: str,
+    confirm_rollback: bool,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Restore the exact pre-apply graph for one Grow operation, once."""
+
+    bootstrap_runtime_store()
+    normalized_brain_id = _assert_grow_preview_brain_scope(brain_id)
+    normalized_investigation_id = str(investigation_id or "").strip()
+    if not normalized_investigation_id or not confirm_rollback:
+        raise _grow_preview_binding_error("grow_v2_rollback_confirmation_required", status_code=400)
+    rolled_back_epoch = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    result: dict[str, Any] | None = None
+    replayed = False
+    with connect(
+        timeout_seconds=LOCAL_GROW_V2_TRANSACTION_BUSY_TIMEOUT_MS / 1000.0,
+        busy_timeout_ms=LOCAL_GROW_V2_TRANSACTION_BUSY_TIMEOUT_MS,
+    ) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM grow_preview_bindings WHERE token_id = ?",
+            (normalized_investigation_id,),
+        ).fetchone()
+        if row is None:
+            raise _grow_preview_binding_error("server_preview_not_found", status_code=404)
+        stored = _validated_local_grow_v2_row(row)
+        if stored["brain_id"] != normalized_brain_id:
+            raise _grow_preview_binding_error("server_preview_brain_mismatch")
+        if str(stored.get("state") or "") == "rolled_back":
+            result = _dict_value(stored.get("rollback_result"))
+            replayed = True
+            conn.rollback()
+        else:
+            if str(stored.get("state") or "") != "consumed":
+                raise _grow_preview_binding_error("grow_v2_rollback_not_applied")
+            apply_result = _dict_value(stored.get("apply_result"))
+            apply_receipt = _dict_value(apply_result.get("signed_apply_receipt"))
+            before_graph = _dict_value(stored.get("before_graph"))
+            if not before_graph:
+                raise _grow_preview_binding_error("grow_v2_rollback_snapshot_missing")
+            current_graph = _fetch_graph_snapshot_conn(conn)
+            current_revision = maintenance_graph_revision(current_graph)
+            expected_after_revision = str(apply_result.get("after_brain_revision") or "")
+            expected_before_revision = str(apply_result.get("before_brain_revision") or "")
+            if current_revision != expected_after_revision:
+                raise _grow_preview_binding_error(
+                    "grow_v2_rollback_stale",
+                    expected_brain_revision=expected_after_revision,
+                    current_brain_revision=current_revision,
+                )
+            if maintenance_graph_revision(before_graph) != expected_before_revision:
+                raise _grow_preview_binding_error("grow_v2_rollback_snapshot_integrity_invalid")
+            _replace_runtime_graph_conn(conn, before_graph)
+            restored_graph = _fetch_graph_snapshot_conn(conn)
+            restored_revision = maintenance_graph_revision(restored_graph)
+            if restored_revision != expected_before_revision:
+                raise _grow_preview_binding_error("grow_v2_rollback_persistence_not_verified")
+            rolled_back_at = datetime.fromtimestamp(rolled_back_epoch, tz=timezone.utc).replace(
+                microsecond=0
+            ).isoformat().replace("+00:00", "Z")
+            receipt = {
+                "schema_version": LOCAL_GROW_V2_ROLLBACK_RECEIPT_SCHEMA_VERSION,
+                "receipt_id": f"grow_rollback_{canonical_sha256({'investigation_id': normalized_investigation_id, 'apply_receipt_id': apply_receipt.get('receipt_id')})[:24]}",
+                "investigation_id": normalized_investigation_id,
+                "brain_id": normalized_brain_id,
+                "apply_receipt_id": str(apply_receipt.get("receipt_id") or ""),
+                "rollback_from_brain_revision": current_revision,
+                "rollback_to_brain_revision": restored_revision,
+                "rolled_back_at": rolled_back_at,
+                "signature_algorithm": "HMAC-SHA256",
+                "signature_key_id": "local-managed-grow-v1",
+            }
+            receipt["signature"] = _local_grow_v2_receipt_signature(receipt)
+            result = {
+                "schema_version": "agvm.local_grow_rollback_result.v1",
+                "investigation_id": normalized_investigation_id,
+                "brain_id": normalized_brain_id,
+                "rollback_from_brain_revision": current_revision,
+                "rollback_to_brain_revision": restored_revision,
+                "signed_rollback_receipt": receipt,
+            }
+            updated = conn.execute(
+                """
+                UPDATE grow_preview_bindings
+                SET state = 'rolled_back', state_updated_at = ?, rollback_result_json = ?
+                WHERE token_id = ? AND brain_id = ? AND operation_family = ? AND state = 'consumed'
+                """,
+                (
+                    rolled_back_epoch,
+                    _json_dump(result),
+                    normalized_investigation_id,
+                    normalized_brain_id,
+                    LOCAL_GROW_V2_OPERATION_FAMILY,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise _grow_preview_binding_error("grow_v2_rollback_concurrency_conflict")
+            conn.commit()
+    if result is None:
+        raise _grow_preview_binding_error("grow_v2_rollback_result_missing", status_code=500)
+    export_refresh: dict[str, Any] = {"status": "ready"}
+    try:
+        _refresh_graph_exports()
+    except Exception as exc:  # pragma: no cover - SQLite is authoritative; replay retries exports.
+        export_refresh = {"status": "pending", "reason": type(exc).__name__}
+    return {**deepcopy(result), "idempotent_replay": replayed, "export_refresh": export_refresh}
 
 
 def _maintenance_preview_error(

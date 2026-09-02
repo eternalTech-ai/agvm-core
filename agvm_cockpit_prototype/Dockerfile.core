@@ -26,9 +26,44 @@ COPY sdk/typescript /app/sdk/typescript
 COPY agvm_cockpit_prototype/index.html ./
 COPY agvm_cockpit_prototype/public ./public
 COPY agvm_cockpit_prototype/src ./src
-RUN npm run build
+COPY agvm_cockpit_prototype/scripts/write-release-artifact-manifest.mjs /tmp/write-release-artifact-manifest.mjs
+
+# These values change for every release but are only needed by the artifact
+# manifest step. Declaring them here keeps npm ci and source-copy layers
+# reusable across Core-only release commits.
+ARG AGVM_IMAGE_VERSION=0.0.0-dev
+ARG AGVM_IMAGE_REVISION=unknown
+ARG AGVM_IMAGE_CREATED=1970-01-01T00:00:00Z
+ARG AGVM_RELEASE_SOURCE_SHA=
+ARG AGVM_RELEASE_BUNDLE_ID=
+RUN npm run build \
+    && node /tmp/write-release-artifact-manifest.mjs \
+        --root /app/agvm_cockpit_prototype/dist \
+        --output /app/agvm_cockpit_prototype/dist/.well-known/detwin-artifact-manifest.json \
+        --version-output /app/agvm_cockpit_prototype/dist/version.json \
+        --component core_ui \
+        --version "${AGVM_IMAGE_VERSION}" \
+        --revision "${AGVM_IMAGE_REVISION}" \
+        --source-sha "${AGVM_RELEASE_SOURCE_SHA}" \
+        --release-bundle "${AGVM_RELEASE_BUNDLE_ID}" \
+        --created "${AGVM_IMAGE_CREATED}"
 
 FROM nginxinc/nginx-unprivileged:1.28-alpine@sha256:7377697a821c131a924a7105fafbe7414db4e9fcc77a6f08f776f33f141ec3f8 AS runtime
+
+ARG AGVM_IMAGE_VERSION=0.0.0-dev
+ARG AGVM_IMAGE_REVISION=unknown
+ARG AGVM_IMAGE_CREATED=1970-01-01T00:00:00Z
+ARG AGVM_RELEASE_SOURCE_SHA=
+ARG AGVM_RELEASE_BUNDLE_ID=
+
+LABEL org.opencontainers.image.title="Detwin Core UI" \
+      org.opencontainers.image.version="${AGVM_IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${AGVM_IMAGE_REVISION}" \
+      org.opencontainers.image.created="${AGVM_IMAGE_CREATED}" \
+      org.opencontainers.image.vendor="Eternal Tech SRL" \
+      ai.detwin.release.source_sha="${AGVM_RELEASE_SOURCE_SHA}" \
+      ai.detwin.release.bundle="${AGVM_RELEASE_BUNDLE_ID}" \
+      ai.detwin.artifact.manifest="/usr/share/nginx/html/.well-known/detwin-artifact-manifest.json"
 
 COPY agvm_cockpit_prototype/nginx.core.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/agvm_cockpit_prototype/dist /usr/share/nginx/html

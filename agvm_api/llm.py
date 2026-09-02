@@ -15,17 +15,29 @@ from typing import Any
 
 from config import (
     DEFAULT_ANSWER_MODEL,
+    DEFAULT_AI_SPATIAL_MODEL,
+    DEFAULT_BRANCH_CONTROLLER_MODEL,
     DEFAULT_COMPILER_MODEL,
+    DEFAULT_EVIDENCE_JUDGE_MODEL,
+    DEFAULT_GROW_SEMANTIC_MODEL,
+    DEFAULT_MASTER_MODEL,
     DEFAULT_OPENAI_MODEL,
+    DEFAULT_PLANNER_MODEL,
     DEFAULT_RETRIEVAL_MODEL,
     DEFAULT_SLEEP_MODEL,
 )
 
 _ROLE_NAMES = (
     "compiler",
+    "planner",
+    "ai_spatial",
     "retrieval",
+    "branch_controller",
+    "evidence_judge",
+    "master",
     "answer",
     "sleep",
+    "grow_semantic",
     "clone_arbiter",
     "clone_sufficiency",
     "clone_speaker",
@@ -48,6 +60,22 @@ _LLM_PROVIDER_SEMAPHORE: threading.BoundedSemaphore | None = None
 _LLM_PROVIDER_SEMAPHORE_LIMIT: int | None = None
 
 
+_PROVIDER_BLOCKING_ERROR_MARKERS = (
+    "insufficient_quota",
+    "credit_balance",
+    "no credits remaining",
+    "billing",
+    "invalid_api_key",
+    "401",
+    "403",
+)
+_PROVIDER_AUTH_ERROR_MARKERS = (
+    "invalid_api_key",
+    "401",
+    "403",
+)
+
+
 def _bounded_int_from_env(name: str, *, default: int, minimum: int, maximum: int) -> int:
     try:
         value = int(str(os.getenv(name, "") or "").strip() or default)
@@ -63,6 +91,12 @@ def _llm_max_concurrent_requests() -> int:
         minimum=1,
         maximum=8,
     )
+
+
+def llm_provider_concurrency_limit() -> int:
+    """Return the provider capacity used by the process-wide request semaphore."""
+
+    return _llm_max_concurrent_requests()
 
 
 def _llm_queue_timeout_seconds(request_timeout: float) -> float:
@@ -153,6 +187,30 @@ def _model_env_or(env_name: str, fallback: str) -> str:
     return str(os.getenv(env_name) or "").strip() or fallback
 
 
+def planner_model() -> str:
+    return _model_env_or("AGVM_PLANNER_MODEL", retrieval_model() or DEFAULT_PLANNER_MODEL)
+
+
+def ai_spatial_model() -> str:
+    return _model_env_or("AGVM_AI_SPATIAL_MODEL", retrieval_model() or DEFAULT_AI_SPATIAL_MODEL)
+
+
+def branch_controller_model() -> str:
+    return _model_env_or("AGVM_BRANCH_CONTROLLER_MODEL", retrieval_model() or DEFAULT_BRANCH_CONTROLLER_MODEL)
+
+
+def evidence_judge_model() -> str:
+    return _model_env_or("AGVM_EVIDENCE_JUDGE_MODEL", retrieval_model() or DEFAULT_EVIDENCE_JUDGE_MODEL)
+
+
+def master_model() -> str:
+    return _model_env_or("AGVM_MASTER_MODEL", answer_model() or DEFAULT_MASTER_MODEL)
+
+
+def grow_semantic_model() -> str:
+    return _model_env_or("AGVM_GROW_SEMANTIC_MODEL", retrieval_model() or DEFAULT_GROW_SEMANTIC_MODEL)
+
+
 def clone_app_arbiter_model() -> str:
     return _model_env_or("AGVM_CLONE_APP_ARBITER_MODEL", retrieval_model())
 
@@ -194,6 +252,28 @@ def record_llm_result(
         _LLM_RUNTIME["last_model"][role] = str(model)
     if timeout_seconds is not None:
         _LLM_RUNTIME["last_timeout_seconds"][role] = float(timeout_seconds)
+
+
+def clear_llm_provider_auth_errors() -> int:
+    """Clear stale provider auth failures after an explicit provider probe succeeds.
+
+    A successful `/setup/provider/test` proves the currently configured key can
+    reach the configured provider models.  That is enough to clear stale key or
+    auth failures after a key rotation.  It is not enough to clear quota/billing
+    failures, because provider model access can remain available when Responses
+    calls are rejected for missing credits.
+    """
+
+    cleared = 0
+    for role in _ROLE_NAMES:
+        error = str(_LLM_RUNTIME["last_error"][role] or "").strip()
+        if not error:
+            continue
+        lowered = error.lower()
+        if any(marker in lowered for marker in _PROVIDER_AUTH_ERROR_MARKERS):
+            _LLM_RUNTIME["last_error"][role] = None
+            cleared += 1
+    return cleared
 
 
 def llm_runtime_status() -> dict[str, Any]:
@@ -246,6 +326,24 @@ def _extract_text(payload: dict[str, Any]) -> str | None:
     return text or None
 
 
+def _responses_incomplete_reason(payload: dict[str, Any]) -> str | None:
+    if str(payload.get("status") or "").strip().lower() != "incomplete":
+        return None
+    details = payload.get("incomplete_details")
+    if isinstance(details, dict):
+        reason = str(details.get("reason") or "").strip().lower()
+        if reason:
+            return reason
+    return "unspecified"
+
+
+def _nonnegative_usage_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def structured_json(
     *,
     system_prompt: str,
@@ -259,6 +357,7 @@ def structured_json(
     api_key_override: str | None = None,
     execution_metadata: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
+    call_started_at = time.monotonic()
     resolved_model = model or llm_model()
     resolved_api_key = (
         str(api_key_override or "").strip()
@@ -345,6 +444,51 @@ def structured_json(
         record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
         return None, error
 
+    incomplete_reason = _responses_incomplete_reason(payload)
+    if incomplete_reason:
+        # Responses may include a truncated `output_text` alongside
+        # status=incomplete. Never attempt to parse or attest that fragment:
+        # it is not a conforming structured response even when its prefix looks
+        # like JSON. The one permitted repair repeats the same AI-bound request
+        # and schema with enough output budget to finish it.
+        if incomplete_reason == "max_output_tokens" and max_output_tokens is not None and int(max_output_tokens) < 12000:
+            retry_timeout = float(timeout) - (time.monotonic() - call_started_at)
+            if retry_timeout <= 0.05:
+                error = "incomplete_response:max_output_tokens:deadline_exhausted"
+                record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
+                return None, error
+            initial_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+            retry_execution: dict[str, Any] = {}
+            parsed, retry_error = structured_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema_name=schema_name,
+                schema=schema,
+                model=resolved_model,
+                timeout=retry_timeout,
+                role=role,
+                max_output_tokens=12000,
+                api_key_override=resolved_api_key,
+                execution_metadata=retry_execution,
+            )
+            if execution_metadata is not None:
+                execution_metadata.clear()
+                execution_metadata.update(retry_execution)
+                execution_metadata["provider_retry"] = {
+                    "count": 1,
+                    "reason": "max_output_tokens",
+                    "initial_max_output_tokens": int(max_output_tokens),
+                    "retry_max_output_tokens": 12000,
+                    "initial_usage": {
+                        key: _nonnegative_usage_count(initial_usage.get(key))
+                        for key in ("input_tokens", "output_tokens", "total_tokens")
+                    },
+                }
+            return parsed, retry_error
+        error = f"incomplete_response:{incomplete_reason}"
+        record_llm_result(role, path="fallback", error=error, model=resolved_model, timeout_seconds=timeout)
+        return None, error
+
     text = _extract_text(payload)
     if not text:
         record_llm_result(role, path="fallback", error="missing_output_text", model=resolved_model, timeout_seconds=timeout)
@@ -375,6 +519,7 @@ def structured_json(
                     "endpoint_origin": endpoint.split("/v1/", 1)[0],
                     "response_id": str(payload.get("id") or payload.get("response_id") or "")[:256],
                     "model": str(payload.get("model") or resolved_model)[:256],
+                    "role": str(role or "")[:80],
                     "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
                     "output_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                     "usage": {

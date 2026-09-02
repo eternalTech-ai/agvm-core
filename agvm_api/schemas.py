@@ -103,7 +103,18 @@ class Provenance(BaseModel):
     guide_conceptual_area: str | None = None
 
 
-SourceTrust = Literal["verified_public", "user_asserted", "uploaded_document", "synthetic_test", "inferred", "system_metadata"]
+# ``observed`` was emitted by V1 stores. Keep it readable so an existing brain
+# cannot make graph endpoints fail during a V2 upgrade. New writers continue to
+# use the more specific trust values selected by the ingestion pipeline.
+SourceTrust = Literal[
+    "verified_public",
+    "user_asserted",
+    "uploaded_document",
+    "synthetic_test",
+    "inferred",
+    "system_metadata",
+    "observed",
+]
 ClaimStatus = Literal["fact", "hypothesis", "source_metadata", "instruction", "test_artifact"]
 LearningMode = Literal["strict_review", "guided_learning", "autonomous_cautious", "autonomous_research", "sleep_review"]
 SourceInvestigationKind = Literal["manual_text", "url", "website", "pdf", "docx", "image", "transcript", "mixed_bundle", "unknown"]
@@ -193,6 +204,11 @@ class VectorNode(BaseModel):
     valid_from: str | None = None
     valid_to: str | None = None
     observed_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    ingested_at: str | None = None
+    superseded_at: str | None = None
+    node_revision: int | None = Field(default=None, ge=1)
     superseded_by: str | None = None
     obsoletes: list[str] = Field(default_factory=list)
     temporal_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -338,55 +354,114 @@ class PreviewBundle(BaseModel):
 
 
 class SourceInvestigationOptions(BaseModel):
+    # Compatibility assertion only.  The authoritative brain scope is the
+    # request top-level ``brain_id`` (or the HTTP header/query scope resolved by
+    # the server).  Keeping this field explicit prevents Pydantic from silently
+    # discarding legacy clients' options.brain_id and lets Core reject drift
+    # before any provider or Search call.
+    brain_id: str | None = None
     analyze_images: Literal["off", "ocr_only", "vision_summary"] = "off"
-    crawl_sublinks: Literal["off", "same_page", "same_domain", "bounded_external"] = "off"
-    use_online_enrichment: bool = False
+    crawl_scope: Literal["off", "same_page", "same_domain", "external_bounded"] = "external_bounded"
+    crawl_sublinks: Literal["off", "same_page", "same_domain", "bounded_external"] = "bounded_external"
+    follow_same_domain: bool = True
+    explore_external_links: bool = True
+    include_images: bool = True
+    use_online_enrichment: bool = True
     metadata_only: bool = False
-    use_browser_budget: bool = False
+    use_browser_budget: bool = True
+    render_browser_pages: bool = True
     pause_on_questions: bool = False
+    semantic_preview: bool = False
+    source_storage_mode: Literal["auto", "source_bound_only"] = "auto"
     clarification_answers: dict[str, Any] = Field(default_factory=dict)
     clarification_default_policy: Literal["apply_defaults", "pause_when_unanswered"] = "apply_defaults"
     treat_as: Literal["auto", "self_memory", "project_workspace", "public_dossier", "reference_library", "technical_document"] = "auto"
     source_trust: Literal["unknown", "user_asserted", "uploaded_document", "public_web", "verified_public_source"] = "unknown"
-    max_pages: int = Field(default=20, ge=1, le=200)
-    max_crawl_pages: int = Field(default=20, ge=1, le=100)
+    max_pages: int = Field(default=250, ge=1, le=250)
+    max_crawl_pages: int = Field(default=250, ge=1, le=250)
     max_depth: int = Field(default=1, ge=0, le=5)
     max_ocr_pages: int = Field(default=8, ge=0, le=100)
-    max_images: int = Field(default=12, ge=0, le=100)
-    max_online_queries: int = Field(default=4, ge=0, le=50)
-    fetch_timeout_seconds: float = Field(default=8.0, ge=0.1, le=30.0)
-    compiler_preview_timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
-    question_limit: int = Field(default=5, ge=0, le=24)
-    max_units: int = Field(default=12, ge=1, le=1024)
-    max_urls: int = Field(default=16, ge=0, le=64)
-    max_total_chars: int = Field(default=120000, ge=1000, le=500000)
+    max_images: int = Field(default=250, ge=0, le=1000)
+    max_online_queries: int = Field(default=25, ge=0, le=100)
+    max_external_domains: int = Field(default=25, ge=0, le=25)
+    max_pages_per_external_domain: int = Field(default=30, ge=0, le=30)
+    max_browser_actions: int = Field(default=64, ge=0, le=250)
+    max_browser_scrolls: int = Field(default=24, ge=0, le=100)
+    fetch_timeout_seconds: float = Field(default=15.0, ge=0.1, le=120.0)
+    crawl_time_budget_seconds: float = Field(default=1800.0, ge=5.0, le=3600.0)
+    compiler_preview_timeout_seconds: float = Field(default=45.0, ge=1.0, le=1800.0)
+    question_limit: int = Field(default=12, ge=0, le=24)
+    max_units: int = Field(default=1500, ge=1, le=1500)
+    max_urls: int = Field(default=250, ge=0, le=250)
+    max_total_chars: int = Field(default=4_000_000, ge=1000, le=10_000_000)
+
+    @field_validator("brain_id")
+    @classmethod
+    def trim_optional_grow_options_brain_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 class SourceInvestigationRequest(BaseModel):
     brain_id: str | None = None
-    raw_input: str = Field(min_length=1)
+    raw_input: str | None = None
+    investigation_id: str | None = None
+    resume_token: str | None = None
+    investigation_version: int | None = Field(default=None, ge=1)
     input_kind: Literal["auto", "manual_text", "url", "website", "pdf", "docx", "image", "transcript", "mixed_bundle"] = "auto"
     source_label: str | None = None
     source_uri: str | None = None
     user_instruction: str | None = None
     options: SourceInvestigationOptions = Field(default_factory=SourceInvestigationOptions)
+    trusted_source_investigation: dict[str, Any] = Field(default_factory=dict)
     run_preview: bool = True
 
     @field_validator("raw_input")
     @classmethod
-    def trim_raw_input(cls, value: str) -> str:
+    def trim_raw_input(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         value = value.strip()
         if not value:
             raise ValueError("source_input_required")
         return value
 
-    @field_validator("source_label", "source_uri", "user_instruction")
+    @field_validator("source_label", "source_uri", "user_instruction", "investigation_id", "resume_token")
     @classmethod
     def trim_optional_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         value = value.strip()
         return value or None
+
+    @model_validator(mode="after")
+    def require_source_or_resume_authority(self) -> "SourceInvestigationRequest":
+        has_resume = bool(self.investigation_id and self.resume_token)
+        has_trusted_source = bool(self.trusted_source_investigation)
+        source_uri = str(self.source_uri or "").strip()
+        has_url_source = bool(
+            source_uri
+            and (
+                self.input_kind in {"url", "website"}
+                or source_uri.lower().startswith(("http://", "https://"))
+            )
+        )
+        if not self.raw_input and not has_url_source and not has_resume and not has_trusted_source:
+            raise ValueError("source_input_or_resume_authority_required")
+        if bool(self.investigation_id) != bool(self.resume_token):
+            raise ValueError("investigation_id_and_resume_token_required_together")
+        declared_scopes = {
+            str(value).strip()
+            for value in (
+                self.brain_id,
+                self.options.brain_id,
+            )
+            if str(value or "").strip()
+        }
+        if len(declared_scopes) > 1:
+            raise ValueError("grow_brain_scope_mismatch")
+        return self
 
 
 class SourceDetection(BaseModel):
@@ -407,6 +482,7 @@ class SourceUnitProvenance(BaseModel):
     source_label: str | None = None
     source_type: str
     hash: str | None = None
+    published_at: str | None = None
     retrieved_at: str | None = None
 
 
@@ -432,6 +508,11 @@ class SourceUnit(BaseModel):
     segment_index: int | None = Field(default=None, ge=1)
     segment_count: int | None = Field(default=None, ge=1)
     formation_strategy: str | None = None
+    content_digest: str | None = None
+    published_at: str | None = None
+    acquired_at: str | None = None
+    acquisition_method: str | None = None
+    acquisition_proof: dict[str, Any] = Field(default_factory=dict)
     provenance: SourceUnitProvenance
     extraction_trace: dict[str, Any] = Field(default_factory=dict)
 
@@ -471,6 +552,8 @@ class SourceInvestigationPackage(BaseModel):
     source_detection: SourceDetection
     budgets: dict[str, Any] = Field(default_factory=dict)
     budget_usage: dict[str, Any] = Field(default_factory=dict)
+    execution_accounting: dict[str, Any] = Field(default_factory=dict)
+    grow_source_policy: dict[str, Any] = Field(default_factory=dict)
     source_units: list[SourceUnit] = Field(default_factory=list)
     extracted_assets: list[dict[str, Any]] = Field(default_factory=list)
     entities: list[dict[str, Any]] = Field(default_factory=list)
@@ -496,6 +579,17 @@ class SourceInvestigationPackage(BaseModel):
 class SourceInvestigationResponse(BaseModel):
     source_investigation: SourceInvestigationPackage
     preview_bundle: PreviewBundle | None = None
+    maintenance_feedback_packets: list[dict[str, Any]] = Field(default_factory=list)
+    clarification_questions: list[Any] = Field(default_factory=list)
+    investigation: dict[str, Any] = Field(default_factory=dict)
+    investigation_session: dict[str, Any] = Field(default_factory=dict)
+    investigation_id: str | None = None
+    resume_token: str | None = None
+    investigation_version: int | None = Field(default=None, ge=1)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    ai_execution_attestation: dict[str, Any] = Field(default_factory=dict)
+    ai_execution_ledger: list[dict[str, Any]] = Field(default_factory=list)
+    apply_ready: bool = False
 
 
 class McpToolContract(BaseModel):
@@ -618,6 +712,35 @@ class McpToolExecutionResponse(BaseModel):
     search_id: str | None = None
     tool_name: str
     status: Literal["ok", "partial", "no_match", "needs_clarification", "blocked", "failed"]
+    completion_state: str | None = None
+    canonical_search_state: str | None = None
+    terminal_for_client: bool | None = None
+    review_required: bool = False
+    more_evidence_needed: bool = False
+    answer_surface_state: Literal["not_ready", "answer_now", "context_level_1_ready", "answer_now_and_continue", "final_sealed"] | None = None
+    answerability_state: Literal["grounded", "partial", "insufficient", "ai_pending"] | None = None
+    closure_state: Literal["open", "exploration_complete", "bounded_partial", "final_sealed"] | None = None
+    final_closure_ready: bool = False
+    final_materialization_pending: bool = False
+    result_ready_terminal: bool = False
+    result_materialization_state: str | None = None
+    result_snapshot_kind: str | None = None
+    snapshot_schema_version: str | None = None
+    snapshot_kind: str | None = None
+    parent_package_revision: str | None = None
+    package_revision: str | None = None
+    snapshot_counters: dict[str, int] | None = None
+    visited_current: int | None = Field(default=None, ge=0)
+    visited_total: int | None = Field(default=None, ge=0)
+    hydrated_current: int | None = Field(default=None, ge=0)
+    hydrated_total: int | None = Field(default=None, ge=0)
+    promoted_current: int | None = Field(default=None, ge=0)
+    promoted_total: int | None = Field(default=None, ge=0)
+    package_current: int | None = Field(default=None, ge=0)
+    package_total: int | None = Field(default=None, ge=0)
+    hydrated: int | None = Field(default=None, ge=0)
+    promoted: int | None = Field(default=None, ge=0)
+    package: int | None = Field(default=None, ge=0)
     context_package: dict[str, Any] = Field(default_factory=dict)
     context_package_materialization: dict[str, Any] = Field(default_factory=dict)
     hot_working_memory: dict[str, Any] = Field(default_factory=dict)
@@ -632,6 +755,7 @@ class McpToolExecutionResponse(BaseModel):
     ai_spatial_landing_contract_runtime: dict[str, Any] = Field(default_factory=dict)
     path_mission_contract: dict[str, Any] = Field(default_factory=dict)
     path_missions: list[dict[str, Any]] = Field(default_factory=list)
+    physical_path_executions: list[dict[str, Any]] = Field(default_factory=list)
     mission_aware_merge_summary: dict[str, Any] = Field(default_factory=dict)
     mission_evidence_ledger: dict[str, Any] = Field(default_factory=dict)
     master_judgement: dict[str, Any] = Field(default_factory=dict)
@@ -727,29 +851,53 @@ class AgentDemoChatTurnResponse(BaseModel):
 
 
 class McpGrowSourceRequest(SourceInvestigationRequest):
-    pass
+    clarification_answers: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def merge_top_level_clarification_answers(self) -> "McpGrowSourceRequest":
+        if self.clarification_answers and not self.options.clarification_answers:
+            self.options = self.options.model_copy(
+                update={"clarification_answers": dict(self.clarification_answers)}
+            )
+        return self
 
 
 class McpGrowApplyRequest(BaseModel):
     brain_id: str | None = None
     investigation_id: str | None = None
+    resume_token: str | None = None
+    investigation_version: int | None = Field(default=None, ge=1)
     source_investigation: dict[str, Any] = Field(default_factory=dict)
     source_formation_contract: dict[str, Any] = Field(default_factory=dict)
     preview_bundle: dict[str, Any] | None = None
     selected_preview_ids: list[str] = Field(default_factory=list)
     learning_mode: LearningMode = "strict_review"
-    clarification_answers: dict[str, str] = Field(default_factory=dict)
+    clarification_answers: dict[str, Any] = Field(default_factory=dict)
     approved_preview_ids: list[str] = Field(default_factory=list)
     question_limit: int = Field(default=12, ge=1, le=24)
     confirm_apply: bool = False
 
-    @field_validator("investigation_id")
+    @field_validator("investigation_id", "resume_token")
     @classmethod
     def trim_optional_investigation_id(cls, value: str | None) -> str | None:
         if value is None:
             return None
         value = value.strip()
         return value or None
+
+
+class McpGrowRollbackRequest(BaseModel):
+    brain_id: str | None = None
+    investigation_id: str = Field(min_length=1)
+    confirm_rollback: bool = False
+
+    @field_validator("investigation_id")
+    @classmethod
+    def trim_grow_rollback_investigation_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("investigation_id_required")
+        return value
 
 
 class McpWriteMemoryPreviewRequest(PreviewRequest):
@@ -804,16 +952,28 @@ class McpClarificationRequest(BaseModel):
 class McpGrowToolExecutionResponse(BaseModel):
     schema_version: str
     brain_id: str | None = None
+    investigation_id: str | None = None
     tool_name: str
-    status: Literal["preview_ready", "asking_clarification", "partial_budget_exhausted", "needs_review", "applied", "blocked", "failed"]
+    status: Literal["preview_ready", "asking_clarification", "partial_budget_exhausted", "needs_review", "applied", "rolled_back", "blocked", "failed"]
     source_investigation: dict[str, Any] = Field(default_factory=dict)
     source_formation_contract: dict[str, Any] = Field(default_factory=dict)
     memory_operation_lifecycle_contract: dict[str, Any] = Field(default_factory=dict)
     preview_bundle: dict[str, Any] | None = None
+    maintenance_feedback_packets: list[dict[str, Any]] = Field(default_factory=list)
     clarification_request: dict[str, Any] = Field(default_factory=dict)
     clarification_questions: list[Any] = Field(default_factory=list)
     compiler_handoff_proof: dict[str, Any] = Field(default_factory=dict)
     persist_result: dict[str, Any] | None = None
+    can_apply_now: bool | None = None
+    selected_preview_ids: list[str] = Field(default_factory=list)
+    receipt_id: str | None = None
+    receipt_signature: str | None = None
+    persisted_node_ids: list[str] = Field(default_factory=list)
+    persisted_edge_count: int | None = None
+    merged_into_existing_ids: list[str] = Field(default_factory=list)
+    brain_revision_before: str | None = None
+    brain_revision_after: str | None = None
+    apply_receipt: dict[str, Any] = Field(default_factory=dict)
     cognitive_write_plan: dict[str, Any] = Field(default_factory=dict)
     learning_policy: dict[str, Any] = Field(default_factory=dict)
     write_trace: dict[str, Any] = Field(default_factory=dict)
@@ -822,8 +982,47 @@ class McpGrowToolExecutionResponse(BaseModel):
     budget: dict[str, Any] = Field(default_factory=dict)
     error_contract: dict[str, Any] = Field(default_factory=dict)
     ai_execution_attestation: dict[str, Any] = Field(default_factory=dict)
+    ai_execution_ledger: list[dict[str, Any]] = Field(default_factory=list)
+    investigation: dict[str, Any] = Field(default_factory=dict)
     investigation_session: dict[str, Any] = Field(default_factory=dict)
+    resume_token: str | None = None
+    investigation_version: int | None = Field(default=None, ge=1)
+    usage: dict[str, Any] = Field(default_factory=dict)
     next_action: str | None = None
+
+    @model_validator(mode="after")
+    def normalize_guided_provider_attestation(self) -> "McpGrowToolExecutionResponse":
+        if self.status != "asking_clarification":
+            return self
+        session = dict(self.investigation_session or {})
+        if not session or session.get("provider_attested") is True:
+            return self
+        attestation = dict(self.ai_execution_attestation or {})
+        provider_attested = bool(
+            attestation.get("provider_executed") is True
+            or (
+                str(attestation.get("status") or "").strip().lower() == "completed"
+                and bool(str(attestation.get("provider") or "").strip())
+            )
+        )
+        if not provider_attested:
+            for entry in self.ai_execution_ledger or []:
+                if not isinstance(entry, dict):
+                    continue
+                entry_attestation = dict(entry.get("attestation") or {})
+                if (
+                    entry_attestation.get("provider_executed") is True
+                    or (
+                        str(entry_attestation.get("status") or "").strip().lower() == "completed"
+                        and bool(str(entry_attestation.get("provider") or "").strip())
+                    )
+                ):
+                    provider_attested = True
+                    break
+        if provider_attested:
+            session["provider_attested"] = True
+            self.investigation_session = session
+        return self
 
 
 class McpMaintenanceRequest(BaseModel):
@@ -1392,6 +1591,7 @@ class RetrieveAnswer(BaseModel):
     document_lookup: dict[str, Any] = Field(default_factory=dict)
     supporting_documents: list[dict[str, Any]] = Field(default_factory=list)
     source_trace: list[dict[str, Any]] = Field(default_factory=list)
+    semantic_authority: dict[str, Any] = Field(default_factory=dict)
 
 
 class RetrieveStep(BaseModel):
@@ -1439,7 +1639,7 @@ class RetrieveContext(BaseModel):
 
 
 class BranchBudget(BaseModel):
-    max_steps: int = Field(default=2, ge=1, le=8)
+    max_steps: int = Field(default=2, ge=1, le=12)
     max_candidate_reads: int = Field(default=10, ge=1, le=MAX_RETRIEVAL_CANDIDATES_PER_STEP)
     max_nearby_bundles: int = Field(default=2, ge=1, le=8)
     max_fulltexts: int = Field(default=3, ge=0, le=24)
@@ -1577,7 +1777,7 @@ class RetrieveBranch(BaseModel):
     family_plan_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     probe_ids: list[str] = Field(default_factory=list)
     goal: str
-    status: Literal["active", "satisfied", "merged", "stopped"] = "active"
+    status: Literal["active", "running", "satisfied", "merged", "stopped"] = "active"
     worker_id: str | None = None
     worker_kind: str | None = None
     success_criteria: dict[str, Any] = Field(default_factory=dict)
@@ -1607,6 +1807,7 @@ class RetrieveBranch(BaseModel):
         "planned",
         "landing",
         "routing",
+        "background_pending",
         "evidence_holding",
         "reroute_pending",
         "goal_satisfied",
@@ -1643,7 +1844,14 @@ class RetrieveBranch(BaseModel):
     controller_reason: str | None = None
     controller_turn_ms: float | None = Field(default=None, ge=0.0)
     controller_evidence_basis: list[str] = Field(default_factory=list)
-    controller_decision_source: Literal["llm", "fallback_timeout", "fallback_parse_error", "fallback_provider_error", "fallback_disabled"] | None = None
+    controller_decision_source: Literal[
+        "llm",
+        "plan_first_v3",
+        "fallback_timeout",
+        "fallback_parse_error",
+        "fallback_provider_error",
+        "fallback_disabled",
+    ] | None = None
     controller_fallback_reason: Literal["timeout", "provider_error", "parse_error", "disabled", "empty"] | None = None
     controller_escalation_needed: bool = False
     controller_escalation_reason: str | None = None
@@ -1656,6 +1864,7 @@ class RetrieveBranch(BaseModel):
         "landed",
         "landing",
         "routing",
+        "background_pending",
         "evidence_holding",
         "reroute_pending",
         "satisfied",
@@ -1712,19 +1921,20 @@ class RetrieveRequest(BaseModel):
     mcp_tool_name: str | None = None
     response_mode: Literal["answer", "context", "both"] = "both"
     retrieval_mode: Literal["flash", "balanced", "heavy", "forensic"] | None = None
+    deadline_at_ms: int | None = Field(default=None, ge=1)
     context_package_mode: Literal["answer_minimal", "mcp_operational", "broad_dossier", "document_full", "forensic_trace"] | None = None
     document_text_policy: Literal["refs_only", "top_raw", "all_raw"] = "refs_only"
     document_id: str | None = None
     complete_paths: bool = False
-    max_probe_count: int = Field(default=6, ge=1, le=6)
-    max_steps: int = Field(default=4, ge=1, le=8)
+    max_probe_count: int = Field(default=6, ge=1, le=12)
+    max_steps: int = Field(default=4, ge=1, le=12)
     max_candidates_per_step: int = Field(
         default=DEFAULT_RETRIEVAL_CANDIDATES_PER_STEP,
         ge=4,
         le=MAX_RETRIEVAL_CANDIDATES_PER_STEP,
     )
     max_matches: int = Field(default=DEFAULT_RETRIEVAL_MAX_MATCHES, ge=1, le=MAX_RETRIEVAL_MATCHES)
-    max_total_branches: int = Field(default=6, ge=1, le=6)
+    max_total_branches: int = Field(default=6, ge=1, le=12)
     max_total_steps: int = Field(default=4, ge=1, le=12)
     max_total_text_chars: int = Field(default=6400, ge=500, le=64000)
     max_nodes_fulltext: int = Field(default=6, ge=1, le=24)
@@ -1750,7 +1960,30 @@ class RetrieveRequest(BaseModel):
         return value or None
 
     @model_validator(mode="after")
-    def scale_default_candidate_budget(self) -> "RetrieveRequest":
+    def scale_mode_structural_budget(self) -> "RetrieveRequest":
+        profiles = {
+            "heavy": {
+                "max_probe_count": 8,
+                "max_steps": 8,
+                "max_total_branches": 8,
+                "max_total_steps": 8,
+                "max_total_text_chars": 32000,
+                "max_nodes_fulltext": 16,
+            },
+            "forensic": {
+                "max_probe_count": 12,
+                "max_steps": 12,
+                "max_total_branches": 12,
+                "max_total_steps": 12,
+                "max_total_text_chars": 64000,
+                "max_nodes_fulltext": 24,
+            },
+        }
+        profile = profiles.get(str(self.retrieval_mode or ""))
+        if profile:
+            for field_name, value in profile.items():
+                if field_name not in self.model_fields_set:
+                    setattr(self, field_name, value)
         if "max_candidates_per_step" not in self.model_fields_set:
             self.max_candidates_per_step = scaled_retrieval_candidate_limit(self.max_matches)
         return self
@@ -1759,6 +1992,13 @@ class RetrieveRequest(BaseModel):
 class RetrieveResponse(BaseModel):
     search_id: str | None = None
     brain_id: str | None = None
+    status: str | None = None
+    completion_state: str | None = None
+    canonical_search_state: str | None = None
+    terminal_for_client: bool | None = None
+    review_required: bool = False
+    more_evidence_needed: bool = False
+    search_outcome_contract: dict[str, Any] = Field(default_factory=dict)
     query_text: str
     thread_id: str | None = None
     response_mode: Literal["answer", "context", "both"] = "both"
@@ -1777,6 +2017,7 @@ class RetrieveResponse(BaseModel):
     ai_spatial_landing_contract_runtime: dict[str, Any] = Field(default_factory=dict)
     path_mission_contract: dict[str, Any] = Field(default_factory=dict)
     path_missions: list[dict[str, Any]] = Field(default_factory=list)
+    physical_path_executions: list[dict[str, Any]] = Field(default_factory=list)
     mission_aware_merge_summary: dict[str, Any] = Field(default_factory=dict)
     mission_evidence_ledger: dict[str, Any] = Field(default_factory=dict)
     master_judgement: dict[str, Any] = Field(default_factory=dict)
@@ -1851,6 +2092,26 @@ class RetrieveResponse(BaseModel):
     background_enrichment_low_yield_rounds: int = Field(default=0, ge=0)
     detached_result_snapshot: bool = False
     result_snapshot_kind: str | None = None
+    snapshot_schema_version: str | None = None
+    snapshot_kind: str | None = None
+    parent_package_revision: str | None = None
+    package_revision: str | None = None
+    snapshot_counters: dict[str, int] | None = None
+    visited_current: int | None = Field(default=None, ge=0)
+    visited_total: int | None = Field(default=None, ge=0)
+    hydrated_current: int | None = Field(default=None, ge=0)
+    hydrated_total: int | None = Field(default=None, ge=0)
+    promoted_current: int | None = Field(default=None, ge=0)
+    promoted_total: int | None = Field(default=None, ge=0)
+    package_current: int | None = Field(default=None, ge=0)
+    package_total: int | None = Field(default=None, ge=0)
+    hydrated: int | None = Field(default=None, ge=0)
+    promoted: int | None = Field(default=None, ge=0)
+    package: int | None = Field(default=None, ge=0)
+    matches_count_total: int | None = Field(default=None, ge=0)
+    steps_count_total: int | None = Field(default=None, ge=0)
+    branches_count_total: int | None = Field(default=None, ge=0)
+    landing_metadata_count_total: int | None = Field(default=None, ge=0)
     result_materialization_state: Literal[
         "none",
         "snapshot_ready",
@@ -1863,6 +2124,7 @@ class RetrieveResponse(BaseModel):
         "path_payload_ready",
         "partial_complete_low_yield",
         "bounded_partial_finalized",
+        "partial_review_required",
         "finalized",
     ] | None = None
     final_materialization_pending: bool = False

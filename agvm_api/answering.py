@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -23,6 +25,7 @@ from exact_field_contract import (
 )
 from memory_hygiene import is_answer_eligible, is_document_eligible
 from metamemory import build_metamemory_package
+from stream_contract import search_ai_stage_timeout_seconds
 
 
 def _fold_text(value: str) -> str:
@@ -37,6 +40,110 @@ def _truncate_prompt_text(value: Any, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: max(0, limit - 3)].rstrip()}..."
+
+
+def _evidence_temporal_context(*sources: Any) -> dict[str, Any]:
+    """Normalize evidence time without confusing audit time with truth time."""
+
+    mappings: list[dict[str, Any]] = []
+    def collect(raw: Any, depth: int = 0) -> None:
+        if not isinstance(raw, dict) or depth > 3:
+            return
+        source = dict(raw)
+        mappings.append(source)
+        for key in (
+            "temporal_context",
+            "semantic_validity",
+            "source_chronology",
+            "bootstrap_source_chronology",
+            "audit_timestamps",
+            "temporal",
+            "provenance",
+            "source_metadata",
+            "lifecycle",
+        ):
+            nested = source.get(key)
+            if key == "bootstrap_source_chronology" and isinstance(nested, dict):
+                for chronology in nested.values():
+                    collect(chronology, depth + 1)
+            else:
+                collect(nested, depth + 1)
+
+    for raw in sources:
+        collect(raw)
+
+    def first(*keys: str) -> Any:
+        for mapping in mappings:
+            for key in keys:
+                value = mapping.get(key)
+                if value not in (None, "", [], {}):
+                    return value
+        return None
+
+    semantic_validity = {
+        "valid_from": first("valid_from"),
+        "valid_to": first("valid_to"),
+        "observed_at": first("observed_at"),
+        "temporal_role": first("temporal_role"),
+    }
+    lifecycle = {
+        "lifecycle_status": first("lifecycle_status", "lifecycle_state"),
+        "superseded_at": first("superseded_at"),
+        "superseded_by": first("superseded_by"),
+        "node_revision": first("node_revision"),
+    }
+    source_chronology = {
+        "published_at": first(
+            "source_published_at",
+            "published_at",
+            "published_date",
+            "publication_date",
+            "date_published",
+        ),
+        "acquired_at": first(
+            "source_acquired_at",
+            "acquired_at",
+        ),
+        "retrieved_at": first(
+            "source_retrieved_at",
+            "retrieved_at",
+            "fetched_at",
+            "collected_at",
+        ),
+    }
+    audit_timestamps = {
+        "recorded_at": first("recorded_at"),
+        "created_at": first("created_at"),
+        "ingested_at": first("ingested_at", "indexed_at"),
+        "updated_at": first("updated_at"),
+    }
+    semantic_validity = {
+        key: value for key, value in semantic_validity.items() if value not in (None, "", [], {})
+    }
+    lifecycle = {
+        key: value for key, value in lifecycle.items() if value not in (None, "", [], {})
+    }
+    source_chronology = {
+        key: value for key, value in source_chronology.items() if value not in (None, "", [], {})
+    }
+    audit_timestamps = {
+        key: value for key, value in audit_timestamps.items() if value not in (None, "", [], {})
+    }
+    context = {
+        "semantic_validity": semantic_validity,
+        "lifecycle": lifecycle,
+        "source_chronology": source_chronology,
+        "audit_timestamps": {
+            **audit_timestamps,
+            **({"meaning": "storage_or_ingestion_audit_only"} if audit_timestamps else {}),
+        },
+    }
+    return {
+        key: value
+        for key, value in context.items()
+        if value not in (None, "", [], {})
+        and not (key == "audit_timestamps" and value == {})
+    }
 
 
 def _eligible_answer_matches(matches: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -454,13 +561,10 @@ def intent_bonus(intent_type: str | None, candidate: dict[str, Any]) -> float:
     if not intent_type:
         return 0.0
     text = str(candidate.get("raw_text") or candidate.get("summary") or "").lower()
-    memory_type = str(candidate.get("memory_type") or "")
     if intent_type == "identity_name":
         bonus = 0.0
         if _extract_name_from_identity(text):
             bonus += 0.22
-        if memory_type in {"identity", "identity_claim"}:
-            bonus += 0.08
         return bonus
     if intent_type == "workplace":
         if any(pattern in text for pattern in ("lavoro ", "work at", "work for")):
@@ -478,10 +582,6 @@ def intent_bonus(intent_type: str | None, candidate: dict[str, Any]) -> float:
         bonus = 0.0
         if _temporal_reference_tokens(text):
             bonus += 0.18
-        if memory_type in {"episodic", "history"}:
-            bonus += 0.08
-        if memory_type in {"project", "knowledge", "document_anchor", "document_chunk"}:
-            bonus += 0.04
         return bonus
     return 0.0
 
@@ -492,16 +592,15 @@ def _titlecase_name(value: str) -> str:
 
 def _extract_name_from_identity(text: str) -> str | None:
     patterns = [
-        r"(?:mi chiamo|my name is)\s+([a-zà-ÿ' ]+?)(?:\s+nato|\s+born|[.,;]|$)",
-        r"(?:sono|i am)\s+(?!nato\b|nata\b|born\b)([a-zà-ÿ' ]+?)(?:\s+nato|\s+born|[.,;]|$)",
+        r"(?i:(?:mi chiamo|my name is))\s+([A-ZÀ-ÖØ-Þ][\w'’-]*(?:\s+[A-ZÀ-ÖØ-Þ][\w'’-]*){0,3})(?=\s+(?i:nato|nata|born)\b|[.,;]|$)",
+        r"(?i:(?:sono|i am))\s+(?!(?i:nato|nata|born)\b)([A-ZÀ-ÖØ-Þ][\w'’-]*(?:\s+[A-ZÀ-ÖØ-Þ][\w'’-]*){0,3})(?=\s+(?i:nato|nata|born)\b|[.,;]|$)",
     ]
-    lowered = text.lower()
     for pattern in patterns:
-        match = re.search(pattern, lowered)
+        match = re.search(pattern, text)
         if match:
-            candidate = match.group(1).strip()
+            candidate = _clean_person_name_value(match.group(1))
             if candidate:
-                return _titlecase_name(candidate)
+                return candidate
     return None
 
 
@@ -1218,11 +1317,11 @@ def build_temporal_inventory(
                 guide_area = str(row.get("guide_area") or "").strip()
                 source_kind = str(row.get("source_kind") or "match").strip()
                 boost = 0.12 if years else 0.06
-                if memory_type in {"episodic", "history"} or guide_area.lower() == "history":
+                if guide_area.lower() == "history":
                     boost += 0.08
-                if memory_type in {"project", "knowledge"} or guide_area.lower() in {"projects", "work"}:
+                if guide_area.lower() in {"projects", "work"}:
                     boost += 0.04
-                if source_kind.startswith("document") or memory_type.startswith("document"):
+                if source_kind.startswith("document"):
                     boost += 0.04
                 confidence = min(0.98, max(score, 0.54) + boost)
                 candidate = {
@@ -3949,11 +4048,10 @@ def extract_grounded_fact_inventory(matches: list[dict[str, Any]]) -> dict[str, 
         summary = str(node.get("summary") or raw_text).strip()
         node_id = str(match["node_id"])
         raw_score = float(match.get("raw_score") or 0.0)
-        memory_type = str(node.get("memory_type") or "")
         guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or "")
         evidence_snippet = str(match.get("evidence_snippet") or raw_text).strip()
 
-        if memory_type == "episodic" or guide_area.lower() == "history":
+        if guide_area.lower() == "history":
             inventory["history"].append(
                 _make_fact(
                     kind="history",
@@ -3995,12 +4093,14 @@ def extract_grounded_fact_inventory(matches: list[dict[str, Any]]) -> dict[str, 
 
             for pattern in (
                 r"([A-ZÀ-ÖØ-Þ][\w'’-]+(?: [A-ZÀ-ÖØ-Þ][\w'’-]+)+)\s+è il nome(?: dell'autrice| dell'autore)?",
-                r"(?:mi chiamo|my name is)\s+([A-ZÀ-ÖØ-Þ][\w'’-]+(?: [A-ZÀ-ÖØ-Þ][\w'’-]+)+)",
-                r"(?:sono|i am)\s+([A-ZÀ-ÖØ-Þ][\w'’-]+(?: [A-ZÀ-ÖØ-Þ][\w'’-]+)+)(?:[.,;]|$)",
+                r"(?i:(?:mi chiamo|my name is))\s+([A-ZÀ-ÖØ-Þ][\w'’-]+(?: [A-ZÀ-ÖØ-Þ][\w'’-]+)+)",
+                r"(?i:(?:sono|i am))\s+([A-ZÀ-ÖØ-Þ][\w'’-]+(?: [A-ZÀ-ÖØ-Þ][\w'’-]+)+)(?:[.,;]|$)",
             ):
-                name_match = re.search(pattern, sentence, flags=re.IGNORECASE)
+                name_match = re.search(pattern, sentence)
                 if name_match:
-                    name_value = _clean_fact_value(name_match.group(1))
+                    name_value = _clean_person_name_value(name_match.group(1))
+                    if not name_value:
+                        continue
                     inventory["name"].append(
                         _make_fact(
                             kind="name",
@@ -4316,21 +4416,6 @@ def extract_grounded_fact_inventory(matches: list[dict[str, Any]]) -> dict[str, 
                     )
                 )
 
-        if memory_type == "project":
-            name_value = _named_entity_sequence(summary)
-            if name_value:
-                inventory["secondary_project"].append(
-                    _make_fact(
-                        kind="secondary_project",
-                        text=f"Il progetto citato è {name_value}.",
-                        node_id=node_id,
-                        raw_score=raw_score,
-                        summary=summary,
-                        priority=0.35,
-                        value=name_value,
-                        evidence_snippet=evidence_snippet,
-                    )
-                )
     return inventory
 
 
@@ -6803,6 +6888,99 @@ def _off_contract_topic_hits(query_text: str, answer_text: str, contract: dict[s
     return deduped
 
 
+_ANSWER_QUERY_FIT_STOPWORDS = {
+    "about",
+    "alla",
+    "alle",
+    "anche",
+    "come",
+    "cosa",
+    "describe",
+    "della",
+    "delle",
+    "does",
+    "explain",
+    "from",
+    "have",
+    "into",
+    "nella",
+    "nelle",
+    "persona",
+    "prima",
+    "quale",
+    "quali",
+    "raccontami",
+    "rispondi",
+    "that",
+    "tell",
+    "this",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "work",
+}
+
+
+def _answer_query_fit_contract(
+    *,
+    query_text: str,
+    answer_text: str,
+    matches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    def term_covered(term: str, folded_text: str) -> bool:
+        if term in folded_text:
+            return True
+        if term in {"anno", "anni", "year", "years"} and re.search(r"\b(?:19|20)\d{2}\b", folded_text):
+            return True
+        return False
+
+    query_terms = list(
+        dict.fromkeys(
+            token
+            for token in _fold_text(query_text).split()
+            if len(token) >= 4 and token not in _ANSWER_QUERY_FIT_STOPWORDS
+        )
+    )[:24]
+    answer_folded = _fold_text(answer_text)
+    evidence_folded = _fold_text(_match_evidence_blob(matches))
+    evidence_supported_terms = [term for term in query_terms if term_covered(term, evidence_folded)]
+    answer_covered_terms = [term for term in evidence_supported_terms if term_covered(term, answer_folded)]
+    minimum_evidence_fit = (
+        1 if 1 < len(query_terms) <= 3 else min(3, max(1, (len(query_terms) + 1) // 2))
+    ) if query_terms else 0
+    required_count = min(1, len(evidence_supported_terms))
+    if not query_terms:
+        passed = True
+        reason = "query_has_no_specific_content_terms"
+    elif len(query_terms) == 1:
+        passed = True
+        reason = "query_fit_delegated_to_object_and_slot_contracts"
+    elif len(evidence_supported_terms) < minimum_evidence_fit:
+        passed = False
+        reason = "retrieved_evidence_does_not_fit_query_terms"
+    elif len(answer_covered_terms) < required_count:
+        passed = False
+        reason = "synthesis_does_not_preserve_supported_query_terms"
+    else:
+        passed = True
+        reason = "supported_query_terms_preserved"
+    return {
+        "schema_version": "agvm.answer_query_fit.v1",
+        "passed": passed,
+        "reason": reason,
+        "query_terms": query_terms,
+        "evidence_supported_terms": evidence_supported_terms,
+        "answer_covered_terms": answer_covered_terms,
+        "missing_supported_terms": [
+            term for term in evidence_supported_terms if term not in answer_covered_terms
+        ],
+        "required_covered_term_count": required_count,
+        "minimum_evidence_fit_term_count": minimum_evidence_fit,
+    }
+
+
 def _answer_adequacy_contract(
     *,
     query_text: str,
@@ -6843,6 +7021,11 @@ def _answer_adequacy_contract(
     third_person_markers: list[str] = _first_person_voice_leak_markers(answer_text) if first_person_required else []
     leak_present = _answer_surface_has_context_ledger_leak(answer_text)
     off_contract_topics = _off_contract_topic_hits(query_text, answer_text, query_contract)
+    query_fit = _answer_query_fit_contract(
+        query_text=query_text,
+        answer_text=answer_text,
+        matches=matches,
+    )
     passed = (
         not objects_without_evidence
         and not missing_objects
@@ -6852,6 +7035,7 @@ def _answer_adequacy_contract(
         and not third_person_markers
         and not leak_present
         and not off_contract_topics
+        and bool(query_fit.get("passed"))
     )
     return {
         "contract_version": "28d.answer_adequacy.v1",
@@ -6873,6 +7057,7 @@ def _answer_adequacy_contract(
         "third_person_markers": third_person_markers,
         "context_ledger_leak": bool(leak_present),
         "off_contract_topics": off_contract_topics,
+        "query_fit": query_fit,
         "query_contract": query_contract,
     }
 
@@ -9291,25 +9476,117 @@ def _mcp_identity_subject_terms_from_contract(semantic_contract: dict[str, Any] 
     hints = dict((semantic_contract or {}).get("identity_hints") or {})
     terms: list[str] = []
 
-    def add(value: Any) -> None:
+    def add(value: Any, *, explicit_alias: bool = False) -> None:
+        if isinstance(value, dict):
+            for key in ("name", "label", "value", "text", "alias"):
+                if value.get(key):
+                    add(value.get(key), explicit_alias=explicit_alias)
+            return
         folded = _fold_text(str(value or ""))
         if folded and len(folded) >= 4 and folded not in terms:
             terms.append(folded)
+        if explicit_alias:
+            alias_tokens = [
+                token
+                for token in folded.split()
+                if len(token) >= 4 and token not in _MCP_MISSION_FIT_STOPWORDS
+            ]
+            if len(folded.split()) > 1:
+                for token in alias_tokens:
+                    if token not in terms:
+                        terms.append(token)
 
     add(hints.get("core_name"))
-    for key in ("self_name_candidates", "aliases"):
-        for item in list(hints.get(key) or []):
-            add(item)
-    return terms[:10]
+    for item in list(hints.get("self_name_candidates") or []):
+        add(item)
+    for item in list(hints.get("aliases") or []):
+        add(item, explicit_alias=True)
+    return terms[:16]
 
 
 def _mcp_identity_subject_name_from_contract(semantic_contract: dict[str, Any] | None) -> str:
     hints = dict((semantic_contract or {}).get("identity_hints") or {})
-    for value in [hints.get("core_name"), *list(hints.get("self_name_candidates") or [])]:
+    for value in [
+        hints.get("core_name"),
+        *list(hints.get("self_name_candidates") or []),
+        *list(hints.get("aliases") or []),
+    ]:
+        if isinstance(value, dict):
+            value = next(
+                (value.get(key) for key in ("name", "label", "value", "text", "alias") if value.get(key)),
+                None,
+            )
         cleaned = " ".join(str(value or "").split()).strip()
         if cleaned:
             return cleaned
     return ""
+
+
+def _mcp_semantic_named_targets(
+    query_text: str,
+    semantic_contract: dict[str, Any] | None,
+) -> list[str]:
+    contract = dict(semantic_contract or {})
+    mission_plan = dict(contract.get("mission_plan_v2") or {})
+    values: list[Any] = [
+        contract.get("server_bound_named_targets"),
+        contract.get("required_named_concept_spans"),
+        mission_plan.get("server_bound_named_targets"),
+    ]
+    for mission in list(mission_plan.get("missions") or []):
+        if not isinstance(mission, dict):
+            continue
+        values.extend(
+            [
+                mission.get("server_bound_named_targets"),
+                mission.get("required_named_concept_spans"),
+            ]
+        )
+    texts: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for item in list(value or []):
+            if isinstance(item, dict):
+                text = str(item.get("text") or item.get("value") or item.get("target") or "").strip()
+            else:
+                text = str(item or "").strip()
+            folded = _fold_text(text)
+            if not text or not folded or folded in seen:
+                continue
+            seen.add(folded)
+            texts.append(text)
+    for target in _query_named_targets(query_text):
+        folded = _fold_text(target)
+        if folded and folded not in seen:
+            seen.add(folded)
+            texts.append(target)
+    return texts[:16]
+
+
+def _mcp_folded_texts_overlap(left: str, right: str) -> bool:
+    left_folded = _fold_text(left)
+    right_folded = _fold_text(right)
+    if not left_folded or not right_folded:
+        return False
+    if left_folded == right_folded:
+        return True
+    return bool(
+        re.search(rf"\b{re.escape(left_folded)}\b", right_folded)
+        or re.search(rf"\b{re.escape(right_folded)}\b", left_folded)
+    )
+
+
+def _mcp_identity_subject_name_allowed_for_query(
+    query_text: str,
+    semantic_contract: dict[str, Any] | None,
+    subject_name: str,
+) -> bool:
+    if not subject_name:
+        return False
+    named_targets = _mcp_semantic_named_targets(query_text, semantic_contract)
+    if not named_targets:
+        return True
+    return any(_mcp_folded_texts_overlap(subject_name, target) for target in named_targets)
 
 
 def _mcp_query_requests_exact_identity_name(query_text: str, required_sections: set[str]) -> bool:
@@ -10875,6 +11152,17 @@ def _mcp_path_traversed_node_ids(route_events: list[dict[str, Any]], bound_branc
 
 def _mcp_path_traversed_edges(route_events: list[dict[str, Any]], bound_branches: list[dict[str, Any]]) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
+    certified_travel_pairs = {
+        (
+            str(event.get("from_node_id") or event.get("source_node_id") or "").strip(),
+            str(event.get("to_node_id") or event.get("target_node_id") or "").strip(),
+        )
+        for event in route_events
+        if isinstance(event, dict)
+        and bool(event.get("travel_performed") or str(event.get("move_type") or "").strip() == "travel")
+        and str(event.get("from_node_id") or event.get("source_node_id") or "").strip()
+        and str(event.get("to_node_id") or event.get("target_node_id") or "").strip()
+    }
     for branch in bound_branches:
         for raw_edge in list(branch.get("traversed_edges") or []):
             if not isinstance(raw_edge, dict):
@@ -10883,6 +11171,9 @@ def _mcp_path_traversed_edges(route_events: list[dict[str, Any]], bound_branches
             if not edge:
                 continue
             edge.setdefault("branch_id", branch.get("branch_id"))
+            from_node = str(edge.get("from_node_id") or edge.get("source_node_id") or edge.get("from") or "").strip()
+            to_node = str(edge.get("to_node_id") or edge.get("target_node_id") or edge.get("to") or "").strip()
+            edge["travel_performed"] = bool(from_node and to_node and (from_node, to_node) in certified_travel_pairs)
             edges.append(edge)
     if not edges:
         for event in route_events:
@@ -11165,6 +11456,7 @@ def build_path_corridor_package(
                     "to_node_id": event.get("to_node_id") or event.get("target_node_id"),
                     "edge_type": edge_type,
                     "move_type": move_type,
+                    "travel_performed": bool(event.get("travel_performed") or move_type == "travel"),
                     "destination_label": event.get("destination_label"),
                     "destination_reached": bool(event.get("destination_reached") or move_type == "destination_reached"),
                     "studied_node_ids": list(event.get("studied_node_ids") or [])[:8],
@@ -12021,6 +12313,8 @@ def _document_workspace_packet_source_trace(
     facts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    source_uri = str(packet.get("source_uri") or "").strip() or None
+    content_hash = str(packet.get("content_hash") or "").strip() or None
     chunk_text_by_index = {
         int(chunk.get("chunk_index") or 0): str(chunk.get("text") or "")
         for chunk in chunks
@@ -12045,6 +12339,8 @@ def _document_workspace_packet_source_trace(
                 "title": _document_workspace_clean_text(row.get("title")),
                 "source_label": row.get("source_label"),
                 "source_type": row.get("source_type"),
+                "source_uri": row.get("source_uri") or source_uri,
+                "content_hash": row.get("content_hash") or content_hash,
                 "chunk_index": row.get("chunk_index"),
                 "source_span_start": row.get("source_span_start"),
                 "source_span_end": row.get("source_span_end"),
@@ -12066,6 +12362,8 @@ def _document_workspace_packet_source_trace(
                 "title": title,
                 "source_label": packet.get("source_label"),
                 "source_type": packet.get("source_type"),
+                "source_uri": source_uri,
+                "content_hash": content_hash,
                 "chunk_index": None,
                 "source_span_start": None,
                 "source_span_end": None,
@@ -12083,6 +12381,8 @@ def _document_workspace_packet_source_trace(
                 "title": title,
                 "source_label": packet.get("source_label"),
                 "source_type": packet.get("source_type"),
+                "source_uri": source_uri,
+                "content_hash": content_hash,
                 "chunk_index": chunk.get("chunk_index"),
                 "source_span_start": chunk.get("source_span_start"),
                 "source_span_end": chunk.get("source_span_end"),
@@ -12091,6 +12391,18 @@ def _document_workspace_packet_source_trace(
             }
         )
     return rows[:48]
+
+
+def _document_workspace_first_trace_value(source_trace: list[dict[str, Any]], key: str) -> Any:
+    for row in source_trace:
+        if not isinstance(row, dict):
+            continue
+        value = row.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            return value
+    return None
 
 
 def _document_workspace_sentence_candidates(text: str) -> list[str]:
@@ -12450,6 +12762,8 @@ def _document_workspace_refs(documents: list[dict[str, Any]]) -> list[dict[str, 
                 "title": _document_workspace_agent_label(document.get("title")) or f"Document {index}",
                 "source_label": _document_workspace_agent_label(document.get("source_label")),
                 "source_type": document.get("source_type"),
+                "source_uri": document.get("source_uri"),
+                "content_hash": document.get("content_hash"),
                 "source_trust": document.get("source_trust"),
                 "lookup_role": str(document.get("lookup_role") or ""),
                 "workspace_tier": str(document.get("workspace_tier") or ""),
@@ -13055,12 +13369,16 @@ def build_document_workspace_package(
         facts = _document_workspace_packet_facts(packet) if materialize_full_document else []
         sections = _document_workspace_sections(full_text=full_text, chunks=chunks)
         source_trace = _document_workspace_packet_source_trace(packet, chunks=chunks, facts=facts) if materialize_full_document else []
+        source_uri = packet.get("source_uri") or _document_workspace_first_trace_value(source_trace, "source_uri")
+        content_hash = packet.get("content_hash") or _document_workspace_first_trace_value(source_trace, "content_hash")
         documents.append(
             {
                 "anchor_node_id": str(packet.get("anchor_node_id") or "").strip(),
                 "title": title,
                 "source_label": packet.get("source_label"),
                 "source_type": packet.get("source_type"),
+                "source_uri": source_uri,
+                "content_hash": content_hash,
                 "source_trust": packet.get("source_trust"),
                 "claim_status": packet.get("claim_status"),
                 "lookup_role": str(packet.get("lookup_role") or lookup.get("kind") or document_mode or "none"),
@@ -13669,11 +13987,18 @@ def _mcp_document_workspace_appendix(document_workspace: dict[str, Any] | None) 
 _MCP_PACKAGE_RENDER_CONTRACT_SCHEMA_VERSION = "agvm.package_render_contract.v1"
 _MCP_MASTER_JUDGEMENT_SCHEMA_VERSION = "agvm.master_judgement.v1"
 _MCP_MASTER_EXPECTED_EVIDENCE_POLICY_SCHEMA_VERSION = "agvm.master_expected_evidence_policy.v1"
+_SEARCH_SEMANTIC_AUTHORITY_REVISION = "ai_v2_s1"
 _MCP_MASTER_SUFFICIENCY_JUDGE_SCHEMA_VERSION = "agvm.master_sufficiency_judge.v1"
 _MCP_AI_MASTER_SUFFICIENCY_SCHEMA_VERSION = "agvm.ai_master_sufficiency.v1"
 _MCP_MASTER_JUDGEMENT_CACHE_MAX = 512
 _MCP_MASTER_JUDGEMENT_CACHE_LOCK = threading.Lock()
 _MCP_MASTER_JUDGEMENT_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _semantic_authority_mode(value: Any) -> str:
+    return "ai_v2" if str(value or "legacy").strip().lower() == "ai_v2" else "legacy"
+
+
 _MCP_AI_MASTER_STATES = {
     "terminal",
     "usable_partial",
@@ -13738,6 +14063,11 @@ def _mcp_compact_mission_evidence_ledger(ledger: dict[str, Any] | None) -> dict[
         "goal",
         "answer_hypothesis",
         "expected_evidence_shape",
+        "required_entities",
+        "required_claims",
+        "subject",
+        "subject_aliases",
+        "success_criteria",
         "hot_cold_policy",
         "landing_region_ref",
         "snapped_landing",
@@ -13844,6 +14174,48 @@ def _mcp_master_goal_key(row: dict[str, Any], goal: str) -> str:
     return "|".join(part for part in (target or answer_field, semantic_goal) if part)[:260]
 
 
+def _mcp_master_goal_semantic_terms(row: dict[str, Any], goal: str) -> set[str]:
+    expected_shape = dict(row.get("expected_evidence_shape") or {})
+    semantic_shape = str(
+        expected_shape.get("claim_shape")
+        or expected_shape.get("evidence_shape")
+        or expected_shape.get("success_question")
+        or row.get("answer_hypothesis")
+        or goal
+    )
+    return set(_mcp_mission_fit_terms(semantic_shape))
+
+
+def _mcp_master_goals_semantically_compatible(
+    left_row: dict[str, Any],
+    left_goal: str,
+    right_row: dict[str, Any],
+    right_goal: str,
+) -> bool:
+    left_terms = _mcp_master_goal_semantic_terms(left_row, left_goal)
+    right_terms = _mcp_master_goal_semantic_terms(right_row, right_goal)
+    if not left_terms or not right_terms:
+        return False
+    relation_terms = {
+        "combine",
+        "combined",
+        "complement",
+        "connect",
+        "connected",
+        "integration",
+        "interrelation",
+        "synergy",
+        "together",
+    }
+    # A relationship/composition question is not equivalent to merely listing
+    # facts in the same section. This is the b289 distinction between service
+    # categories and how those categories work together.
+    if bool(left_terms & relation_terms) != bool(right_terms & relation_terms):
+        return False
+    shared = left_terms & right_terms
+    return bool(shared) and len(shared) / max(1, min(len(left_terms), len(right_terms))) >= 0.5
+
+
 def _mcp_master_slot_key(row: dict[str, Any]) -> str:
     expected_shape = dict(row.get("expected_evidence_shape") or {})
     for value in (
@@ -13926,7 +14298,24 @@ def _mcp_master_cache_payload(
     render_contract: dict[str, Any],
     path_truth_contract: dict[str, Any] | None,
     document_refs: list[dict[str, Any]],
+    allow_ai_master: bool,
+    retrieval_mode: str,
+    ai_timeout_ceiling_seconds: float | None,
+    llm_available: bool,
+    semantic_authority: str,
 ) -> dict[str, Any]:
+    def stable_render_contract(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: stable_render_contract(item)
+                for key, item in value.items()
+                if key not in {"package_builder_ms", "master_judgement_id"}
+                and not key.endswith(("_timing_ms", "_elapsed_ms", "_duration_ms"))
+            }
+        if isinstance(value, list):
+            return [stable_render_contract(item) for item in value]
+        return value
+
     revision_context = dict(ledger.get("revision_context") or {})
     revisions = {
         key: ledger.get(key) or revision_context.get(key)
@@ -13981,19 +14370,49 @@ def _mcp_master_cache_payload(
     return {
         "schema_version": _MCP_MASTER_JUDGEMENT_SCHEMA_VERSION,
         "query": _fold_text(query_text)[:260],
+        "mission_ledger_digest": _mcp_mission_ledger_digest(ledger),
         "ledger_status": ledger.get("status"),
         "branch_judgement_summary": ledger.get("branch_judgement_summary"),
         "revision_context": revisions,
         "rows": rows,
-        "render_blocked": bool(render_contract.get("blocked")),
-        "render_blocked_reasons": list(render_contract.get("blocked_reasons") or [])[:16],
+        # Provider time available to execute the judgement and renderer timing
+        # diagnostics do not change the semantic question being judged. Keeping
+        # them in this key caused every final-package rebuild to invoke a fresh
+        # Master and allowed a late deadline-capped failure to replace an
+        # earlier successful attestation for the same ledger.
+        "render_contract": stable_render_contract(render_contract),
         "path_truth": dict(path_truth_contract or {}),
-        "document_ref_ids": [
-            str(ref.get("document_id") or ref.get("anchor_node_id") or ref.get("title") or "").strip()
+        "document_refs": [
+            {
+                key: ref.get(key)
+                for key in (
+                    "document_id",
+                    "anchor_node_id",
+                    "title",
+                    "raw_available",
+                    "raw_text_available",
+                    "raw_availability",
+                    "temporal_context",
+                )
+                if ref.get(key) not in (None, "", [], {})
+            }
             for ref in document_refs[:24]
-            if str(ref.get("document_id") or ref.get("anchor_node_id") or ref.get("title") or "").strip()
+            if isinstance(ref, dict)
         ],
+        "allow_ai_master": bool(allow_ai_master),
+        "retrieval_mode": str(retrieval_mode or "balanced"),
+        "llm_available": bool(llm_available),
+        "semantic_authority": {
+            "mode": _semantic_authority_mode(semantic_authority),
+            "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+        },
     }
+
+
+def _mcp_mission_ledger_digest(ledger: dict[str, Any] | None) -> str:
+    compact = _mcp_compact_mission_evidence_ledger(ledger)
+    encoded = json.dumps(compact, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _mcp_master_cache_key(
@@ -14003,6 +14422,11 @@ def _mcp_master_cache_key(
     render_contract: dict[str, Any],
     path_truth_contract: dict[str, Any] | None,
     document_refs: list[dict[str, Any]],
+    allow_ai_master: bool,
+    retrieval_mode: str,
+    ai_timeout_ceiling_seconds: float | None,
+    llm_available: bool,
+    semantic_authority: str,
 ) -> str:
     payload = _mcp_master_cache_payload(
         query_text=query_text,
@@ -14010,12 +14434,23 @@ def _mcp_master_cache_key(
         render_contract=render_contract,
         path_truth_contract=path_truth_contract,
         document_refs=document_refs,
+        allow_ai_master=allow_ai_master,
+        retrieval_mode=retrieval_mode,
+        ai_timeout_ceiling_seconds=ai_timeout_ceiling_seconds,
+        llm_available=llm_available,
+        semantic_authority=semantic_authority,
     )
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def _mcp_master_query_scope(query_text: str, rows: list[dict[str, Any]], document_state: str, path_state: str) -> str:
-    if document_state in {"raw_refs_ready", "refs_available", "missing"}:
+    document_requested = any(
+        bool(dict(row.get("expected_evidence_shape") or {}).get("document_requested"))
+        or str(dict(row.get("expected_evidence_shape") or {}).get("answer_field") or "").strip().lower() == "document"
+        or str(dict(row.get("branch_judgement") or {}).get("state") or "").strip().lower() == "needs_document"
+        for row in rows
+    )
+    if document_requested and document_state in {"raw_refs_ready", "refs_available", "missing"}:
         return "document_hydration"
     non_path_states = {"no_path_truth", "route_truth_ready", "not_requested", "not_required"}
     if path_state not in non_path_states or _mcp_master_bool_from_query(
@@ -14039,6 +14474,7 @@ def _mcp_master_expected_evidence_policy(
     path_state: str,
     branch_state_counts: dict[str, int],
     master_state: str,
+    semantic_authority: str = "legacy",
 ) -> dict[str, Any]:
     query_scope = _mcp_master_query_scope(query_text, rows, document_state, path_state)
     branch_count = len(rows)
@@ -14055,11 +14491,24 @@ def _mcp_master_expected_evidence_policy(
         or branch_state_counts.get("useful_partial")
         or branch_state_counts.get("wrong_region")
         or branch_state_counts.get("needs_radius_widen")
+        or branch_state_counts.get("needs_document")
     )
     if master_state in {"no_match", "provider_degraded", "blocked"} and not branch_state_counts.get("useful_partial"):
         ai_sufficiency_required = False
-    if master_state == "terminal" and query_scope not in {"broad_multi_branch", "path_aware"} and not branch_state_counts.get("useful_partial"):
+    actionable_open_states = any(
+        branch_state_counts.get(state)
+        for state in ("useful_partial", "wrong_region", "needs_radius_widen", "needs_document")
+    )
+    if master_state == "terminal" and query_scope not in {"broad_multi_branch", "path_aware"} and not actionable_open_states:
         ai_sufficiency_required = False
+    if _semantic_authority_mode(semantic_authority) == "ai_v2" and master_state in {
+        "terminal",
+        "usable_partial",
+        "needs_hydration",
+        "needs_more_search",
+        "no_match",
+    }:
+        ai_sufficiency_required = True
     return {
         "schema_version": _MCP_MASTER_EXPECTED_EVIDENCE_POLICY_SCHEMA_VERSION,
         "query_scope": query_scope,
@@ -14075,6 +14524,7 @@ def _mcp_master_expected_evidence_policy(
         ),
         "static_required_sections_are_not_terminality_source": True,
         "ai_sufficiency_required": ai_sufficiency_required,
+        "semantic_authority": _semantic_authority_mode(semantic_authority),
         "safety_invariants": [
             "ai_participation",
             "visible_provenance",
@@ -14086,14 +14536,18 @@ def _mcp_master_expected_evidence_policy(
     }
 
 
-def _mcp_master_ai_timeout_seconds(master_state: str, query_scope: str) -> float:
-    if master_state in {"usable_partial", "needs_more_search"}:
-        return 2.8 if query_scope in {"broad_multi_branch", "path_aware"} else 2.2
-    if query_scope == "path_aware":
-        return 3.2
-    if query_scope == "broad_multi_branch":
-        return 3.0
-    return 2.0
+def _mcp_master_ai_timeout_seconds(
+    master_state: str,
+    query_scope: str,
+    *,
+    retrieval_mode: str = "balanced",
+    timeout_ceiling_seconds: float | None = None,
+) -> float:
+    del master_state, query_scope
+    stage_timeout = search_ai_stage_timeout_seconds("master_judge", retrieval_mode)
+    if timeout_ceiling_seconds is None:
+        return stage_timeout
+    return max(0.001, min(stage_timeout, float(timeout_ceiling_seconds)))
 
 
 def _mcp_master_compact_goal_coverage(goal_coverage: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -14113,9 +14567,143 @@ def _mcp_master_compact_goal_coverage(goal_coverage: list[dict[str, Any]]) -> li
                 "document_ref_count": int(item.get("document_ref_count") or 0),
                 "route_event_count": int(item.get("route_event_count") or 0),
                 "next_action": str(item.get("branch_next_recommended_action") or "")[:120],
+                "evidence_refs": [
+                    str(value).strip()
+                    for value in list(item.get("evidence_refs") or [])[:8]
+                    if str(value).strip()
+                ],
+                "evidence_summaries": [
+                    {
+                        "evidence_ref": str(dict(value).get("evidence_ref") or "")[:180],
+                        "kind": str(dict(value).get("kind") or "evidence")[:40],
+                        "summary": str(dict(value).get("summary") or "")[:420],
+                        "temporal_context": dict(dict(value).get("temporal_context") or {}) or None,
+                    }
+                    for value in list(item.get("evidence_summaries") or [])[:6]
+                    if isinstance(value, dict)
+                    and str(value.get("evidence_ref") or "").strip()
+                    and str(value.get("summary") or "").strip()
+                ],
             }
         )
     return compact
+
+
+def _mcp_master_evidence_projection(row: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
+    refs: list[str] = []
+    summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for lane, kind in (("hot_evidence", "memory"), ("cold_evidence", "memory"), ("document_refs", "document")):
+        for raw_item in list(row.get(lane) or []):
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            evidence_ref = str(
+                item.get("node_id")
+                or item.get("evidence_id")
+                or item.get("document_id")
+                or item.get("anchor_node_id")
+                or item.get("id")
+                or ""
+            ).strip()
+            if not evidence_ref or evidence_ref in seen:
+                continue
+            seen.add(evidence_ref)
+            refs.append(evidence_ref)
+            summary = str(
+                item.get("text")
+                or item.get("summary")
+                or item.get("source_title")
+                or item.get("title")
+                or ""
+            ).strip()
+            if summary:
+                summaries.append(
+                    {
+                        "evidence_ref": evidence_ref[:180],
+                        "kind": kind,
+                        "summary": summary[:420],
+                        "temporal_context": _evidence_temporal_context(item) or None,
+                    }
+                )
+            if len(refs) >= 8:
+                return refs, summaries[:6]
+    return refs, summaries[:6]
+
+
+def _mcp_master_validate_human_findings(
+    findings: list[dict[str, Any]],
+    *,
+    goal_coverage: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    allowed_refs = {
+        str(evidence_ref).strip()
+        for goal in goal_coverage
+        if isinstance(goal, dict)
+        for evidence_ref in list(goal.get("evidence_refs") or [])
+        if str(evidence_ref).strip()
+    }
+    validated: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_finding in findings[:8]:
+        if not isinstance(raw_finding, dict):
+            continue
+        finding = dict(raw_finding)
+        text_fields = {
+            key: str(finding.get(key) or "").strip()
+            for key in (
+                "summary",
+                "reason",
+                "impact",
+                "next_step",
+                "source_claim_summary",
+                "brain_evidence_summary",
+                "comparison",
+            )
+        }
+        if not all(text_fields.values()):
+            continue
+        requested_refs = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in list(finding.get("evidence_refs") or [])
+                if str(value).strip()
+            )
+        )[:8]
+        evidence_refs = [value for value in requested_refs if value in allowed_refs]
+        # A model that cited only unknown evidence is not allowed to surface that finding.
+        if requested_refs and not evidence_refs:
+            continue
+        severity = str(finding.get("severity") or "watch").strip().lower()
+        if severity not in {"info", "watch", "warning", "critical"}:
+            severity = "watch"
+        finding_type = str(finding.get("finding_type") or "semantic_review").strip().lower()
+        if finding_type not in {
+            "semantic_review",
+            "conflict",
+            "missing_evidence",
+            "partial_evidence",
+            "ambiguity",
+            "provenance_gap",
+        }:
+            finding_type = "semantic_review"
+        identity = (text_fields["summary"].casefold(), text_fields["comparison"].casefold())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        validated.append(
+            {
+                **{key: value[:520] for key, value in text_fields.items()},
+                "evidence_refs": evidence_refs,
+                "severity": severity,
+                "finding_type": finding_type,
+                "ai_authored": True,
+                "evidence_refs_validated": True,
+                "diagnostic_only": True,
+                "executable": False,
+            }
+        )
+    return validated
 
 
 def _mcp_master_normalize_ai_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -14144,6 +14732,9 @@ def _mcp_master_normalize_ai_payload(payload: dict[str, Any] | None) -> dict[str
         if str(item or "").strip()
     ]
     next_call = str(data.get("next_recommended_call") or "").strip() or None
+    unresolved_gap = str(data.get("unresolved_gap") or "").strip() or None
+    expected_information_gain = str(data.get("expected_information_gain") or "").strip() or None
+    human_findings = [dict(item) for item in list(data.get("human_findings") or []) if isinstance(item, dict)]
     return {
         "schema_version": _MCP_AI_MASTER_SUFFICIENCY_SCHEMA_VERSION,
         "master_state": state,
@@ -14153,7 +14744,58 @@ def _mcp_master_normalize_ai_payload(payload: dict[str, Any] | None) -> dict[str
         "missing_goals": list(dict.fromkeys(missing_goals))[:12],
         "covered_goals": list(dict.fromkeys(covered_goals))[:12],
         "next_recommended_call": next_call,
+        "unresolved_gap": unresolved_gap[:420] if unresolved_gap else None,
+        "expected_information_gain": (
+            expected_information_gain[:420] if expected_information_gain else None
+        ),
+        "human_findings": human_findings[:8],
     }
+
+
+def _mcp_master_ai_consistency_error(
+    payload: dict[str, Any] | None,
+    *,
+    goal_coverage: list[dict[str, Any]],
+    partial_goals: list[str],
+    missing_goals: list[str],
+    expected_evidence_policy: dict[str, Any],
+    render_contract: dict[str, Any],
+) -> str | None:
+    decision = dict(payload or {})
+    state = str(decision.get("master_state") or "").strip().lower()
+    nonterminal = state in {"usable_partial", "needs_hydration", "needs_more_search"}
+    every_goal_resolved = bool(goal_coverage) and all(
+        str(item.get("master_goal_state") or "").strip().lower() == "covered"
+        for item in goal_coverage
+    )
+    safety_gap = bool(
+        expected_evidence_policy.get("document_hydration_required")
+        or expected_evidence_policy.get("path_truth_required")
+        or render_contract.get("blocked")
+        or list(render_contract.get("blocked_reasons") or [])
+    )
+    concrete_gap = bool(
+        partial_goals
+        or missing_goals
+        or list(decision.get("missing_goals") or [])
+        or str(decision.get("unresolved_gap") or "").strip()
+    )
+    next_action = str(decision.get("next_recommended_call") or "").strip()
+    expected_gain = str(decision.get("expected_information_gain") or "").strip()
+    if nonterminal and not concrete_gap:
+        return "nonterminal_decision_without_concrete_gap"
+    if nonterminal and not next_action:
+        return "nonterminal_decision_without_executable_action"
+    if nonterminal and not expected_gain:
+        return "nonterminal_decision_without_expected_information_gain"
+    if nonterminal and every_goal_resolved and not safety_gap and not (
+        str(decision.get("unresolved_gap") or "").strip()
+        or partial_goals
+        or missing_goals
+        or list(decision.get("missing_goals") or [])
+    ):
+        return "nonterminal_decision_without_named_gap_or_next_action"
+    return None
 
 
 def _mcp_master_run_ai_sufficiency(
@@ -14170,6 +14812,8 @@ def _mcp_master_run_ai_sufficiency(
     path_state: str,
     reason_codes: list[str],
     render_contract: dict[str, Any],
+    retrieval_mode: str,
+    timeout_ceiling_seconds: float | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, float]:
     if not llm_enabled():
         return None, "llm_disabled", 0.0
@@ -14177,7 +14821,18 @@ def _mcp_master_run_ai_sufficiency(
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["master_state", "confidence", "reason"],
+        "required": [
+            "master_state",
+            "confidence",
+            "reason",
+            "reason_codes",
+            "covered_goals",
+            "missing_goals",
+            "next_recommended_call",
+            "unresolved_gap",
+            "expected_information_gain",
+            "human_findings",
+        ],
         "properties": {
             "master_state": {"type": "string", "enum": sorted(_MCP_AI_MASTER_STATES)},
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
@@ -14197,11 +14852,63 @@ def _mcp_master_run_ai_sufficiency(
                     "none",
                 ],
             },
+            "unresolved_gap": {"type": ["string", "null"]},
+            "expected_information_gain": {"type": ["string", "null"]},
+            "human_findings": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "summary",
+                        "reason",
+                        "impact",
+                        "next_step",
+                        "source_claim_summary",
+                        "brain_evidence_summary",
+                        "comparison",
+                        "evidence_refs",
+                        "severity",
+                        "finding_type",
+                    ],
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "impact": {"type": "string"},
+                        "next_step": {"type": "string"},
+                        "source_claim_summary": {"type": "string"},
+                        "brain_evidence_summary": {"type": "string"},
+                        "comparison": {"type": "string"},
+                        "evidence_refs": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["info", "watch", "warning", "critical"],
+                        },
+                        "finding_type": {
+                            "type": "string",
+                            "enum": [
+                                "semantic_review",
+                                "conflict",
+                                "missing_evidence",
+                                "partial_evidence",
+                                "ambiguity",
+                                "provenance_gap",
+                            ],
+                        },
+                    },
+                },
+            },
         },
     }
     prompt_payload = {
         "schema_version": _MCP_AI_MASTER_SUFFICIENCY_SCHEMA_VERSION,
         "query": str(query_text or "")[:700],
+        "decision_time_utc": datetime.now(timezone.utc).isoformat(),
         "deterministic_precheck_state": master_state,
         "query_scope": query_scope,
         "goal_coverage": _mcp_master_compact_goal_coverage(goal_coverage),
@@ -14225,6 +14932,20 @@ def _mcp_master_run_ai_sufficiency(
             "do_not_invent_evidence": True,
             "static_sections_are_advisory_except_safety_provenance_path_document": True,
             "terminal_requires_enough_goal_evidence_for_this_query": True,
+            "nonterminal_requires_named_gap_or_next_action": True,
+            "nonterminal_requires_concrete_gap_action_and_information_gain": True,
+            "fully_resolved_without_safety_gap_must_be_terminal": True,
+            "human_findings_are_ai_authored_not_reason_code_templates": True,
+            "human_findings_must_compare_the_user_goal_with_brain_evidence": True,
+            "evidence_refs_must_come_only_from_goal_coverage": True,
+            "human_findings_are_diagnostic_never_executable_actions": True,
+            "temporal_semantics": {
+                "semantic_validity_event_or_observation_time_and_lifecycle_guide_current_or_as_of": True,
+                "publication_time_is_source_chronology_not_claim_validity": True,
+                "compare_temporal_scopes_before_calling_evidence_contradictory": True,
+                "superseded_evidence_can_explain_evolution_without_being_current": True,
+                "created_recorded_acquired_retrieved_and_ingested_are_nonsemantic_audit_time": True,
+            },
         },
     }
     started_at = time.perf_counter()
@@ -14234,14 +14955,28 @@ def _mcp_master_run_ai_sufficiency(
             "You are AGVM's Master sufficiency judge. Read compact branch judgements and decide whether the MCP context payload "
             "is sufficient for the current agent request. Do not answer the user. Do not require a fixed checklist when the branch "
             "evidence already satisfies the user's goal, but never approve missing provenance, missing document hydration, missing path truth, "
-            "private/off-contract material, or provider-degraded states."
+            "private/off-contract material, or provider-degraded states. A nonterminal decision is valid only when it names a concrete "
+            "unresolved semantic gap, chooses one executable next_recommended_call, and states the distinct information expected from it. "
+            "Do not continue merely because more detail might exist. Terminal and no-match decisions must set those two explanatory fields to null. "
+            "Also write human_findings only for meaningful conflicts, ambiguities, missing/partial evidence, provenance gaps, or review points. "
+            "Each finding must explain in natural language what the user is asking or asserting, what the brain evidence says, and the concrete comparison. "
+            "Use only evidence_refs listed in goal_coverage. Never convert reason codes, diagnostic labels, route states, or internal IDs into user actions. "
+            "Return an empty human_findings array when there is no meaningful human review item. For current or as-of requests, judge evidence using "
+            "semantic validity, explicitly sourced event/observation time, and lifecycle or supersession when present. Treat publication time separately as source chronology: "
+            "it can date the source but cannot by itself establish when the claim was true, current, or newer. Distinguish a real contradiction from "
+            "a claim that evolved across time. created_at, recorded_at, acquired_at, retrieved_at and ingested_at are audit or source-handling timestamps and never make a claim newer, current, or truer."
         ),
         user_prompt=json.dumps(prompt_payload, ensure_ascii=False),
         schema_name="agvm_ai_master_sufficiency_v1",
         schema=schema,
-        timeout=_mcp_master_ai_timeout_seconds(master_state, query_scope),
+        timeout=_mcp_master_ai_timeout_seconds(
+            master_state,
+            query_scope,
+            retrieval_mode=retrieval_mode,
+            timeout_ceiling_seconds=timeout_ceiling_seconds,
+        ),
         role="answer",
-        max_output_tokens=320,
+        max_output_tokens=900,
     )
     elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 3)
     if error or not isinstance(payload, dict):
@@ -14249,6 +14984,63 @@ def _mcp_master_run_ai_sufficiency(
     normalized = _mcp_master_normalize_ai_payload(payload)
     if not normalized:
         return None, "invalid_ai_master_sufficiency_payload", elapsed_ms
+    normalized["human_findings"] = _mcp_master_validate_human_findings(
+        list(normalized.get("human_findings") or []),
+        goal_coverage=goal_coverage,
+    )
+    consistency_error = _mcp_master_ai_consistency_error(
+        normalized,
+        goal_coverage=goal_coverage,
+        partial_goals=partial_goals,
+        missing_goals=missing_goals,
+        expected_evidence_policy=expected_evidence_policy,
+        render_contract=render_contract,
+    )
+    if consistency_error:
+        remaining_timeout = _mcp_master_ai_timeout_seconds(
+            master_state,
+            query_scope,
+            retrieval_mode=retrieval_mode,
+            timeout_ceiling_seconds=timeout_ceiling_seconds,
+        ) - (elapsed_ms / 1000.0)
+        if remaining_timeout <= 0.1:
+            return None, consistency_error, elapsed_ms
+        repair_started_at = time.perf_counter()
+        repaired, repair_error = structured_json(
+            model=answer_model(),
+            system_prompt=(
+                "Repair one internally inconsistent AGVM Master sufficiency decision. Do not answer the user and do not invent a gap. "
+                "A nonterminal state must name a concrete unresolved semantic gap, an executable next_recommended_call, and the distinct "
+                "information that call is expected to add. If every mission is covered and no document, path, provenance, privacy, or "
+                "render safety gap remains, return terminal and set unresolved_gap and expected_information_gain to null."
+            ),
+            user_prompt=json.dumps(
+                {**prompt_payload, "previous_output": normalized, "consistency_error": consistency_error},
+                ensure_ascii=False,
+            ),
+            schema_name="agvm_ai_master_sufficiency_repair_v1",
+            schema=schema,
+            timeout=max(0.1, remaining_timeout),
+            role="answer",
+            max_output_tokens=900,
+        )
+        elapsed_ms += round((time.perf_counter() - repair_started_at) * 1000.0, 3)
+        normalized = _mcp_master_normalize_ai_payload(repaired if isinstance(repaired, dict) else None)
+        if repair_error or not normalized:
+            return None, repair_error or "invalid_ai_master_sufficiency_repair", elapsed_ms
+        normalized["human_findings"] = _mcp_master_validate_human_findings(
+            list(normalized.get("human_findings") or []),
+            goal_coverage=goal_coverage,
+        )
+        if _mcp_master_ai_consistency_error(
+            normalized,
+            goal_coverage=goal_coverage,
+            partial_goals=partial_goals,
+            missing_goals=missing_goals,
+            expected_evidence_policy=expected_evidence_policy,
+            render_contract=render_contract,
+        ):
+            return None, "inconsistent_ai_master_sufficiency_repair", elapsed_ms
     return normalized, None, elapsed_ms
 
 
@@ -14302,7 +15094,17 @@ def _mcp_master_apply_ai_sufficiency(
         agent_state = "no_match"
         continuation = {"state": "none", "tool_action": None, "reason": "ai_master_approved_no_match"}
     else:
-        next_call = _mcp_master_next_call_for_state(state, document_state=document_state, path_state=path_state)
+        # The AI Master already chose an executable continuation from the
+        # schema allow-list.  Preserve that semantic decision instead of
+        # replacing it with a deterministic inspection call that cannot add
+        # evidence (notably ``continue_retrieve_context`` becoming
+        # ``inspect_context_package``).
+        ai_next_call = str(ai_payload.get("next_recommended_call") or "").strip()
+        next_call = ai_next_call or _mcp_master_next_call_for_state(
+            state,
+            document_state=document_state,
+            path_state=path_state,
+        )
         terminal = False
         final_seal = False
         context_state = "partial" if state in {"usable_partial", "needs_hydration", "needs_more_search"} else state
@@ -14317,6 +15119,20 @@ def _mcp_master_apply_ai_sufficiency(
     updated_reason_codes = list(dict.fromkeys([*reason_codes, *list(ai_payload.get("reason_codes") or []), "ai_master_sufficiency_used"]))
     if safety_downgraded:
         updated_reason_codes.append("ai_master_terminal_downgraded_by_safety_invariant")
+    human_findings = [
+        dict(item)
+        for item in list(ai_payload.get("human_findings") or [])
+        if isinstance(item, dict)
+    ][:8]
+    issue_diagnostics = [
+        {
+            **finding,
+            "issue": str(finding.get("summary") or "").strip(),
+            "why": str(finding.get("reason") or "").strip(),
+            "target": str(finding.get("source_claim_summary") or "").strip(),
+        }
+        for finding in human_findings
+    ]
     return {
         "master_state": state,
         "context_state": context_state,
@@ -14329,7 +15145,11 @@ def _mcp_master_apply_ai_sufficiency(
         "unresolved_goals": ai_missing if state not in {"terminal", "no_match"} else [],
         "continuation_recommendation": continuation,
         "next_recommended_call": next_call,
+        "unresolved_gap": ai_payload.get("unresolved_gap") if not terminal else None,
+        "expected_information_gain": ai_payload.get("expected_information_gain") if not terminal else None,
         "reason_codes": updated_reason_codes[:24],
+        "human_findings": human_findings,
+        "issue_diagnostics": issue_diagnostics,
     }
 
 
@@ -14341,23 +15161,34 @@ def build_mcp_master_judgement(
     path_truth_contract: dict[str, Any] | None = None,
     document_refs: list[dict[str, Any]] | None = None,
     allow_ai_master: bool = False,
+    retrieval_mode: str = "balanced",
+    ai_timeout_ceiling_seconds: float | None = None,
+    semantic_authority: str = "legacy",
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     ledger = dict(mission_evidence_ledger or {})
     rows = [dict(row) for row in list(ledger.get("rows") or []) if isinstance(row, dict)]
     render_contract = dict(package_render_contract or {})
     refs = [dict(ref) for ref in list(document_refs or []) if isinstance(ref, dict)]
+    llm_available = bool(llm_enabled())
+    authority_mode = _semantic_authority_mode(semantic_authority)
+    mission_ledger_digest = _mcp_mission_ledger_digest(ledger)
     cache_key = _mcp_master_cache_key(
         query_text=query_text,
         ledger=ledger,
         render_contract=render_contract,
         path_truth_contract=path_truth_contract,
         document_refs=refs,
+        allow_ai_master=allow_ai_master,
+        retrieval_mode=retrieval_mode,
+        ai_timeout_ceiling_seconds=ai_timeout_ceiling_seconds,
+        llm_available=llm_available,
+        semantic_authority=authority_mode,
     )
     with _MCP_MASTER_JUDGEMENT_CACHE_LOCK:
         cached = _MCP_MASTER_JUDGEMENT_CACHE.get(cache_key)
     if cached:
-        result = dict(cached)
+        result = copy.deepcopy(cached)
         result["cache_hit"] = True
         result["master_judge_timing_ms"] = round((time.perf_counter() - started_at) * 1000.0, 3)
         return result
@@ -14391,18 +15222,17 @@ def build_mcp_master_judgement(
         and _mcp_master_row_has_visible_evidence(row)
         and _mcp_master_goal_key(row, str(row.get("goal") or row.get("mission_id") or ""))
     }
-    resolved_slot_keys = {
-        _mcp_master_slot_key(row)
-        for row in rows
-        if (
-            str(dict(row.get("branch_judgement") or {}).get("state") or row.get("coverage_state") or "").strip().lower()
-            in resolved_states
-            or str(row.get("coverage_state") or "").strip().lower() == "resolved"
-        )
-        and _mcp_master_row_has_visible_evidence(row)
-        and _mcp_master_slot_key(row)
-    }
-    broad_slot_subsumption = _is_broad_self_query(query_text)
+    resolved_rows_by_slot: dict[str, list[dict[str, Any]]] = {}
+    for resolved_row in rows:
+        resolved_state = str(
+            dict(resolved_row.get("branch_judgement") or {}).get("state")
+            or resolved_row.get("coverage_state")
+            or ""
+        ).strip().lower()
+        slot_key = _mcp_master_slot_key(resolved_row)
+        if resolved_state in resolved_states and slot_key and _mcp_master_row_has_visible_evidence(resolved_row):
+            resolved_rows_by_slot.setdefault(slot_key, []).append(resolved_row)
+    broad_slot_subsumption = authority_mode != "ai_v2" and _is_broad_self_query(query_text)
     deterministic_contract_complete = bool(render_contract.get("deterministic_contract_passed")) and not bool(
         list(render_contract.get("blocked_reasons") or [])
     )
@@ -14434,17 +15264,28 @@ def build_mcp_master_judgement(
         row_has_useful_evidence = bool(hot_count or cold_count or document_count)
         useful_evidence_count += int(row_has_useful_evidence)
         master_goal_state = "missing"
-        subsumed_by_resolved_duplicate = bool(
-            (goal_key and goal_key in resolved_goal_keys)
-            or (
-                (broad_slot_subsumption or deterministic_contract_complete)
-                and _mcp_master_slot_key(row)
-                and _mcp_master_slot_key(row) in resolved_slot_keys
-                and (
-                    broad_slot_subsumption
-                    or _mcp_master_slot_key(row) in deterministic_required_sections
+        slot_key = _mcp_master_slot_key(row)
+        slot_resolved_rows = resolved_rows_by_slot.get(slot_key, [])
+        semantic_slot_duplicate = authority_mode != "ai_v2" and bool(
+            deterministic_contract_complete
+            and slot_key in deterministic_required_sections
+            and any(
+                _mcp_master_goals_semantically_compatible(
+                    resolved_row,
+                    str(resolved_row.get("goal") or resolved_row.get("mission_id") or ""),
+                    row,
+                    goal,
                 )
+                for resolved_row in slot_resolved_rows
             )
+        )
+        # Broad dossiers may intentionally fan out several equivalent routes
+        # per section. Narrow queries require exact or semantic equivalence;
+        # sharing only the rendering slot is never enough.
+        subsumed_by_resolved_duplicate = authority_mode != "ai_v2" and bool(
+            (goal_key and goal_key in resolved_goal_keys)
+            or (broad_slot_subsumption and slot_resolved_rows)
+            or semantic_slot_duplicate
         ) and bool(
             effective_state not in resolved_states
             and coverage_state != "resolved"
@@ -14498,6 +15339,7 @@ def build_mcp_master_judgement(
             reason_codes.append("duplicate_only")
         if excluded_count and not row_has_useful_evidence:
             reason_codes.append("excluded_only")
+        evidence_refs, evidence_summaries = _mcp_master_evidence_projection(row)
         goal_coverage.append(
             {
                 "mission_id": mission_id,
@@ -14515,6 +15357,8 @@ def build_mcp_master_judgement(
                 "cold_evidence_count": cold_count,
                 "document_ref_count": document_count,
                 "route_event_count": len([item for item in list(row.get("route_events") or []) if isinstance(item, dict)]),
+                "evidence_refs": evidence_refs,
+                "evidence_summaries": evidence_summaries,
                 "correction_signal": dict(row.get("correction_signal") or {}),
             }
         )
@@ -14629,6 +15473,7 @@ def build_mcp_master_judgement(
         path_state=path_state,
         branch_state_counts=branch_state_counts,
         master_state=master_state,
+        semantic_authority=authority_mode,
     )
     deterministic_precheck_state = (
         "clear_terminal"
@@ -14656,7 +15501,13 @@ def build_mcp_master_judgement(
     ai_master_payload: dict[str, Any] | None = None
     ai_master_error: str | None = None
     ai_master_turn_ms = 0.0
-    ai_master_enabled = bool(allow_ai_master or render_contract.get("ai_master_judge_enabled"))
+    human_findings: list[dict[str, Any]] = []
+    issue_diagnostics: list[dict[str, Any]] = []
+    ai_master_enabled = bool(
+        authority_mode == "ai_v2"
+        or allow_ai_master
+        or render_contract.get("ai_master_judge_enabled")
+    )
     if ai_master_enabled and bool(expected_evidence_policy.get("ai_sufficiency_required")) and master_state not in {"blocked", "provider_degraded"}:
         ai_master_payload, ai_master_error, ai_master_turn_ms = _mcp_master_run_ai_sufficiency(
             query_text=query_text,
@@ -14671,6 +15522,8 @@ def build_mcp_master_judgement(
             path_state=path_state,
             reason_codes=reason_codes,
             render_contract=render_contract,
+            retrieval_mode=retrieval_mode,
+            timeout_ceiling_seconds=ai_timeout_ceiling_seconds,
         )
         sufficiency_judge["master_ai_required"] = True
         sufficiency_judge["master_ai_used"] = bool(ai_master_payload)
@@ -14699,11 +15552,13 @@ def build_mcp_master_judgement(
             unresolved_from_ai = list(ai_update["unresolved_goals"])
             continuation_recommendation = dict(ai_update["continuation_recommendation"])
             reason_codes = list(ai_update["reason_codes"])
+            human_findings = list(ai_update.get("human_findings") or [])
+            issue_diagnostics = list(ai_update.get("issue_diagnostics") or [])
             sufficiency_judge["tier"] = "ai_master_sufficiency"
             sufficiency_judge["ai_sufficiency_state"] = f"ai_master_{master_state}"
             sufficiency_judge["ai_master_decision"] = ai_master_payload
             partial_goals = [goal for goal in partial_goals if goal in unresolved_from_ai] if unresolved_from_ai else ([] if master_state in {"terminal", "no_match"} else partial_goals)
-        elif llm_enabled() and master_state == "terminal":
+        elif authority_mode == "ai_v2":
             master_state = "usable_partial"
             context_state = "partial"
             agent_payload_state = "partial_context"
@@ -14715,9 +15570,9 @@ def build_mcp_master_judgement(
                 "tool_action": "inspect_context_package",
                 "reason": "ai_master_required_but_unavailable",
             }
-            reason_codes = list(dict.fromkeys([*reason_codes, "ai_master_required_but_unavailable_terminal_downgraded"]))[:24]
-            sufficiency_judge["ai_sufficiency_state"] = "required_but_unavailable_terminal_not_certified"
-            sufficiency_judge["master_ai_timeout_fallback"] = True
+            reason_codes = list(dict.fromkeys([*reason_codes, "ai_master_required_but_unavailable_review_required"]))[:24]
+            sufficiency_judge["ai_sufficiency_state"] = "required_but_unavailable_review_required"
+            sufficiency_judge["master_ai_timeout_fallback"] = False
         else:
             sufficiency_judge["ai_sufficiency_state"] = "required_but_unavailable_deterministic_partial_fallback"
             sufficiency_judge["master_ai_timeout_fallback"] = bool(llm_enabled())
@@ -14758,16 +15613,32 @@ def build_mcp_master_judgement(
         "branch_state_counts": branch_state_counts,
         "subsumed_unresolved_goals": subsumed_unresolved_goals,
         "reason_codes": reason_codes,
+        "human_findings": human_findings,
+        "issue_diagnostics": issue_diagnostics,
         "ledger_row_count": len(rows),
+        "mission_ledger_digest": mission_ledger_digest,
         "cache_key": cache_key[:16],
         "cache_hit": False,
         "master_judge_timing_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
         "source": "mission_evidence_ledger",
+        "review_required": bool(authority_mode == "ai_v2" and not sufficiency_judge.get("master_ai_used")),
+        "semantic_authority": {
+            "mode": authority_mode,
+            "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+            "master_ai_used": bool(sufficiency_judge.get("master_ai_used")),
+            "fallback_used": False if authority_mode == "ai_v2" else bool(sufficiency_judge.get("master_ai_timeout_fallback")),
+        },
     }
-    with _MCP_MASTER_JUDGEMENT_CACHE_LOCK:
-        if len(_MCP_MASTER_JUDGEMENT_CACHE) >= _MCP_MASTER_JUDGEMENT_CACHE_MAX:
-            _MCP_MASTER_JUDGEMENT_CACHE.clear()
-        _MCP_MASTER_JUDGEMENT_CACHE[cache_key] = dict(result)
+    cache_is_authoritative = not bool(
+        authority_mode == "ai_v2"
+        and sufficiency_judge.get("master_ai_required")
+        and not sufficiency_judge.get("master_ai_used")
+    )
+    if cache_is_authoritative:
+        with _MCP_MASTER_JUDGEMENT_CACHE_LOCK:
+            if len(_MCP_MASTER_JUDGEMENT_CACHE) >= _MCP_MASTER_JUDGEMENT_CACHE_MAX:
+                _MCP_MASTER_JUDGEMENT_CACHE.clear()
+            _MCP_MASTER_JUDGEMENT_CACHE[cache_key] = copy.deepcopy(result)
     return result
 
 
@@ -14788,6 +15659,163 @@ def _mcp_ledger_candidate_text(value: Any) -> str | None:
         if text:
             return text
     return None
+
+
+def _mcp_mission_requirement_values(row: dict[str, Any], kind: str) -> list[str]:
+    expected_shape = dict(row.get("expected_evidence_shape") or {})
+    if kind == "entity":
+        fields = (
+            row.get("required_entities"),
+            expected_shape.get("required_entities"),
+            expected_shape.get("target_entities"),
+            expected_shape.get("entities"),
+        )
+    else:
+        fields = (
+            row.get("required_claims"),
+            expected_shape.get("required_claims"),
+            expected_shape.get("claims"),
+        )
+    values: list[str] = []
+    for field in fields:
+        raw_values = list(field) if isinstance(field, (list, tuple, set)) else [field]
+        for raw_value in raw_values:
+            if isinstance(raw_value, dict):
+                raw_value = next(
+                    (
+                        raw_value.get(key)
+                        for key in ("text", "name", "label", "claim", "value")
+                        if raw_value.get(key)
+                    ),
+                    None,
+                )
+            cleaned = _mcp_clean_agent_text(raw_value)
+            folded = _fold_text(cleaned)
+            if cleaned and len(folded) >= 3 and folded not in {_fold_text(item) for item in values}:
+                values.append(cleaned)
+    return values[:16]
+
+
+_MCP_MISSION_FIT_STOPWORDS = {
+    "about",
+    "after",
+    "answer",
+    "anche",
+    "come",
+    "con",
+    "connect",
+    "della",
+    "delle",
+    "describe",
+    "explain",
+    "from",
+    "identify",
+    "include",
+    "into",
+    "nella",
+    "nelle",
+    "that",
+    "their",
+    "this",
+    "through",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+}
+
+
+def _mcp_mission_fit_terms(value: Any) -> list[str]:
+    return list(
+        dict.fromkeys(
+            token
+            for token in _fold_text(value).split()
+            if len(token) >= 4 and token not in _MCP_MISSION_FIT_STOPWORDS
+        )
+    )[:24]
+
+
+def _mcp_mission_success_criteria(row: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            preferred = next(
+                (
+                    value.get(key)
+                    for key in ("text", "criterion", "description", "label", "value", "claim")
+                    if value.get(key)
+                ),
+                None,
+            )
+            if preferred is not None:
+                collect(preferred)
+                return
+            for nested in value.values():
+                collect(nested)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                collect(nested)
+            return
+        cleaned = _mcp_clean_agent_text(value)
+        folded = _fold_text(cleaned)
+        if cleaned and len(folded) >= 3 and folded not in {_fold_text(item) for item in values}:
+            values.append(cleaned)
+
+    collect(row.get("success_criteria"))
+    return values[:16]
+
+
+def _mcp_requirement_is_covered(requirement: str, text: Any, *, entity: bool) -> bool:
+    folded_requirement = _fold_text(requirement)
+    folded_text = _fold_text(text)
+    if not folded_requirement or not folded_text:
+        return False
+    if folded_requirement in folded_text:
+        return True
+    terms = _mcp_mission_fit_terms(requirement)
+    if not terms:
+        return False
+    covered = sum(1 for term in terms if term in folded_text)
+    if entity:
+        return covered == len(terms) or (len(terms) >= 2 and covered >= len(terms) - 1)
+    return covered >= min(2, len(terms)) and covered / len(terms) >= 0.5
+
+
+def _mcp_mission_candidate_grounding(
+    row: dict[str, Any],
+    text: str,
+    section_candidates: Sequence[str],
+) -> dict[str, Any]:
+    required_entities = _mcp_mission_requirement_values(row, "entity")
+    required_claims = _mcp_mission_requirement_values(row, "claim")
+    covered_entities = [
+        item for item in required_entities if _mcp_requirement_is_covered(item, text, entity=True)
+    ]
+    covered_claims = [
+        item for item in required_claims if _mcp_requirement_is_covered(item, text, entity=False)
+    ]
+    strict_requirements_present = bool(required_entities or required_claims)
+    fit = bool(covered_entities or covered_claims)
+    if required_entities and required_claims:
+        fit = bool(covered_entities and covered_claims)
+    grounded_slot = next(
+        (section for section in section_candidates if section in _MCP_CONTEXT_SECTION_TITLES),
+        "history",
+    )
+    return {
+        "schema_version": "agvm.mission_candidate_grounding.v1",
+        "mission_id": str(row.get("mission_id") or "").strip(),
+        "grounded_slot": grounded_slot,
+        "required_entities": required_entities,
+        "covered_entities": covered_entities,
+        "required_claims": required_claims,
+        "covered_claims": covered_claims,
+        "strict_requirements_present": strict_requirements_present,
+        "fit": fit,
+    }
 
 
 def _mcp_ledger_row_section_candidates(row: dict[str, Any]) -> list[str]:
@@ -14824,8 +15852,12 @@ def _mcp_ledger_hot_candidates(compact_ledger: dict[str, Any]) -> list[dict[str,
             text = _mcp_ledger_candidate_text(evidence)
             if not text:
                 continue
+            mission_grounding = _mcp_mission_candidate_grounding(row, text, section_candidates)
             section = _mcp_context_section_key(
-                evidence.get("section") or evidence.get("support_slot") or primary_section,
+                evidence.get("section")
+                or evidence.get("support_slot")
+                or mission_grounding.get("grounded_slot")
+                or primary_section,
                 text,
             )
             if section not in _MCP_CONTEXT_SECTION_TITLES:
@@ -14861,10 +15893,125 @@ def _mcp_ledger_hot_candidates(compact_ledger: dict[str, Any]) -> list[dict[str,
                     "branch_goals": [branch_goal] if branch_goal else [],
                     "mission_id": str(row.get("mission_id") or "").strip(),
                     "path_id": str(row.get("path_id") or "").strip(),
+                    "mission_grounding": mission_grounding,
                     "ledger_order": (row_index, evidence_index),
                 }
             )
     return candidates
+
+
+def _mcp_mission_coverage_manifest(
+    compact_ledger: dict[str, Any],
+    promoted_context: Any,
+    hot_context: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    promoted_blob = str(promoted_context or "")
+    rows: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for raw_row in list(compact_ledger.get("rows") or []):
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        mission_id = str(row.get("mission_id") or "").strip()
+        required_entities = _mcp_mission_requirement_values(row, "entity")
+        required_claims = _mcp_mission_requirement_values(row, "claim")
+        covered_entities = [
+            item
+            for item in required_entities
+            if _mcp_requirement_is_covered(item, promoted_blob, entity=True)
+        ]
+        covered_claims = [
+            item
+            for item in required_claims
+            if _mcp_requirement_is_covered(item, promoted_blob, entity=False)
+        ]
+        missing_entities = [item for item in required_entities if item not in covered_entities]
+        missing_claims = [item for item in required_claims if item not in covered_claims]
+        grounded_slots = list(
+            dict.fromkeys(
+                str(dict(item.get("mission_grounding") or {}).get("grounded_slot") or item.get("section") or "").strip()
+                for item in hot_context
+                if str(dict(item.get("mission_grounding") or {}).get("mission_id") or "").strip() == mission_id
+                and bool(dict(item.get("mission_grounding") or {}).get("fit"))
+            )
+        )
+        strict_requirements_present = bool(required_entities or required_claims)
+        passed = bool(
+            not strict_requirements_present
+            or (not missing_entities and not missing_claims and grounded_slots)
+        )
+        if not strict_requirements_present:
+            state = "not_declared"
+        elif passed:
+            state = "covered"
+        elif covered_entities or covered_claims:
+            state = "partial"
+        else:
+            state = "missing"
+        row_result = {
+            "mission_id": mission_id,
+            "goal": str(row.get("goal") or "").strip(),
+            "state": state,
+            "passed": passed,
+            "required_entities": required_entities,
+            "covered_entities": covered_entities,
+            "missing_entities": missing_entities,
+            "required_claims": required_claims,
+            "covered_claims": covered_claims,
+            "missing_claims": missing_claims,
+            "grounded_slots": grounded_slots,
+        }
+        rows.append(row_result)
+        if strict_requirements_present and not passed:
+            missing_labels = [*missing_entities, *missing_claims]
+            diagnostics.append(
+                {
+                    "issue": "Mission evidence is not fully represented in the context package.",
+                    "mission_id": mission_id,
+                    "why": (
+                        "Required entities or claims were not found in a grounded promoted slot: "
+                        + "; ".join(missing_labels)
+                    ),
+                    "evidence_inspected": len(
+                        [
+                            item
+                            for item in hot_context
+                            if str(dict(item.get("mission_grounding") or {}).get("mission_id") or "").strip()
+                            == mission_id
+                        ]
+                    ),
+                    "target": str(row.get("goal") or row.get("answer_hypothesis") or mission_id).strip(),
+                    "next_step": "Continue retrieval or hydrate evidence for the missing mission requirements before synthesis.",
+                }
+            )
+    evaluated_rows = [row for row in rows if row.get("state") != "not_declared"]
+    return {
+        "schema_version": "agvm.mission_package_coverage.v1",
+        "evaluated": bool(evaluated_rows),
+        "passed": bool(not evaluated_rows or all(bool(row.get("passed")) for row in evaluated_rows)),
+        "row_count": len(rows),
+        "evaluated_row_count": len(evaluated_rows),
+        "covered_row_count": sum(1 for row in evaluated_rows if bool(row.get("passed"))),
+        "rows": rows,
+        "issue_diagnostics": diagnostics,
+    }
+
+
+def _mcp_mission_rows_by_node_id(compact_ledger: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows_by_node_id: dict[str, dict[str, Any]] = {}
+    for raw_row in list(compact_ledger.get("rows") or []):
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        for lane in ("hot_evidence", "cold_evidence"):
+            for raw_evidence in list(row.get(lane) or []):
+                if not isinstance(raw_evidence, dict):
+                    continue
+                for key in ("node_id", "target_node_id", "source_node_id"):
+                    node_id = str(raw_evidence.get(key) or "").strip()
+                    if node_id and node_id not in rows_by_node_id:
+                        rows_by_node_id[node_id] = row
+    return rows_by_node_id
 
 
 def _mcp_unresolved_or_missing_body_lines(
@@ -14893,6 +16040,10 @@ def _mcp_unresolved_or_missing_body_lines(
                 lines.append(
                     "- Explicit query entity coverage is unresolved: "
                     + ", ".join(str(item) for item in missing_explicit_query_entities if str(item).strip())
+                )
+            elif section == "mission_query_fit":
+                lines.append(
+                    "- Mission query fit is unresolved: required entities or claims are not yet represented in a grounded package slot."
                 )
             elif section == "work_entity_inventory":
                 lines.append("- Work/company inventory is unresolved: discovered linked work entities are not yet fully visible in the context package.")
@@ -14945,6 +16096,7 @@ def _mcp_master_renderer_projection(
     ordered_sections: Sequence[dict[str, Any]],
     original_contract_passed: bool,
     original_status: str,
+    semantic_authority: str = "legacy",
 ) -> dict[str, Any]:
     master_state = str((master_judgement or {}).get("master_state") or "").strip().lower()
     final_unresolved = [str(section).strip() for section in unresolved_sections if str(section).strip()]
@@ -14954,9 +16106,12 @@ def _mcp_master_renderer_projection(
         "answer_context_alignment",
         "link_aware_context",
         "explicit_query_entity_coverage",
+        "mission_query_fit",
         "path_truth",
         "document_refs",
     }
+    if _semantic_authority_mode(semantic_authority) == "ai_v2":
+        safety_blockers.discard("mission_query_fit")
     if ledger_renderer_mode and master_state in {"terminal", "no_match"}:
         kept: list[str] = []
         for section in final_unresolved:
@@ -15028,6 +16183,9 @@ def build_mcp_context_package(
     document_text_policy: str | None = None,
     mission_evidence_ledger: dict[str, Any] | None = None,
     allow_ai_master: bool = False,
+    ai_master_timeout_ceiling_seconds: float | None = None,
+    semantic_authority: str = "legacy",
+    master_judgement_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     package_render_started_at = time.perf_counter()
     context_structured = dict(context_structured or {})
@@ -15035,6 +16193,7 @@ def build_mcp_context_package(
         mission_evidence_ledger or context_structured.get("mission_evidence_ledger")
     )
     ledger_renderer_mode = bool(compact_mission_evidence_ledger)
+    authority_mode = _semantic_authority_mode(semantic_authority)
     effective_document_text_policy = _mcp_normalize_document_text_policy(document_text_policy)
     required_sections, optional_sections, allowed_sections, forbidden_sections, broad_context, document_mode = _mcp_context_contract_sets(semantic_contract, query_text)
     effective_package_mode = _mcp_infer_context_package_mode(
@@ -15388,6 +16547,7 @@ def build_mcp_context_package(
     cold_context: list[dict[str, Any]] = []
     excluded_material: list[dict[str, Any]] = []
     debug_ledger: list[dict[str, Any]] = []
+    mission_rows_by_node_id = _mcp_mission_rows_by_node_id(compact_mission_evidence_ledger)
     candidate_text_by_node_id: dict[str, str] = {}
     if ledger_renderer_mode:
         debug_ledger.append(
@@ -15423,6 +16583,22 @@ def build_mcp_context_package(
         if node_id and text and node_id not in candidate_text_by_node_id:
             candidate_text_by_node_id[node_id] = text
         answer_support_candidate = bool(node_id and node_id in answer_evidence_ids) or _mcp_text_has_alignment_term(text, answer_alignment_terms)
+        mission_grounding = dict(candidate.get("mission_grounding") or {})
+        if not mission_grounding and node_id in mission_rows_by_node_id:
+            mission_row = mission_rows_by_node_id[node_id]
+            mission_grounding = _mcp_mission_candidate_grounding(
+                mission_row,
+                text,
+                _mcp_ledger_row_section_candidates(mission_row),
+            )
+        mission_grounded_candidate = bool(
+            mission_grounding.get("fit")
+            and (
+                list(mission_grounding.get("covered_entities") or [])
+                or list(mission_grounding.get("covered_claims") or [])
+            )
+        )
+        ledger_evidence_candidate = bool(node_id and node_id in mission_rows_by_node_id)
         candidate_support_sections = {
             _mcp_context_section_key(slot)
             for slot in list(candidate.get("support_slots") or []) + list(candidate.get("branch_goals") or [])
@@ -15432,10 +16608,12 @@ def build_mcp_context_package(
             broad_context
             or section_key in contract_core_sections
             or bool(candidate_support_sections & contract_core_sections)
+            or mission_grounded_candidate
         )
         subject_anchor_required = _mcp_subject_anchor_required(query_text, semantic_contract)
         subject_anchored_candidate = bool(
             _mcp_text_is_subject_anchored(text, source_title, semantic_contract)
+            or bool(mission_grounding.get("covered_entities"))
             or (
                 source_kind == "structured_context"
                 and bool(candidate.get("structured_subject_context"))
@@ -15481,10 +16659,10 @@ def build_mcp_context_package(
         elif exact_field_requirements and not exact_field_match:
             promotion_state = "cold"
             reason = "does_not_satisfy_exact_requested_field"
-        elif section_key in forbidden_sections:
+        elif section_key in forbidden_sections and not (authority_mode == "ai_v2" and ledger_evidence_candidate):
             promotion_state = "excluded"
             reason = "forbidden_by_semantic_contract"
-        elif section_key not in allowed_sections:
+        elif section_key not in allowed_sections and not (authority_mode == "ai_v2" and ledger_evidence_candidate):
             promotion_state = "cold"
             reason = "off_contract_reservoir"
         elif (
@@ -15492,6 +16670,7 @@ def build_mcp_context_package(
             and section_key in {"identity", "work", "relationships", "history", "temporal_inventory", "style", "values"}
             and not subject_anchored_candidate
             and not exact_field_match
+            and not (authority_mode == "ai_v2" and ledger_evidence_candidate)
         ):
             promotion_state = "cold"
             reason = "subject_anchor_missing"
@@ -15499,6 +16678,7 @@ def build_mcp_context_package(
             relation_anchor_required_for_section
             and not requested_relation_candidate
             and not exact_field_match
+            and not (authority_mode == "ai_v2" and ledger_evidence_candidate)
         ):
             promotion_state = "cold"
             reason = "missing_requested_relation_anchor"
@@ -15507,14 +16687,21 @@ def build_mcp_context_package(
             and not core_context_candidate
             and not answer_support_candidate
             and not exact_field_match
+            and not (authority_mode == "ai_v2" and ledger_evidence_candidate)
         ):
             promotion_state = "cold"
             reason = "non_core_context_reservoir"
-        elif bool(candidate.get("unrequested_work_optional_section")) and not exact_field_match:
+        elif (
+            bool(candidate.get("unrequested_work_optional_section"))
+            and not exact_field_match
+            and not (authority_mode == "ai_v2" and ledger_evidence_candidate)
+        ):
             promotion_state = "cold"
             reason = "unrequested_optional_context_reservoir"
         elif non_fact_context_candidate:
             reason = "promoted_non_fact_context"
+        elif mission_grounded_candidate:
+            reason = "promoted_mission_grounded_evidence"
         elif answer_support_candidate:
             reason = "promoted_answer_support"
 
@@ -15525,6 +16712,8 @@ def build_mcp_context_package(
                 "promotion_state": promotion_state,
                 "reason": reason,
                 "source_title": source_title,
+                "mission_id": str(mission_grounding.get("mission_id") or ""),
+                "mission_grounding": mission_grounding,
             }
         )
         if promotion_state == "hot":
@@ -15543,6 +16732,7 @@ def build_mcp_context_package(
                     "source_kind": source_kind,
                     "claim_status": claim_status,
                     "node_id": node_id,
+                    "mission_grounding": mission_grounding,
                 }
             )
         elif promotion_state == "cold":
@@ -15556,6 +16746,7 @@ def build_mcp_context_package(
                     "source_kind": source_kind,
                     "claim_status": claim_status,
                     "node_id": node_id,
+                    "mission_grounding": mission_grounding,
                 }
             )
         else:
@@ -15569,6 +16760,7 @@ def build_mcp_context_package(
                     "source_kind": source_kind,
                     "claim_status": claim_status,
                     "node_id": node_id,
+                    "mission_grounding": mission_grounding,
                 }
             )
 
@@ -15689,7 +16881,21 @@ def build_mcp_context_package(
         predicate=_mcp_text_can_backfill_work_from_identity,
     )
     promote_relation_timeline_context()
-    identity_subject_name = _mcp_identity_subject_name_from_contract(semantic_contract) or _mcp_subject_name_from_query(query_text)
+    contract_identity_subject_name = _mcp_identity_subject_name_from_contract(semantic_contract)
+    if contract_identity_subject_name and not _mcp_identity_subject_name_allowed_for_query(
+        query_text,
+        semantic_contract,
+        contract_identity_subject_name,
+    ):
+        contract_identity_subject_name = ""
+    query_identity_subject_name = "" if contract_identity_subject_name else _mcp_subject_name_from_query(query_text)
+    identity_subject_name = contract_identity_subject_name or query_identity_subject_name
+    identity_subject_source_title = "identity nucleus" if contract_identity_subject_name else "query named target"
+    identity_subject_debug_reason = (
+        "exact_identity_name_from_nucleus"
+        if contract_identity_subject_name
+        else "exact_identity_name_from_query_target"
+    )
     exact_identity_name_requested = _mcp_query_requests_exact_identity_name(query_text, required_sections)
     if identity_subject_name and exact_identity_name_requested:
         identity_line = f"The memory subject's name is {identity_subject_name}."
@@ -15701,15 +16907,15 @@ def build_mcp_context_package(
         ]
         if folded_identity_line not in {_fold_text(item) for item in existing_identity_items}:
             sections["identity"]["items"].insert(0, identity_line)
-            sections["identity"]["sources"].append("identity nucleus")
+            sections["identity"]["sources"].append(identity_subject_source_title)
             sections["identity"]["confidence"] = max(float(sections["identity"]["confidence"]), 0.9)
             hot_context.insert(
                 0,
                 {
                     "section": "identity",
                     "text": identity_line,
-                    "source_title": "identity nucleus",
-                    "source_kind": "identity_nucleus",
+                    "source_title": identity_subject_source_title,
+                    "source_kind": "identity_nucleus" if contract_identity_subject_name else "query_named_target",
                     "claim_status": "fact",
                     "node_id": "",
                 },
@@ -15719,8 +16925,8 @@ def build_mcp_context_package(
                     "node_id": "",
                     "section_key": "identity",
                     "promotion_state": "hot",
-                    "reason": "exact_identity_name_from_nucleus",
-                    "source_title": "identity nucleus",
+                    "reason": identity_subject_debug_reason,
+                    "source_title": identity_subject_source_title,
                 }
             )
     if (
@@ -15731,14 +16937,14 @@ def build_mcp_context_package(
     ):
         identity_line = f"Identity subject: {identity_subject_name}."
         sections["identity"]["items"].insert(0, identity_line)
-        sections["identity"]["sources"].append("identity nucleus")
+        sections["identity"]["sources"].append(identity_subject_source_title)
         sections["identity"]["confidence"] = max(float(sections["identity"]["confidence"]), 0.74)
         hot_context.append(
             {
                 "section": "identity",
                 "text": identity_line,
-                "source_title": "identity nucleus",
-                "source_kind": "identity_nucleus",
+                "source_title": identity_subject_source_title,
+                "source_kind": "identity_nucleus" if contract_identity_subject_name else "query_named_target",
                 "claim_status": "fact",
                 "node_id": "",
             }
@@ -16553,9 +17759,46 @@ def build_mcp_context_package(
     unresolved_sections = sorted(section for section in required_sections if section not in satisfied_sections)
     supplied_semantic_slot_contracts = list((semantic_contract or {}).get("semantic_slot_contracts") or [])
     if str((semantic_contract or {}).get("schema_version") or "") == "agvm.semantic_query_contract.v2":
-        supplied_semantic_slot_contracts = list(
-            build_query_contract(query_text, retrieval_mode=retrieval_mode).get("semantic_slot_contracts") or []
-        )
+        v2_required_sections = [
+            _mcp_context_section_key(section)
+            for section in list(dict((semantic_contract or {}).get("context_contract") or {}).get("required_sections") or [])
+            if str(section or "").strip()
+        ]
+        if v2_required_sections:
+            explicit_v2_slots = [
+                dict(item)
+                for item in supplied_semantic_slot_contracts
+                if isinstance(item, dict)
+            ]
+            supplied_semantic_slot_contracts = []
+            for section in dict.fromkeys(v2_required_sections):
+                matching_slot = next(
+                    (
+                        dict(item)
+                        for item in explicit_v2_slots
+                        if _mcp_context_section_key(
+                            item.get("section") or item.get("slot_key") or item.get("slot_id")
+                        )
+                        == section
+                    ),
+                    None,
+                )
+                supplied_semantic_slot_contracts.append(
+                    ({**matching_slot, "required": True} if matching_slot else None)
+                    or {
+                        "schema_version": "agvm.semantic_slot_contract.v1",
+                        "slot_id": section,
+                        "slot_key": section,
+                        "section": section,
+                        "required": True,
+                    }
+                )
+        elif not supplied_semantic_slot_contracts:
+            supplied_semantic_slot_contracts = list(
+                dict((semantic_contract or {}).get("legacy_contract") or {}).get("semantic_slot_contracts")
+                or build_query_contract(query_text, retrieval_mode=retrieval_mode).get("semantic_slot_contracts")
+                or []
+            )
     semantic_slot_contracts = [
         dict(item)
         for item in supplied_semantic_slot_contracts
@@ -16624,6 +17867,24 @@ def build_mcp_context_package(
         for item in list(section.get("items") or [])
     )
     folded_promoted_context_blob = _fold_text(promoted_context_blob)
+    mission_coverage_manifest = _mcp_mission_coverage_manifest(
+        compact_mission_evidence_ledger,
+        promoted_context_blob,
+        hot_context,
+    )
+    issue_diagnostics = list(mission_coverage_manifest.get("issue_diagnostics") or [])
+    mission_query_fit_diagnostic_only = bool(
+        authority_mode == "ai_v2"
+        and bool(mission_coverage_manifest.get("evaluated"))
+        and not bool(mission_coverage_manifest.get("passed"))
+    )
+    if (
+        bool(mission_coverage_manifest.get("evaluated"))
+        and not bool(mission_coverage_manifest.get("passed"))
+        and not mission_query_fit_diagnostic_only
+        and "mission_query_fit" not in unresolved_sections
+    ):
+        unresolved_sections.append("mission_query_fit")
     explicit_query_entities = _mcp_explicit_query_entities(query_text) if _query_is_work_or_company(query_text) else []
     missing_explicit_query_entities = [
         entity
@@ -17025,6 +18286,11 @@ def build_mcp_context_package(
         "blocked_reasons": list(dict.fromkeys(package_render_blocked_reasons))[:16],
         "deterministic_contract_passed": bool(contract_passed),
         "deterministic_required_sections": sorted(required_sections),
+        "mission_query_fit_diagnostic_only": mission_query_fit_diagnostic_only,
+        "semantic_authority": {
+            "mode": authority_mode,
+            "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+        },
         "semantic_discovery_disabled": ledger_renderer_mode,
         "disabled_rescue_functions": (
             [
@@ -17040,16 +18306,28 @@ def build_mcp_context_package(
             else []
         ),
     }
-    master_judgement = build_mcp_master_judgement(
-        query_text=query_text,
-        mission_evidence_ledger=compact_mission_evidence_ledger,
-        package_render_contract=package_render_contract,
-        path_truth_contract=path_truth_contract,
-        document_refs=document_refs,
-        allow_ai_master=bool(allow_ai_master),
-    ) if ledger_renderer_mode else {}
+    master_judgement = (
+        copy.deepcopy(master_judgement_override)
+        if ledger_renderer_mode and master_judgement_override
+        else build_mcp_master_judgement(
+            query_text=query_text,
+            mission_evidence_ledger=compact_mission_evidence_ledger,
+            package_render_contract=package_render_contract,
+            path_truth_contract=path_truth_contract,
+            document_refs=document_refs,
+            allow_ai_master=bool(allow_ai_master),
+            retrieval_mode=retrieval_mode,
+            ai_timeout_ceiling_seconds=ai_master_timeout_ceiling_seconds,
+            semantic_authority=authority_mode,
+        ) if ledger_renderer_mode else {}
+    )
     if master_judgement:
         package_render_contract["master_judgement_id"] = master_judgement.get("master_judgement_id")
+        issue_diagnostics.extend(
+            dict(item)
+            for item in list(master_judgement.get("issue_diagnostics") or [])
+            if isinstance(item, dict)
+        )
     original_status = "contract_satisfied" if contract_passed else "partial" if ordered_sections else "insufficient"
     master_renderer_projection = _mcp_master_renderer_projection(
         ledger_renderer_mode=ledger_renderer_mode,
@@ -17059,6 +18337,7 @@ def build_mcp_context_package(
         ordered_sections=ordered_sections,
         original_contract_passed=contract_passed,
         original_status=original_status,
+        semantic_authority=authority_mode,
     )
     final_status = str(master_renderer_projection.get("final_status") or original_status)
     final_contract_passed = bool(master_renderer_projection.get("final_contract_passed"))
@@ -17159,6 +18438,9 @@ def build_mcp_context_package(
             "missing_requested_relations": missing_requested_relations,
             "explicit_query_entities": explicit_query_entities,
             "missing_explicit_query_entities": missing_explicit_query_entities,
+            "mission_coverage": mission_coverage_manifest,
+            "issue_diagnostics": issue_diagnostics,
+            "human_findings": list(master_judgement.get("human_findings") or []),
             "semantic_required_slot_keys": [
                 str(item.get("slot_key") or item.get("slot_id") or "")
                 for item in semantic_slot_contracts
@@ -17181,6 +18463,9 @@ def build_mcp_context_package(
         "package_render_contract": package_render_contract,
         "master_judgement": master_judgement,
         "mission_evidence_ledger": compact_mission_evidence_ledger,
+        "mission_coverage": mission_coverage_manifest,
+        "issue_diagnostics": issue_diagnostics,
+        "human_findings": list(master_judgement.get("human_findings") or []),
         "agent_markdown": agent_markdown,
         "sections": ordered_sections,
         "structured_sections": ordered_sections,
@@ -17325,6 +18610,9 @@ _ANSWER_DEMO_SOURCE_NOISE_MARKERS = (
     "page title",
     "visible text",
     "headings",
+    "contact via",
+    "your main contact",
+    "office access",
 )
 
 
@@ -17614,6 +18902,20 @@ def _context_package_answer_fragments(
     fragments: list[tuple[str, str]] = []
     seen_fragments: set[str] = set()
 
+    def append_fragment(section_key: str, fragment: str) -> bool:
+        folded = _fold_text(fragment)
+        if not folded or folded in seen_fragments:
+            return False
+        if any(
+            (len(folded) >= 34 and folded in seen)
+            or (len(seen) >= 34 and seen in folded)
+            for seen in seen_fragments
+        ):
+            return False
+        seen_fragments.add(folded)
+        fragments.append((section_key, fragment))
+        return True
+
     def add_best_fragment_from_section(section: dict[str, Any], *, limit: int) -> int:
         section_key = str(section.get("key") or "").strip()
         added = 0
@@ -17640,17 +18942,45 @@ def _context_package_answer_fragments(
             )
             if not fragment:
                 continue
-            folded = _fold_text(fragment)
-            if not folded or folded in seen_fragments:
-                continue
-            if any((len(folded) >= 34 and folded in seen) or (len(seen) >= 34 and seen in folded) for seen in seen_fragments):
-                continue
-            seen_fragments.add(folded)
-            fragments.append((section_key, fragment))
-            added += 1
+            if append_fragment(section_key, fragment):
+                added += 1
             if added >= limit:
                 break
         return added
+
+    compact_ledger = _mcp_compact_mission_evidence_ledger(package.get("mission_evidence_ledger"))
+    mission_candidates = _mcp_ledger_hot_candidates(compact_ledger)
+    query_terms = set(_mcp_mission_fit_terms(query_text))
+    ranked_mission_candidates = sorted(
+        mission_candidates,
+        key=lambda candidate: (
+            bool(dict(candidate.get("mission_grounding") or {}).get("fit")),
+            len(query_terms.intersection(_mcp_mission_fit_terms(candidate.get("text")))),
+            float(candidate.get("confidence") or 0.0),
+        ),
+        reverse=True,
+    )
+    mission_limit = min(max_fragments, 8 if broad else 4)
+    for candidate in ranked_mission_candidates:
+        grounding = dict(candidate.get("mission_grounding") or {})
+        candidate_terms = set(_mcp_mission_fit_terms(candidate.get("text")))
+        if not grounding.get("fit") and query_terms and not query_terms.intersection(candidate_terms):
+            continue
+        section_key = str(candidate.get("section_key") or grounding.get("grounded_slot") or "history").strip()
+        if section_key in excluded or section_key not in _MCP_CONTEXT_SECTION_TITLES:
+            continue
+        fragment = _context_package_answer_fragment(
+            query_text,
+            str(candidate.get("text") or ""),
+            first_person=first_person,
+            section_key=section_key,
+            subject_name=subject_name,
+            broad=broad,
+        )
+        if fragment:
+            append_fragment(section_key, fragment)
+        if len(fragments) >= mission_limit:
+            break
 
     for required_section in required_sections:
         section = next((item for item in ranked_sections if str(item.get("key") or "").strip() == required_section), None)
@@ -17689,6 +19019,17 @@ def _context_package_answer_fragments(
                     "node_id": node_id,
                     "text": text,
                     "kind": str(hot.get("section") or "approved_context"),
+                    "mission_id": str(dict(hot.get("mission_grounding") or {}).get("mission_id") or hot.get("mission_id") or "").strip(),
+                    "evidence_id": str(hot.get("evidence_id") or hot.get("id") or "").strip(),
+                    "source_id": str(hot.get("source_id") or hot.get("source_node_id") or "").strip(),
+                    "source_title": str(hot.get("source_title") or hot.get("title") or "").strip(),
+                    "source_uri": str(hot.get("source_uri") or hot.get("uri") or hot.get("url") or "").strip(),
+                    "document_id": str(hot.get("document_id") or hot.get("source_document_id") or "").strip(),
+                    "source_type": str(hot.get("source_type") or hot.get("source_kind") or "").strip(),
+                    "content_digest": str(hot.get("content_digest") or hot.get("digest") or "").strip(),
+                    "evidence_revision": str(hot.get("evidence_revision") or hot.get("revision") or "").strip(),
+                    "package_revision": str(hot.get("package_revision") or hot.get("package_revision_id") or "").strip(),
+                    "brain_revision": str(hot.get("brain_revision") or hot.get("graph_revision") or "").strip(),
                 }
             )
     if not evidence_node_ids:
@@ -17705,11 +19046,281 @@ def _context_package_answer_fragments(
                         "node_id": node_id,
                         "text": text,
                         "kind": section or "approved_context",
+                        "mission_id": str(dict(hot.get("mission_grounding") or {}).get("mission_id") or hot.get("mission_id") or "").strip(),
+                        "evidence_id": str(hot.get("evidence_id") or hot.get("id") or "").strip(),
+                        "source_id": str(hot.get("source_id") or hot.get("source_node_id") or "").strip(),
+                        "source_title": str(hot.get("source_title") or hot.get("title") or "").strip(),
+                        "source_uri": str(hot.get("source_uri") or hot.get("uri") or hot.get("url") or "").strip(),
+                        "document_id": str(hot.get("document_id") or hot.get("source_document_id") or "").strip(),
+                        "source_type": str(hot.get("source_type") or hot.get("source_kind") or "").strip(),
+                        "content_digest": str(hot.get("content_digest") or hot.get("digest") or "").strip(),
+                        "evidence_revision": str(hot.get("evidence_revision") or hot.get("revision") or "").strip(),
+                        "package_revision": str(hot.get("package_revision") or hot.get("package_revision_id") or "").strip(),
+                        "brain_revision": str(hot.get("brain_revision") or hot.get("graph_revision") or "").strip(),
                     }
                 )
             if len(evidence_node_ids) >= 12:
                 break
-    return fragments, evidence_node_ids[:12], evidence_snippets[:8]
+    return fragments, evidence_node_ids[:24], evidence_snippets[:24]
+
+
+def _canonical_answer_sha256_digest(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"^sha-?256\s*[:=]\s*", "", text)
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        return None
+    return f"sha256:{text}"
+
+
+def _nonempty_answer_binding_values(*values: Any) -> list[str]:
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value or "").strip()))
+
+
+def _context_package_answer_claim_proofs(
+    package: dict[str, Any],
+    evidence_snippets: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    compact_ledger = _mcp_compact_mission_evidence_ledger(package.get("mission_evidence_ledger"))
+    revision_context = dict(compact_ledger.get("revision_context") or {})
+    brain_revision = str(
+        compact_ledger.get("brain_revision")
+        or revision_context.get("brain_revision")
+        or ""
+    ).strip()
+    package_revision_context = dict(package.get("revision_context") or {})
+    package_materialization = dict(package.get("context_package_materialization") or {})
+    package_revision_values = _nonempty_answer_binding_values(
+        package.get("package_revision"),
+        package.get("package_revision_id"),
+        package_revision_context.get("package_revision"),
+        package_revision_context.get("package_revision_id"),
+        package_materialization.get("package_revision"),
+        package_materialization.get("package_revision_id"),
+    )
+    package_revision = package_revision_values[0] if package_revision_values else ""
+    package_brain_revision_values = _nonempty_answer_binding_values(
+        package.get("brain_revision"),
+        package_revision_context.get("brain_revision"),
+        package_materialization.get("brain_revision"),
+    )
+    package_brain_revision = package_brain_revision_values[0] if package_brain_revision_values else ""
+    rows_by_node_id = _mcp_mission_rows_by_node_id(compact_ledger)
+    proofs: list[dict[str, Any]] = []
+    for raw_snippet in evidence_snippets:
+        snippet = dict(raw_snippet or {})
+        node_id = str(snippet.get("node_id") or "").strip()
+        row = dict(rows_by_node_id.get(node_id) or {})
+        row_evidence = next(
+            (
+                dict(item)
+                for item in list(row.get("hot_evidence") or [])
+                if isinstance(item, dict)
+                and str(item.get("node_id") or item.get("target_node_id") or item.get("source_node_id") or "").strip()
+                == node_id
+            ),
+            {},
+        )
+        persisted_mission_id = str(row.get("mission_id") or "").strip()
+        snippet_mission_id = str(snippet.get("mission_id") or "").strip()
+        mission_id = persisted_mission_id or snippet_mission_id
+        text = str(snippet.get("text") or "").strip()
+        source_id = str(snippet.get("source_id") or row_evidence.get("source_id") or row_evidence.get("source_node_id") or "").strip()
+        document_id = str(snippet.get("document_id") or row_evidence.get("document_id") or row_evidence.get("source_document_id") or "").strip()
+        persisted_content_digest = str(row_evidence.get("content_digest") or row_evidence.get("digest") or "").strip()
+        snippet_content_digest = str(snippet.get("content_digest") or "").strip()
+        upstream_content_digest = persisted_content_digest or snippet_content_digest
+        content_digest = f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}" if text else ""
+        canonical_content_digest = _canonical_answer_sha256_digest(content_digest)
+        canonical_upstream_digests = [
+            _canonical_answer_sha256_digest(value)
+            for value in (persisted_content_digest, snippet_content_digest)
+            if value
+        ]
+        content_digest_matches_upstream = bool(
+            canonical_content_digest
+            and canonical_upstream_digests
+            and all(value == canonical_content_digest for value in canonical_upstream_digests)
+        )
+        persisted_evidence_id = str(row_evidence.get("evidence_id") or row_evidence.get("id") or "").strip()
+        snippet_evidence_id = str(snippet.get("evidence_id") or "").strip()
+        evidence_id = persisted_evidence_id or snippet_evidence_id
+        evidence_revision = str(row_evidence.get("evidence_revision") or row_evidence.get("revision") or "").strip()
+        snippet_evidence_revision = str(snippet.get("evidence_revision") or "").strip()
+        evidence_package_revision_values = _nonempty_answer_binding_values(
+            row_evidence.get("package_revision"),
+            row_evidence.get("package_revision_id"),
+            snippet.get("package_revision"),
+            snippet.get("package_revision_id"),
+        )
+        evidence_package_revision = evidence_package_revision_values[0] if evidence_package_revision_values else ""
+        evidence_brain_revision_values = _nonempty_answer_binding_values(
+            row_evidence.get("brain_revision"),
+            row_evidence.get("graph_revision"),
+            snippet.get("brain_revision"),
+            snippet.get("graph_revision"),
+        )
+        evidence_brain_revision = evidence_brain_revision_values[0] if evidence_brain_revision_values else ""
+        mission_binding_matches = bool(
+            persisted_mission_id
+            and (not snippet_mission_id or snippet_mission_id == persisted_mission_id)
+        )
+        evidence_binding_matches = bool(
+            persisted_evidence_id
+            and (not snippet_evidence_id or snippet_evidence_id == persisted_evidence_id)
+        )
+        evidence_revision_binding_matches = bool(
+            evidence_revision
+            and (
+                not snippet_evidence_revision
+                or snippet_evidence_revision == evidence_revision
+            )
+        )
+        package_revision_binding_matches = bool(
+            package_revision
+            and len(package_revision_values) == 1
+            and bool(evidence_package_revision_values)
+            and all(value == package_revision for value in evidence_package_revision_values)
+        )
+        brain_revision_binding_matches = bool(
+            brain_revision
+            and bool(package_brain_revision_values)
+            and bool(evidence_brain_revision_values)
+            and all(value == brain_revision for value in package_brain_revision_values)
+            and all(value == brain_revision for value in evidence_brain_revision_values)
+        )
+        valid = bool(
+            mission_binding_matches
+            and evidence_binding_matches
+            and evidence_revision_binding_matches
+            and (node_id or source_id or document_id)
+            and content_digest_matches_upstream
+            and package_revision_binding_matches
+            and brain_revision_binding_matches
+            and text
+        )
+        proofs.append(
+            {
+                "schema_version": "agvm.answer_claim_proof.v1",
+                "mission_id": mission_id,
+                "evidence_id": evidence_id,
+                "node_id": node_id,
+                "source_id": source_id,
+                "document_id": document_id,
+                "content_digest": content_digest,
+                "upstream_content_digest": upstream_content_digest,
+                "upstream_content_digest_canonical": canonical_upstream_digests[0] if canonical_upstream_digests else "",
+                "content_digest_matches_upstream": content_digest_matches_upstream,
+                "evidence_revision": evidence_revision,
+                "evidence_revision_binding_matches": evidence_revision_binding_matches,
+                "package_revision": package_revision,
+                "evidence_package_revision": evidence_package_revision,
+                "package_revision_binding_matches": package_revision_binding_matches,
+                "brain_revision": brain_revision,
+                "package_brain_revision": package_brain_revision,
+                "evidence_brain_revision": evidence_brain_revision,
+                "brain_revision_binding_matches": brain_revision_binding_matches,
+                "mission_binding_matches": mission_binding_matches,
+                "evidence_binding_matches": evidence_binding_matches,
+                "source_title": str(snippet.get("source_title") or "").strip(),
+                "source_uri": str(snippet.get("source_uri") or "").strip(),
+                "source_type": str(snippet.get("source_type") or "").strip(),
+                "claim_text": text,
+                "valid": valid,
+            }
+        )
+    return proofs
+
+
+def _context_package_answer_mission_coverage(
+    package: dict[str, Any],
+    answer_text: str,
+    evidence_snippets: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    compact_ledger = _mcp_compact_mission_evidence_ledger(package.get("mission_evidence_ledger"))
+    claim_proofs = _context_package_answer_claim_proofs(package, evidence_snippets)
+    rows: list[dict[str, Any]] = []
+    for raw_row in list(compact_ledger.get("rows") or []):
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        mission_id = str(row.get("mission_id") or "").strip()
+        mission_proofs = [
+            proof
+            for proof in claim_proofs
+            if proof.get("valid") and proof.get("mission_id") == mission_id
+        ]
+        required_entities = _mcp_mission_requirement_values(row, "entity")
+        required_claims = _mcp_mission_requirement_values(row, "claim")
+        success_criteria = _mcp_mission_success_criteria(row)
+
+        def covered(requirement: str, *, entity: bool) -> bool:
+            return bool(
+                _mcp_requirement_is_covered(requirement, answer_text, entity=entity)
+                and any(
+                    _mcp_requirement_is_covered(requirement, proof.get("claim_text"), entity=entity)
+                    for proof in mission_proofs
+                )
+            )
+
+        covered_entities = [item for item in required_entities if covered(item, entity=True)]
+        covered_claims = [item for item in required_claims if covered(item, entity=False)]
+        covered_criteria = [item for item in success_criteria if covered(item, entity=False)]
+        missing_entities = [item for item in required_entities if item not in covered_entities]
+        missing_claims = [item for item in required_claims if item not in covered_claims]
+        missing_criteria = [item for item in success_criteria if item not in covered_criteria]
+        declared = bool(required_entities or required_claims or success_criteria)
+        proof_ready = bool(mission_proofs)
+        rows.append(
+            {
+                "mission_id": mission_id,
+                "goal": str(row.get("goal") or "").strip(),
+                "declared": declared,
+                "proof_ready": proof_ready,
+                "passed": bool(
+                    not declared
+                    or (proof_ready and not (missing_entities or missing_claims or missing_criteria))
+                ),
+                "required_entities": required_entities,
+                "covered_entities": covered_entities,
+                "missing_entities": missing_entities,
+                "required_claims": required_claims,
+                "covered_claims": covered_claims,
+                "missing_claims": missing_claims,
+                "success_criteria": success_criteria,
+                "covered_success_criteria": covered_criteria,
+                "missing_success_criteria": missing_criteria,
+                "proof_evidence_ids": [str(proof.get("evidence_id") or "") for proof in mission_proofs],
+            }
+        )
+    evaluated = [row for row in rows if row.get("declared")]
+    missing_requirements = list(
+        dict.fromkeys(
+            item
+            for row in evaluated
+            for item in [
+                *list(row.get("missing_entities") or []),
+                *list(row.get("missing_claims") or []),
+                *list(row.get("missing_success_criteria") or []),
+            ]
+            if item
+        )
+    )
+    for row in evaluated:
+        if not row.get("proof_ready"):
+            label = str(row.get("goal") or row.get("mission_id") or "mission proof").strip()
+            if label and label not in missing_requirements:
+                missing_requirements.append(label)
+    return {
+        "schema_version": "agvm.answer_mission_coverage.v1",
+        "evaluated": bool(evaluated),
+        "passed": bool(not evaluated or all(bool(row.get("passed")) for row in evaluated)),
+        "review_required": bool(evaluated and not all(bool(row.get("passed")) for row in evaluated)),
+        "rows": rows,
+        "claim_proofs": claim_proofs,
+        "missing_requirements": missing_requirements,
+    }
 
 
 def build_answer_demo_from_mcp_context_package(
@@ -17756,17 +19367,46 @@ def build_answer_demo_from_mcp_context_package(
     if not answer_short:
         return None
 
+    mission_coverage = _context_package_answer_mission_coverage(
+        package,
+        answer_full,
+        evidence_snippets,
+    )
+    missing_requirements = list(mission_coverage.get("missing_requirements") or [])
+    partial = bool(mission_coverage.get("review_required"))
+    if partial:
+        italian = any(
+            token in _fold_text(query_text).split()
+            for token in ("come", "cosa", "quale", "quali", "perche", "chi", "dove", "quando")
+        )
+        if italian:
+            limit_text = (
+                "Le evidence promosse non confermano ancora: "
+                + "; ".join(missing_requirements)
+                + ". Questi punti restano da verificare."
+            )
+        else:
+            limit_text = (
+                "The promoted evidence does not yet establish: "
+                + "; ".join(missing_requirements)
+                + ". Those points remain unconfirmed."
+            )
+        answer_full = clean_answer_surface_text(f"{answer_full} {limit_text}")
+        answer_short = answer_full if len(answer_full) <= 900 else _truncate_prompt_text(answer_full, 900)
+
     return {
         "answer_text": answer_short,
         "answer_full": answer_full,
-        "mode": "contract_human_synthesis",
-        "confidence": 0.86,
-        "evidence_node_ids": evidence_node_ids[:12],
-        "reasoning_summary": "Answer demo synthesized strictly from the approved MCP context package after its contract passed.",
-        "insufficient": False,
-        "answerability_state": "grounded",
-        "evidence_snippets": evidence_snippets[:8],
-        "support_node_count": len(evidence_node_ids[:12]),
+        "mode": "mission_grounded_partial" if partial else "contract_human_synthesis",
+        "confidence": 0.68 if partial else 0.86,
+        "evidence_node_ids": evidence_node_ids,
+        "reasoning_summary": "Answer synthesized strictly from consolidated promoted mission evidence and revision-bound claim proofs.",
+        "insufficient": partial,
+        "answerability_state": "partial" if partial else "grounded",
+        "review_required": partial,
+        "completion_state": "review_required" if partial else "complete",
+        "evidence_snippets": evidence_snippets,
+        "support_node_count": len(evidence_node_ids),
         "support_slot_count": len({section for section, _fragment in fragments}),
         "family_attribution_summary": {
             section: sum(1 for item_section, _fragment in fragments if item_section == section)
@@ -17774,6 +19414,7 @@ def build_answer_demo_from_mcp_context_package(
         },
         "contradiction_present": False,
         "context_package_answer_demo": True,
+        "mission_coverage": mission_coverage,
     }
 
 
@@ -18573,6 +20214,7 @@ def generate_grounded_answer(
     retrieval_mode: str = "balanced",
     document_mode: str = "none",
     document_packets: list[dict[str, Any]] | None = None,
+    semantic_authority: str = "legacy",
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     answer_matches = _eligible_answer_matches(matches)
     document_matches = [dict(match) for match in list(matches or []) if is_document_eligible(match)]
@@ -18580,6 +20222,67 @@ def generate_grounded_answer(
         context_matches = document_matches or answer_matches or [dict(match) for match in list(matches or [])]
         context = build_context_payload(context_matches, shared_evidence, evidence_reservoir=evidence_reservoir, query_text=query_text)
         return None, context
+    authority_mode = _semantic_authority_mode(semantic_authority)
+    if authority_mode == "ai_v2":
+        synthesis_matches = document_matches or answer_matches
+        payload, error = llm_grounded_answer(
+            query_text,
+            synthesis_matches,
+            shared_evidence,
+            evidence_reservoir=evidence_reservoir,
+            retrieval_mode=retrieval_mode,
+        )
+        context = dict((payload or {}).get("context") or {}) or build_context_payload(
+            synthesis_matches,
+            shared_evidence,
+            evidence_reservoir=evidence_reservoir,
+            query_text=query_text,
+        )
+        if payload and payload.get("answer_text"):
+            answer = {
+                "answer_text": payload["answer_text"],
+                "mode": payload["mode"],
+                "confidence": payload["confidence"],
+                "evidence_node_ids": payload["evidence_node_ids"],
+                "reasoning_summary": payload["reasoning_summary"],
+                "insufficient": payload["insufficient"],
+                "answerability_state": payload.get("answerability_state") or ("insufficient" if payload["insufficient"] else "grounded"),
+                "evidence_snippets": payload.get("evidence_snippets") or [],
+                "support_node_count": int(payload.get("support_node_count") or 0),
+                "support_slot_count": int(payload.get("support_slot_count") or 0),
+                "family_attribution_summary": dict(payload.get("family_attribution_summary") or {}),
+                "contradiction_present": bool(payload.get("contradiction_present")),
+                "answer_adequacy": dict(payload.get("answer_adequacy") or {}),
+                "semantic_authority": {
+                    "mode": authority_mode,
+                    "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+                    "fallback_used": False,
+                },
+            }
+            answer = _apply_answer_contract(query_text, answer, synthesis_matches)
+        else:
+            answer = {
+                "answer_text": "",
+                "mode": "ai_unavailable",
+                "confidence": 0.0,
+                "evidence_node_ids": [],
+                "reasoning_summary": "AI synthesis was unavailable; no deterministic answer was substituted.",
+                "insufficient": True,
+                "answerability_state": "partial",
+                "review_required": True,
+                "provider_error": str(error or "ai_synthesis_empty"),
+                "evidence_snippets": [],
+                "support_node_count": 0,
+                "support_slot_count": 0,
+                "family_attribution_summary": {},
+                "contradiction_present": False,
+                "semantic_authority": {
+                    "mode": authority_mode,
+                    "revision": _SEARCH_SEMANTIC_AUTHORITY_REVISION,
+                    "fallback_used": False,
+                },
+            }
+        return answer if response_mode in {"answer", "both"} else None, context if response_mode in {"context", "both"} else None
     document_answer = _document_answer_from_packets(
         query_text=query_text,
         matches=document_matches,
@@ -18622,16 +20325,19 @@ def generate_grounded_answer(
         if work_answer_requires_broad_synthesis and len(str(candidate.get("answer_text") or "").strip()) < 180 and len(answer_matches) >= 3:
             return False
         adequacy = dict(candidate.get("answer_adequacy") or {})
+        query_fit = dict(adequacy.get("query_fit") or {})
         return (
             not bool(candidate.get("insufficient"))
             and str(candidate.get("answerability_state") or "") == "grounded"
             and bool(adequacy.get("passed", True))
+            and bool(query_fit.get("passed", True))
         )
 
     def candidate_rank(candidate: dict[str, Any] | None) -> tuple[float, ...]:
         if not candidate:
             return (-1.0,)
         adequacy = dict(candidate.get("answer_adequacy") or {})
+        query_fit = dict(adequacy.get("query_fit") or {})
         state_rank = {"grounded": 3.0, "partial": 2.0, "insufficient": 0.0}.get(str(candidate.get("answerability_state") or ""), 1.0)
         if bool(candidate.get("insufficient")):
             state_rank -= 0.5
@@ -18644,6 +20350,7 @@ def generate_grounded_answer(
         return (
             state_rank,
             1.0 if bool(adequacy.get("passed")) else 0.0,
+            1.0 if bool(query_fit.get("passed", True)) else 0.0,
             -float(missing_required_slots),
             float(support_slots),
             float(support_nodes),
@@ -18816,6 +20523,95 @@ def _preferred_section_summary_item(section_key: str, items: list[str]) -> str |
     return max(pool, key=score)
 
 
+_GROUNDED_QUERY_LOW_INFORMATION_TERMS = {
+    "main",
+    "they",
+    "them",
+    "work",
+    "works",
+    "together",
+}
+
+
+def _grounded_query_entity_terms(query_text: str, query_terms: set[str]) -> set[str]:
+    titlecase_terms = {
+        _fold_text(match.group(0)).split()[0]
+        for match in re.finditer(r"\b[A-ZÀ-ÖØ-Þ][\w'’-]*", str(query_text or ""))
+        if _fold_text(match.group(0))
+    }
+    question_openers = {"what", "which", "where", "when", "who", "how", "describe", "explain"}
+    return (titlecase_terms - question_openers).intersection(query_terms)
+
+
+def _grounded_query_evidence_answer(
+    query_text: str,
+    matches: Sequence[dict[str, Any]],
+) -> str | None:
+    query_terms = set(_mcp_mission_fit_terms(query_text))
+    if not query_terms:
+        return None
+    entity_terms = _grounded_query_entity_terms(query_text, query_terms)
+    content_query_terms = query_terms - entity_terms - _GROUNDED_QUERY_LOW_INFORMATION_TERMS
+    ranked: list[tuple[int, float, int, str]] = []
+    for index, raw_match in enumerate(matches):
+        match = dict(raw_match or {})
+        node = dict(match.get("node") or {})
+        text = str(
+            match.get("evidence_snippet")
+            or node.get("raw_text")
+            or match.get("summary")
+            or node.get("summary")
+            or ""
+        ).strip()
+        if not text:
+            continue
+        for sentence in _sentence_candidates(text) or [text]:
+            folded_sentence = _fold_text(sentence)
+            if "\ufffd" in sentence or _answer_demo_source_noise_reason(sentence, fragment_level=True):
+                continue
+            sentence_terms = set(_mcp_mission_fit_terms(sentence))
+            overlap_terms = query_terms.intersection(sentence_terms)
+            # A named subject plus generic verbs is not an answer. This keeps
+            # testimonials and consultant biographies available as sources,
+            # while preventing them from becoming the primary synthesis merely
+            # because they repeat the entity name.
+            if entity_terms and content_query_terms and not overlap_terms.intersection(content_query_terms):
+                continue
+            overlap = len(overlap_terms)
+            if not folded_sentence or overlap <= 0:
+                continue
+            ranked.append(
+                (
+                    overlap,
+                    float(match.get("score") or match.get("confidence") or node.get("confidence") or 0.0),
+                    -index,
+                    sentence.strip(),
+                )
+            )
+    selected: list[str] = []
+    seen: set[str] = set()
+    covered_terms: set[str] = set()
+    strongest_overlap = max((item[0] for item in ranked), default=0)
+    minimum_relevant_overlap = max(1, (strongest_overlap + 1) // 2)
+    for _overlap, _confidence, _index, sentence in sorted(ranked, reverse=True):
+        if _overlap < minimum_relevant_overlap:
+            continue
+        folded = _fold_text(sentence)
+        if not folded or folded in seen:
+            continue
+        if any(len(folded) >= 32 and (folded in prior or prior in folded) for prior in seen):
+            continue
+        selected.append(sentence)
+        seen.add(folded)
+        covered_terms.update(query_terms.intersection(_mcp_mission_fit_terms(sentence)))
+        if len(selected) >= 6 or len(covered_terms) >= min(6, len(query_terms)):
+            break
+    if not selected:
+        return None
+    answer = clean_answer_surface_text(" ".join(selected))
+    return polish_final_answer_surface(query_text, answer) or answer or None
+
+
 def _deterministic_context_dossier(
     query_text: str,
     context: dict[str, Any] | None,
@@ -18853,10 +20649,29 @@ def _deterministic_context_dossier(
     evidence_limit = 16 if long_form else 8
     snippet_limit = 520 if long_form else 320
     for match in matches[:evidence_limit]:
-        snippet = str(match.get("evidence_snippet") or match["node"].get("raw_text") or match["summary"] or "").strip()
+        node = dict(match.get("node") or {})
+        snippet = str(match.get("evidence_snippet") or node.get("raw_text") or match.get("summary") or node.get("summary") or "").strip()
         if not snippet:
             continue
-        evidence_lines.append(f"- [{match['node_id']}] {_truncate_prompt_text(snippet, snippet_limit)}")
+        node_id = str(match.get("node_id") or node.get("id") or "unknown").strip()
+        source_id = str(match.get("source_id") or node.get("source_id") or "").strip()
+        document_id = str(match.get("document_id") or node.get("document_id") or "").strip()
+        source_uri = str(match.get("source_uri") or node.get("source_uri") or node.get("url") or "").strip()
+        content_digest = str(match.get("content_digest") or node.get("content_digest") or "").strip()
+        if not content_digest:
+            content_digest = f"sha256:{hashlib.sha256(snippet.encode('utf-8')).hexdigest()}"
+        provenance = ", ".join(
+            item
+            for item in (
+                f"node={node_id}" if node_id else "",
+                f"source={source_id}" if source_id else "",
+                f"document={document_id}" if document_id else "",
+                f"uri={source_uri}" if source_uri else "",
+                f"digest={content_digest}",
+            )
+            if item
+        )
+        evidence_lines.append(f"- [{provenance}] {_truncate_prompt_text(snippet, snippet_limit)}")
         if _is_temporal_reference_query(query_text) and _sentence_has_temporal_signal(snippet):
             temporal_lines.append(_truncate_prompt_text(snippet, 260))
     dossier = "\n\n".join(dossier_sections)
@@ -18873,6 +20688,9 @@ def _deterministic_context_dossier(
         answer_full = f"{answer_full or ''} {temporal_answer}".strip()
     if answer_full and _prefers_first_person_answer(query_text):
         answer_full = " ".join(_self_voice_fragment(sentence) for sentence in _sentence_candidates(answer_full)).strip()
+    grounded_answer = _grounded_query_evidence_answer(query_text, matches)
+    if grounded_answer and not broad_answer:
+        answer_full = grounded_answer
     return answer_full, dossier or None
 
 
@@ -19529,11 +21347,14 @@ def _enforce_human_answer_surface(
     query_text: str,
     answer_text: str | None,
     matches: list[dict[str, Any]],
+    semantic_authority: str = "legacy",
 ) -> str | None:
     text = clean_answer_surface_text(answer_text)
     if not text:
         return None
     text = polish_final_answer_surface(query_text, text) or text
+    if _semantic_authority_mode(semantic_authority) == "ai_v2":
+        return text
     original_contract = _answer_adequacy_contract(query_text=query_text, answer_text=text, matches=matches)
     if (
         original_contract.get("context_ledger_leak")
@@ -19579,6 +21400,103 @@ def _enforce_human_answer_surface(
     return polish_final_answer_surface(query_text, payload.get("answer_text") or text) or None
 
 
+def _shared_answer_deadline_timeout(
+    shared_evidence: dict[str, Any] | None,
+    *,
+    retrieval_mode: str,
+) -> float | None:
+    defaults = {
+        "flash": 90.0,
+        "balanced": 180.0,
+        "heavy": 360.0,
+        "forensic": 600.0,
+    }
+    default = defaults.get(str(retrieval_mode or "").strip().lower(), 180.0)
+    remaining_values: list[float] = []
+    deadline_supplied = False
+    queue: list[tuple[int, Any]] = [(0, shared_evidence or {})]
+    seen_objects: set[int] = set()
+    while queue:
+        depth, value = queue.pop(0)
+        if depth > 4 or id(value) in seen_objects:
+            continue
+        if isinstance(value, dict):
+            seen_objects.add(id(value))
+            for key, nested in value.items():
+                normalized_key = str(key or "").strip().lower()
+                if normalized_key in {
+                    "deadline_remaining_seconds",
+                    "remaining_budget_seconds",
+                    "remaining_seconds",
+                    "provider_deadline_remaining_seconds",
+                }:
+                    deadline_supplied = True
+                    try:
+                        numeric = float(nested)
+                    except (TypeError, ValueError):
+                        continue
+                    remaining_values.append(numeric)
+                elif normalized_key in {"deadline_at", "deadline_epoch_seconds"}:
+                    deadline_supplied = True
+                    try:
+                        numeric = float(nested) - time.time()
+                    except (TypeError, ValueError):
+                        continue
+                    remaining_values.append(numeric)
+                elif isinstance(nested, (dict, list, tuple)):
+                    queue.append((depth + 1, nested))
+        elif isinstance(value, (list, tuple)):
+            seen_objects.add(id(value))
+            queue.extend((depth + 1, nested) for nested in value if isinstance(nested, (dict, list, tuple)))
+    if not deadline_supplied or not remaining_values:
+        return default
+    remaining = min(remaining_values)
+    if remaining <= 0:
+        return None
+    reserve = min(15.0, max(1.0, remaining * 0.05))
+    usable = remaining - reserve
+    if usable <= 0:
+        return None
+    return min(default, usable)
+
+
+def _shared_deadline_grounded_partial(
+    *,
+    query_text: str,
+    matches: list[dict[str, Any]],
+    deterministic_answer: str | None,
+    deterministic_dossier: str | None,
+    retrieval_mode: str,
+) -> tuple[str | None, str | None]:
+    answer_surface = _coerce_long_answer_full(
+        deterministic_answer,
+        deterministic_dossier,
+        retrieval_mode=retrieval_mode,
+        query_text=query_text,
+    )
+    answer_surface = _enforce_human_answer_surface(
+        query_text=query_text,
+        answer_text=answer_surface,
+        matches=matches,
+    )
+    review_note = (
+        "Review required: this is a grounded partial from the retrieved evidence; "
+        "the shared synthesis deadline expired before a new AI call could start."
+    )
+    if answer_surface:
+        answer_surface = clean_answer_surface_text(f"{answer_surface} {review_note}")
+    else:
+        answer_surface = review_note
+    dossier = str(deterministic_dossier or "").strip()
+    deadline_section = (
+        "## Review Required\nStatus: review_required\n"
+        "The shared synthesis deadline expired before provider execution. "
+        "No new AI synthesis was started; the answer remains a grounded partial."
+    )
+    dossier = f"{dossier}\n\n{deadline_section}".strip()
+    return answer_surface, dossier
+
+
 def build_context_dossier(
     query_text: str,
     matches: list[dict[str, Any]],
@@ -19595,9 +21513,26 @@ def build_context_dossier(
         retrieval_mode=retrieval_mode,
     )
     deterministic_answer_full, deterministic_dossier = _deterministic_context_dossier(query_text, context, matches)
+    llm_available = bool(allow_llm and llm_enabled())
+    ai_synthesis_requested = bool(
+        llm_available
+        and (retrieval_mode in {"heavy", "forensic"} or _is_broad_self_query(query_text))
+    )
+    provider_timeout = (
+        _shared_answer_deadline_timeout(shared_evidence, retrieval_mode=retrieval_mode)
+        if ai_synthesis_requested
+        else None
+    )
+    if ai_synthesis_requested and provider_timeout is None:
+        return _shared_deadline_grounded_partial(
+            query_text=query_text,
+            matches=matches,
+            deterministic_answer=deterministic_answer_full,
+            deterministic_dossier=deterministic_dossier,
+            retrieval_mode=retrieval_mode,
+        )
     if (
-        allow_llm
-        and llm_enabled()
+        llm_available
         and _is_broad_self_query(query_text)
         and retrieval_mode in {"heavy", "forensic"}
     ):
@@ -19622,7 +21557,7 @@ def build_context_dossier(
                 _enforce_human_answer_surface(query_text=query_text, answer_text=answer_surface, matches=matches),
                 context_dossier,
             )
-    if not allow_llm or not llm_enabled() or (retrieval_mode not in {"heavy", "forensic"} and not _is_broad_self_query(query_text)):
+    if not llm_available or (retrieval_mode not in {"heavy", "forensic"} and not _is_broad_self_query(query_text)):
         context_dossier = _coerce_long_context_dossier(
             deterministic_dossier,
             deterministic_dossier,
@@ -19702,7 +21637,7 @@ def build_context_dossier(
         user_prompt=user_prompt,
         schema_name="agvm_context_dossier",
         schema=schema,
-        timeout=8.0 if retrieval_mode == "heavy" else 12.0,
+        timeout=provider_timeout,
         role="answer",
     )
     if error or not payload:

@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextvars import ContextVar, copy_context
+import copy
 import hashlib
+import math
 import os
 import re
 import threading
@@ -44,14 +46,26 @@ from answering import (
     _query_is_entity_connection_path_request,
     _apply_answer_contract,
     _query_named_targets,
+    _evidence_temporal_context,
 )
 from ai_modules_v2 import AiModuleContractError, validate_ai_execution_attestation
 from public_v1_landing_contract import build_public_v1_landing_contract
 from config import ATLAS_VERSION, BUCKET_SIZE, FACET_FIELDS, INDEX_VERSION, ROUTING_FIELDS
 from document_evidence_lane import rank_document_evidence_candidates
 from document_need_contract import build_target_document_need_contract
-from llm import answer_model, compiler_model, llm_enabled, retrieval_model, structured_json
-from memory_hygiene import is_answer_eligible, is_document_eligible
+from llm import (
+    answer_model,
+    branch_controller_model,
+    compiler_model,
+    evidence_judge_model,
+    llm_enabled,
+    llm_provider_concurrency_limit,
+    master_model,
+    planner_model,
+    retrieval_model,
+    structured_json,
+)
+from memory_hygiene import is_answer_eligible, is_document_eligible, lifecycle_eligibility
 from metamemory import build_metamemory_package, metamemory_snapshot, metamemory_spatial_brief
 from semantic_contract import sanitize_identity_hints
 from heuristic_calibration import (
@@ -100,6 +114,15 @@ from sqlite_store import (
     save_warm_thread_state,
 )
 from storage import load_atlas, load_index, save_atlas, save_index, utc_timestamp
+from stream_contract import (
+    canonical_result_ready_payload,
+    canonicalize_search_result,
+    normalize_stream_lifecycle_payload,
+    search_ai_stage_timeout_seconds,
+    search_mission_ledger_digest,
+    search_mode_budget_seconds,
+    search_snapshot_counters,
+)
 
 
 PATH_MISSION_SCHEMA_VERSION = "agvm.path_mission.v1"
@@ -127,6 +150,20 @@ _AI_BRANCH_AUTOJUDGE_STATES = {
 }
 
 
+def _search_final_runtime_bindings(
+    *,
+    brain_id: str | None,
+    brain_revision: str | None,
+    mission_evidence_ledger: dict[str, Any] | None,
+) -> dict[str, str | None]:
+    ledger = dict(mission_evidence_ledger or {})
+    return {
+        "brain_id": str(brain_id or "").strip() or None,
+        "brain_revision": str(ledger.get("brain_revision") or brain_revision or "").strip() or None,
+        "mission_ledger_digest": search_mission_ledger_digest(ledger) or None,
+    }
+
+
 def _fold_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", str(value or ""))
     ascii_only = "".join(char for char in normalized if not unicodedata.combining(char))
@@ -151,6 +188,21 @@ def _runtime_stage_phase_timings(stage_timing: dict[str, Any]) -> dict[str, Any]
 
 
 def _fetch_hot_path_heuristic_calibration_snapshot() -> dict[str, Any]:
+    hot_path_calibration_enabled = str(
+        os.getenv("AGVM_SEARCH_HOT_PATH_HEURISTIC_CALIBRATION_ENABLED") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not hot_path_calibration_enabled:
+        return {
+            "schema_version": "heuristic_calibration.v2",
+            "event_count": 0,
+            "compiled_priors": {},
+            "failure_signatures": {},
+            "summary": {},
+            "recent_events": [],
+            "recent_landing_correction_events": [],
+            "hot_path_skipped": True,
+            "skip_reason": "hot_path_calibration_disabled",
+        }
     try:
         return fetch_heuristic_calibration_snapshot(include_recent=False)
     except TypeError:
@@ -159,6 +211,8 @@ def _fetch_hot_path_heuristic_calibration_snapshot() -> dict[str, Any]:
 
 _SUPERSEDE_LOCK = threading.Lock()
 _SUPERSEDE_REQUESTS: dict[str, dict[str, Any]] = {}
+_SEARCH_RUNTIME_SEARCH_ID: ContextVar[str | None] = ContextVar("agvm_search_runtime_search_id", default=None)
+_SEARCH_RUNTIME_STOP_EVENT: ContextVar[threading.Event | None] = ContextVar("agvm_search_runtime_stop_event", default=None)
 
 
 def request_search_supersede(
@@ -194,6 +248,39 @@ def _clear_search_supersede(search_id: str | None) -> None:
         return
     with _SUPERSEDE_LOCK:
         _SUPERSEDE_REQUESTS.pop(normalized_search_id, None)
+
+
+_SEARCH_RUNTIME_STOP_GRACE_SECONDS = 0.05
+
+
+def _set_search_runtime_stop(stop_event: threading.Event | None) -> None:
+    if stop_event is not None:
+        stop_event.set()
+
+
+def _search_runtime_stop_reason(
+    *,
+    search_id: str | None = None,
+    stop_event: threading.Event | None = None,
+    include_stop_event: bool = True,
+    deadline_grace_seconds: float = _SEARCH_RUNTIME_STOP_GRACE_SECONDS,
+) -> str | None:
+    if search_id is None:
+        search_id = _SEARCH_RUNTIME_SEARCH_ID.get()
+    if stop_event is None:
+        stop_event = _SEARCH_RUNTIME_STOP_EVENT.get()
+    supersede_request = _peek_search_supersede(search_id)
+    if supersede_request:
+        return (
+            str(supersede_request.get("reason") or "superseded_by_followup").strip()
+            or "superseded_by_followup"
+        )
+    remaining_seconds = _search_deadline_remaining_seconds()
+    if remaining_seconds is not None and remaining_seconds <= max(0.0, float(deadline_grace_seconds)):
+        return "search_mode_budget_timeout"
+    if include_stop_event and stop_event is not None and stop_event.is_set():
+        return "search_runtime_stop_requested"
+    return None
 
 
 CANONICAL_QUERY_GOALS = {
@@ -534,6 +621,7 @@ def _aspect_landing_templates(query_text: str) -> dict[str, tuple[str, str]]:
 
 
 def node_for_index(node: dict[str, Any]) -> dict[str, Any]:
+    lifecycle = lifecycle_eligibility(node)
     return {
         "id": str(node["id"]),
         "node_kind": str(node["node_kind"]),
@@ -570,9 +658,11 @@ def node_for_index(node: dict[str, Any]) -> dict[str, Any]:
         "last_sleep_review_at": node.get("last_sleep_review_at"),
         "source_trust": node.get("source_trust") or "user_asserted",
         "claim_status": node.get("claim_status") or "fact",
-        "answer_eligible": bool(node.get("answer_eligible", True)),
+        "answer_eligible": is_answer_eligible(node),
         "profile_eligible": bool(node.get("profile_eligible", True)),
-        "document_eligible": bool(node.get("document_eligible", True)),
+        "document_eligible": is_document_eligible(node),
+        "lifecycle_status": lifecycle["lifecycle_status"],
+        "lifecycle_eligibility": lifecycle,
         "matrix_revision_id": node.get("matrix_revision_id"),
         "topology_revision_id": node.get("topology_revision_id"),
         "matrix_calibration_plan_signature": node.get("matrix_calibration_plan_signature"),
@@ -618,7 +708,8 @@ def build_index(nodes: list[dict[str, Any]]) -> dict[str, Any]:
 
 def ensure_index(graph: dict[str, Any]) -> dict[str, Any]:
     index_payload = load_index()
-    node_ids = sorted(str(node["id"]) for node in graph.get("nodes", []))
+    graph_nodes = [dict(node) for node in graph.get("nodes", [])]
+    node_ids = sorted(str(node["id"]) for node in graph_nodes)
     current_ids = sorted(str(key) for key in (index_payload.get("spatial_index") or {}).keys())
     required_node_keys = {
         "node_kind",
@@ -631,15 +722,23 @@ def ensure_index(graph: dict[str, Any]) -> dict[str, Any]:
         "claim_status",
         "answer_eligible",
         "document_eligible",
+        "lifecycle_status",
+        "lifecycle_eligibility",
     }
     has_complete_nodes = True
     for node in (index_payload.get("spatial_index") or {}).values():
         if not required_node_keys.issubset(set(dict(node).keys())):
             has_complete_nodes = False
             break
-    if current_ids == node_ids and has_complete_nodes:
+    indexed_nodes = dict(index_payload.get("spatial_index") or {})
+    lifecycle_is_current = all(
+        dict(indexed_nodes.get(str(node["id"])) or {}).get("lifecycle_eligibility")
+        == lifecycle_eligibility(node)
+        for node in graph_nodes
+    )
+    if current_ids == node_ids and has_complete_nodes and lifecycle_is_current:
         return index_payload
-    rebuilt = build_index(graph.get("nodes", []))
+    rebuilt = build_index(graph_nodes)
     return save_index(rebuilt)
 
 
@@ -1032,49 +1131,108 @@ def finalize_node(seed: dict[str, Any], graph: dict[str, Any], index_payload: di
 
 
 def _planner_seed_timeout_seconds(retrieval_mode: str | None, query_text: str | None = None) -> float:
-    normalized = str(retrieval_mode or "balanced").strip().lower()
-    query_class = _query_class(query_text or "")
-    if query_class == "broad_summary":
-        return {
-            "flash": 3.2,
-            "balanced": 7.5,
-            "heavy": 9.5,
-            "forensic": 10.5,
-        }.get(normalized, 7.5)
-    if query_class in {"style_values", "broad_summary"} and normalized in {"balanced", "heavy"}:
-        normalized = "forensic"
-    elif query_class == "style_values" and normalized == "balanced":
-        normalized = "heavy"
-    return {
-        "flash": 2.4,
-        "balanced": 3.8,
-        "heavy": 5.2,
-        "forensic": 6.2,
-    }.get(normalized, 3.8)
+    del query_text
+    return search_mode_budget_seconds(retrieval_mode)
+
+
+def _search_ai_admission_timeout_seconds(
+    retrieval_mode: str | None,
+    query_text: str | None = None,
+) -> float:
+    """Bound the first HTTP planning gate independently from the whole run.
+
+    The mode budget owns the full Search lifecycle. Admission is only the first
+    product-visible gate, so it must fail closed quickly instead of spending the
+    entire run budget before the client can attach to a stream.
+    """
+
+    del query_text
+    mode = str(retrieval_mode or "balanced").strip().lower()
+    if mode == "quick":
+        mode = "flash"
+    elif mode == "deep":
+        mode = "heavy"
+    defaults = {
+        # The public defaults use GPT-5-family planners. Structured planner
+        # responses regularly cross the old 12-16 second admission window
+        # even when the provider is healthy, which made a fresh local install
+        # fail closed before Search could create its session. Keep admission
+        # bounded well below each mode's end-to-end budget while allowing one
+        # healthy provider round-trip to finish.
+        "flash": 20.0,
+        "balanced": 30.0,
+        "heavy": 45.0,
+        "forensic": 60.0,
+    }
+    default = defaults.get(mode, 12.0)
+    for env_name in (
+        f"AGVM_SEARCH_AI_ADMISSION_{mode.upper()}_TIMEOUT_SECONDS",
+        "AGVM_SEARCH_AI_ADMISSION_TIMEOUT_SECONDS",
+    ):
+        raw = str(os.getenv(env_name) or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(1.0, min(90.0, float(raw)))
+        except ValueError:
+            continue
+    return default
+
+
+def _emit_final_context_wave_event() -> bool:
+    raw = str(os.getenv("AGVM_SEARCH_EMIT_FINAL_CONTEXT_WAVE_EVENT") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _planner_seed_retry_timeout_seconds(retrieval_mode: str | None, query_text: str | None = None) -> float:
-    normalized = str(retrieval_mode or "balanced").strip().lower()
-    query_class = _query_class(query_text or "")
-    if query_class == "broad_summary":
-        return {
-            "balanced": 4.0,
-            "heavy": 8.5,
-            "forensic": 10.5,
-        }.get(normalized, 0.0)
-    if query_class in {"style_values", "broad_summary"} and normalized in {"balanced", "heavy"}:
-        normalized = "forensic"
-    elif query_class == "style_values" and normalized == "balanced":
-        normalized = "heavy"
-    return {
-        "balanced": 4.4,
-        "heavy": 5.4,
-        "forensic": 6.4,
-    }.get(normalized, 0.0)
+    del retrieval_mode, query_text
+    # One mode budget owns the request. A second independent micro-timeout made
+    # the effective lifecycle non-deterministic and could outlive the UI run.
+    return 0.0
 
 
 def _planner_seed_transport_guard_seconds() -> float:
     return 0.8
+
+
+def _compound_direct_fact_strand_cap(query_text: str, query_contract: dict[str, Any]) -> int:
+    """Allow a small complete strand set without widening atomic fact queries."""
+
+    query_kind = str(query_contract.get("query_kind") or "").strip().lower()
+    if query_kind == "exact_relation_fact":
+        return 1
+    requested_aspects = {
+        str(aspect or "").strip().lower()
+        for aspect in list(query_contract.get("requested_aspects") or [])
+        if str(aspect or "").strip()
+    }
+    required_slots = {
+        _canonical_required_slot(str(slot))
+        for slot in [
+            *list(query_contract.get("required_slots") or []),
+            *list(query_contract.get("required_semantic_slots") or []),
+        ]
+        if str(slot or "").strip()
+    }
+    explicit_signal_count = int(query_contract.get("explicit_multi_signal_count") or 0)
+    normalized_query = f" {_fold_text(query_text)} "
+    compound_clause = bool(
+        re.search(
+            r"\b(?:and|plus|as well as|along with|e|ed|inoltre)\b.*\b(?:how|why|what|which|when|where|come|perche|cosa|quale|quando|dove)\b",
+            normalized_query,
+        )
+        or re.search(
+            r"\b(?:how|why|what|which|when|where|come|perche|cosa|quale|quando|dove)\b.*\b(?:and|plus|as well as|along with|e|ed|inoltre)\b",
+            normalized_query,
+        )
+    )
+    compound = bool(
+        query_kind in {"multi_fact", "work_narrative", "narrative_relation"}
+        or len(requested_aspects) > 1
+        or len(required_slots) > 1
+        or (explicit_signal_count > 0 and compound_clause)
+    )
+    return 3 if compound else 1
 
 
 def _planner_seed_max_items(query_text: str, max_probe_count: int, max_total_branches: int | None = None) -> int:
@@ -1102,7 +1260,7 @@ def _planner_seed_max_items(query_text: str, max_probe_count: int, max_total_bra
     if _query_is_entity_connection_path_request(query_text):
         class_cap = max(3, int(query_contract.get("min_landing_count") or 3))
     elif query_class == "direct_fact":
-        class_cap = 3 if _is_temporal_reference_query(query_text) else 1
+        class_cap = 3 if _is_temporal_reference_query(query_text) else _compound_direct_fact_strand_cap(query_text, query_contract)
     elif query_class == "document_lookup":
         class_cap = 3 if _is_temporal_reference_query(query_text) else 2
     elif query_class in {"relation_fact", "style_values"}:
@@ -1115,12 +1273,28 @@ def _planner_seed_max_items(query_text: str, max_probe_count: int, max_total_bra
         class_cap = max(class_cap, int(query_contract.get("min_landing_count") or 1))
     if multi_slot_min > 1 and str(query_contract.get("query_kind") or "") != "exact_relation_fact":
         class_cap = max(class_cap, multi_slot_min)
+    if query_class == "direct_fact":
+        class_cap = min(3, class_cap)
     hard_limit = max(1, int(max_probe_count))
     if multi_slot_min > 1:
         hard_limit = max(hard_limit, multi_slot_min)
     if max_total_branches is not None:
         hard_limit = min(hard_limit, max(1, int(max_total_branches)))
     return max(1, min(hard_limit, class_cap))
+
+
+def _preserve_authoritative_ai_missions(
+    strands: list[dict[str, Any]] | None,
+    *,
+    max_probe_count: int,
+) -> list[dict[str, Any]]:
+    """Keep every valid provider mission; execution budgets are applied to workers."""
+
+    # Retain the parameter for callers that also compile bounded workers. It is
+    # deliberately not a ledger limit: dropping a valid provider mission here
+    # makes an unexecuted requirement invisible and can falsely certify Search.
+    del max_probe_count
+    return [dict(item) for item in list(strands or []) if isinstance(item, dict)]
 
 
 def _planner_seed_source_from_error(error: str | None) -> str:
@@ -1148,9 +1322,9 @@ def _compact_retrieval_seed_metamemory() -> str:
 
 def _minimal_retrieval_seed_taxonomy() -> str:
     return (
-        "Minimal AGVM field taxonomy for the fast seed retry.\n"
-        "Allowed goals: name, birthplace, residence, role, projects, family, father, partner, mentor, sibling, style, values, history, documents.\n"
-        "Allowed answer fields: identity, identity_and_place, role_and_projects, relationships, communication_style, values, history, document_sources.\n"
+        "Minimal AGVM mission contract for the fast seed retry.\n"
+        "Goals and answer fields are free-form semantic labels. Preserve every named entity and requested relationship.\n"
+        "Legacy labels such as identity, projects, relationships, history, and documents may be used only when they accurately describe the mission.\n"
         "Each strand must include a landing_hint. Destination queues are omitted in this retry; the backend compiles them. "
         "Do not emit path geometry or broad narrative."
     )
@@ -1161,7 +1335,11 @@ def _planner_seed_slot_guidance(query_text: str, *, max_items: int) -> str:
     required_slots = [slot for slot in _required_slots_for_query(query_text) if slot]
     guidance_lines = [
         f"Query class: {query_class}.",
-        f"Max strands allowed: {max_items}.",
+        (
+            f"Concurrent worker budget: {max_items}. This limits execution only; "
+            "it must not truncate the semantic mission plan."
+        ),
+        "Return every distinct mission required to answer the query, including missions that cannot run concurrently.",
         f"Required slots in priority order: {', '.join(required_slots) if required_slots else 'identity'}.",
     ]
     if query_class == "broad_summary":
@@ -1169,7 +1347,7 @@ def _planner_seed_slot_guidance(query_text: str, *, max_items: int) -> str:
             [
                 "For broad summary, maximize slot coverage before duplicating the same slot.",
                 "Prefer one strand per slot before emitting both role and projects.",
-                "If capacity is tight, preserve identity, place, work, history, style, values, and relationships as far as max strands allows.",
+                "Preserve identity, place, work, history, style, values, and relationships whenever the query requires them.",
             ]
         )
     elif _query_is_entity_connection_path_request(query_text):
@@ -1419,37 +1597,63 @@ def _normalize_answer_strands(
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
-    for index, raw in enumerate(list(strands or [])[: max(1, int(max_probe_count))], start=1):
+    source_rows = list(strands or [])
+    preserve_complete_ai_plan = _normalized_planner_family(planner_family, fallback="heuristic") == "ai"
+    root_bound_named_targets = _server_bound_named_target_spans(query_text)
+    if not preserve_complete_ai_plan:
+        source_rows = source_rows[: max(1, int(max_probe_count))]
+    for index, raw in enumerate(source_rows, start=1):
         if not isinstance(raw, dict):
             continue
         landing_hint = _truncate_prompt_text(
             raw.get("landing_hint") or raw.get("query_text") or raw.get("answer_field") or raw.get("goal") or query_text,
             180,
         )
-        goal = _canonical_goal_from_context(
-            str(raw.get("goal") or ""),
+        semantic_goal = _truncate_prompt_text(
+            raw.get("semantic_goal") or raw.get("goal") or raw.get("why_required") or landing_hint,
+            240,
+        )
+        goal_taxonomy = _canonical_goal_from_context(
+            str(raw.get("goal_taxonomy") or raw.get("goal") or ""),
             root_query_text=query_text,
             probe_query_text=landing_hint,
             expected_guide_area=str(raw.get("expected_guide_area") or ""),
         )
-        if not goal:
-            goal = _goal_for_query_text(landing_hint or query_text, str(raw.get("expected_guide_area") or ""))
-        if not goal:
+        if not goal_taxonomy:
+            goal_taxonomy = _goal_for_query_text(landing_hint or query_text, str(raw.get("expected_guide_area") or ""))
+        if not goal_taxonomy:
             continue
+        goal = semantic_goal if str(planner_family or "").strip().lower() == "ai" and semantic_goal else goal_taxonomy
+        raw_family = _normalized_planner_family(str(raw.get("planner_family") or ""), fallback=planner_family)
+        authoritative_mission_identity = ""
+        if raw_family == "ai":
+            authoritative_mission_identity = str(raw.get("mission_id") or raw.get("strand_id") or "").strip().lower()
+            if not authoritative_mission_identity:
+                criteria_payload = {
+                    "answer_hypothesis": _fold_text(str(raw.get("answer_hypothesis") or "")),
+                    "why_required": _fold_text(str(raw.get("why_required") or raw.get("inverse_rationale") or "")),
+                    "required_entities": sorted(_fold_text(str(item)) for item in list(raw.get("required_entities") or [])),
+                    "expected_evidence": sorted(_fold_text(str(item)) for item in list(raw.get("expected_evidence") or [])),
+                    "success_criteria": sorted(_fold_text(str(item)) for item in list(raw.get("success_criteria") or [])),
+                    "destination_queue": list(raw.get("destination_queue") or []),
+                }
+                criteria_digest = hashlib.sha256(
+                    json.dumps(criteria_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+                authoritative_mission_identity = f"criteria:{criteria_digest}"
         signature = (
-            str(raw.get("answer_field") or _expected_answer_field_for_goal(goal) or "").strip().lower(),
+            str(raw.get("answer_field") or _expected_answer_field_for_goal(goal_taxonomy) or "").strip().lower(),
             str(goal).strip().lower(),
-            _fold_text(landing_hint),
+            f"{_fold_text(landing_hint)}::{authoritative_mission_identity}",
         )
         if signature in seen:
             continue
         seen.add(signature)
         priority = round(max(0.0, min(1.0, float(raw.get("priority") or max(0.35, 1.0 - ((index - 1) * 0.14))))), 4)
-        raw_family = _normalized_planner_family(str(raw.get("planner_family") or ""), fallback=planner_family)
         strand = _heuristic_answer_strand(
             strand_id=str(raw.get("strand_id") or f"strand_{planner_family}_{index}").strip() or f"strand_{planner_family}_{index}",
             query_text=query_text,
-            goal=goal,
+            goal=goal_taxonomy,
             landing_hint=landing_hint,
             priority=priority,
             planner_family=raw_family,
@@ -1465,10 +1669,33 @@ def _normalize_answer_strands(
                 planner_family=raw_family,
             ),
         )
+        strand["goal"] = goal
+        strand["semantic_goal"] = semantic_goal or goal
+        strand["goal_taxonomy"] = goal_taxonomy
         strand["answer_field"] = _canonical_answer_field(
             str(raw.get("answer_field") or strand.get("answer_field") or "").strip() or None,
-            goal=goal,
+            goal=goal_taxonomy,
         )
+        strand["mission_id"] = str(raw.get("mission_id") or raw.get("strand_id") or strand.get("strand_id") or "").strip()
+        strand["why_required"] = _truncate_prompt_text(raw.get("why_required") or raw.get("inverse_rationale") or "", 360) or None
+        bound_named_targets = _merge_server_bound_named_targets(
+            root_bound_named_targets,
+            raw.get("server_bound_named_targets"),
+            raw.get("required_named_concept_spans"),
+        )
+        required_entities = _merge_required_entities_with_bound_targets(
+            [str(item).strip() for item in list(raw.get("required_entities") or []) if str(item).strip()],
+            bound_named_targets,
+        )
+        expected_evidence = [str(item).strip() for item in list(raw.get("expected_evidence") or []) if str(item).strip()]
+        success_criteria = [str(item).strip() for item in list(raw.get("success_criteria") or []) if str(item).strip()]
+        strand["required_entities"] = _dedupe_limited(required_entities, limit=max(1, len(required_entities)))
+        strand["server_bound_named_targets"] = bound_named_targets
+        strand["root_query_text"] = str(query_text or "").strip()
+        strand["expected_evidence"] = _dedupe_limited(expected_evidence, limit=max(1, len(expected_evidence)))
+        strand["success_criteria"] = _dedupe_limited(success_criteria, limit=max(1, len(success_criteria)))
+        raw_mission_metadata = raw.get("metadata") or raw.get("mission_metadata") or {}
+        strand["mission_metadata"] = dict(raw_mission_metadata) if isinstance(raw_mission_metadata, Mapping) else {}
         strand["planner_family"] = raw_family
         strand["family_plan_id"] = str(raw.get("family_plan_id") or _family_plan_id_for_family(raw_family)).strip() or _family_plan_id_for_family(raw_family)
         strand["family_plan_confidence"] = round(
@@ -1489,10 +1716,16 @@ def _normalize_answer_strands(
             4,
         )
         normalized.append(strand)
+    if preserve_complete_ai_plan:
+        return normalized
     return normalized[: max(1, int(max_probe_count))]
 
 
 def _semantic_contract_memory_type_for_goal(goal: str) -> str | None:
+    # Migration/debug facet only. Search routing authority must come from
+    # coordinates, topology, source edges, and evidence text; callers may still
+    # display this label while legacy payloads migrate away from type-first
+    # contracts.
     normalized = str(goal or "").strip().lower()
     if normalized in {"name", "birthplace", "residence"}:
         return "identity"
@@ -1579,8 +1812,8 @@ def _append_required_semantic_slot_strands(
     query_text: str,
     max_count: int,
 ) -> None:
-    if len(raw_strands) >= max_count:
-        return
+    # `max_count` is the concurrent worker allowance, not a semantic-ledger cap.
+    del max_count
     required_slots = [
         _canonical_required_slot(str(slot).strip())
         for slot in list(_required_slots_for_query(query_text))
@@ -1595,8 +1828,6 @@ def _append_required_semantic_slot_strands(
     }
     subject = _semantic_contract_subject_label(contract, query_text)
     for slot in required_slots:
-        if len(raw_strands) >= max_count:
-            break
         if slot in covered_slots:
             continue
         goal = _semantic_contract_goal_for_required_slot(slot, query_text)
@@ -1657,11 +1888,10 @@ def _answer_strands_from_semantic_contract(
             if target_key and target_key not in landing_by_target:
                 landing_by_target[target_key] = landing
 
-    max_count = max(1, int(max_probe_count))
+    execution_worker_limit = max(1, int(max_probe_count))
     raw_strands: list[dict[str, Any]] = []
     contract_intent = str((dict(contract.get("intent") or {})).get("primary") or "").strip().lower()
-    total = max(1, min(max_count, len(expected_evidence) or len(landing_hypotheses) or 1))
-    for index, target in enumerate(expected_evidence[:max_count], start=1):
+    for index, target in enumerate(expected_evidence, start=1):
         target_id = str(target.get("target_id") or "").strip()
         landing = landing_by_target.get(target_id, {})
         claim_shape = str(target.get("claim_shape") or landing.get("textual_probe") or "").strip()
@@ -1704,7 +1934,7 @@ def _answer_strands_from_semantic_contract(
         )
 
     if not raw_strands:
-        for index, landing in enumerate(landing_hypotheses[:max_count], start=1):
+        for index, landing in enumerate(landing_hypotheses, start=1):
             landing_hint = str(landing.get("textual_probe") or query_text).strip()
             guide_area = _guide_area_for_goal(landing_hint)
             goal = _canonical_goal_from_context(
@@ -1738,20 +1968,16 @@ def _answer_strands_from_semantic_contract(
         raw_strands,
         contract=contract,
         query_text=query_text,
-        max_count=max_count,
+        max_count=execution_worker_limit,
     )
 
     normalized = _normalize_answer_strands(
         raw_strands,
         query_text=query_text,
-        max_probe_count=max_count,
+        max_probe_count=max(1, len(raw_strands)),
         planner_family="ai",
     )
-    return _select_answer_strands_for_query(
-        normalized,
-        query_text=query_text,
-        max_probe_count=max_count,
-    )
+    return _preserve_authoritative_ai_missions(normalized, max_probe_count=execution_worker_limit)
 
 
 def _supplement_answer_strands_for_query(
@@ -1905,22 +2131,44 @@ def _supplement_answer_strands_for_query(
 def _answer_strands_to_probe_specs(answer_strands: list[dict[str, Any]], *, root_query_text: str) -> list[dict[str, Any]]:
     strands = [dict(item) for item in list(answer_strands or []) if isinstance(item, dict)]
     total_priority = sum(max(0.0, float(item.get("priority") or 0.0)) for item in strands) or float(max(1, len(strands)))
+    root_bound_named_targets = _server_bound_named_target_spans(root_query_text)
     specs: list[dict[str, Any]] = []
     for strand in strands:
-        goal = _canonical_goal_from_context(
-            str(strand.get("goal") or ""),
+        semantic_goal = _truncate_prompt_text(strand.get("semantic_goal") or strand.get("goal") or "", 240)
+        goal_taxonomy = _canonical_goal_from_context(
+            str(strand.get("goal_taxonomy") or strand.get("goal") or ""),
             root_query_text=root_query_text,
             probe_query_text=str(strand.get("landing_hint") or root_query_text),
             expected_guide_area=str(strand.get("expected_guide_area") or ""),
         )
-        if not goal:
+        if not goal_taxonomy:
             continue
+        goal = semantic_goal or goal_taxonomy
         priority = round(max(0.0, min(1.0, float(strand.get("priority") or 0.0))), 4)
+        bound_named_targets = _merge_server_bound_named_targets(
+            root_bound_named_targets,
+            strand.get("server_bound_named_targets"),
+            strand.get("required_named_concept_spans"),
+        )
         specs.append(
             {
                 "strand_id": str(strand.get("strand_id") or "").strip() or None,
+                "mission_id": str(strand.get("mission_id") or strand.get("strand_id") or "").strip() or None,
+                "root_query_text": str(root_query_text or "").strip(),
                 "query_text": str(strand.get("landing_hint") or root_query_text).strip() or root_query_text.strip(),
                 "goal": goal,
+                "semantic_goal": goal,
+                "goal_taxonomy": goal_taxonomy,
+                "why_required": str(strand.get("why_required") or "").strip() or None,
+                "required_entities": _merge_required_entities_with_bound_targets(
+                    strand.get("required_entities"),
+                    bound_named_targets,
+                ),
+                "server_bound_named_targets": bound_named_targets,
+                "required_named_concept_spans": bound_named_targets,
+                "expected_evidence": list(strand.get("expected_evidence") or []),
+                "success_criteria": list(strand.get("success_criteria") or []),
+                "mission_metadata": dict(strand.get("mission_metadata") or {}),
                 "answer_hypothesis": str(strand.get("answer_hypothesis") or "").strip() or inverse_query_hint(root_query_text),
                 "weight": round(priority / total_priority, 6),
                 "landing_basis": "answer_strand_bootstrap",
@@ -1929,7 +2177,7 @@ def _answer_strands_to_probe_specs(answer_strands: list[dict[str, Any]], *, root
                 "radial_expectation": str(strand.get("radial_expectation") or "mid").strip() or "mid",
                 "inverse_rationale": str(strand.get("inverse_rationale") or "").strip() or None,
                 "priority": priority,
-                "expected_answer_field": str(strand.get("answer_field") or "").strip() or _expected_answer_field_for_goal(goal),
+                "expected_answer_field": str(strand.get("answer_field") or "").strip() or _expected_answer_field_for_goal(goal_taxonomy),
                 "destination_queue": [dict(item) for item in list(strand.get("destination_queue") or []) if isinstance(item, dict)],
                 "search_radius": _default_search_radius(
                     str(strand.get("radial_expectation") or "mid"),
@@ -1986,15 +2234,19 @@ def _planner_seed_plan_from_payload(
     if not payload:
         return None
     seed_max_probe_count = _planner_seed_max_items(query.query_text, query.max_probe_count, query.max_total_branches)
+    raw_ai_strands = [
+        dict(item)
+        for item in list(payload.get("answer_strands") or [])
+        if isinstance(item, dict)
+    ]
     ai_answer_strands = _normalize_answer_strands(
-        list(payload.get("answer_strands") or []),
+        raw_ai_strands,
         query_text=query.query_text,
-        max_probe_count=seed_max_probe_count,
+        max_probe_count=max(1, len(raw_ai_strands)),
         planner_family="ai",
     )
-    ai_answer_strands = _select_answer_strands_for_query(
+    ai_answer_strands = _preserve_authoritative_ai_missions(
         ai_answer_strands,
-        query_text=query.query_text,
         max_probe_count=seed_max_probe_count,
     )
     if not ai_answer_strands:
@@ -2004,10 +2256,11 @@ def _planner_seed_plan_from_payload(
         return None
     return {
         "probes": probes[: int(query.max_total_branches)],
+        "answer_strands": ai_answer_strands,
         "stop_policy": {"stop_when_confidence_ge": 0.78},
         "planner_source": planner_source,
         "seed_summary": str(payload.get("seed_summary") or "").strip() or None,
-        "seed_query_class": str(payload.get("seed_query_class") or "").strip() or _query_class(query.query_text),
+        "seed_query_class": "ai_authored",
         "seed_recovered_from_timeout": bool(recovered_from_timeout),
     }
 
@@ -2023,35 +2276,29 @@ def _run_fast_planner_seed_request(
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not llm_enabled():
         return None, "llm_disabled"
-    seed_query_class = _query_class(query.query_text)
-    max_items = _planner_seed_max_items(query.query_text, query.max_probe_count, query.max_total_branches)
+    # Concurrency is a resource boundary, not a semantic classifier.  The
+    # provider receives the untouched goal and may emit more missions than can
+    # execute at once; the controller schedules them later.
+    execution_worker_limit = max(1, min(int(query.max_probe_count), int(query.max_total_branches)))
     identity_hints = _planner_seed_identity_context(identity_source)
-    slot_guidance = _planner_seed_slot_guidance(query.query_text, max_items=max_items)
     identity_hints_json = _truncate_prompt_text(json.dumps(identity_hints, ensure_ascii=False), 420)
     metamemory_block = _minimal_retrieval_seed_taxonomy() if minimal else _compact_retrieval_seed_metamemory()
-    allowed_goals = ["name", "birthplace", "residence", "role", "projects", "family", "father", "partner", "mentor", "sibling", "style", "values", "history", "documents"]
-    allowed_answer_fields = [
-        "identity",
-        "identity_and_place",
-        "role_and_projects",
-        "relationships",
-        "communication_style",
-        "values",
-        "history",
-        "document_sources",
-    ]
     strand_properties = {
-        "answer_field": {"type": "string", "enum": allowed_answer_fields},
+        "answer_field": {"type": "string"},
         "answer_hypothesis": {"type": "string"},
-        "goal": {"type": "string", "enum": allowed_goals},
+        "goal": {"type": "string"},
         "landing_hint": {"type": "string"},
         "priority": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "mission_id": {"type": ["string", "null"]},
+        "why_required": {"type": ["string", "null"]},
+        "required_entities": {"type": "array", "items": {"type": "string"}},
+        "expected_evidence": {"type": "array", "items": {"type": "string"}},
+        "success_criteria": {"type": "array", "items": {"type": "string"}},
     }
     strand_required = ["answer_field", "answer_hypothesis", "goal", "landing_hint", "priority"]
     if not minimal:
         strand_properties["destination_queue"] = {
             "type": "array",
-            "maxItems": 3,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -2074,7 +2321,6 @@ def _run_fast_planner_seed_request(
         "properties": {
             "answer_strands": {
                 "type": "array",
-                "maxItems": max_items,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -2089,37 +2335,97 @@ def _run_fast_planner_seed_request(
     system_prompt = (
         "AGVM fast planner seed.\n"
         f"{metamemory_block}\n\n"
-        f"{slot_guidance}\n\n"
-        "Return bounded JSON only. One strand = one answer field. "
+        "Return JSON only. One strand is one free-form semantic mission required to answer the query. "
+        "Return the complete required mission ledger even when it exceeds the concurrent worker budget. "
+        "Worker capacity limits execution only; it never truncates the semantic mission ledger. "
+        "Every mission must be necessary for the exact question: exclude adjacent analysis, comparisons, examples, recommendations, or future work that the user did not request. "
+        "If removing a mission would still leave the exact question fully answerable, do not emit that mission. "
+        "Preserve named entities, requested relationships, expected evidence, and explicit success criteria. "
+        "Expected evidence and success criteria must prove only the exact user-requested claim; they must never broaden it into a more demanding audit. "
+        "Do not require business registration, industry classification, corporate structure, exhaustive completeness, external certification, or multi-source corroboration unless the user explicitly asks for it. "
+        "Retrieval mode changes search depth and evidence volume, never the meaning of the question or its success threshold. "
+        "For a basic identity request, direct evidence that defines the subject and what it does is sufficient. For a services request, direct service or capability descriptions are sufficient. "
+        "The goal and answer_field are open semantic labels; do not collapse the user's request into a generic taxonomy. "
         "Short strings. No answer prose, geometry, hops, or broad narrative."
     )
     user_prompt = (
         f"Query: {query.query_text}\n"
-        f"Class: {seed_query_class}; max strands: {max_items}; required: {', '.join(_required_slots_for_query(query.query_text))}.\n"
+        f"Concurrent worker budget: {execution_worker_limit}. This is a scheduling limit only and must not alter or truncate the semantic mission ledger.\n"
         f"Identity hints: {identity_hints_json}\n"
-        "Goals: name,birthplace,residence,role,projects,family,father,partner,mentor,sibling,style,values,history,documents.\n"
-        "Fields: identity,identity_and_place,role_and_projects,relationships,communication_style,values,history,document_sources."
+        "Create the smallest complete set of distinct semantic missions. A focused single-intent question should normally remain one mission unless independently evidenced claims are logically required. Do not omit a required mission because it cannot execute concurrently. "
+        "Before returning, verify that every expected_evidence and success_criteria item is strictly entailed by the scope of the exact query, and remove any stronger requirement. "
+        "Use taxonomy-like labels only as optional answer_field metadata."
     )
     requested_timeout = timeout_override if timeout_override is not None else _planner_seed_timeout_seconds(retrieval_mode, query.query_text)
     request = {
-        "model": retrieval_model(),
+        "model": planner_model(),
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
         "schema_name": "agvm_fast_planner_seed",
         "schema": schema,
         "timeout": requested_timeout + _planner_seed_transport_guard_seconds(),
-        "role": "retrieval",
-        "max_output_tokens": 900 if minimal else 1400,
+        "role": "planner",
+        "max_output_tokens": 4000 if minimal else 6000,
     }
+    repairable_errors = {"invalid_json", "missing_output_text", "llm_empty"}
+
+    def repair_request() -> dict[str, Any] | None:
+        deadline = _SEARCH_AI_DEADLINE.get()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                return None
+        else:
+            remaining = float(request["timeout"])
+        return {
+            **request,
+            "system_prompt": (
+                f"{system_prompt}\n\n"
+                "The previous provider output did not conform to the required JSON format. "
+                "Repeat the original task and return only one corrected response that conforms "
+                "to the exact same schema."
+            ),
+            "timeout": max(0.1, min(float(request["timeout"]), remaining)),
+        }
+
     if execution_metadata is not None:
-        return structured_json(
+        payload, error = structured_json(
             **request,
             execution_metadata=execution_metadata,
         )
-    return _run_attested_search_ai_json(
-        call_name="planner_seed_refinement",
-        **request,
-    ), None
+        normalized_error = str(error or ("llm_empty" if not payload else "")).strip().lower()
+        if normalized_error not in repairable_errors:
+            return payload, error
+        retry_request = repair_request()
+        if retry_request is None:
+            execution_metadata.clear()
+            return None, error or "llm_empty"
+        repair_metadata: dict[str, Any] = {}
+        repaired_payload, repair_error = structured_json(
+            **retry_request,
+            execution_metadata=repair_metadata,
+        )
+        if repair_error or not repaired_payload:
+            execution_metadata.clear()
+            return None, repair_error or "llm_empty"
+        execution_metadata.clear()
+        execution_metadata.update(repair_metadata)
+        return repaired_payload, None
+    try:
+        return _run_attested_search_ai_json(
+            call_name="planner_seed_refinement",
+            **request,
+        ), None
+    except SearchAiExecutionError as exc:
+        if str(exc.provider_error or "").strip().lower() not in repairable_errors:
+            raise
+        retry_request = repair_request()
+        if retry_request is None:
+            raise
+        return _run_attested_search_ai_json(
+            call_name="planner_seed_refinement",
+            **retry_request,
+        ), None
 
 
 def llm_fast_planner_seed(
@@ -2137,6 +2443,592 @@ def llm_fast_planner_seed(
 
 
 SEARCH_AI_ADMISSION_SCHEMA_VERSION = "agvm.search_ai_admission.v2"
+SEARCH_MISSION_PLAN_V2_SCHEMA_VERSION = "agvm.search_mission_plan.v2"
+SEARCH_SEMANTIC_AUTHORITY_V2 = "ai_attested_mission_plan_v2"
+
+
+def _search_semantic_authority_v2_enabled() -> bool:
+    """MissionPlanV2 is the only semantic authority for new Search runs.
+
+    The environment flag was useful while the additive contract was being
+    introduced, but leaving semantic behaviour dependent on process startup
+    made otherwise identical bundles execute different search products.  V2 is
+    now unconditional; persisted records still have to carry the independently
+    attested V2 markers before they are trusted by `_record_uses...` or
+    `_persisted_runtime_semantic_authority`.
+    """
+
+    return True
+
+
+def _search_plan_first_v3_enabled() -> bool:
+    """Use the bounded AI-authored corridor executor for every new V2 run.
+
+    As with semantic authority V2, the rollout flag is no longer allowed to
+    change the product contract at process start. Persisted legacy records
+    remain readable through their own recorded authority markers.
+    """
+
+    return True
+
+
+def _branch_round_worker_count(
+    active_spec_count: int,
+    max_total_branches: int,
+) -> int:
+    """Return the worker count used by the shared branch ThreadPool."""
+
+    return min(max(0, int(active_spec_count)), max(1, int(max_total_branches)))
+
+
+def _record_uses_semantic_authority_v2(record: Mapping[str, Any] | None) -> bool:
+    payload = dict(record or {})
+    return bool(
+        _search_semantic_authority_v2_enabled()
+        and payload.get("semantic_authority_v2") is True
+        and str(payload.get("semantic_authority") or "").strip() == SEARCH_SEMANTIC_AUTHORITY_V2
+    )
+
+
+def _server_bound_named_target_spans(
+    query_text: str,
+    *,
+    candidates: Sequence[Any] | None = None,
+    limit: int = 16,
+) -> list[dict[str, Any]]:
+    text = str(query_text or "")
+    if not text:
+        return []
+    connector_tokens = {
+        "a",
+        "al",
+        "alla",
+        "alle",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "da",
+        "de",
+        "del",
+        "della",
+        "delle",
+        "di",
+        "do",
+        "e",
+        "ed",
+        "for",
+        "from",
+        "in",
+        "into",
+        "of",
+        "on",
+        "or",
+        "per",
+        "the",
+        "to",
+        "with",
+    }
+    question_prefix_tokens = {
+        "are",
+        "can",
+        "che",
+        "come",
+        "cosa",
+        "could",
+        "describe",
+        "did",
+        "do",
+        "does",
+        "dove",
+        "explain",
+        "how",
+        "is",
+        "perche",
+        "please",
+        "qual",
+        "quale",
+        "should",
+        "tell",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "would",
+    }
+
+    def folded_token(token: str) -> str:
+        return _fold_text(str(token or "").replace("\u2019", "'")).strip("'\".,:;!?()[]{}")
+
+    def strong_named_token(token: str) -> bool:
+        raw = str(token or "").strip("'\".,:;!?()[]{}")
+        folded = folded_token(raw)
+        if not raw or folded in connector_tokens or folded in question_prefix_tokens:
+            return False
+        raw = re.sub(r"(?:['\u2019]s)$", "", raw, flags=re.IGNORECASE)
+        letters = [ch for ch in raw if ch.isalpha()]
+        if not letters:
+            return any(ch.isdigit() for ch in raw) and any(ch.isupper() for ch in raw)
+        return letters[0].isupper() or (len(letters) > 1 and all(ch.isupper() for ch in letters))
+
+    token_matches = list(re.finditer(r"[^\W_][\w'\u2019.-]*", text, flags=re.UNICODE))
+    raw_candidates = (
+        [str(item).strip() for item in list(candidates or []) if str(item).strip()]
+        if candidates is not None
+        else _query_named_targets(text)
+    )
+    candidate_spans: list[tuple[int, int]] = []
+    for needle in raw_candidates:
+        if not str(needle or "").strip():
+            continue
+        for match in re.finditer(re.escape(str(needle).strip()), text, flags=re.IGNORECASE):
+            candidate_spans.append((int(match.start()), int(match.end())))
+
+    for start_index, start_match in enumerate(token_matches):
+        if not strong_named_token(start_match.group(0)):
+            continue
+        end_index = start_index
+        strong_count = 1
+        index = start_index + 1
+        while index < len(token_matches):
+            token = token_matches[index].group(0)
+            folded = folded_token(token)
+            if strong_named_token(token):
+                end_index = index
+                strong_count += 1
+                index += 1
+                continue
+            if (
+                folded in connector_tokens
+                and index + 1 < len(token_matches)
+                and strong_named_token(token_matches[index + 1].group(0))
+            ):
+                end_index = index + 1
+                strong_count += 1
+                index += 2
+                continue
+            break
+        if strong_count < 2 or end_index <= start_index:
+            continue
+        candidate_spans.append((int(start_match.start()), int(token_matches[end_index].end())))
+        if re.search(r"(?:['\u2019]s)$", start_match.group(0), flags=re.IGNORECASE):
+            suffix_start = start_index + 1
+            while suffix_start <= end_index and not strong_named_token(token_matches[suffix_start].group(0)):
+                suffix_start += 1
+            suffix_strong_count = sum(
+                1
+                for item in token_matches[suffix_start : end_index + 1]
+                if strong_named_token(item.group(0))
+            )
+            if suffix_start <= end_index and suffix_strong_count >= 2:
+                candidate_spans.append((int(token_matches[suffix_start].start()), int(token_matches[end_index].end())))
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for start, end in sorted(candidate_spans, key=lambda span: (span[0], -(span[1] - span[0]))):
+        exact = text[start:end].strip()
+        if not exact:
+            continue
+        offset = text[start:end].find(exact)
+        if offset > 0:
+            start += offset
+            end = start + len(exact)
+        if folded_token(exact) in question_prefix_tokens:
+            continue
+        key = (_fold_text(exact), int(start), int(end))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "schema_version": "agvm.server_bound_named_concept_span.v1",
+                "text": exact,
+                "start": int(start),
+                "end": int(end),
+                "source": "root_query_exact_span",
+                "authority": "server_exact_span",
+            }
+        )
+        if len(rows) >= max(1, int(limit)):
+            return rows
+    return rows
+
+
+def _bound_named_target_rows(value: Any, *, limit: int = 16) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for item in list(value or []):
+        if not isinstance(item, Mapping):
+            continue
+        text = str(item.get("text") or item.get("value") or item.get("target") or "").strip()
+        try:
+            start = int(item.get("start") if item.get("start") is not None else item.get("span_start"))
+            end = int(item.get("end") if item.get("end") is not None else item.get("span_end"))
+        except (TypeError, ValueError):
+            continue
+        if not text or end <= start:
+            continue
+        key = (_fold_text(text), start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "schema_version": "agvm.server_bound_named_concept_span.v1",
+                "text": text,
+                "start": start,
+                "end": end,
+                "source": str(item.get("source") or "root_query_exact_span").strip(),
+                "authority": "server_exact_span",
+            }
+        )
+        if len(rows) >= max(1, int(limit)):
+            break
+    return rows
+
+
+def _merge_server_bound_named_targets(*values: Any, limit: int = 16) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for value in values:
+        for row in _bound_named_target_rows(value, limit=limit):
+            key = (_fold_text(row.get("text") or ""), int(row["start"]), int(row["end"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+            if len(rows) >= max(1, int(limit)):
+                return rows
+    return rows
+
+
+def _merge_required_entities_with_bound_targets(
+    required_entities: Any,
+    bound_targets: Any,
+    *,
+    limit: int = 16,
+) -> list[str]:
+    rows: list[str] = []
+    seen: set[str] = set()
+    for value in list(required_entities or []):
+        text = str(value or "").strip()
+        folded = _fold_text(text)
+        if text and folded and folded not in seen:
+            seen.add(folded)
+            rows.append(text)
+    for target in _bound_named_target_rows(bound_targets, limit=limit):
+        text = str(target.get("text") or "").strip()
+        folded = _fold_text(text)
+        if text and folded and folded not in seen:
+            seen.add(folded)
+            rows.append(text)
+        if len(rows) >= max(1, int(limit)):
+            break
+    return rows[: max(1, int(limit))]
+
+
+def _semantic_named_target_texts(
+    *,
+    query_text: str,
+    semantic_contract: Mapping[str, Any] | None = None,
+    bound_named_targets: Any = None,
+    limit: int = 16,
+) -> list[str]:
+    contract = dict(semantic_contract or {})
+    mission_plan = dict(contract.get("mission_plan_v2") or {})
+    values: list[Any] = [
+        bound_named_targets,
+        contract.get("server_bound_named_targets"),
+        contract.get("required_named_concept_spans"),
+        mission_plan.get("server_bound_named_targets"),
+    ]
+    for mission in list(mission_plan.get("missions") or []):
+        if not isinstance(mission, Mapping):
+            continue
+        values.extend(
+            [
+                mission.get("server_bound_named_targets"),
+                mission.get("required_named_concept_spans"),
+            ]
+        )
+    rows = _merge_server_bound_named_targets(
+        *values,
+        _server_bound_named_target_spans(query_text, limit=limit),
+        limit=limit,
+    )
+    texts: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        text = str(row.get("text") or "").strip()
+        folded = _fold_text(text)
+        if not text or not folded or folded in seen:
+            continue
+        seen.add(folded)
+        texts.append(text)
+    return texts[: max(1, int(limit))]
+
+
+def _identity_hint_candidate_texts(identity_hints: Mapping[str, Any] | None) -> list[str]:
+    hints = dict(identity_hints or {})
+    values: list[Any] = [
+        hints.get("core_name"),
+        hints.get("display_name"),
+        hints.get("name"),
+        hints.get("subject_name"),
+        *list(hints.get("self_name_candidates") or []),
+        *list(hints.get("aliases") or []),
+    ]
+    texts: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if isinstance(value, Mapping):
+            value = next(
+                (
+                    value.get(key)
+                    for key in ("name", "label", "value", "text", "alias")
+                    if value.get(key)
+                ),
+                "",
+            )
+        text = " ".join(str(value or "").split()).strip()
+        folded = _fold_text(text)
+        if not text or not folded or folded in seen:
+            continue
+        seen.add(folded)
+        texts.append(text)
+    return texts[:16]
+
+
+def _folded_texts_overlap(left: str, right: str) -> bool:
+    left_folded = _fold_text(left)
+    right_folded = _fold_text(right)
+    if not left_folded or not right_folded:
+        return False
+    if left_folded == right_folded:
+        return True
+    return bool(
+        re.search(rf"\b{re.escape(left_folded)}\b", right_folded)
+        or re.search(rf"\b{re.escape(right_folded)}\b", left_folded)
+    )
+
+
+def _identity_hints_match_named_targets(
+    identity_hints: Mapping[str, Any] | None,
+    named_targets: Sequence[str],
+) -> bool:
+    identity_candidates = _identity_hint_candidate_texts(identity_hints)
+    if not identity_candidates or not named_targets:
+        return False
+    return any(
+        _folded_texts_overlap(identity_candidate, named_target)
+        for identity_candidate in identity_candidates
+        for named_target in named_targets
+    )
+
+
+def _identity_hint_value_matches_named_targets(value: Any, named_targets: Sequence[str]) -> bool:
+    values: list[Any]
+    if isinstance(value, Mapping):
+        values = [
+            value.get(key)
+            for key in (
+                "name",
+                "label",
+                "value",
+                "text",
+                "alias",
+                "summary",
+                "title",
+                "source_title",
+            )
+        ]
+    else:
+        values = [value]
+    return any(
+        _folded_texts_overlap(str(candidate or ""), named_target)
+        for candidate in values
+        for named_target in named_targets
+    )
+
+
+def _filter_identity_hint_values_by_named_targets(
+    values: Any,
+    named_targets: Sequence[str],
+) -> list[Any]:
+    filtered: list[Any] = []
+    seen: set[str] = set()
+    for value in list(values or []):
+        if not _identity_hint_value_matches_named_targets(value, named_targets):
+            continue
+        fingerprint = _fold_text(
+            json.dumps(value, sort_keys=True, ensure_ascii=False)
+            if isinstance(value, Mapping)
+            else str(value)
+        )
+        if fingerprint and fingerprint in seen:
+            continue
+        if fingerprint:
+            seen.add(fingerprint)
+        filtered.append(value)
+    return filtered
+
+
+def _semantic_identity_hints_for_named_targets(
+    *,
+    query_text: str,
+    identity_hints: Mapping[str, Any] | None,
+    semantic_authority_v2: bool,
+    semantic_contract: Mapping[str, Any] | None = None,
+    bound_named_targets: Any = None,
+) -> dict[str, Any]:
+    sanitized = sanitize_identity_hints(identity_hints)
+    if not semantic_authority_v2 or not sanitized:
+        return sanitized
+    named_targets = _semantic_named_target_texts(
+        query_text=query_text,
+        semantic_contract=semantic_contract,
+        bound_named_targets=bound_named_targets,
+    )
+    if not named_targets:
+        return sanitized
+    filtered = dict(sanitized)
+    for key in ("core_name", "display_name", "name", "subject_name"):
+        value = filtered.get(key)
+        if value is None:
+            filtered.pop(key, None)
+            continue
+        if not _identity_hint_value_matches_named_targets(value, named_targets):
+            filtered.pop(key, None)
+    for key in (
+        "self_name_candidates",
+        "aliases",
+        "partner_candidates",
+        "mentor_candidates",
+        "sibling_candidates",
+        "role_candidates",
+        "project_candidates",
+        "employer_candidates",
+    ):
+        values = _filter_identity_hint_values_by_named_targets(filtered.get(key), named_targets)
+        if values:
+            filtered[key] = values
+        else:
+            filtered.pop(key, None)
+    core_nodes = _filter_identity_hint_values_by_named_targets(filtered.get("core_nodes"), named_targets)
+    if core_nodes:
+        filtered["core_nodes"] = core_nodes
+    else:
+        filtered.pop("core_nodes", None)
+    return filtered
+
+
+def search_identity_nucleus_for_named_targets(
+    query_text: str,
+    identity_nucleus: Mapping[str, Any] | None,
+    *,
+    semantic_authority_v2: bool | None = None,
+) -> dict[str, Any]:
+    nucleus = dict(identity_nucleus or {})
+    v2_authority = (
+        _search_semantic_authority_v2_enabled()
+        if semantic_authority_v2 is None
+        else bool(semantic_authority_v2)
+    )
+    if not v2_authority or not nucleus:
+        return nucleus
+    named_targets = _semantic_named_target_texts(
+        query_text=query_text,
+        semantic_contract=None,
+        bound_named_targets=_server_bound_named_target_spans(query_text),
+    )
+    if not named_targets:
+        return nucleus
+    filtered = dict(nucleus)
+    for key in ("core_name", "display_name", "name", "subject_name"):
+        if key in filtered and not _identity_hint_value_matches_named_targets(
+            filtered.get(key),
+            named_targets,
+        ):
+            filtered.pop(key, None)
+    for key in (
+        "self_name_candidates",
+        "aliases",
+        "partner_candidates",
+        "mentor_candidates",
+        "sibling_candidates",
+        "role_candidates",
+        "project_candidates",
+        "employer_candidates",
+    ):
+        if key in filtered:
+            values = _filter_identity_hint_values_by_named_targets(filtered.get(key), named_targets)
+            if values:
+                filtered[key] = values
+            else:
+                filtered.pop(key, None)
+    if "core_nodes" in filtered:
+        core_nodes = _filter_identity_hint_values_by_named_targets(filtered.get("core_nodes"), named_targets)
+        if core_nodes:
+            filtered["core_nodes"] = core_nodes
+        else:
+            filtered.pop("core_nodes", None)
+    return filtered
+
+
+def _v2_bound_recall_terms(*records: Any, query_text: str = "", limit: int = 16) -> list[str]:
+    bound_targets = _merge_server_bound_named_targets(
+        *[
+            dict(record or {}).get("server_bound_named_targets")
+            for record in records
+            if isinstance(record, Mapping)
+        ],
+        _server_bound_named_target_spans(query_text, limit=limit),
+        limit=limit,
+    )
+    return _merge_required_entities_with_bound_targets([], bound_targets, limit=limit)
+
+
+def _persisted_runtime_semantic_authority(runtime_plan: Mapping[str, Any] | None) -> str:
+    plan = dict(runtime_plan or {})
+    semantic_contract = dict(plan.get("semantic_contract") or {})
+    admission = dict(plan.get("search_ai_admission") or {})
+    attestation = dict(plan.get("ai_execution_attestation") or {})
+    planner_runtime = dict(plan.get("planner_runtime") or {})
+    attested_v2 = bool(
+        plan.get("semantic_authority_v2") is True
+        and str(plan.get("semantic_authority") or "").strip() == SEARCH_SEMANTIC_AUTHORITY_V2
+        and semantic_contract.get("semantic_authority_v2") is True
+        and str(semantic_contract.get("semantic_authority") or "").strip() == SEARCH_SEMANTIC_AUTHORITY_V2
+        and admission.get("status") == "admitted"
+        and admission.get("reason") == "provider_plan_attested"
+        and attestation.get("provider_executed") is True
+        and planner_runtime.get("ai_execution_attested") is True
+    )
+    return "ai_v2" if attested_v2 else "legacy"
+
+
+def _answer_surface_allowed_for_semantic_authority(
+    answer: Mapping[str, Any] | None,
+    semantic_authority: str,
+) -> bool:
+    """Keep deterministic answer drafts out of an AI-authoritative Search."""
+
+    if str(semantic_authority or "").strip().lower() != "ai_v2":
+        return True
+    payload = dict(answer or {})
+    authority = dict(payload.get("semantic_authority") or {})
+    return bool(
+        str(payload.get("mode") or "").strip().lower() == "llm"
+        and str(authority.get("mode") or "").strip().lower() == "ai_v2"
+        and authority.get("fallback_used") is False
+        and str(authority.get("attested_call_name") or "")
+        in {"grounded_answer", "master_judge"}
+        and bool(str(authority.get("request_sha256") or "").strip())
+        and bool(str(authority.get("output_sha256") or "").strip())
+    )
 
 _NON_AI_PROVIDER_NAMES = {
     "deterministic",
@@ -2150,6 +3042,105 @@ _SEARCH_AI_CALL_LEDGER: ContextVar[list[dict[str, Any]] | None] = ContextVar(
     "agvm_search_ai_call_ledger",
     default=None,
 )
+_SEARCH_AI_DEADLINE: ContextVar[float | None] = ContextVar("agvm_search_ai_deadline", default=None)
+
+
+def _attest_grounded_answer_surface(
+    answer: Mapping[str, Any] | None,
+    call_ledger: list[dict[str, Any]] | None,
+    *,
+    provider_answerability_state: str | None = None,
+    provider_insufficient: bool | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(answer, Mapping):
+        return None
+    payload = dict(answer)
+    if str(payload.get("mode") or "").strip().lower() != "llm":
+        payload.pop("semantic_authority", None)
+        return payload
+    existing = dict(payload.get("semantic_authority") or {})
+    existing_call_name = str(existing.get("attested_call_name") or "").strip()
+    if existing_call_name == "master_judge":
+        row = next(
+            (
+                item
+                for item in reversed(list(call_ledger or []))
+                if str(item.get("call_name") or "") == "master_judge"
+            ),
+            None,
+        )
+        try:
+            attestation = validate_ai_execution_attestation(
+                dict((row or {}).get("ai_execution_attestation") or {})
+            )
+        except AiModuleContractError:
+            attestation = {}
+        provider = str(attestation.get("provider") or "").strip().lower()
+        if (
+            attestation
+            and provider not in _NON_AI_PROVIDER_NAMES
+            and str(existing.get("mode") or "").strip().lower() == "ai_v2"
+            and existing.get("fallback_used") is False
+            and str(existing.get("request_sha256") or "") == str(attestation.get("request_sha256") or "")
+            and str(existing.get("output_sha256") or "") == str(attestation.get("output_sha256") or "")
+        ):
+            payload["semantic_authority"] = {
+                **existing,
+                "mode": "ai_v2",
+                "revision": str(existing.get("revision") or "ai_v2_s1"),
+                "fallback_used": False,
+                "attested_call_name": "master_judge",
+                "provider": provider,
+                "model": str(attestation.get("model") or "") or existing.get("model"),
+                "response_id": str(attestation.get("response_id") or "") or existing.get("response_id"),
+                "request_sha256": str(attestation.get("request_sha256") or ""),
+                "output_sha256": str(attestation.get("output_sha256") or ""),
+                "provider_answerability_state": str(
+                    provider_answerability_state
+                    or existing.get("provider_answerability_state")
+                    or payload.get("answerability_state")
+                    or ""
+                ) or None,
+                "provider_insufficient": (
+                    provider_insufficient
+                    if provider_insufficient is not None
+                    else existing.get("provider_insufficient", bool(payload.get("insufficient")))
+                ),
+            }
+            return payload
+    row = next(
+        (item for item in reversed(list(call_ledger or [])) if str(item.get("call_name") or "") == "grounded_answer"),
+        None,
+    )
+    try:
+        attestation = validate_ai_execution_attestation(dict((row or {}).get("ai_execution_attestation") or {}))
+    except AiModuleContractError:
+        attestation = {}
+    provider = str(attestation.get("provider") or "").strip().lower()
+    if not attestation or provider in _NON_AI_PROVIDER_NAMES:
+        payload.pop("semantic_authority", None)
+        return payload
+    payload["semantic_authority"] = {
+        "mode": "ai_v2",
+        "revision": "ai_v2_s1",
+        "fallback_used": False,
+        "attested_call_name": "grounded_answer",
+        "attested_call_id": str((row or {}).get("call_id") or "") or None,
+        "provider": provider,
+        "model": str(attestation.get("model") or "") or None,
+        "response_id": str(attestation.get("response_id") or "") or None,
+        "request_sha256": str(attestation.get("request_sha256") or ""),
+        "output_sha256": str(attestation.get("output_sha256") or ""),
+        "provider_answerability_state": str(
+            provider_answerability_state or existing.get("provider_answerability_state") or payload.get("answerability_state") or ""
+        ) or None,
+        "provider_insufficient": (
+            provider_insufficient
+            if provider_insufficient is not None
+            else existing.get("provider_insufficient", bool(payload.get("insufficient")))
+        ),
+    }
+    return payload
 
 
 class SearchAiExecutionError(AiModuleContractError):
@@ -2159,15 +3150,169 @@ class SearchAiExecutionError(AiModuleContractError):
         super().__init__(f"search_ai_call_failed::{self.call_name}::{self.provider_error}")
 
 
+def _search_ai_stage_timeout_seconds(stage: str, retrieval_mode: str | None) -> float:
+    return search_ai_stage_timeout_seconds(stage, retrieval_mode)
+
+
+def _runtime_ai_spatial_contract_timeout_seconds(retrieval_mode: str | None) -> float:
+    """Give runtime spatial planning the configured Search navigation budget.
+
+    Spatial materialization runs inside the query worker, after the stream has
+    opened.  Its provider call is therefore a navigation-stage operation, not
+    a first-payload micro-call, and must use the same per-mode/env authority as
+    the rest of Search AI.
+    """
+
+    return _search_ai_stage_timeout_seconds("navigation", retrieval_mode)
+
+
+def _run_provider_aware_ai_queue(
+    items: list[Any],
+    *,
+    worker: Any,
+    mode_capacity: int,
+    search_id: str | None = None,
+    stop_event: threading.Event | None = None,
+    default_result: Any = None,
+) -> list[Any]:
+    """Execute every item while keeping queued work outside the provider semaphore."""
+
+    queued_items = list(items or [])
+    if not queued_items:
+        return []
+    if _search_runtime_stop_reason(search_id=search_id, stop_event=stop_event):
+        _set_search_runtime_stop(stop_event)
+        return [default_result for _item in queued_items]
+    provider_capacity = max(1, int(llm_provider_concurrency_limit()))
+    worker_capacity = max(1, min(len(queued_items), int(mode_capacity), provider_capacity))
+    results: list[Any] = [default_result for _item in queued_items]
+    executor = ThreadPoolExecutor(max_workers=worker_capacity)
+    try:
+        future_by_index: dict[Any, int] = {}
+        for index, item in enumerate(queued_items):
+            if _search_runtime_stop_reason(search_id=search_id, stop_event=stop_event):
+                _set_search_runtime_stop(stop_event)
+                break
+            future_by_index[executor.submit(copy_context().run, worker, item)] = index
+        pending = set(future_by_index)
+        completed_all = False
+        try:
+            while pending:
+                if _search_runtime_stop_reason(search_id=search_id, stop_event=stop_event):
+                    _set_search_runtime_stop(stop_event)
+                    break
+                completed, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                if not completed:
+                    continue
+                for future in completed:
+                    results[future_by_index[future]] = future.result()
+            completed_all = not pending
+        finally:
+            if pending:
+                _set_search_runtime_stop(stop_event)
+                for future in pending:
+                    future.cancel()
+            executor.shutdown(wait=completed_all, cancel_futures=not completed_all)
+    except Exception:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    return results
+
+
+def _select_navigation_specs_for_round(
+    specs: list[tuple[dict[str, Any], dict[str, Any], str]],
+    *,
+    round_capacity: int,
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    """Schedule one provider-sized navigation wave before returning to Master.
+
+    A Search round is a semantic control cycle, not a drain of the whole
+    provider queue. Draining six strands through a two-call provider before
+    consulting Master can consume the complete mode budget and leave no time
+    for the authoritative verdict. Prefer strands that have not yet received
+    an AI navigation turn, keep mission diversity, and let the next Master
+    decision stop, reroute, or schedule the remaining work.
+    """
+
+    capacity = max(1, int(round_capacity))
+    rows = list(specs or [])
+    if len(rows) <= capacity:
+        return rows
+
+    def mission_key(spec: tuple[dict[str, Any], dict[str, Any], str]) -> str:
+        branch, probe, _kind = spec
+        return str(
+            branch.get("mission_id")
+            or branch.get("path_mission_id")
+            or branch.get("strand_id")
+            or probe.get("mission_id")
+            or probe.get("path_mission_id")
+            or probe.get("strand_id")
+            or branch.get("branch_id")
+            or probe.get("probe_id")
+            or ""
+        ).strip()
+
+    ordered = sorted(
+        enumerate(rows),
+        key=lambda item: (
+            0 if list(item[1][0].get("pending_master_actions") or []) else 1,
+            int(item[1][0].get("ai_navigation_round_count") or 0),
+            -float(item[1][0].get("branch_priority") or item[1][1].get("weight") or 0.0),
+            item[0],
+        ),
+    )
+    selected: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    selected_keys: set[str] = set()
+    for _index, spec in ordered:
+        key = mission_key(spec)
+        if key and key in selected_keys:
+            continue
+        selected.append(spec)
+        if key:
+            selected_keys.add(key)
+        if len(selected) >= capacity:
+            break
+    if len(selected) < capacity:
+        selected_ids = {id(spec[0]) for spec in selected}
+        for _index, spec in ordered:
+            if id(spec[0]) in selected_ids:
+                continue
+            selected.append(spec)
+            selected_ids.add(id(spec[0]))
+            if len(selected) >= capacity:
+                break
+    return selected
+
+
 def _run_attested_search_ai_json(
     *,
     call_name: str,
+    execution_record_out: dict[str, Any] | None = None,
     **request: Any,
 ) -> dict[str, Any]:
     """Run one Search AI request and accept it only with its own v2 proof."""
+    stop_reason = _search_runtime_stop_reason(include_stop_event=False, deadline_grace_seconds=0.0)
+    if stop_reason:
+        _set_search_runtime_stop(_SEARCH_RUNTIME_STOP_EVENT.get())
+        raise SearchAiExecutionError(call_name, stop_reason)
     if not llm_enabled():
         raise SearchAiExecutionError(call_name, "llm_disabled")
 
+    deadline = _SEARCH_AI_DEADLINE.get()
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SearchAiExecutionError(call_name, "search_mode_budget_timeout")
+        try:
+            call_timeout = max(0.1, float(request.get("timeout") or remaining))
+        except (TypeError, ValueError):
+            call_timeout = max(0.1, remaining)
+        # The global Search deadline is an outer ceiling. It must not replace a
+        # smaller stage timeout: navigation workers run before route traversal,
+        # so expanding a local timeout to the full mode budget can stall every
+        # branch while one provider request or queue slot is unhealthy.
+        request["timeout"] = max(0.001, min(call_timeout, remaining))
     execution_metadata: dict[str, Any] = {}
     payload, error = structured_json(
         **request,
@@ -2186,15 +3331,17 @@ def _run_attested_search_ai_json(
     if provider in _NON_AI_PROVIDER_NAMES:
         raise SearchAiExecutionError(call_name, "search_ai_provider_invalid")
 
+    execution_record = {
+        "call_id": f"{call_name}:{uuid.uuid4().hex}",
+        "call_name": str(call_name),
+        "ai_execution_attestation": attestation,
+    }
+    if execution_record_out is not None:
+        execution_record_out.clear()
+        execution_record_out.update(copy.deepcopy(execution_record))
     ledger = _SEARCH_AI_CALL_LEDGER.get()
     if ledger is not None:
-        ledger.append(
-            {
-                "call_id": f"{call_name}:{uuid.uuid4().hex}",
-                "call_name": str(call_name),
-                "ai_execution_attestation": attestation,
-            }
-        )
+        ledger.append(execution_record)
     return dict(payload)
 
 
@@ -2206,9 +3353,11 @@ def _attested_search_ai_provider(call_name: str) -> Any:
     binds the same transaction ledger and still obtains fresh execution metadata.
     """
     transaction_ledger = _SEARCH_AI_CALL_LEDGER.get()
+    transaction_deadline = _SEARCH_AI_DEADLINE.get()
 
     def provider(**request: Any) -> tuple[dict[str, Any], None]:
         token = _SEARCH_AI_CALL_LEDGER.set(transaction_ledger)
+        deadline_token = _SEARCH_AI_DEADLINE.set(transaction_deadline)
         try:
             schema_name = str(request.get("schema_name") or "request").strip()
             payload = _run_attested_search_ai_json(
@@ -2217,6 +3366,7 @@ def _attested_search_ai_provider(call_name: str) -> Any:
             )
             return payload, None
         finally:
+            _SEARCH_AI_DEADLINE.reset(deadline_token)
             _SEARCH_AI_CALL_LEDGER.reset(token)
 
     return provider
@@ -2259,21 +3409,89 @@ def _generate_attested_grounded_answer(
     if response_mode == "context":
         return None, context
 
-    evidence_pack = [
-        {
-            "node_id": str(match.get("node_id") or ""),
-            "summary": str(match.get("summary") or "")[:1200],
-            "evidence": str(
-                match.get("evidence_snippet")
-                or dict(match.get("node") or {}).get("raw_text")
-                or dict(match.get("node") or {}).get("summary")
-                or ""
-            )[:2200],
-            "score": float(match.get("score") or match.get("raw_score") or 0.0),
-            "sources": [str(item) for item in list(match.get("sources") or [])[:8]],
-        }
-        for match in matches[:64]
-    ]
+    # The model may cite any ID exposed here.  Equivalent document facts often
+    # exist as several graph nodes with identical source text; exposing all of
+    # those IDs lets the answer cite a duplicate that the public context package
+    # legitimately collapses.  Pick one stable representative per evidence
+    # statement so answer support and the rendered package share the same proof
+    # identity.
+    evidence_pack: list[dict[str, Any]] = []
+    seen_evidence_statements: set[str] = set()
+    for match in matches[:64]:
+        node_id = str(match.get("node_id") or "").strip()
+        node = dict(match.get("node") or {})
+        evidence_text = str(
+            match.get("evidence_snippet")
+            or dict(match.get("node") or {}).get("raw_text")
+            or dict(match.get("node") or {}).get("summary")
+            or ""
+        )[:1800]
+        statement_key = _fold_text(evidence_text or str(match.get("summary") or ""))
+        if not node_id or not statement_key or statement_key in seen_evidence_statements:
+            continue
+        seen_evidence_statements.add(statement_key)
+        evidence_pack.append(
+            {
+                "node_id": node_id,
+                "summary": str(match.get("summary") or "")[:600],
+                "evidence": evidence_text,
+                "score": float(match.get("score") or match.get("raw_score") or 0.0),
+                "sources": [str(item) for item in list(match.get("sources") or [])[:8]],
+                "temporal_context": _evidence_temporal_context(match, node) or None,
+            }
+        )
+    # The evidence pack above is the only detailed proof surface supplied to
+    # the answer model.  ``shared_evidence`` and ``context`` can each contain
+    # the same hydrated text many times (per branch, mission and rendered
+    # section); serializing them verbatim made a successful wide search exceed
+    # the provider context window precisely when it found the most evidence.
+    # Preserve mission intent and evidence identity without duplicating bodies.
+    shared = dict(shared_evidence or {})
+    mission_ledger = dict(shared.get("mission_evidence_ledger") or {})
+    mission_coverage: list[dict[str, Any]] = []
+    for row_value in list(mission_ledger.get("rows") or [])[:24]:
+        if not isinstance(row_value, Mapping):
+            continue
+        row = dict(row_value)
+        evidence_ids = _dedupe_limited(
+            [
+                str(item.get("node_id") or "").strip()
+                for lane in ("hot_evidence", "cold_evidence")
+                for item in list(row.get(lane) or [])
+                if isinstance(item, Mapping)
+                and str(item.get("node_id") or "").strip()
+            ],
+            limit=16,
+        )
+        mission_coverage.append(
+            {
+                "mission_id": str(row.get("mission_id") or "").strip() or None,
+                "goal": str(row.get("goal") or "").strip()[:700] or None,
+                "coverage_state": str(row.get("coverage_state") or "").strip() or None,
+                "coverage_reason": str(row.get("coverage_reason") or "").strip()[:300] or None,
+                "evidence_node_ids": evidence_ids,
+                "document_ref_count": len(list(row.get("document_refs") or [])),
+            }
+        )
+    prompt_shared_evidence = {
+        "covered_goals": [
+            str(item)[:500]
+            for item in list(shared.get("covered_goals") or [])[:24]
+            if str(item).strip()
+        ],
+        "fulfilled_goals": [
+            str(item)[:500]
+            for item in list(shared.get("fulfilled_goals") or [])[:24]
+            if str(item).strip()
+        ],
+        "mission_coverage": mission_coverage,
+        "contradiction_flags": [
+            dict(item)
+            for item in list(shared.get("contradiction_flags") or [])[:12]
+            if isinstance(item, Mapping)
+        ],
+        "confidence": shared.get("confidence"),
+    }
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -2320,32 +3538,36 @@ def _generate_attested_grounded_answer(
         system_prompt=(
             "You are the AGVM grounded answer generator. Answer only from the supplied reviewed evidence. "
             "Never invent facts. If support is insufficient, say so explicitly and mark the answer insufficient. "
-            "Return a human-facing answer plus structured reusable context."
+            "Return a human-facing answer plus structured reusable context. For current or as-of answers, interpret semantic validity, "
+            "explicitly sourced event/observation time, and lifecycle or supersession when supplied. Treat publication time separately as source chronology: "
+            "it can date the source but cannot by itself establish when the claim was true, current, or newer; distinguish historical evolution from contradiction. "
+            "created_at, recorded_at, acquired_at, retrieved_at and ingested_at are audit or source-handling timestamps: they never make the underlying claim newer, current, or more true."
         ),
         user_prompt=json.dumps(
             {
                 "query": query_text,
                 "retrieval_mode": retrieval_mode,
+                "decision_time_utc": utc_timestamp(),
                 "evidence": evidence_pack,
-                "shared_evidence": dict(shared_evidence or {}),
-                "context_seed": context,
+                "shared_evidence": prompt_shared_evidence,
+                "temporal_policy": {
+                    "semantic_validity_event_or_observation_time_and_lifecycle_guide_current_or_as_of": True,
+                    "publication_time_is_source_chronology_not_claim_validity": True,
+                    "created_recorded_acquired_retrieved_and_ingested_are_nonsemantic_audit_time": True,
+                },
             },
             ensure_ascii=False,
             default=str,
         ),
         schema_name="agvm_grounded_answer_attested",
         schema=schema,
-        timeout=20.0,
+        timeout=_search_ai_stage_timeout_seconds("grounded_answer", retrieval_mode),
         role="answer",
     )
     answer_text = str(payload.get("answer_text") or "").strip()
     if not answer_text:
         raise SearchAiExecutionError("grounded_answer", "invalid_json")
-    known_ids = {
-        str(match.get("node_id") or "")
-        for match in matches
-        if str(match.get("node_id") or "")
-    }
+    known_ids = {str(item.get("node_id") or "") for item in evidence_pack if str(item.get("node_id") or "")}
     evidence_node_ids = [
         str(item)
         for item in list(payload.get("evidence_node_ids") or [])
@@ -2359,6 +3581,8 @@ def _generate_attested_grounded_answer(
         shared_evidence=shared_evidence,
         evidence_node_ids=evidence_node_ids,
     )
+    provider_answerability_state = answerability_state
+    provider_insufficient = bool(payload.get("insufficient"))
     answer = _apply_answer_contract(
         query_text,
         {
@@ -2376,6 +3600,12 @@ def _generate_attested_grounded_answer(
             "contradiction_present": bool(support_metadata.get("contradiction_present")),
         },
         matches,
+    )
+    answer = _attest_grounded_answer_surface(
+        answer,
+        _SEARCH_AI_CALL_LEDGER.get(),
+        provider_answerability_state=provider_answerability_state,
+        provider_insufficient=provider_insufficient,
     )
     context = {
         **dict(context or {}),
@@ -2488,6 +3718,75 @@ def _validate_attested_runtime_plan(plan: Mapping[str, Any] | None) -> dict[str,
     return admission
 
 
+def _mission_plan_v2_from_attested_strands(
+    strands: list[dict[str, Any]],
+    *,
+    query_text: str,
+) -> dict[str, Any]:
+    missions: list[dict[str, Any]] = []
+    root_bound_named_targets = _server_bound_named_target_spans(query_text)
+    for index, raw in enumerate(strands, start=1):
+        strand = dict(raw or {})
+        strand_id = str(strand.get("strand_id") or f"strand_ai_{index}").strip()
+        mission_id = str(strand.get("mission_id") or strand_id).strip()
+        semantic_goal = _truncate_prompt_text(
+            strand.get("semantic_goal")
+            or strand.get("goal")
+            or strand.get("answer_hypothesis")
+            or query_text,
+            360,
+        )
+        if not mission_id or not semantic_goal:
+            raise AiModuleContractError("search_ai_mission_plan_material_invalid")
+        bound_named_targets = _merge_server_bound_named_targets(
+            root_bound_named_targets,
+            strand.get("server_bound_named_targets"),
+            strand.get("required_named_concept_spans"),
+        )
+        missions.append(
+            {
+                "mission_id": mission_id,
+                "strand_id": strand_id,
+                "root_query_text": str(query_text or "").strip(),
+                "semantic_goal": semantic_goal,
+                "answer_field": str(strand.get("answer_field") or "knowledge").strip() or "knowledge",
+                "answer_hypothesis": _truncate_prompt_text(strand.get("answer_hypothesis") or "", 520) or None,
+                "why_required": _truncate_prompt_text(
+                    strand.get("why_required") or strand.get("inverse_rationale") or "",
+                    420,
+                )
+                or None,
+                "required_entities": _merge_required_entities_with_bound_targets(
+                    [str(item).strip() for item in list(strand.get("required_entities") or []) if str(item).strip()],
+                    bound_named_targets,
+                    limit=max(1, len(list(strand.get("required_entities") or [])) + len(bound_named_targets)),
+                ),
+                "server_bound_named_targets": bound_named_targets,
+                "required_named_concept_spans": bound_named_targets,
+                "expected_evidence": _dedupe_limited(
+                    [str(item).strip() for item in list(strand.get("expected_evidence") or []) if str(item).strip()],
+                    limit=max(1, len(list(strand.get("expected_evidence") or []))),
+                ),
+                "success_criteria": _dedupe_limited(
+                    [str(item).strip() for item in list(strand.get("success_criteria") or []) if str(item).strip()],
+                    limit=max(1, len(list(strand.get("success_criteria") or []))),
+                ),
+                "priority": round(max(0.0, min(1.0, float(strand.get("priority") or 0.5))), 4),
+                "planner_family": "ai",
+                "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2,
+            }
+        )
+    return {
+        "schema_version": SEARCH_MISSION_PLAN_V2_SCHEMA_VERSION,
+        "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2,
+        "query_text": str(query_text or "").strip(),
+        "server_bound_named_targets": root_bound_named_targets,
+        "root_query_text": str(query_text or "").strip(),
+        "mission_count": len(missions),
+        "missions": missions,
+    }
+
+
 def _semantic_contract_from_attested_admission(
     *,
     query: RetrieveRequest,
@@ -2500,12 +3799,23 @@ def _semantic_contract_from_attested_admission(
         admission.get("answer_strands"),
         material_name="strand",
     )
+    semantic_authority_v2 = _search_semantic_authority_v2_enabled()
+    root_bound_named_targets = _server_bound_named_target_spans(query.query_text)
+    mission_plan_v2 = _mission_plan_v2_from_attested_strands(
+        strands,
+        query_text=query.query_text,
+    )
     expected_evidence: list[dict[str, Any]] = []
     landing_hypotheses: list[dict[str, Any]] = []
     required_sections: list[str] = []
     for index, strand in enumerate(strands, start=1):
         strand_id = str(strand.get("strand_id") or f"strand_ai_{index}")
         answer_field = str(strand.get("answer_field") or strand.get("goal") or "knowledge")
+        bound_named_targets = _merge_server_bound_named_targets(
+            root_bound_named_targets,
+            strand.get("server_bound_named_targets"),
+            strand.get("required_named_concept_spans"),
+        )
         claim_shape = str(
             strand.get("answer_hypothesis")
             or strand.get("landing_hint")
@@ -2527,6 +3837,9 @@ def _semantic_contract_from_attested_admission(
                 "negative_conditions": ["do_not_invent_missing_evidence"],
                 "success_question": f"Does the retrieved evidence support {claim_shape}?",
                 "origin_strand_id": strand_id,
+                "root_query_text": str(query.query_text or "").strip(),
+                "server_bound_named_targets": bound_named_targets,
+                "required_named_concept_spans": bound_named_targets,
             }
         )
         landing_hypotheses.append(
@@ -2536,6 +3849,7 @@ def _semantic_contract_from_attested_admission(
                 "textual_probe": str(strand.get("landing_hint") or claim_shape),
                 "why_traverse": str(strand.get("inverse_rationale") or claim_shape),
                 "origin_strand_id": strand_id,
+                "server_bound_named_targets": bound_named_targets,
             }
         )
         if answer_field not in required_sections:
@@ -2544,22 +3858,35 @@ def _semantic_contract_from_attested_admission(
     attestation = validate_ai_execution_attestation(
         admission.get("ai_execution_attestation")
     )
+    contract_identity_hints = _semantic_identity_hints_for_named_targets(
+        query_text=query.query_text,
+        identity_hints=identity_hints,
+        semantic_authority_v2=semantic_authority_v2,
+        bound_named_targets=root_bound_named_targets,
+    )
     contract = {
         "schema_version": "agvm.semantic_query_contract.v2",
         "contract_version": "2.0",
         "contract_authority": "search_ai_admission_materialization",
+        "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2 if semantic_authority_v2 else "legacy_compatible",
+        "semantic_authority_v2": semantic_authority_v2,
+        "mission_plan_v2": mission_plan_v2,
         "compiler_status": "materialized_from_attested_planner_seed",
         "compiler_error": None,
         "user_query": query.query_text,
+        "root_query_text": str(query.query_text or "").strip(),
+        "server_bound_named_targets": root_bound_named_targets,
+        "required_named_concept_spans": root_bound_named_targets,
         "mcp_tool_name": query.mcp_tool_name,
         "retrieval_mode": retrieval_mode,
-        "legacy_contract": dict(legacy_contract),
-        "identity_hints": sanitize_identity_hints(identity_hints),
+        "legacy_contract": {**dict(legacy_contract), "diagnostic_only": True},
+        "identity_hints": contract_identity_hints,
         "intent": {
-            "primary": str(dict(legacy_contract).get("query_kind") or _query_class(query.query_text)),
+            "primary": "ai_mission_plan",
             "secondary": required_sections[:8],
             "is_followup": bool(query.thread_id),
-            "requires_document_mode": _query_class(query.query_text) == "document_lookup",
+            "requires_document_mode": False,
+            "routing_authority": "ai_only",
         },
         "expected_evidence": expected_evidence,
         "forbidden_evidence": [
@@ -2589,12 +3916,18 @@ def _semantic_contract_from_attested_admission(
         "schema_version": "agvm.semantic_contract_runtime.v2",
         "status": "completed",
         "source": "search_ai_admission_materialization",
+        "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2 if semantic_authority_v2 else "legacy_compatible",
+        "semantic_authority_v2": semantic_authority_v2,
+        "mission_plan_v2_schema_version": SEARCH_MISSION_PLAN_V2_SCHEMA_VERSION,
+        "mission_plan_v2_mission_count": len(list(mission_plan_v2.get("missions") or [])),
         "material": True,
         "ai_required": True,
         "provider_state": "attested_origin",
         "fallback_used": False,
         "provider_call_performed": False,
         "origin_call_name": "planner_seed_admission",
+        "root_query_text": str(query.query_text or "").strip(),
+        "server_bound_named_targets": root_bound_named_targets,
         "origin_attestation_fingerprint": {
             "request_sha256": attestation.get("request_sha256"),
             "output_sha256": attestation.get("output_sha256"),
@@ -2632,15 +3965,27 @@ def build_search_ai_http_block_payload(admission: dict[str, Any]) -> dict[str, A
         code = "blocked_ai_provider_invalid_output"
     else:
         code = "blocked_ai_provider_error"
+    if code == "blocked_ai_provider_unavailable":
+        message = "AI unavailable. Configure or verify the provider before starting Search."
+        user_message = "AI unavailable — configure provider to run Search."
+        next_action = "configure_provider"
+    elif code == "blocked_ai_provider_timeout":
+        message = "AI planner timed out before Search could start."
+        user_message = "Search planner timed out — retry, use a lighter query, or start asynchronous Search."
+        next_action = "retry_or_start_async_search"
+    else:
+        message = "AI planner returned an unusable response before Search could start."
+        user_message = "Search planner could not produce a valid plan — retry the query."
+        next_action = "retry_search"
     error = {
         "schema_version": "agvm.search_ai_http_block.v1",
         "status": "blocked",
         "code": code,
         "reason": code,
         "provider_reason": raw_reason,
-        "message": "AI unavailable. Configure or verify the provider before starting Search.",
-        "user_message": "AI unavailable — configure provider to run Search.",
-        "next_action": "configure_provider",
+        "message": message,
+        "user_message": user_message,
+        "next_action": next_action,
         "configuration_path": "/setup/env",
         "provider_test_path": "/setup/provider/test",
         "search_id": None,
@@ -2653,6 +3998,20 @@ def build_search_ai_http_block_payload(admission: dict[str, Any]) -> dict[str, A
     # Keep FastAPI's historical `detail` shape while also exposing the same
     # contract at top level for UI clients that do not unwrap HTTPException.
     return {**error, "detail": dict(error)}
+
+
+def build_search_ai_execution_http_block_payload(provider_error: str | None) -> dict[str, Any]:
+    """Normalize a provider failure that occurs after Search admission.
+
+    Admission proves that the provider was available at the start of the request;
+    every later AI call can still time out or return unusable output. Those
+    failures share the same public fail-closed contract and must never escape as
+    an unstructured 500 response.
+    """
+
+    return build_search_ai_http_block_payload(
+        {"reason": _search_ai_block_reason(provider_error)}
+    )
 
 
 def require_search_ai_admission(
@@ -2670,15 +4029,66 @@ def require_search_ai_admission(
             "charged_units": 0,
         }
 
-    execution_metadata: dict[str, Any] = {}
     retrieval_mode = str(query.retrieval_mode or _select_retrieval_mode(query)[0])
-    payload, error = _run_fast_planner_seed_request(
-        query,
-        identity_source=identity_source,
-        retrieval_mode=retrieval_mode,
-        minimal=False,
-        execution_metadata=execution_metadata,
+    admission_started_at_ms = int(time.time() * 1000)
+    search_budget_seconds = search_mode_budget_seconds(retrieval_mode)
+    admission_budget_seconds = min(
+        search_budget_seconds,
+        _search_ai_admission_timeout_seconds(retrieval_mode, query.query_text)
+        + _planner_seed_transport_guard_seconds()
+        + 0.5,
     )
+    runtime_deadline_at_ms = min(
+        int(query.deadline_at_ms) if query.deadline_at_ms is not None else 2**63 - 1,
+        admission_started_at_ms + int(search_budget_seconds * 1000),
+    )
+    admission_deadline_at_ms = min(
+        int(query.deadline_at_ms) if query.deadline_at_ms is not None else 2**63 - 1,
+        admission_started_at_ms + int(admission_budget_seconds * 1000),
+    )
+    admission_remaining_seconds = max(
+        0.0,
+        (admission_deadline_at_ms - admission_started_at_ms) / 1000.0,
+    )
+    if admission_remaining_seconds <= 0.05:
+        return {
+            "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
+            "status": "blocked",
+            "reason": "blocked_ai_provider_timeout",
+            "provider_error": "search_mode_budget_timeout",
+            "chargeable": False,
+            "charged_units": 0,
+        }
+
+    execution_metadata: dict[str, Any] = {}
+    admission_deadline_token = _SEARCH_AI_DEADLINE.set(
+        _effective_search_deadline_monotonic(
+            query,
+            now_epoch_ms=admission_started_at_ms,
+            authoritative_deadline_at_ms=admission_deadline_at_ms,
+            inherited_deadline=_SEARCH_AI_DEADLINE.get(),
+        )
+    )
+    try:
+        payload, error = _run_fast_planner_seed_request(
+            query,
+            identity_source=identity_source,
+            retrieval_mode=retrieval_mode,
+            minimal=False,
+            timeout_override=max(
+                0.1,
+                min(
+                    admission_remaining_seconds - _planner_seed_transport_guard_seconds(),
+                    _search_ai_admission_timeout_seconds(
+                        retrieval_mode,
+                        query.query_text,
+                    ),
+                ),
+            ),
+            execution_metadata=execution_metadata,
+        )
+    finally:
+        _SEARCH_AI_DEADLINE.reset(admission_deadline_token)
     if error or not payload:
         return {
             "schema_version": SEARCH_AI_ADMISSION_SCHEMA_VERSION,
@@ -2689,19 +4099,19 @@ def require_search_ai_admission(
             "charged_units": 0,
         }
 
+    raw_answer_strands = [
+        dict(item)
+        for item in list(payload.get("answer_strands") or [])
+        if isinstance(item, dict)
+    ]
     answer_strands = _normalize_answer_strands(
-        list(payload.get("answer_strands") or []),
+        raw_answer_strands,
         query_text=query.query_text,
-        max_probe_count=_planner_seed_max_items(
-            query.query_text,
-            query.max_probe_count,
-            query.max_total_branches,
-        ),
+        max_probe_count=max(1, len(raw_answer_strands)),
         planner_family="ai",
     )
-    answer_strands = _select_answer_strands_for_query(
+    answer_strands = _preserve_authoritative_ai_missions(
         answer_strands,
-        query_text=query.query_text,
         max_probe_count=query.max_total_branches,
     )
     if not answer_strands:
@@ -2733,6 +4143,7 @@ def require_search_ai_admission(
         "provider_error": None,
         "chargeable": True,
         "charged_units": 0,
+        "runtime_deadline_at_ms": runtime_deadline_at_ms,
         "planner_seed_payload": dict(payload),
         "answer_strands": answer_strands,
         "ai_execution_attestation": attestation,
@@ -3155,7 +4566,6 @@ def _temporal_source_event_rank(text: str, node: dict[str, Any] | None = None) -
     if not folded:
         return 0.0
     node_payload = dict(node or {})
-    memory_type = str(node_payload.get("memory_type") or "").strip().lower()
     guide_area = str(
         node_payload.get("guide_area")
         or dict(node_payload.get("provenance") or {}).get("guide_conceptual_area")
@@ -3174,8 +4584,6 @@ def _temporal_source_event_rank(text: str, node: dict[str, Any] | None = None) -
         score += 0.04
     if guide_area in {"history", "media signals", "projects", "documents"}:
         score += 0.08
-    if memory_type in {"episodic", "history", "project", "document_fact", "document_chunk"}:
-        score += 0.07
     if any(marker in folded for marker in _TEMPORAL_LOW_SIGNAL_MARKERS):
         score -= 0.08
     year_count = len(set(re.findall(r"\b(?:19|20)\d{2}\b", folded)))
@@ -3226,13 +4634,12 @@ def _temporal_sweep_match_for_node(query_text: str, node: dict[str, Any]) -> dic
     )
     years = sorted({str(year) for entry in entries for year in list(entry.get("years") or []) if str(year)}, key=lambda value: int(value))
     guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or node.get("guide_area") or "")
-    memory_type = str(node.get("memory_type") or "")
     base_score = 0.86
     if requested_terms:
         base_score += 0.08
-    if guide_area.lower() == "history" or memory_type in {"episodic", "history"}:
+    if guide_area.lower() == "history":
         base_score += 0.05
-    if guide_area.lower() in {"projects", "media signals", "documents"} or memory_type in {"project", "document_anchor", "document_chunk"}:
+    if guide_area.lower() in {"projects", "media signals", "documents"}:
         base_score += 0.03
     temporal_event_rank = _temporal_source_event_rank(str(best_entry.get("text") or raw_text or summary), node)
     score = min(0.995, max(base_score, float(best_entry.get("confidence") or 0.0)) + min(0.08, temporal_event_rank * 0.12))
@@ -3304,9 +4711,8 @@ def _temporal_target_match_for_node(query_text: str, node: dict[str, Any], targe
     if _fold_text(target) not in haystack:
         return None
     guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or node.get("guide_area") or "")
-    memory_type = str(node.get("memory_type") or "")
     score = max(0.93, min(0.975, float(node.get("memory_confidence") or node.get("evidence_confidence") or 0.82) + 0.08))
-    slot = "projects" if guide_area.lower() == "projects" or memory_type == "project" else _goal_to_slot(_goal_for_query_text(target, guide_area))
+    slot = "projects" if guide_area.lower() == "projects" else _goal_to_slot(_goal_for_query_text(target, guide_area))
     return {
         "node_id": node_id,
         "summary": summary,
@@ -3331,7 +4737,6 @@ def _named_target_goal_for_node(
     target_folded = _fold_text(target)
     node_text = _fold_text(f"{node.get('summary') or ''} {node.get('raw_text') or ''}")
     guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or node.get("guide_area") or "")
-    memory_type = str(node.get("memory_type") or "").strip().lower()
     context = dict(identity_context or {})
 
     def folded_values(key: str) -> set[str]:
@@ -3346,8 +4751,7 @@ def _named_target_goal_for_node(
     if target_folded in folded_values("project_candidates") or target_folded in folded_values("employer_candidates"):
         return "projects"
     if (
-        memory_type == "project"
-        or guide_area.lower() == "projects"
+        guide_area.lower() == "projects"
         or any(token in node_text for token in ("project", "progetto", "sto costruendo", "sta costruendo", "guido", "guida", "works on", "building"))
     ):
         return "projects"
@@ -3375,7 +4779,6 @@ def _named_target_match_for_node(
     if not target_folded or target_folded not in haystack:
         return None
     guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or node.get("guide_area") or "")
-    memory_type = str(node.get("memory_type") or "")
     goal = _named_target_goal_for_node(query_text, node, target, identity_context)
     slot = _goal_to_slot(goal)
     confidence = max(
@@ -3384,7 +4787,7 @@ def _named_target_match_for_node(
         float(node.get("identity_resolution_confidence") or 0.0),
         0.72,
     )
-    if goal == "projects" and (memory_type == "project" or guide_area.lower() == "projects"):
+    if goal == "projects" and guide_area.lower() == "projects":
         confidence = max(confidence, 0.9)
     score = max(0.86, min(0.98, confidence + 0.08))
     return {
@@ -3731,14 +5134,29 @@ def _contract_match_priority(query_text: str, match: dict[str, Any]) -> float:
     if "goal_support" in sources and slots & required_slots:
         priority += 0.35
     node = dict(match.get("node") or {})
-    identifier_fit = _identifier_exact_match_score(query_text, _node_retrieval_surface(node))
+    # Expansion lanes can return a fully hydrated top-level match without
+    # repeating the node payload. Contract ranking must still see that text;
+    # otherwise exact mission evidence is sorted behind generic node matches.
+    match_surface = " ".join(
+        str(value or "").strip()
+        for value in (
+            _node_retrieval_surface(node),
+            match.get("summary"),
+            match.get("text"),
+            match.get("raw_text"),
+            match.get("evidence_snippet"),
+            match.get("title"),
+            match.get("source_title"),
+        )
+        if str(value or "").strip()
+    )
+    identifier_fit = _identifier_exact_match_score(query_text, match_surface)
     if identifier_fit:
         priority += 6.0 * identifier_fit
-    memory_type = str(match.get("memory_type") or node.get("memory_type") or "").strip().lower()
-    if "relationships" in slots and memory_type == "relational":
-        priority += 0.75
-    if "values" in slots and memory_type in {"value", "identity_style", "identity"}:
-        priority += 0.55
+    # Preserve mission vocabulary in the global merge. Scores from different
+    # branches are not directly comparable, so explicit query overlap must be
+    # part of the contract priority rather than a late per-branch tiebreaker.
+    priority += 2.0 * lexical_overlap(query_text, match_surface)
     return round(priority, 4)
 
 
@@ -3943,13 +5361,18 @@ def _normalize_destination_queue(
     if not destination_specs:
         destination_specs = _semantic_destination_templates_for_goal(goal)
     normalized: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
     for index, destination in enumerate(destination_specs, start=1):
         label = str(destination.get("label") or destination.get("destination_label") or destination.get("goal") or goal or probe_label).strip() or probe_label
         guide_area = str(destination.get("guide_area") or fallback_guide_area or "").strip() or None
         memory_type = str(destination.get("memory_type") or fallback_memory_type or "").strip() or None
         radial_expectation = str(destination.get("radial_expectation") or fallback_radial_expectation or "mid").strip() or "mid"
-        signature = (label.lower(), str(guide_area or "").lower(), str(memory_type or "").lower())
+        target_bucket_keys = [str(item) for item in list(destination.get("target_bucket_keys") or fallback_bucket_keys or []) if str(item).strip()][:4]
+        target_node_ids = [str(item) for item in list(destination.get("target_node_ids") or []) if str(item).strip()][:4]
+        # De-authorized metadata labels deliberately do not participate in the
+        # lease/dedupe key. Two destinations may display different metadata
+        # facets without becoming different routing authorities.
+        signature = (label.lower(), tuple(sorted(target_bucket_keys)), tuple(sorted(target_node_ids)))
         if signature in seen:
             continue
         seen.add(signature)
@@ -3960,8 +5383,8 @@ def _normalize_destination_queue(
                 "destination_key": "::".join(
                     [
                         str(label or "").strip().lower(),
-                        str(guide_area or "").strip().lower(),
-                        str(memory_type or "").strip().lower(),
+                        f"buckets={','.join(sorted(target_bucket_keys))}",
+                        f"nodes={','.join(sorted(target_node_ids))}",
                     ]
                 ),
                 "label": label,
@@ -3969,13 +5392,64 @@ def _normalize_destination_queue(
                 "memory_type": memory_type,
                 "radial_expectation": radial_expectation,
                 "semantic_color_hint": str(destination.get("semantic_color_hint") or fallback_color_hex or "").strip() or None,
-                "target_bucket_keys": [str(item) for item in list(destination.get("target_bucket_keys") or fallback_bucket_keys or []) if str(item).strip()][:4],
-                "target_node_ids": [str(item) for item in list(destination.get("target_node_ids") or []) if str(item).strip()][:4],
+                "target_bucket_keys": target_bucket_keys,
+                "target_node_ids": target_node_ids,
                 "rationale": _truncate_prompt_text(str(destination.get("rationale") or destination.get("reason") or f"{probe_label} should cover {label}").strip(), 180),
                 "priority": round(max(0.0, min(1.0, float(destination.get("priority") or max(0.3, 1.0 - ((index - 1) * 0.14))))), 4),
+                "execution_role": (
+                    "reserve"
+                    if str(destination.get("execution_role") or "").strip().lower() == "reserve"
+                    else "conditional_extension"
+                    if str(destination.get("execution_role") or "").strip().lower()
+                    == "conditional_extension"
+                    else "primary"
+                ),
+                "activation_condition": _truncate_prompt_text(
+                    str(destination.get("activation_condition") or "").strip(),
+                    260,
+                )
+                or None,
+                "activates_for_mission_id": _truncate_prompt_text(
+                    str(destination.get("activates_for_mission_id") or "").strip(),
+                    120,
+                )
+                or None,
+                "activation_predicate": (
+                    str(destination.get("activation_predicate") or "").strip().lower()
+                    if str(destination.get("activation_predicate") or "").strip().lower()
+                    in {
+                        "mission_unresolved",
+                        "no_evidence",
+                        "wrong_region",
+                        "document_reference_not_materialized",
+                    }
+                    else None
+                ),
+                "max_execution_stops": (
+                    1
+                    if str(destination.get("execution_role") or "").strip().lower()
+                    in {"reserve", "conditional_extension"}
+                    else None
+                ),
+                "expected_discovery": _truncate_prompt_text(
+                    str(destination.get("expected_discovery") or "").strip(),
+                    360,
+                )
+                or None,
+                "hydration_policy": _truncate_prompt_text(
+                    str(destination.get("hydration_policy") or "").strip(),
+                    220,
+                )
+                or None,
+                "hydration_capabilities": sorted(
+                    _provider_authored_hydration_capabilities(destination)
+                ),
             }
         )
-    return normalized[:4]
+    # Four primary forensic stops plus one conditional extension and one
+    # reserve are valid. Scheduling keeps both optional stops out of the
+    # unconditional corridor.
+    return normalized[:6]
 
 
 def _destination_lease_key(destination: dict[str, Any] | None) -> str | None:
@@ -3984,11 +5458,19 @@ def _destination_lease_key(destination: dict[str, Any] | None) -> str | None:
     if explicit:
         return explicit
     label = str(destination.get("label") or "").strip().lower()
-    guide_area = str(destination.get("guide_area") or "").strip().lower()
-    memory_type = str(destination.get("memory_type") or "").strip().lower()
-    if not any((label, guide_area, memory_type)):
+    target_bucket_keys = sorted(
+        str(item).strip().lower()
+        for item in list(destination.get("target_bucket_keys") or [])
+        if str(item).strip()
+    )
+    target_node_ids = sorted(
+        str(item).strip().lower()
+        for item in list(destination.get("target_node_ids") or [])
+        if str(item).strip()
+    )
+    if not any((label, target_bucket_keys, target_node_ids)):
         return None
-    return "::".join([label, guide_area, memory_type])
+    return "::".join([label, f"buckets={','.join(target_bucket_keys)}", f"nodes={','.join(target_node_ids)}"])
 
 
 def _hex_to_rgb(hex_value: str | None) -> tuple[int, int, int] | None:
@@ -4013,8 +5495,7 @@ def _color_similarity_from_hex(left_hex: str | None, right_hex: str | None) -> f
 
 def _route_region_id_for_candidate(candidate: dict[str, Any]) -> str:
     node = dict(candidate or {})
-    guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or node.get("guide_area") or "").strip().lower() or "unknown"
-    memory_type = str(node.get("memory_type") or "").strip().lower() or "unknown"
+    bucket_key = str((node.get("bucket") or {}).get("key") or "").strip().lower()
     radial_value = compute_radius_value(
         dict(node.get("routing_semantic_scores") or {}),
         dict(node.get("routing_facets") or {}),
@@ -4031,7 +5512,9 @@ def _route_region_id_for_candidate(candidate: dict[str, Any]) -> str:
         radial_expectation = "mid"
     else:
         radial_expectation = "outer"
-    return f"{guide_area}::{memory_type}::{radial_expectation}"
+    if bucket_key:
+        return f"bucket::{bucket_key}::{radial_expectation}"
+    return f"spatial::{radial_expectation}"
 
 
 def _region_descriptor_from_candidate(
@@ -4067,16 +5550,24 @@ def _region_descriptor_from_candidate(
 
 def _route_candidate_source_label(sources: list[str]) -> str:
     normalized_sources = {str(source or "") for source in list(sources or [])}
+    if "evidence_edge_follow" in normalized_sources:
+        return "evidence_edge_follow"
     if "route_highway" in normalized_sources or "action_highway" in normalized_sources:
         return "highway"
     if "highway_neighbor" in normalized_sources:
         return "highway_neighbor"
     if "route_link" in normalized_sources or "action_link" in normalized_sources:
         return "link"
+    if "path_tube_scan" in normalized_sources:
+        return "path_tube_scan"
     if "adjacent_bucket" in normalized_sources:
         return "adjacent_bucket"
     if "exact_temporal" in normalized_sources:
         return "exact_temporal"
+    if "server_bound_provenance_recall" in normalized_sources:
+        return "server_bound_provenance_recall"
+    if "server_bound_text_recall" in normalized_sources:
+        return "server_bound_text_recall"
     if "nearby_radius" in normalized_sources:
         return "nearby_radius"
     if "goal_support" in normalized_sources:
@@ -4092,10 +5583,14 @@ def _route_candidate_move_type(sources: list[str], *, current_node_id: str | Non
     normalized_sources = {str(source or "") for source in list(sources or [])}
     if current_node_id and candidate_id == current_node_id:
         return "hydrate_current_node", "none", False
+    if "evidence_edge_follow" in normalized_sources:
+        return "follow_evidence_edge", "link", True
     if "route_highway" in normalized_sources or "action_highway" in normalized_sources or "highway_neighbor" in normalized_sources:
         return "follow_highway", "highway", True
     if "route_link" in normalized_sources or "action_link" in normalized_sources:
         return "follow_local_link", "link", True
+    if "path_tube_scan" in normalized_sources:
+        return "inspect_path_tube", "local", True
     return "inspect_local_neighbors", "local", True
 
 
@@ -4135,13 +5630,27 @@ def _destination_queue_for_execution(branch: dict[str, Any]) -> tuple[list[dict[
     return execution_queue, execution_index
 
 
-def _destination_identity(destination: dict[str, Any] | None) -> tuple[str, str, str, str]:
+def _destination_identity(destination: dict[str, Any] | None) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
     destination = dict(destination or {})
+    target_bucket_keys = tuple(
+        sorted(
+            str(item).strip().lower()
+            for item in list(destination.get("target_bucket_keys") or [])
+            if str(item).strip()
+        )
+    )
+    target_node_ids = tuple(
+        sorted(
+            str(item).strip().lower()
+            for item in list(destination.get("target_node_ids") or [])
+            if str(item).strip()
+        )
+    )
     return (
         str(destination.get("destination_id") or "").strip().lower(),
-        str(destination.get("label") or "").strip().lower(),
-        str(destination.get("guide_area") or "").strip().lower(),
-        str(destination.get("memory_type") or "").strip().lower(),
+        _destination_lease_key(destination) or str(destination.get("label") or "").strip().lower(),
+        target_bucket_keys,
+        target_node_ids,
     )
 
 
@@ -4316,6 +5825,57 @@ def _finalize_terminal_branch_destinations(branch: dict[str, Any], *, round_inde
     return updated
 
 
+def _normalize_terminal_branches(
+    branches: list[dict[str, Any]],
+    *,
+    stop_reason: str,
+    round_index: int,
+) -> list[dict[str, Any]]:
+    """Freeze branch lifecycle and destination state before terminal authority."""
+
+    normalized: list[dict[str, Any]] = []
+    for branch in branches:
+        updated = dict(branch)
+        prior_status = str(updated.get("status") or "")
+        if prior_status == "active":
+            updated["status"] = "satisfied" if stop_reason == "all_branch_goals_satisfied" else "stopped"
+            updated["stop_reason"] = stop_reason or "search_completed"
+            _bulk_mark_open_destinations(
+                updated,
+                state="superseded_by_stronger_branch" if updated["status"] == "satisfied" else "suppressed_by_master",
+                state_reason=str(updated["stop_reason"]),
+                round_index=int(updated.get("last_round_index") or round_index),
+            )
+        elif not str(updated.get("stop_reason") or ""):
+            updated["stop_reason"] = stop_reason if prior_status in {"stopped", "satisfied"} else "search_completed"
+        if prior_status == "merged":
+            _bulk_mark_open_destinations(
+                updated,
+                state="merged",
+                state_reason=str(updated.get("stop_reason") or "merged"),
+                round_index=int(updated.get("last_round_index") or round_index),
+            )
+        route_state = str(updated.get("route_state") or "")
+        if str(updated.get("status") or "") == "satisfied" and route_state not in {"goal_satisfied", "merged", "superseded"}:
+            updated.update(route_state="goal_satisfied", lifecycle_stage="satisfied")
+        elif str(updated.get("status") or "") == "stopped" and route_state in {"", "planned", "landing", "routing", "evidence_holding", "reroute_pending"}:
+            updated["route_state"] = "route_exhausted" if str(updated.get("stop_reason") or "") in {"route_exhausted", "destination_reached_no_remaining_destinations", "budget_exhausted"} else "stopped"
+            updated["lifecycle_stage"] = "stopped"
+        updated = _finalize_terminal_branch_destinations(
+            updated,
+            round_index=int(updated.get("last_round_index") or round_index),
+        )
+        updated["active_destination"] = _canonical_active_destination(updated.get("active_destination"))
+        updated["family_contribution_summary"] = {
+            "planner_family": str(updated.get("planner_family") or "heuristic"),
+            "evidence_node_count": len(list(updated.get("evidence_node_ids") or [])),
+            "route_yield": round(float(updated.get("route_yield") or 0.0), 4),
+            "covered_slot_count": len(list(updated.get("covered_slots") or [])),
+        }
+        normalized.append(updated)
+    return normalized
+
+
 def _final_closure_summary(branches: list[dict[str, Any]]) -> dict[str, Any]:
     blockers: list[dict[str, Any]] = []
     blocker_reason_histogram: dict[str, int] = defaultdict(int)
@@ -4424,6 +5984,2543 @@ def _surface_runtime_fields(
     }
 
 
+def _reconcile_final_surface_with_master_judgement(
+    *,
+    final_surface_fields: dict[str, Any] | None,
+    master_judgement: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Drop mission blockers superseded by a coherent terminal master judgement."""
+    surface = dict(final_surface_fields or {})
+    master = dict(master_judgement or {})
+    master_resolved = bool(
+        str(master.get("master_state") or "").strip().lower() == "terminal"
+        and master.get("terminal_for_client") is True
+        and master.get("final_seal_allowed") is True
+        and not list(master.get("missing_goals") or [])
+        and not list(master.get("unresolved_goals") or [])
+        and not list(master.get("partial_goals") or [])
+    )
+    if not master_resolved:
+        return surface, False
+
+    blockers = [
+        dict(item)
+        for item in list(surface.get("final_closure_blockers") or [])
+        if isinstance(item, dict)
+    ]
+    mission_blockers = [
+        item for item in blockers if str(item.get("code") or "").strip() == "required_mission_unresolved"
+    ]
+    stale_mission_surface = bool(
+        mission_blockers or int(surface.get("unresolved_required_mission_count") or 0) > 0
+    )
+    if not stale_mission_surface:
+        return surface, False
+
+    retained_blockers = [item for item in blockers if item not in mission_blockers]
+    surface["final_closure_blockers"] = retained_blockers[:16]
+    surface["unresolved_required_mission_count"] = 0
+    if retained_blockers:
+        surface["unresolved_destination_count"] = max(
+            len(retained_blockers),
+            int(surface.get("unresolved_destination_count") or 0) - len(mission_blockers),
+        )
+        return surface, True
+
+    surface.update(
+        {
+            "answer_surface_state": "final_sealed",
+            "closure_state": "final_sealed",
+            "final_closure_ready": True,
+            "unresolved_destination_count": 0,
+            "closure_blocker_reason_histogram": {},
+            "answer_now_before_exploration_complete": False,
+            "final_closure_after_destination_resolution": True,
+        }
+    )
+    return surface, True
+
+
+def _operational_master_human_findings(
+    operational_decision: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+    *,
+    terminal: bool,
+) -> list[dict[str, Any]]:
+    """Project AI-authored mission explanations, never reason-code templates."""
+
+    decision = dict(operational_decision or {})
+    ledger_rows = [
+        dict(row)
+        for row in list(dict(mission_evidence_ledger or {}).get("rows") or [])
+        if isinstance(row, Mapping)
+    ]
+    rows_by_id = {
+        str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip(): row
+        for row in ledger_rows
+        if str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip()
+    }
+    findings: list[dict[str, Any]] = []
+    finding_index_by_gap: dict[str, int] = {}
+
+    def human_text(value: Any) -> str:
+        text = _truncate_prompt_text(str(value or "").strip(), 520)
+        if re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+){2,}", text.casefold()):
+            return ""
+        return text
+    for raw_assessment in list(decision.get("mission_evidence_assessments") or []):
+        if not isinstance(raw_assessment, Mapping):
+            continue
+        assessment = dict(raw_assessment)
+        mission_id = str(assessment.get("mission_id") or "").strip()
+        row = dict(rows_by_id.get(mission_id) or {})
+        unsupported = _dedupe_limited(
+            [
+                human_text(item)
+                for item in list(assessment.get("unsupported_claims") or [])
+                if human_text(item)
+            ],
+            limit=8,
+        )
+        meaningful_review = bool(
+            not assessment.get("entailed")
+            or not assessment.get("subject_attribution_established")
+            or not assessment.get("direct_mission_fit")
+            or not assessment.get("success_criteria_satisfied")
+            or unsupported
+        )
+        if terminal and not meaningful_review:
+            continue
+        if not meaningful_review:
+            continue
+        explanation = human_text(
+            str(
+                assessment.get("explanation")
+                or assessment.get("evidence_selection_rationale")
+                or decision.get("unresolved_gap")
+                or decision.get("reason")
+                or ""
+            ).strip(),
+        )
+        subject_comparison = human_text(
+            str(assessment.get("subject_attribution") or explanation).strip(),
+        )
+        goal = _truncate_prompt_text(str(row.get("goal") or "").strip(), 520)
+        claim = _truncate_prompt_text(str(assessment.get("claim") or "").strip(), 520)
+        impact = human_text("; ".join(unsupported)) or human_text(
+            decision.get("unresolved_gap")
+        ) or explanation
+        next_step = human_text(decision.get("next_evidence_action"))
+        if not next_step:
+            next_step = (
+                f"Find evidence that directly addresses: {unsupported[0]}"
+                if unsupported
+                else explanation
+            )
+        if not all((explanation, subject_comparison, goal or claim, impact, next_step)):
+            continue
+        allowed_ids = {
+            str(item.get("node_id") or "").strip()
+            for item in list(row.get("hot_evidence") or [])
+            if isinstance(item, Mapping) and str(item.get("node_id") or "").strip()
+        }
+        evidence_refs = [
+            str(item).strip()
+            for item in list(assessment.get("evidence_node_ids") or [])
+            if str(item).strip() in allowed_ids
+        ][:8]
+        summary = unsupported[0] if unsupported else claim or goal
+        gap_key = _normalized_evidence_excerpt(summary)
+        if gap_key in finding_index_by_gap:
+            existing = findings[finding_index_by_gap[gap_key]]
+            existing["evidence_refs"] = _dedupe_limited(
+                list(existing.get("evidence_refs") or []) + evidence_refs,
+                limit=8,
+            )
+            existing["mission_ids"] = _dedupe_limited(
+                list(existing.get("mission_ids") or []) + [mission_id],
+                limit=8,
+            )
+            continue
+        finding_index_by_gap[gap_key] = len(findings)
+        findings.append(
+            {
+                "summary": summary,
+                "reason": explanation,
+                "impact": impact,
+                "next_step": next_step,
+                "source_claim_summary": goal or claim,
+                "brain_evidence_summary": claim or explanation,
+                "comparison": subject_comparison,
+                "evidence_refs": evidence_refs,
+                "severity": "warning" if not assessment.get("entailed") else "watch",
+                "finding_type": "missing_evidence" if not assessment.get("entailed") else "partial_evidence",
+                "ai_authored": True,
+                "evidence_refs_validated": True,
+                "diagnostic_only": True,
+                "executable": False,
+                "mission_id": mission_id,
+                "mission_ids": [mission_id],
+            }
+        )
+        if len(findings) >= 8:
+            break
+    if findings or terminal:
+        return findings
+
+    unresolved_gap = human_text(decision.get("unresolved_gap")) or human_text(
+        decision.get("reason")
+    )
+    next_step = human_text(decision.get("next_evidence_action")) or unresolved_gap
+    if not unresolved_gap or not next_step:
+        return []
+    return [
+        {
+            "summary": unresolved_gap,
+            "reason": unresolved_gap,
+            "impact": unresolved_gap,
+            "next_step": next_step,
+            "source_claim_summary": unresolved_gap,
+            "brain_evidence_summary": unresolved_gap,
+            "comparison": unresolved_gap,
+            "evidence_refs": [],
+            "severity": "watch",
+            "finding_type": "semantic_review",
+            "ai_authored": True,
+            "evidence_refs_validated": True,
+            "diagnostic_only": True,
+            "executable": False,
+        }
+    ]
+
+
+def _operational_master_renderer_judgement(
+    *,
+    query_text: str,
+    retrieval_mode: str,
+    mission_evidence_ledger: dict[str, Any],
+    operational_decision: dict[str, Any] | None,
+    document_refs: list[dict[str, Any]] | None = None,
+    plan_first_runtime: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the in-loop Master verdict without running a renderer-time AI judge."""
+
+    decision = dict(operational_decision or {})
+    ledger_digest = search_mission_ledger_digest(mission_evidence_ledger or {})
+    decision_digest = str(decision.get("mission_ledger_digest") or "").strip()
+    attestation = dict(decision.get("ai_execution_attestation") or {})
+    source_is_ai = str(decision.get("decision_source") or "").strip() == "llm"
+    snapshot_matches = bool(ledger_digest and decision_digest == ledger_digest)
+    runtime = dict(plan_first_runtime or {})
+    plan_first_binding_required = bool(
+        runtime.get("enabled") is True
+        or decision.get("plan_first_plan_digest")
+        or decision.get("frozen_surface_digest")
+    )
+    attestation_valid = False
+    try:
+        validate_ai_execution_attestation(attestation)
+        attestation_valid = True
+    except (AiModuleContractError, TypeError, ValueError):
+        attestation_valid = False
+    plan_first_binding_valid = bool(
+        runtime.get("schema_version") == "agvm.search_plan_first.v3"
+        and runtime.get("enabled") is True
+        and int(runtime.get("final_master_attempt_count") or 0) == 1
+        and int(runtime.get("final_master_attested_count") or 0) == 1
+        and str(runtime.get("plan_digest") or "").strip()
+        and str(decision.get("plan_first_plan_digest") or "").strip()
+        == str(runtime.get("plan_digest") or "").strip()
+        and str(runtime.get("ledger_digest") or "").strip() == ledger_digest
+        and str(runtime.get("frozen_surface_digest") or "").strip()
+        and str(decision.get("frozen_surface_digest") or "").strip()
+        == str(runtime.get("frozen_surface_digest") or "").strip()
+    )
+    base = build_mcp_master_judgement(
+        query_text=query_text,
+        mission_evidence_ledger=mission_evidence_ledger,
+        package_render_contract={
+            "source_is_ledger_only": True,
+            "blocked": False,
+            "blocked_reasons": [],
+            "operational_master_projection": True,
+        },
+        path_truth_contract={},
+        document_refs=list(document_refs or []),
+        allow_ai_master=False,
+        retrieval_mode=retrieval_mode,
+        semantic_authority="ai_v2",
+    )
+    if not (
+        source_is_ai
+        and snapshot_matches
+        and attestation
+        and (not plan_first_binding_required or (attestation_valid and plan_first_binding_valid))
+    ):
+        return {
+            **base,
+            "master_state": "blocked",
+            "context_state": "blocked",
+            "agent_payload_state": "blocked",
+            "terminal_for_client": False,
+            "final_seal_allowed": False,
+            "review_required": True,
+            "master_ai_used": False,
+            "master_sufficiency_source": "operational_master_snapshot_unavailable",
+            "next_recommended_call": "continue_retrieve_context",
+            "continuation_recommendation": {
+                "state": "required",
+                "tool_action": "continue_retrieve_context",
+                "reason": "operational_master_snapshot_unavailable",
+            },
+            "mission_ledger_digest": ledger_digest,
+            "semantic_authority": {
+                "mode": "ai_v2",
+                "revision": "ai_v2_s1",
+                "master_ai_used": False,
+                "fallback_used": False,
+            },
+        }
+
+    decision_name = str(decision.get("decision") or "").strip()
+    should_continue = bool(decision.get("should_continue_expanding", True))
+    can_answer = bool(decision.get("can_answer_now"))
+    structural_unresolved = _plan_first_structurally_unresolved_required_mission_rows(
+        mission_evidence_ledger
+    )
+    mission_entailment_validation = _validate_master_mission_entailments(
+        decision,
+        mission_evidence_ledger,
+    )
+    terminal = bool(
+        decision_name in {"emit_answer_final", "stop_all"}
+        and not should_continue
+        and can_answer
+        and not structural_unresolved
+        and bool(mission_entailment_validation.get("valid"))
+        and (not plan_first_binding_required or plan_first_binding_valid)
+    )
+    budget_terminal_review = bool(decision.get("budget_terminal_review"))
+    if terminal:
+        master_state = "terminal"
+        next_call = None
+        continuation = {"state": "none", "tool_action": None, "reason": "operational_master_approved_terminal_context"}
+    elif budget_terminal_review:
+        # The authoritative Master did run, but the bounded Search budget cannot
+        # execute another evidence wave. This is a terminal reviewable partial,
+        # not an internal "judge missing" failure and not permission to seal.
+        master_state = "usable_partial"
+        next_call = None
+        continuation = {
+            "state": "none",
+            "tool_action": None,
+            "reason": str(decision.get("reason") or "master_requires_more_evidence_at_budget_boundary"),
+        }
+    else:
+        master_state = (
+            "needs_hydration"
+            if decision_name in {"request_doc_anchor", "request_doc_chunk"}
+            else "needs_more_search"
+        )
+        next_call = "retrieve_document" if master_state == "needs_hydration" else "continue_retrieve_context"
+        continuation = {
+            "state": "required",
+            "tool_action": next_call,
+            "reason": str(decision.get("reason") or "operational_master_requires_more_evidence"),
+        }
+    human_findings = _operational_master_human_findings(
+        decision,
+        mission_evidence_ledger,
+        terminal=terminal,
+    )
+    sufficiency_judge = {
+        **dict(base.get("sufficiency_judge") or {}),
+        "tier": "operational_ai_master",
+        "master_ai_required": True,
+        "master_ai_used": True,
+        "master_ai_error": None,
+        "ai_sufficiency_state": f"operational_ai_master_{master_state}",
+        "mission_ledger_digest": ledger_digest,
+        "ai_execution_attestation": attestation,
+        "ai_master_decision": {
+            key: value
+            for key, value in decision.items()
+            if key not in {"ai_execution_attestation", "mission_evidence_ledger"}
+        },
+    }
+    rendered = {
+        **base,
+        "master_judgement_id": f"operational_master_{master_state}_{ledger_digest[:16]}",
+        "master_state": master_state,
+        "context_state": "complete" if terminal else "partial",
+        "agent_payload_state": "usable_context" if terminal else "partial_context",
+        "terminal_for_client": bool(terminal or budget_terminal_review),
+        "final_seal_allowed": terminal,
+        "review_required": not terminal,
+        "no_match_claim": False,
+        "next_recommended_call": next_call,
+        "continuation_recommendation": continuation,
+        "unresolved_gap": None if terminal else decision.get("unresolved_gap") or decision.get("reason"),
+        "expected_information_gain": None if terminal else decision.get("expected_information_gain"),
+        "master_ai_required": True,
+        "master_ai_used": True,
+        "master_ai_timeout_fallback": False,
+        "master_sufficiency_source": "operational_ai_master",
+        "sufficiency_judge": sufficiency_judge,
+        "mission_ledger_digest": ledger_digest,
+        "plan_first_plan_digest": str(decision.get("plan_first_plan_digest") or "") or None,
+        "frozen_surface_digest": str(decision.get("frozen_surface_digest") or "") or None,
+        "ledger_row_count": len(list(dict(mission_evidence_ledger or {}).get("rows") or [])),
+        "source": "operational_master_loop",
+        "semantic_authority": {
+            "mode": "ai_v2",
+            "revision": "ai_v2_s1",
+            "master_ai_used": True,
+            "fallback_used": False,
+        },
+        "ai_execution_attestation": attestation,
+        "mission_entailment_validation": mission_entailment_validation,
+        "human_findings": human_findings,
+        "human_finding_count": len(human_findings),
+        "human_finding_source": "operational_ai_master_mission_assessments",
+        "technical_reason_codes_collapsed": True,
+    }
+    if terminal:
+        # Plan-first deliberately has no recurrent branch AI judge. The single
+        # final Master owns semantic sufficiency, while the server retains only
+        # structural vetoes (stale/missed/unbound/no-provenance missions).
+        rendered["missing_goals"] = []
+        rendered["unresolved_goals"] = []
+        rendered["partial_goals"] = []
+        rendered["unresolved_gap"] = None
+    return rendered
+
+
+def _plan_first_existing_master_requires_terminal_review(
+    *,
+    plan_first_runtime: Mapping[str, Any] | None,
+    operational_decision: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+    unresolved_required_missions: list[dict[str, Any]] | None,
+) -> bool:
+    """Keep one valid bounded V3 Master verdict terminal and reviewable."""
+
+    runtime = dict(plan_first_runtime or {})
+    decision = dict(operational_decision or {})
+    ledger = dict(mission_evidence_ledger or {})
+    ledger_digest = search_mission_ledger_digest(ledger)
+    attestation = dict(decision.get("ai_execution_attestation") or {})
+    try:
+        validate_ai_execution_attestation(attestation)
+    except (AiModuleContractError, TypeError, ValueError):
+        return False
+    binding_valid = bool(
+        runtime.get("schema_version") == "agvm.search_plan_first.v3"
+        and runtime.get("enabled") is True
+        and int(runtime.get("final_master_attempt_count") or 0) == 1
+        and int(runtime.get("final_master_attested_count") or 0) == 1
+        and str(decision.get("decision_source") or "").strip() == "llm"
+        and str(runtime.get("plan_digest") or "").strip()
+        and str(decision.get("plan_first_plan_digest") or "").strip()
+        == str(runtime.get("plan_digest") or "").strip()
+        and str(runtime.get("ledger_digest") or "").strip() == ledger_digest
+        and str(decision.get("mission_ledger_digest") or "").strip() == ledger_digest
+        and str(runtime.get("frozen_surface_digest") or "").strip()
+        and str(decision.get("frozen_surface_digest") or "").strip()
+        == str(runtime.get("frozen_surface_digest") or "").strip()
+    )
+    if not binding_valid:
+        return False
+    terminal = bool(
+        str(decision.get("decision") or "").strip() in {"emit_answer_final", "stop_all"}
+        and not bool(decision.get("should_continue_expanding"))
+        and bool(decision.get("can_answer_now"))
+        and not list(unresolved_required_missions or [])
+    )
+    return not terminal
+
+
+def _apply_plan_first_terminal_master_renderer_authority(
+    context_package: Mapping[str, Any] | None,
+    *,
+    master_judgement: Mapping[str, Any] | None,
+    plan_first_runtime: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Make post-Master renderer coverage diagnostic, never a second judge."""
+
+    package = copy.deepcopy(dict(context_package or {}))
+    master = dict(master_judgement or {})
+    runtime = dict(plan_first_runtime or {})
+    terminal_authority = _valid_plan_first_terminal_master_authority(
+        master,
+        plan_first_runtime=runtime,
+        mission_evidence_ledger=mission_evidence_ledger,
+    )
+    if not terminal_authority:
+        return package, False
+    contract = dict(package.get("contract") or {})
+    unresolved = _dedupe_limited(
+        [
+            str(item).strip()
+            for item in list(contract.get("unresolved_sections") or [])
+            if str(item).strip()
+        ],
+        limit=24,
+    )
+    if not unresolved and bool(contract.get("passed")):
+        return package, False
+    renderer_contract_passed_before_authority = bool(contract.get("passed"))
+    contract.update(
+        {
+            "passed": True,
+            "unresolved_sections": [],
+            "diagnostic_unresolved_sections": unresolved,
+            "renderer_diagnostics_only": True,
+            "renderer_contract_passed_before_master_authority": (
+                renderer_contract_passed_before_authority
+            ),
+            "terminal_authority_source": "plan_first_ai_master",
+            "warnings": _dedupe_limited(
+                [
+                    *list(contract.get("warnings") or []),
+                    *[f"renderer_diagnostic:{item}" for item in unresolved],
+                ],
+                limit=24,
+            ),
+        }
+    )
+    package["contract"] = contract
+    package["renderer_diagnostics_only"] = True
+    return package, True
+
+
+def _valid_plan_first_terminal_master_authority(
+    master_judgement: Mapping[str, Any] | None,
+    *,
+    plan_first_runtime: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> bool:
+    """Validate the sole semantic authority for a terminal Search context."""
+
+    master = dict(master_judgement or {})
+    authority = dict(master.get("semantic_authority") or {})
+    runtime = dict(plan_first_runtime or {})
+    ledger = dict(mission_evidence_ledger or {})
+    ledger_digest = search_mission_ledger_digest(ledger)
+    try:
+        validate_ai_execution_attestation(
+            dict(master.get("ai_execution_attestation") or {})
+        )
+    except (AiModuleContractError, TypeError, ValueError):
+        return False
+    return bool(
+        ledger_digest
+        and list(ledger.get("rows") or [])
+        and str(master.get("master_state") or "").strip() == "terminal"
+        and master.get("terminal_for_client") is True
+        and master.get("final_seal_allowed") is True
+        and master.get("review_required") is False
+        and master.get("master_ai_used") is True
+        and not list(master.get("missing_goals") or [])
+        and not list(master.get("unresolved_goals") or [])
+        and not list(master.get("partial_goals") or [])
+        and str(authority.get("mode") or "").strip() == "ai_v2"
+        and authority.get("master_ai_used") is True
+        and authority.get("fallback_used") is False
+        and str(master.get("mission_ledger_digest") or "").strip()
+        == ledger_digest
+        and str(master.get("plan_first_plan_digest") or "").strip()
+        == str(runtime.get("plan_digest") or "").strip()
+        and str(master.get("frozen_surface_digest") or "").strip()
+        == str(runtime.get("frozen_surface_digest") or "").strip()
+        and runtime.get("schema_version") == "agvm.search_plan_first.v3"
+        and runtime.get("enabled") is True
+        and int(runtime.get("final_master_attempt_count") or 0) == 1
+        and int(runtime.get("final_master_attested_count") or 0) == 1
+    )
+
+
+def _apply_plan_first_terminal_context_public_projection(
+    result: Mapping[str, Any] | None,
+    *,
+    master_judgement: Mapping[str, Any] | None,
+    plan_first_runtime: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Seal an attested terminal context independently from the answer demo.
+
+    Search's public product is the evidence/context package.  The optional
+    natural-language answer is generated afterwards and may be unavailable
+    without invalidating an already terminal, revision-bound Master verdict.
+    """
+
+    projected = copy.deepcopy(dict(result or {}))
+    master = copy.deepcopy(dict(master_judgement or {}))
+    if not _valid_plan_first_terminal_master_authority(
+        master,
+        plan_first_runtime=plan_first_runtime,
+        mission_evidence_ledger=mission_evidence_ledger,
+    ):
+        return projected, False
+    context_package = copy.deepcopy(dict(projected.get("context_package") or {}))
+    context_contract = dict(context_package.get("contract") or {})
+    context_materialization = copy.deepcopy(
+        dict(projected.get("context_package_materialization") or {})
+    )
+    context_has_material = bool(
+        str(context_package.get("agent_markdown") or "").strip()
+        or list(context_package.get("sections") or [])
+        or list(context_package.get("document_refs") or [])
+    )
+    if not (
+        context_contract.get("passed") is True
+        and not list(context_contract.get("unresolved_sections") or [])
+        and context_materialization.get("contract_passed") is True
+        and context_has_material
+    ):
+        return projected, False
+
+    answer = projected.get("answer")
+    answer_ready = bool(
+        isinstance(answer, Mapping)
+        and str(answer.get("answer_text") or "").strip()
+    )
+    answer_demo = copy.deepcopy(dict(projected.get("answer_demo_materialization") or {}))
+    answer_requested = str(projected.get("response_mode") or "").strip() in {"answer", "both"}
+    if answer_requested and not answer_ready:
+        answer_demo.update(
+            {
+                "state": "provider_degraded",
+                "reason": "answer_demo_provider_unavailable_after_terminal_context",
+                "context_package_contract_passed": True,
+                "context_package_is_source_of_truth": True,
+                "answer_demo_is_secondary": True,
+                "blocked_by_ai_materialization_hard_gate": False,
+            }
+        )
+    projected["answer_demo_materialization"] = answer_demo
+    context_materialization.update(
+        {
+            "state": "context_ready",
+            "contract_passed": True,
+            "terminal": True,
+            "answer_demo_decoupled": True,
+        }
+    )
+    projected["context_package_materialization"] = context_materialization
+
+    hard_gate = copy.deepcopy(dict(projected.get("ai_materialization_hard_gate") or {}))
+    hard_gate.update(
+        {
+            "satisfied": True,
+            "blocked": False,
+            "validation_state": "master_ai_terminal_context_attested",
+            "blockers": [],
+            "mcp_context_package_ready": True,
+            "answer_demo_ready": answer_ready,
+            "answer_demo_blockers": [] if answer_ready else ["answer_demo_provider_degraded"],
+            "secondary_answer_demo_pending": bool(answer_requested and not answer_ready),
+        }
+    )
+    projected["ai_materialization_hard_gate"] = hard_gate
+    validation_gate = copy.deepcopy(dict(projected.get("ai_validation_gate") or {}))
+    validation_gate.update(
+        {
+            "satisfied": True,
+            "blocked": False,
+            "blockers": [],
+            "materialization_hard_gate": copy.deepcopy(hard_gate),
+            "materialization_gate_state": "master_ai_terminal_context_attested",
+            "mcp_context_package_ready": True,
+            "answer_demo_ready": answer_ready,
+            "secondary_answer_demo_pending": bool(answer_requested and not answer_ready),
+        }
+    )
+    projected["ai_validation_gate"] = validation_gate
+    projected.update(
+        {
+            "status": "completed",
+            "completion_state": "completed",
+            "canonical_search_state": "completed",
+            "review_required": False,
+            "terminal_for_client": True,
+            "final_seal_allowed": True,
+            "final_closure_ready": True,
+            "final_closure_blockers": [],
+            "unresolved_destination_count": 0,
+            "unresolved_required_missions": [],
+            "unresolved_required_mission_count": 0,
+            "closure_state": "final_sealed",
+            # This is the canonical lifecycle of the public Search surface.
+            # A secondary answer demo may degrade after the Master has already
+            # sealed a grounded context, but that diagnostic must not replace
+            # the finite answer-surface state consumed by the API schema.
+            "answer_surface_state": "final_sealed",
+            # Canonical answerability remains grounded because the attested
+            # context is the product; answer-demo degradation is diagnostic.
+            "answerability_state": "grounded",
+            "stop_reason": (
+                "master_ai_terminal_grounded_answer_attested"
+                if answer_ready
+                else "master_ai_terminal_context_attested"
+            ),
+            "result_materialization_state": "finalized",
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "search_product_state": "usable_context",
+            "answer_demo_degraded": bool(answer_requested and not answer_ready),
+            "master_judgement": master,
+        }
+    )
+    return projected, True
+
+
+def _apply_plan_first_usable_partial_public_projection(
+    result: Mapping[str, Any] | None,
+    *,
+    master_judgement: Mapping[str, Any] | None,
+    plan_first_runtime: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Publish one valid bounded Master partial without renderer inversion."""
+
+    projected = copy.deepcopy(dict(result or {}))
+    master = copy.deepcopy(dict(master_judgement or {}))
+    runtime = dict(plan_first_runtime or {})
+    ledger_digest = search_mission_ledger_digest(
+        dict(mission_evidence_ledger or {})
+    )
+    authority = dict(master.get("semantic_authority") or {})
+    try:
+        validate_ai_execution_attestation(
+            dict(master.get("ai_execution_attestation") or {})
+        )
+        attestation_valid = True
+    except (AiModuleContractError, TypeError, ValueError):
+        attestation_valid = False
+    explicit_integrity = projected.get("payload_integrity")
+    payload_integrity = (
+        dict(explicit_integrity)
+        if isinstance(explicit_integrity, Mapping)
+        else _build_context_payload_integrity(projected)
+    )
+    integrity_valid = bool(payload_integrity.get("passed") is True)
+    runtime_failure_states = {
+        "provider_degraded",
+        "provider_error",
+        "runtime_error",
+        "failed",
+        "error",
+        "timeout",
+        "timed_out",
+    }
+    runtime_failure_reasons = {
+        "path_mission_not_executed_by_runtime",
+        "provider_failed_before_mission_resolution",
+        "provider_degraded_before_mission_resolution",
+        "runtime_failed_before_mission_resolution",
+    }
+    required_runtime_blockers: list[dict[str, Any]] = []
+    for raw_row in list(dict(mission_evidence_ledger or {}).get("rows") or []):
+        if not isinstance(raw_row, dict) or raw_row.get("required") is False:
+            continue
+        row = dict(raw_row)
+        judgement = dict(row.get("branch_judgement") or {})
+        states = {
+            str(row.get("coverage_state") or "").strip().lower(),
+            str(judgement.get("state") or "").strip().lower(),
+        }
+        reasons = {
+            str(row.get("coverage_reason") or "").strip().lower(),
+            str(row.get("missing_reason") or "").strip().lower(),
+        }
+        invalidated = bool(
+            row.get("stale")
+            or row.get("invalidated")
+            or row.get("superseded")
+            or judgement.get("stale")
+            or judgement.get("invalidated")
+        )
+        if not (
+            invalidated
+            or states.intersection(runtime_failure_states)
+            or reasons.intersection(runtime_failure_reasons)
+        ):
+            continue
+        required_runtime_blockers.append(
+            {
+                "mission_id": str(row.get("mission_id") or "").strip() or None,
+                "coverage_state": str(row.get("coverage_state") or "").strip() or None,
+                "coverage_reason": str(
+                    row.get("coverage_reason") or row.get("missing_reason") or ""
+                ).strip()
+                or None,
+                "invalidated": invalidated,
+            }
+        )
+    valid_partial = bool(
+        attestation_valid
+        and integrity_valid
+        and not required_runtime_blockers
+        and str(master.get("master_state") or "").strip() == "usable_partial"
+        and master.get("terminal_for_client") is True
+        and master.get("final_seal_allowed") is False
+        and master.get("review_required") is True
+        and master.get("master_ai_used") is True
+        and str(authority.get("mode") or "").strip() == "ai_v2"
+        and authority.get("master_ai_used") is True
+        and authority.get("fallback_used") is False
+        and str(master.get("mission_ledger_digest") or "").strip()
+        == ledger_digest
+        and str(master.get("plan_first_plan_digest") or "").strip()
+        == str(runtime.get("plan_digest") or "").strip()
+        and str(master.get("frozen_surface_digest") or "").strip()
+        == str(runtime.get("frozen_surface_digest") or "").strip()
+        and runtime.get("schema_version") == "agvm.search_plan_first.v3"
+        and runtime.get("enabled") is True
+        and int(runtime.get("final_master_attempt_count") or 0) == 1
+        and int(runtime.get("final_master_attested_count") or 0) == 1
+    )
+    if not valid_partial:
+        return projected, False
+    master.update(
+        {
+            "master_state": "usable_partial",
+            "context_state": "partial",
+            "agent_payload_state": "partial_context",
+            "terminal_for_client": True,
+            "final_seal_allowed": False,
+            "review_required": True,
+            "next_recommended_call": None,
+            "continuation_recommendation": {
+                "state": "none",
+                "tool_action": None,
+                "reason": str(master.get("unresolved_gap") or "bounded_search_review_required"),
+            },
+        }
+    )
+    projected.update(
+        {
+            "status": "review_required",
+            "completion_state": "review_required",
+            "canonical_search_state": "review_required",
+            "review_required": True,
+            "terminal_for_client": True,
+            "final_closure_ready": False,
+            "stop_reason": "review_required_master_needs_more_search_at_budget",
+            "answerability_state": "partial",
+            "result_materialization_state": "partial_review_required",
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "master_judgement": master,
+        }
+    )
+    # The legacy answer-demo/materialization validator runs before the single
+    # plan-first Master and can legitimately reject a final answer while useful
+    # evidence still exists. Once the strictly bound V2 Master has certified a
+    # terminal reviewable partial, that older gate is diagnostic only: leaving
+    # it blocked lets canonicalization invert the Master back to ``blocked``.
+    hard_gate = copy.deepcopy(dict(projected.get("ai_materialization_hard_gate") or {}))
+    hard_gate.update(
+        {
+            "satisfied": False,
+            "blocked": False,
+            "validation_state": "review_required_master_needs_more_search_at_budget",
+            "blockers": [],
+            "final_requested": False,
+            "judge_materialized": True,
+            "review_required": True,
+            "mcp_context_package_ready": bool(projected.get("context_package")),
+        }
+    )
+    projected["ai_materialization_hard_gate"] = hard_gate
+    validation_gate = copy.deepcopy(dict(projected.get("ai_validation_gate") or {}))
+    validation_gate.update(
+        {
+            "satisfied": False,
+            "blocked": False,
+            "final_requested": False,
+            "review_required": True,
+            "blockers": [],
+            "materialization_hard_gate": copy.deepcopy(hard_gate),
+            "materialization_gate_state": "review_required_master_needs_more_search_at_budget",
+            "mcp_context_package_ready": bool(projected.get("context_package")),
+        }
+    )
+    projected["ai_validation_gate"] = validation_gate
+    landing_materialization = copy.deepcopy(
+        dict(projected.get("ai_landing_materialization") or {})
+    )
+    if landing_materialization:
+        landing_materialization.update(
+            {
+                "hard_gate": copy.deepcopy(hard_gate),
+                "final_gate_state": "review_required_master_needs_more_search_at_budget",
+                "final_seal_blocked": False,
+                "review_required": True,
+            }
+        )
+        projected["ai_landing_materialization"] = landing_materialization
+    planner_runtime = copy.deepcopy(dict(projected.get("planner_runtime") or {}))
+    if planner_runtime:
+        planner_runtime["ai_materialization_hard_gate"] = copy.deepcopy(hard_gate)
+        planner_runtime["ai_validation_gate"] = copy.deepcopy(validation_gate)
+        if landing_materialization:
+            planner_runtime["ai_landing_materialization"] = copy.deepcopy(
+                landing_materialization
+            )
+        projected["planner_runtime"] = planner_runtime
+    context_package = copy.deepcopy(dict(projected.get("context_package") or {}))
+    if context_package:
+        context_package["master_judgement"] = copy.deepcopy(master)
+        projected["context_package"] = context_package
+    master_state = copy.deepcopy(dict(projected.get("master_state") or {}))
+    decision_history = [
+        dict(item)
+        for item in list(master_state.get("decision_history") or [])
+        if isinstance(item, dict)
+    ]
+    renderer_sources = {
+        "context_package_gate",
+        "ai_materialization_hard_gate",
+        "ai_validation_gate",
+    }
+    superseded = [
+        row
+        for row in decision_history
+        if str(row.get("decision_source") or "").strip() in renderer_sources
+    ]
+    master_state.update(
+        {
+            "status": "review_required",
+            "terminal_for_client": True,
+            "final_closure_ready": False,
+            "decision_history": [
+                row
+                for row in decision_history
+                if str(row.get("decision_source") or "").strip() not in renderer_sources
+            ],
+            "superseded_renderer_decisions": superseded,
+        }
+    )
+    projected["master_state"] = master_state
+    shared_evidence = copy.deepcopy(dict(projected.get("shared_evidence") or {}))
+    if shared_evidence:
+        blackboard = copy.deepcopy(dict(shared_evidence.get("blackboard") or {}))
+        blackboard.update(
+            {
+                "master_state": copy.deepcopy(master_state),
+                "answer_surface_state": "usable_partial",
+                "closure_state": "review_required",
+                "final_closure_ready": False,
+            }
+        )
+        shared_evidence.update(
+            {
+                "master_state": copy.deepcopy(master_state),
+                "blackboard": blackboard,
+                "answer_surface_state": "usable_partial",
+                "closure_state": "review_required",
+                "final_closure_ready": False,
+            }
+        )
+        projected["shared_evidence"] = shared_evidence
+    planner_runtime = copy.deepcopy(dict(projected.get("planner_runtime") or {}))
+    if planner_runtime:
+        planner_runtime["master_state"] = copy.deepcopy(master_state)
+        planner_runtime["master_judgement"] = copy.deepcopy(master)
+        projected["planner_runtime"] = planner_runtime
+    return projected, True
+
+
+def _freeze_operational_master_surface(**surface: Any) -> dict[str, Any]:
+    """Detach renderer inputs that belong to one operational Master wave."""
+
+    return {key: copy.deepcopy(value) for key, value in surface.items()}
+
+
+def _project_frozen_plan_first_evidence(
+    surface: Mapping[str, Any],
+    mission_evidence_ledger: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project immutable post-Master evidence without retrieval or hydration."""
+
+    frozen = dict(surface or {})
+    return copy.deepcopy(
+        {
+            "branches": list(frozen.get("branches") or []),
+            "steps": list(frozen.get("steps") or []),
+            "matches": list(frozen.get("matches") or []),
+            "evidence_reservoir": dict(frozen.get("evidence_reservoir") or {}),
+            "document_packets": list(frozen.get("document_packets") or []),
+            "shared_evidence": dict(frozen.get("shared_evidence") or {}),
+            "context": dict(frozen.get("context") or {}),
+            "path_corridors": dict(frozen.get("path_corridors") or {}),
+            "route_runtime": dict(frozen.get("route_runtime") or {}),
+            "landing_metadata": list(frozen.get("landing_metadata") or []),
+            "mission_evidence_ledger": dict(mission_evidence_ledger or {}),
+        }
+    )
+
+
+def _bind_plan_first_ai_document_hydration_request(
+    master_decision: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Bind one Master-authored hydration request to one frozen document ref.
+
+    The Master remains the semantic authority.  This guard only proves that
+    every requested identifier already exists on the selected mission row;
+    it never selects a document from text, rank, keywords, or query shape.
+    """
+
+    decision = dict(master_decision or {})
+    decision_name = str(decision.get("decision") or "").strip()
+    if decision_name not in {"request_doc_anchor", "request_doc_chunk"}:
+        return None
+    mission_id = str(decision.get("mission_id") or "").strip()
+    if not mission_id:
+        return None
+    requested = {
+        key: str(decision.get(key) or "").strip()
+        for key in ("document_id", "document_anchor_id", "chunk_node_id")
+    }
+    if decision_name == "request_doc_anchor" and not (
+        requested["document_id"] or requested["document_anchor_id"]
+    ):
+        return None
+    if decision_name == "request_doc_chunk" and not requested["chunk_node_id"]:
+        return None
+
+    matching_rows = [
+        dict(row)
+        for row in list(dict(mission_evidence_ledger or {}).get("rows") or [])
+        if isinstance(row, Mapping)
+        and str(
+            dict(row).get("mission_id")
+            or dict(row).get("path_id")
+            or dict(row).get("branch_id")
+            or ""
+        ).strip()
+        == mission_id
+    ]
+    if len(matching_rows) != 1:
+        return None
+    row = matching_rows[0]
+    matching_refs: list[dict[str, Any]] = []
+    for raw_ref in list(row.get("document_refs") or []):
+        if not isinstance(raw_ref, Mapping):
+            continue
+        ref = dict(raw_ref)
+        ref_document_id = str(ref.get("document_id") or ref.get("id") or "").strip()
+        ref_anchor_id = str(ref.get("anchor_node_id") or "").strip()
+        ref_chunk_ids = {
+            str(item).strip()
+            for item in list(ref.get("chunk_node_ids") or [])
+            if str(item).strip()
+        }
+        if requested["document_id"] and requested["document_id"] != ref_document_id:
+            continue
+        if requested["document_anchor_id"] and requested["document_anchor_id"] != ref_anchor_id:
+            continue
+        if requested["chunk_node_id"] and requested["chunk_node_id"] not in ref_chunk_ids:
+            continue
+        matching_refs.append(ref)
+    if len(matching_refs) != 1:
+        return None
+
+    ref = matching_refs[0]
+    target_node_ids = _dedupe_limited(
+        [
+            requested["document_anchor_id"],
+            requested["chunk_node_id"],
+            str(ref.get("anchor_node_id") or "").strip(),
+            str(ref.get("document_id") or ref.get("id") or "").strip(),
+        ],
+        limit=4,
+    )
+    if not target_node_ids:
+        return None
+    return {
+        "schema_version": "agvm.search_ai_document_hydration_binding.v1",
+        "mission_id": mission_id,
+        "decision": decision_name,
+        "document_id": str(ref.get("document_id") or ref.get("id") or "").strip(),
+        "document_anchor_id": str(ref.get("anchor_node_id") or "").strip() or None,
+        "chunk_node_id": requested["chunk_node_id"] or None,
+        "target_node_ids": target_node_ids,
+        "source": "master_exact_frozen_document_ref",
+    }
+
+
+def _materialize_plan_first_ai_document_hydration(
+    *,
+    binding: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+    frozen_surface: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Hydrate one exact AI-selected ref without running another Search."""
+
+    bound = dict(binding or {})
+    ledger = copy.deepcopy(dict(mission_evidence_ledger or {}))
+    surface = copy.deepcopy(dict(frozen_surface or {}))
+    target_ids = _dedupe_limited(
+        [str(item).strip() for item in list(bound.get("target_node_ids") or []) if str(item).strip()],
+        limit=4,
+    )
+    hydrated_nodes = {
+        str(node.get("id") or "").strip(): dict(node)
+        for node in fetch_nodes_by_ids(target_ids, include_raw_text=True)
+        if isinstance(node, Mapping)
+        and str(node.get("id") or "").strip()
+        and str(node.get("raw_text") or "").strip()
+    }
+    if not hydrated_nodes:
+        return ledger, surface, {
+            **bound,
+            "applied": False,
+            "reason": "exact_target_raw_text_unavailable",
+            "hydrated_node_ids": [],
+        }
+
+    document_id = str(bound.get("document_id") or "").strip()
+    anchor_id = str(bound.get("document_anchor_id") or "").strip()
+
+    def ref_matches(raw_ref: Any) -> bool:
+        if not isinstance(raw_ref, Mapping):
+            return False
+        ref = dict(raw_ref)
+        return bool(
+            (document_id and document_id == str(ref.get("document_id") or ref.get("id") or "").strip())
+            or (anchor_id and anchor_id == str(ref.get("anchor_node_id") or "").strip())
+        )
+
+    rows = []
+    touched_mission_ids: list[str] = []
+    for raw_row in list(ledger.get("rows") or []):
+        if not isinstance(raw_row, Mapping):
+            continue
+        row = copy.deepcopy(dict(raw_row))
+        refs = [copy.deepcopy(dict(ref)) for ref in list(row.get("document_refs") or []) if isinstance(ref, Mapping)]
+        row_ref_match = any(ref_matches(ref) for ref in refs)
+        if row_ref_match:
+            for ref in refs:
+                if ref_matches(ref):
+                    ref["raw_available"] = True
+                    ref["raw_ready"] = True
+                    ref["hydration_source"] = "master_exact_frozen_document_ref"
+            existing_evidence = {
+                str(item.get("node_id") or "").strip(): copy.deepcopy(dict(item))
+                for item in list(row.get("hot_evidence") or [])
+                if isinstance(item, Mapping) and str(item.get("node_id") or "").strip()
+            }
+            for node_id, node in hydrated_nodes.items():
+                evidence = existing_evidence.get(node_id, {})
+                evidence.update(
+                    {
+                        "node_id": node_id,
+                        "text": str(node.get("raw_text") or ""),
+                        "text_source": "raw_text",
+                        "source": str(evidence.get("source") or "master_exact_document_hydration"),
+                        "promotion_state": "hot",
+                        "hydrated_from_node_store": True,
+                    }
+                )
+                if node.get("summary") and not evidence.get("navigation_summary"):
+                    evidence["navigation_summary"] = str(node.get("summary") or "")
+                existing_evidence[node_id] = evidence
+            row["hot_evidence"] = list(existing_evidence.values())
+            row["document_refs"] = refs
+            row["document_refs_seen"] = copy.deepcopy(refs)
+            row["hydrated_node_ids"] = _dedupe_limited(
+                [*list(row.get("hydrated_node_ids") or []), *hydrated_nodes.keys()],
+                limit=64,
+            )
+            touched_mission_ids.append(
+                str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip()
+            )
+        rows.append(row)
+    ledger["rows"] = rows
+
+    updated_branches = []
+    for raw_branch in list(surface.get("branches") or []):
+        branch = copy.deepcopy(dict(raw_branch))
+        refs = [copy.deepcopy(dict(ref)) for ref in list(branch.get("document_refs") or []) if isinstance(ref, Mapping)]
+        if any(ref_matches(ref) for ref in refs):
+            for ref in refs:
+                if ref_matches(ref):
+                    ref["raw_available"] = True
+                    ref["raw_ready"] = True
+                    ref["hydration_source"] = "master_exact_frozen_document_ref"
+            branch["document_refs"] = refs
+            branch["hydrated_node_ids"] = _dedupe_limited(
+                [*list(branch.get("hydrated_node_ids") or []), *hydrated_nodes.keys()],
+                limit=64,
+            )
+            branch["hydrated_node_count"] = len(list(branch["hydrated_node_ids"]))
+        updated_branches.append(branch)
+    surface["branches"] = updated_branches
+
+    updated_matches = []
+    for raw_match in list(surface.get("matches") or []):
+        match = copy.deepcopy(dict(raw_match))
+        node_id = str(match.get("node_id") or "").strip()
+        if node_id in hydrated_nodes:
+            match["node"] = copy.deepcopy(hydrated_nodes[node_id])
+            match["evidence_snippet"] = _evidence_snippet(
+                "", "", str(hydrated_nodes[node_id].get("raw_text") or "")
+            )
+            match["hydration_confirmed"] = True
+            match["hydration_authority"] = "master_exact_frozen_document_ref"
+        updated_matches.append(match)
+    surface["matches"] = updated_matches
+
+    # Keep the immutable renderer payload aligned with the evidence ledger.
+    # This is a projection of the exact server-bound node fetched above, not
+    # another document lookup or a semantic selection pass.
+    updated_packets = []
+    for raw_packet in list(surface.get("document_packets") or []):
+        packet = copy.deepcopy(dict(raw_packet))
+        packet_anchor_id = str(packet.get("anchor_node_id") or "").strip()
+        packet_document_id = str(packet.get("document_id") or "").strip()
+        packet_chunk_ids = {
+            str(item).strip()
+            for item in list(packet.get("chunk_node_ids") or [])
+            if str(item).strip()
+        }
+        packet_matches = bool(
+            (anchor_id and anchor_id == packet_anchor_id)
+            or (document_id and document_id in {packet_document_id, packet_anchor_id})
+            or packet_chunk_ids.intersection(hydrated_nodes)
+        )
+        if packet_matches:
+            anchor_node = hydrated_nodes.get(packet_anchor_id)
+            if anchor_node is not None:
+                packet["anchor_raw_text"] = str(anchor_node.get("raw_text") or "")
+            ordered_chunks = [
+                copy.deepcopy(dict(item))
+                for item in list(packet.get("ordered_chunk_sequence") or [])
+                if isinstance(item, Mapping)
+            ]
+            chunks_by_id = {
+                str(item.get("node_id") or "").strip(): item
+                for item in ordered_chunks
+                if str(item.get("node_id") or "").strip()
+            }
+            for node_id in sorted(packet_chunk_ids.intersection(hydrated_nodes)):
+                chunk = chunks_by_id.get(node_id, {"node_id": node_id})
+                chunk["raw_text"] = str(hydrated_nodes[node_id].get("raw_text") or "")
+                chunk["evidence_snippet"] = str(chunk["raw_text"])
+                chunk["hydrated_from_node_store"] = True
+                chunks_by_id[node_id] = chunk
+            packet["ordered_chunk_sequence"] = list(chunks_by_id.values())
+            anchor_chars = len(str(packet.get("anchor_raw_text") or ""))
+            chunk_chars = sum(
+                len(str(item.get("raw_text") or ""))
+                for item in list(packet.get("ordered_chunk_sequence") or [])
+                if isinstance(item, Mapping)
+            )
+            fact_chars = sum(
+                len(str(item.get("raw_text") or ""))
+                for item in list(packet.get("supported_fact_text") or [])
+                if isinstance(item, Mapping)
+            )
+            packet["raw_text_char_count"] = anchor_chars + chunk_chars + fact_chars
+            packet["complete_text_available"] = bool(anchor_chars or chunk_chars)
+            packet["full_text_mode"] = (
+                "anchor_raw" if anchor_chars else "ordered_chunk_sequence"
+            )
+            packet["full_text"] = _document_packet_full_text(packet) or None
+            packet["hydration_authority"] = "master_exact_frozen_document_ref"
+            packet["hydrated_node_ids"] = sorted(hydrated_nodes)
+            catalog_index = copy.deepcopy(dict(packet.get("catalog_index") or {}))
+            catalog_index.update(
+                {
+                    "full_text_available": bool(packet.get("full_text")),
+                    "raw_text_char_count": int(packet.get("raw_text_char_count") or 0),
+                }
+            )
+            packet["catalog_index"] = catalog_index
+        updated_packets.append(packet)
+    surface["document_packets"] = updated_packets
+
+    route_runtime = copy.deepcopy(dict(surface.get("route_runtime") or {}))
+    route_runtime["hydrated_node_count"] = max(
+        int(route_runtime.get("hydrated_node_count") or 0),
+        len(hydrated_nodes),
+    )
+    surface["route_runtime"] = route_runtime
+    receipt = {
+        **bound,
+        "applied": True,
+        "reason": "master_exact_frozen_document_ref_hydrated",
+        "hydrated_node_ids": sorted(hydrated_nodes),
+        "touched_mission_ids": _dedupe_limited(touched_mission_ids, limit=24),
+        "no_new_search": True,
+    }
+    ledger["ai_document_hydration_recovery"] = copy.deepcopy(receipt)
+    return ledger, surface, receipt
+
+
+def _frozen_master_support_ids(
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> set[str]:
+    """Return only answer-citable IDs certified in the frozen ledger."""
+
+    support_ids: set[str] = set()
+    for raw_row in list(dict(mission_evidence_ledger or {}).get("rows") or []):
+        if not isinstance(raw_row, Mapping):
+            continue
+        row = dict(raw_row)
+        for raw_evidence in list(row.get("hot_evidence") or []):
+            if not isinstance(raw_evidence, Mapping):
+                continue
+            node_id = str(dict(raw_evidence).get("node_id") or "").strip()
+            if node_id:
+                support_ids.add(node_id)
+        for raw_ref in list(row.get("document_refs") or []):
+            if not isinstance(raw_ref, Mapping):
+                continue
+            ref = dict(raw_ref)
+            for key in ("document_id", "anchor_node_id", "node_id"):
+                ref_id = str(ref.get(key) or "").strip()
+                if ref_id:
+                    support_ids.add(ref_id)
+            support_ids.update(
+                str(item).strip()
+                for item in list(ref.get("chunk_node_ids") or [])
+                if str(item).strip()
+            )
+    return support_ids
+
+
+def _normalized_evidence_excerpt(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _master_claim_is_blind_authority_bound(
+    master_claim: Any,
+    authority_claim: Any,
+) -> bool:
+    """Accept exact agreement or a clause-exact narrowing of blind authority.
+
+    Compound queries can make the blind EvidenceJudge include the next
+    mission's directly supported clause in its claim.  The terminal Master is
+    expected to keep each assessment mission-specific.  Requiring byte-level
+    equality turns that safe narrowing into a false review barrier.  We still
+    fail closed for paraphrases or expansions: the Master's normalized claim
+    must be an exact leading clause and the authority may only continue at an
+    explicit conjunction boundary.
+    """
+
+    master = _normalized_evidence_excerpt(master_claim).rstrip(".!? ")
+    authority = _normalized_evidence_excerpt(authority_claim).rstrip(".!? ")
+    if not master or not authority:
+        return False
+    if master == authority:
+        return True
+    if not authority.startswith(master):
+        return False
+    continuation = authority[len(master):]
+    return bool(
+        re.match(
+            r"^(?:[,;:]\s*)?(?:and|but|while|whereas)\b",
+            continuation,
+        )
+    )
+
+
+def _canonicalize_evidence_excerpt(source_text: Any, excerpt: Any) -> str:
+    """Return the verbatim frozen-source slice represented by an AI excerpt."""
+
+    source = str(source_text or "")
+    requested = str(excerpt or "").strip()
+    if not source or not requested:
+        return ""
+    if requested in source:
+        return requested
+    pieces = [piece for piece in re.split(r"\s+", requested) if piece]
+    if not pieces:
+        return ""
+    match = re.search(
+        r"\s+".join(re.escape(piece) for piece in pieces),
+        source,
+        flags=re.IGNORECASE,
+    )
+    return match.group(0) if match else ""
+
+
+def _canonical_evidence_witness_spans(
+    node_id: str,
+    source_text: Any,
+    *,
+    max_source_chars: int = 900,
+    max_span_chars: int = 620,
+) -> list[dict[str, str]]:
+    """Expose stable exact source slices for the one EvidenceJudge repair.
+
+    The server only establishes byte-exact witness identities.  It never
+    selects a witness semantically; the AI repair must choose a span ID.
+    """
+
+    source = str(source_text or "")[: max(1, int(max_source_chars))]
+    if not source:
+        return []
+    spans: list[dict[str, str]] = []
+    start = 0
+    while start < len(source) and len(spans) < 4:
+        end = min(len(source), start + max_span_chars)
+        if end < len(source):
+            candidates = [
+                source.rfind("\n", start + 160, end),
+                source.rfind(". ", start + 160, end),
+                source.rfind("; ", start + 160, end),
+                source.rfind(" ", start + 160, end),
+            ]
+            boundary = max(candidates)
+            if boundary > start:
+                end = boundary + (1 if source[boundary] in ".;" else 0)
+        excerpt = source[start:end].strip()
+        if excerpt:
+            digest = hashlib.sha256(
+                f"{node_id}\0{start}\0{end}\0{excerpt}".encode("utf-8")
+            ).hexdigest()[:24]
+            spans.append(
+                {
+                    "canonical_span_id": f"witness::{digest}",
+                    "excerpt": excerpt,
+                }
+            )
+        start = max(end, start + 1)
+        while start < len(source) and source[start].isspace():
+            start += 1
+    return spans
+
+
+def _validate_blind_evidence_authority(
+    payload: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+    *,
+    attestation: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind one blind AI evidence review to exact frozen mission excerpts."""
+
+    ledger = dict(mission_evidence_ledger or {})
+    required_rows = [
+        dict(row)
+        for row in list(ledger.get("rows") or [])
+        if isinstance(row, Mapping) and dict(row).get("required") is not False
+    ]
+    required_by_id = {
+        str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip(): row
+        for row in required_rows
+        if str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip()
+    }
+    blockers: list[dict[str, Any]] = []
+    try:
+        validated_attestation = validate_ai_execution_attestation(dict(attestation or {}))
+        if str(validated_attestation.get("provider") or "").strip().lower() in _NON_AI_PROVIDER_NAMES:
+            raise AiModuleContractError("evidence_judge_provider_invalid")
+    except (AiModuleContractError, TypeError, ValueError):
+        validated_attestation = {}
+        blockers.append({"reason": "evidence_judge_attestation_invalid"})
+
+    packets = [
+        dict(item)
+        for item in list(dict(payload or {}).get("mission_claim_packets") or [])
+        if isinstance(item, Mapping)
+    ]
+    packets_by_id: dict[str, dict[str, Any]] = {}
+    normalized_packets: list[dict[str, Any]] = []
+    for packet in packets:
+        mission_id = str(packet.get("mission_id") or "").strip()
+        if not mission_id or mission_id in packets_by_id:
+            blockers.append({"mission_id": mission_id or None, "reason": "evidence_judge_mission_id_invalid"})
+            continue
+        row = required_by_id.get(mission_id)
+        if row is None:
+            blockers.append({"mission_id": mission_id, "reason": "evidence_judge_unexpected_mission"})
+            continue
+        evidence_by_id = {
+            str(item.get("node_id") or "").strip(): str(item.get("text") or "").strip()
+            for item in list(row.get("hot_evidence") or [])
+            if isinstance(item, Mapping) and str(item.get("node_id") or "").strip()
+        }
+        cited_ids = _dedupe_limited(
+            [str(item).strip() for item in list(packet.get("evidence_node_ids") or []) if str(item).strip()],
+            limit=16,
+        )
+        proposed_excerpts = [
+            {
+                "node_id": str(item.get("node_id") or "").strip(),
+                "excerpt": _truncate_prompt_text(str(item.get("excerpt") or "").strip(), 700),
+            }
+            for item in list(packet.get("evidence_excerpts") or [])
+            if isinstance(item, Mapping)
+        ]
+        excerpts = [
+            {
+                "node_id": item["node_id"],
+                "excerpt": _canonicalize_evidence_excerpt(
+                    evidence_by_id.get(item["node_id"]),
+                    item["excerpt"],
+                ),
+            }
+            for item in proposed_excerpts
+            if item["node_id"] and item["excerpt"]
+        ]
+        proposed_excerpt_ids = {
+            item["node_id"] for item in proposed_excerpts if item["node_id"] and item["excerpt"]
+        }
+        excerpt_by_id = {
+            item["node_id"]: item["excerpt"]
+            for item in excerpts
+            if item["node_id"] and item["excerpt"]
+        }
+        entailed = bool(packet.get("entailed"))
+        claim = _truncate_prompt_text(str(packet.get("claim") or "").strip(), 1200)
+        reason = None
+        if entailed and not claim:
+            reason = "evidence_judge_claim_missing"
+        elif entailed and not cited_ids:
+            reason = "evidence_judge_ids_missing"
+        elif cited_ids and set(cited_ids) != proposed_excerpt_ids:
+            reason = "evidence_judge_excerpt_ids_mismatch"
+        elif cited_ids and not set(cited_ids).issubset(evidence_by_id):
+            reason = "evidence_judge_id_outside_mission"
+        elif cited_ids and any(not excerpt_by_id.get(node_id) for node_id in cited_ids):
+            reason = "evidence_judge_excerpt_not_exactly_bound"
+        if reason:
+            blocker = {"mission_id": mission_id, "reason": reason}
+            if reason in {
+                "evidence_judge_id_outside_mission",
+                "evidence_judge_excerpt_ids_mismatch",
+                "evidence_judge_excerpt_not_exactly_bound",
+            }:
+                blocker["cited_evidence_node_ids"] = cited_ids
+                blocker["allowed_evidence_node_ids"] = sorted(evidence_by_id)
+            if reason == "evidence_judge_excerpt_not_exactly_bound":
+                invalid_excerpts = []
+                for item in proposed_excerpts:
+                    node_id = item.get("node_id") or ""
+                    if node_id not in cited_ids:
+                        continue
+                    if excerpt_by_id.get(node_id):
+                        continue
+                    source_text = evidence_by_id.get(node_id) or ""
+                    invalid_excerpts.append(
+                        {
+                            "node_id": node_id,
+                            "proposed_excerpt": item.get("excerpt") or "",
+                            "source_text_head": _truncate_prompt_text(
+                                source_text,
+                                900,
+                            ),
+                        }
+                    )
+                if invalid_excerpts:
+                    blocker["invalid_evidence_excerpts"] = invalid_excerpts[:8]
+            blockers.append(blocker)
+        normalized = {
+            "mission_id": mission_id,
+            "entailed": bool(entailed and not reason),
+            "claim": claim if entailed and not reason else "",
+            "evidence_node_ids": cited_ids if not reason else [],
+            "evidence_excerpts": excerpts if not reason else [],
+            "explanation": _truncate_prompt_text(str(packet.get("explanation") or "").strip(), 1200),
+            "unsupported_claims": _dedupe_limited(
+                [_truncate_prompt_text(str(item).strip(), 360) for item in list(packet.get("unsupported_claims") or []) if str(item).strip()],
+                limit=8,
+            ),
+        }
+        packets_by_id[mission_id] = normalized
+        normalized_packets.append(normalized)
+
+    for mission_id in required_by_id:
+        if mission_id not in packets_by_id:
+            blockers.append({"mission_id": mission_id, "reason": "evidence_judge_mission_missing"})
+    return {
+        "schema_version": "agvm.blind_evidence_authority.v1",
+        "valid": bool(required_by_id) and not blockers,
+        "mission_claim_packets": normalized_packets,
+        "required_mission_count": len(required_by_id),
+        "attestation": validated_attestation,
+        "blockers": blockers,
+    }
+
+
+_BLIND_EVIDENCE_AUTHORITY_REPAIR_REASONS = {
+    "evidence_judge_mission_id_invalid",
+    "evidence_judge_unexpected_mission",
+    "evidence_judge_mission_missing",
+    "evidence_judge_id_outside_mission",
+    "evidence_judge_excerpt_ids_mismatch",
+    "evidence_judge_excerpt_not_exactly_bound",
+}
+
+
+def _blind_evidence_authority_repair_feedback(
+    validation: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    blockers = [
+        dict(item)
+        for item in list(dict(validation or {}).get("blockers") or [])
+        if isinstance(item, Mapping)
+    ]
+    if not blockers:
+        return None
+    if any(str(item.get("reason") or "") not in _BLIND_EVIDENCE_AUTHORITY_REPAIR_REASONS for item in blockers):
+        return None
+    cited_ids_by_mission: dict[str, set[str]] = defaultdict(set)
+    for blocker in blockers:
+        mission_id = str(blocker.get("mission_id") or "").strip()
+        if not mission_id:
+            continue
+        cited_ids_by_mission[mission_id].update(
+            str(item).strip()
+            for item in list(blocker.get("cited_evidence_node_ids") or [])
+            if str(item).strip()
+        )
+    rows: list[dict[str, Any]] = []
+    for raw_row in list(dict(mission_evidence_ledger or {}).get("rows") or []):
+        if not isinstance(raw_row, Mapping) or dict(raw_row).get("required") is False:
+            continue
+        row = dict(raw_row)
+        mission_id = str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip()
+        if not mission_id:
+            continue
+        allowed_ids = _dedupe_limited(
+            [
+                str(item.get("node_id") or item.get("id") or "").strip()
+                for item in list(row.get("hot_evidence") or [])
+                if isinstance(item, Mapping) and str(item.get("node_id") or item.get("id") or "").strip()
+            ],
+            limit=64,
+        )
+        allowed_evidence = []
+        canonical_witnesses = []
+        preferred_ids = cited_ids_by_mission.get(mission_id, set()).intersection(allowed_ids)
+        if not preferred_ids:
+            preferred_ids = set(allowed_ids)
+        for item in list(row.get("hot_evidence") or []):
+            if not isinstance(item, Mapping):
+                continue
+            node_id = str(item.get("node_id") or item.get("id") or "").strip()
+            if not node_id:
+                continue
+            text = str(
+                item.get("text")
+                or item.get("raw_text")
+                or item.get("summary")
+                or item.get("claim")
+                or item.get("evidence_snippet")
+                or ""
+            ).strip()
+            if not text:
+                continue
+            allowed_evidence.append(
+                {
+                    "node_id": node_id,
+                    "text": _truncate_prompt_text(text, 900),
+                }
+            )
+            if node_id in preferred_ids:
+                spans = _canonical_evidence_witness_spans(node_id, text)
+                if spans:
+                    canonical_witnesses.append(
+                        {
+                            "node_id": node_id,
+                            "spans": spans,
+                        }
+                    )
+            if len(allowed_evidence) >= 32:
+                break
+        rows.append(
+            {
+                "mission_id": mission_id,
+                "allowed_evidence_node_ids": allowed_ids,
+                "allowed_evidence": allowed_evidence,
+                "canonical_witnesses": canonical_witnesses,
+            }
+        )
+    if not rows:
+        return None
+    required_mission_ids = [str(row["mission_id"]) for row in rows]
+    return {
+        "reason": "previous_evidence_judge_output_failed_server_binding",
+        "invalid_blockers": blockers[:16],
+        "required_mission_ids": required_mission_ids,
+        "required_mission_count": len(required_mission_ids),
+        "packet_cardinality_contract": {
+            "exactly_one_packet_per_required_mission": True,
+            "duplicate_mission_ids_allowed": False,
+            "unexpected_mission_ids_allowed": False,
+            "missing_required_mission_ids_allowed": False,
+        },
+        "mission_allowed_evidence_node_ids": rows,
+        "instruction": (
+            "Return exactly required_mission_count packets: one corrected packet for each "
+            "exact ID in required_mission_ids, with no duplicate, missing, or additional "
+            "mission IDs. Select evidence only through canonical_span_id values supplied "
+            "under that mission's canonical_witnesses. Never write, repair, paraphrase, or "
+            "invent an excerpt. The server will bind the selected span IDs back to their "
+            "exact source text. Otherwise set entailed=false."
+        ),
+    }
+
+
+def _bind_canonical_repair_witnesses(
+    payload: Mapping[str, Any] | None,
+    repair_feedback: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Convert AI-selected server witness IDs into exact excerpt packets."""
+
+    witness_by_mission: dict[str, dict[tuple[str, str], str]] = {}
+    for raw_row in list(
+        dict(repair_feedback or {}).get("mission_allowed_evidence_node_ids") or []
+    ):
+        if not isinstance(raw_row, Mapping):
+            continue
+        row = dict(raw_row)
+        mission_id = str(row.get("mission_id") or "").strip()
+        if not mission_id:
+            continue
+        available: dict[tuple[str, str], str] = {}
+        for raw_witness in list(row.get("canonical_witnesses") or []):
+            if not isinstance(raw_witness, Mapping):
+                continue
+            witness = dict(raw_witness)
+            node_id = str(witness.get("node_id") or "").strip()
+            for raw_span in list(witness.get("spans") or []):
+                if not isinstance(raw_span, Mapping):
+                    continue
+                span = dict(raw_span)
+                span_id = str(span.get("canonical_span_id") or "").strip()
+                excerpt = str(span.get("excerpt") or "")
+                if node_id and span_id and excerpt:
+                    available[(node_id, span_id)] = excerpt
+        witness_by_mission[mission_id] = available
+
+    packets: list[dict[str, Any]] = []
+    for raw_packet in list(dict(payload or {}).get("mission_claim_packets") or []):
+        if not isinstance(raw_packet, Mapping):
+            continue
+        packet = dict(raw_packet)
+        mission_id = str(packet.get("mission_id") or "").strip()
+        available = witness_by_mission.get(mission_id, {})
+        evidence_ids: list[str] = []
+        excerpts: list[dict[str, str]] = []
+        invalid_selection = False
+        for raw_selection in list(packet.get("evidence_witnesses") or []):
+            if not isinstance(raw_selection, Mapping):
+                invalid_selection = True
+                continue
+            selection = dict(raw_selection)
+            node_id = str(selection.get("node_id") or "").strip()
+            span_id = str(selection.get("canonical_span_id") or "").strip()
+            excerpt = available.get((node_id, span_id))
+            if not excerpt:
+                invalid_selection = True
+                continue
+            if node_id not in evidence_ids:
+                evidence_ids.append(node_id)
+            excerpts.append({"node_id": node_id, "excerpt": excerpt})
+        packets.append(
+            {
+                "mission_id": mission_id,
+                "entailed": bool(packet.get("entailed")) and not invalid_selection,
+                "claim": str(packet.get("claim") or "") if not invalid_selection else "",
+                "evidence_node_ids": evidence_ids if not invalid_selection else [],
+                "evidence_excerpts": excerpts if not invalid_selection else [],
+                "explanation": str(packet.get("explanation") or ""),
+                "unsupported_claims": list(packet.get("unsupported_claims") or []),
+            }
+        )
+    return {"mission_claim_packets": packets}
+
+
+def evidence_judge_llm(
+    *,
+    query_text: str,
+    retrieval_mode: str,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Run one blind, evidence-first semantic review before terminal Master."""
+
+    rows = []
+    for raw_row in list(dict(mission_evidence_ledger or {}).get("rows") or []):
+        if not isinstance(raw_row, Mapping) or dict(raw_row).get("required") is False:
+            continue
+        row = dict(raw_row)
+        rows.append(
+            _compact_branch_autojudge_row(
+                row,
+                counts=_branch_judgement_evidence_counts(row),
+                evidence_limit=32,
+                blind_semantic_review=True,
+                root_query_text_fallback=query_text,
+            )
+        )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["mission_claim_packets"],
+        "properties": {
+            "mission_claim_packets": {
+                "type": "array",
+                "maxItems": 24,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "mission_id", "entailed", "claim", "evidence_node_ids",
+                        "evidence_excerpts", "explanation", "unsupported_claims",
+                    ],
+                    "properties": {
+                        "mission_id": {"type": "string", "maxLength": 256},
+                        "entailed": {"type": "boolean"},
+                        "claim": {"type": "string", "maxLength": 1200},
+                        "evidence_node_ids": {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 256}},
+                        "evidence_excerpts": {
+                            "type": "array", "maxItems": 16,
+                            "items": {
+                                "type": "object", "additionalProperties": False,
+                                "required": ["node_id", "excerpt"],
+                                "properties": {
+                                    "node_id": {"type": "string", "maxLength": 256},
+                                    "excerpt": {"type": "string", "maxLength": 700},
+                                },
+                            },
+                        },
+                        "explanation": {"type": "string", "maxLength": 1200},
+                        "unsupported_claims": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 360}},
+                    },
+                },
+            }
+        },
+    }
+    repair_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["mission_claim_packets"],
+        "properties": {
+            "mission_claim_packets": {
+                "type": "array",
+                "maxItems": 24,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "mission_id", "entailed", "claim", "evidence_witnesses",
+                        "explanation", "unsupported_claims",
+                    ],
+                    "properties": {
+                        "mission_id": {"type": "string", "maxLength": 256},
+                        "entailed": {"type": "boolean"},
+                        "claim": {"type": "string", "maxLength": 1200},
+                        "evidence_witnesses": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["node_id", "canonical_span_id"],
+                                "properties": {
+                                    "node_id": {"type": "string", "maxLength": 256},
+                                    "canonical_span_id": {"type": "string", "maxLength": 256},
+                                },
+                            },
+                        },
+                        "explanation": {"type": "string", "maxLength": 1200},
+                        "unsupported_claims": {
+                            "type": "array", "maxItems": 8,
+                            "items": {"type": "string", "maxLength": 360},
+                        },
+                    },
+                },
+            }
+        },
+    }
+    system_prompt = (
+        "You are an evidence-first mission judge. You never see planner hypotheses or planner success criteria and must not infer missing facts. "
+        "For each required mission, evaluate the exact mission goal in the scope of root_query_text against only that mission's visible promoted source evidence. "
+        "Do not demand evidence broader than the mission goal. Return an entailed claim when the exact subject and requested relationship are directly supported. "
+        "For every cited node copy a short exact excerpt verbatim from that node's visible text. Related examples, biographies, surveys, generic capabilities and nearby graph topics are not definitions of the subject. "
+        "If direct support is absent, set entailed=false and leave claim empty. Cite exact visible evidence that explains the gap when available; otherwise leave evidence arrays empty. Explain the concrete missing or conflicting information in natural language."
+    )
+    base_user_payload = {"query": query_text, "missions": rows}
+
+    def run_judge(
+        *,
+        call_name: str,
+        repair_feedback: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        execution_record: dict[str, Any] = {}
+        user_payload = dict(base_user_payload)
+        effective_system_prompt = system_prompt
+        if repair_feedback:
+            user_payload["repair_feedback"] = dict(repair_feedback)
+            effective_system_prompt = (
+                f"{system_prompt} This is the only repair turn for server binding. "
+                "Use the repair feedback as a hard ID contract."
+            )
+        repair_turn = bool(repair_feedback)
+        payload = _run_attested_search_ai_json(
+            call_name=call_name,
+            execution_record_out=execution_record,
+            model=evidence_judge_model(),
+            system_prompt=effective_system_prompt,
+            user_prompt=json.dumps(
+                user_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            schema_name=(
+                "agvm_blind_evidence_judge_canonical_repair"
+                if repair_turn
+                else "agvm_blind_evidence_judge"
+            ),
+            schema=repair_schema if repair_turn else schema,
+            timeout=_search_ai_stage_timeout_seconds("master_judge", retrieval_mode),
+            role="evidence_judge",
+        )
+        if repair_turn:
+            payload = _bind_canonical_repair_witnesses(payload, repair_feedback)
+        return payload, execution_record
+
+    payload, execution_record = run_judge(call_name="evidence_judge")
+    validation = _validate_blind_evidence_authority(
+        payload,
+        mission_evidence_ledger,
+        attestation=dict(execution_record.get("ai_execution_attestation") or {}),
+    )
+    repair_feedback = _blind_evidence_authority_repair_feedback(
+        validation,
+        mission_evidence_ledger,
+    )
+    if not repair_feedback:
+        return validation
+    try:
+        repaired_payload, repaired_record = run_judge(
+            call_name="evidence_judge_repair",
+            repair_feedback=repair_feedback,
+        )
+        repaired = _validate_blind_evidence_authority(
+            repaired_payload,
+            mission_evidence_ledger,
+            attestation=dict(repaired_record.get("ai_execution_attestation") or {}),
+        )
+        repaired["repair_attempted"] = True
+        repaired["repair_reason"] = "server_binding_ids"
+        repaired["initial_blockers"] = list(validation.get("blockers") or [])[:16]
+        return repaired
+    except SearchAiExecutionError as exc:
+        validation["repair_attempted"] = True
+        validation["repair_reason"] = "server_binding_ids"
+        validation["repair_error"] = {
+            "reason": "evidence_judge_repair_provider_failure",
+            "call_name": exc.call_name,
+            "provider_error": exc.provider_error,
+        }
+        return validation
+
+
+def _validate_master_mission_entailments(
+    master_decision: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+    evidence_authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the Master's semantic proof without re-judging it heuristically.
+
+    The provider remains the semantic authority. The server only enforces the
+    frozen contract: one assessment per required mission, a non-empty human
+    claim and explanation, and evidence IDs belonging to that exact row.
+    Planner hypotheses are deliberately absent from these acceptance checks.
+    """
+
+    decision = dict(master_decision or {})
+    ledger = dict(mission_evidence_ledger or {})
+    required_rows = [
+        dict(row)
+        for row in list(ledger.get("rows") or [])
+        if isinstance(row, Mapping) and dict(row).get("required") is not False
+    ]
+    required_by_id = {
+        str(
+            row.get("mission_id")
+            or row.get("path_id")
+            or row.get("branch_id")
+            or ""
+        ).strip(): row
+        for row in required_rows
+        if str(
+            row.get("mission_id")
+            or row.get("path_id")
+            or row.get("branch_id")
+            or ""
+        ).strip()
+    }
+    assessments = [
+        dict(item)
+        for item in list(decision.get("mission_evidence_assessments") or [])
+        if isinstance(item, Mapping)
+    ]
+    assessment_by_id = {
+        str(item.get("mission_id") or "").strip(): item
+        for item in assessments
+        if str(item.get("mission_id") or "").strip()
+    }
+    blockers: list[dict[str, Any]] = []
+    authority = dict(
+        evidence_authority
+        or decision.get("_evidence_authority")
+        or {}
+    )
+    authority_packets = {
+        str(item.get("mission_id") or "").strip(): dict(item)
+        for item in list(authority.get("mission_claim_packets") or [])
+        if isinstance(item, Mapping) and str(item.get("mission_id") or "").strip()
+    }
+    if authority and not bool(authority.get("valid")):
+        blockers.append({"reason": "blind_evidence_authority_invalid"})
+    accepted_support_ids: set[str] = set()
+    for mission_id, row in required_by_id.items():
+        assessment = assessment_by_id.get(mission_id)
+        if assessment is None:
+            blockers.append(
+                {
+                    "mission_id": mission_id,
+                    "reason": "mission_entailment_missing",
+                }
+            )
+            continue
+        row_support_ids = _frozen_master_support_ids({"rows": [row]})
+        semantic_quality_contract_required = bool(
+            dict(row.get("expected_evidence_shape") or {}).get(
+                "semantic_quality_contract_required"
+            )
+        )
+        cited_ids = {
+            str(item).strip()
+            for item in list(assessment.get("evidence_node_ids") or [])
+            if str(item).strip()
+        }
+        authority_packet = authority_packets.get(mission_id) if authority else None
+        reason = None
+        if authority and authority_packet is None:
+            reason = "blind_evidence_authority_mission_missing"
+        elif authority_packet is not None and not bool(authority_packet.get("entailed")):
+            reason = "blind_evidence_authority_not_entailed"
+        elif authority_packet is not None and not _master_claim_is_blind_authority_bound(
+            assessment.get("claim"),
+            authority_packet.get("claim"),
+        ):
+            reason = "master_claim_differs_from_blind_authority"
+        elif authority_packet is not None and cited_ids != {
+            str(item).strip()
+            for item in list(authority_packet.get("evidence_node_ids") or [])
+            if str(item).strip()
+        }:
+            reason = "master_evidence_differs_from_blind_authority"
+        elif not bool(assessment.get("entailed")):
+            reason = "mission_claim_not_entailed"
+        elif not str(assessment.get("claim") or "").strip():
+            reason = "mission_claim_missing"
+        elif not str(assessment.get("explanation") or "").strip():
+            reason = "mission_entailment_explanation_missing"
+        elif semantic_quality_contract_required and not str(
+            assessment.get("subject_attribution") or ""
+        ).strip():
+            reason = "mission_subject_attribution_missing"
+        elif semantic_quality_contract_required and not bool(
+            assessment.get("subject_attribution_established")
+        ):
+            reason = "mission_subject_attribution_not_established"
+        elif semantic_quality_contract_required and not bool(
+            assessment.get("direct_mission_fit")
+        ):
+            reason = "mission_evidence_not_direct_fit"
+        elif semantic_quality_contract_required and not bool(
+            assessment.get("success_criteria_satisfied")
+        ):
+            reason = "mission_success_criteria_not_satisfied"
+        elif semantic_quality_contract_required and not str(
+            assessment.get("evidence_selection_rationale") or ""
+        ).strip():
+            reason = "mission_evidence_selection_rationale_missing"
+        elif not cited_ids:
+            reason = "mission_entailment_evidence_missing"
+        elif not cited_ids.issubset(row_support_ids):
+            reason = "mission_entailment_evidence_outside_row"
+        elif list(assessment.get("unsupported_claims") or []):
+            reason = "mission_claim_has_unsupported_parts"
+        if reason:
+            blockers.append({"mission_id": mission_id, "reason": reason})
+            continue
+        accepted_support_ids.update(cited_ids)
+    unexpected_ids = sorted(set(assessment_by_id) - set(required_by_id))
+    if unexpected_ids:
+        blockers.append(
+            {
+                "reason": "unexpected_mission_entailment",
+                "mission_ids": unexpected_ids,
+            }
+        )
+    answer_support_ids = {
+        str(item).strip()
+        for item in list(
+            dict(decision.get("grounded_answer") or {}).get(
+                "evidence_node_ids"
+            )
+            or []
+        )
+        if str(item).strip()
+    }
+    if bool(decision.get("can_answer_now")) and (
+        not answer_support_ids
+        or not answer_support_ids.issubset(accepted_support_ids)
+    ):
+        blockers.append({"reason": "answer_support_not_entailed_by_missions"})
+    return {
+        "schema_version": "agvm.master_mission_entailment_validation.v1",
+        "valid": not blockers and bool(required_by_id),
+        "required_mission_count": len(required_by_id),
+        "assessed_mission_count": len(assessment_by_id),
+        "accepted_support_ids": sorted(accepted_support_ids),
+        "blockers": blockers,
+    }
+
+
+def _project_master_authored_grounded_answer(
+    *,
+    query_text: str,
+    response_mode: str,
+    master_decision: Mapping[str, Any] | None,
+    master_attestation: Mapping[str, Any] | None,
+    frozen_surface: Mapping[str, Any] | None,
+    frozen_ledger: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    """Validate and project the sole Master's answer without a provider call."""
+
+    if str(response_mode or "").strip() not in {"answer", "both"}:
+        return None, None, "not_requested"
+    decision = dict(master_decision or {})
+    authored = dict(decision.get("grounded_answer") or {})
+    if not bool(decision.get("can_answer_now")):
+        return None, None, "suppressed_by_master"
+    answer_text = str(authored.get("answer_text") or "").strip()
+    support_ids = _dedupe_limited(
+        [
+            str(item).strip()
+            for item in list(authored.get("evidence_node_ids") or [])
+            if str(item).strip()
+        ],
+        limit=16,
+    )
+    certified_ids = _frozen_master_support_ids(frozen_ledger)
+    if not answer_text or not support_ids or not set(support_ids).issubset(certified_ids):
+        return None, None, "invalid_frozen_evidence_binding"
+    entailment_validation = _validate_master_mission_entailments(
+        decision,
+        frozen_ledger,
+    )
+    if not bool(entailment_validation.get("valid")):
+        return None, None, "mission_entailment_not_certified"
+    try:
+        attestation = validate_ai_execution_attestation(dict(master_attestation or {}))
+    except (AiModuleContractError, TypeError, ValueError):
+        return None, None, "master_attestation_invalid"
+    provider = str(attestation.get("provider") or "").strip().lower()
+    if not attestation or provider in _NON_AI_PROVIDER_NAMES:
+        return None, None, "master_attestation_invalid"
+    answerability_state = str(
+        authored.get("answerability_state") or "partial"
+    ).strip().lower()
+    if answerability_state not in {"grounded", "partial"} or bool(
+        authored.get("insufficient")
+    ):
+        return None, None, "master_answer_insufficient"
+    surface = dict(frozen_surface or {})
+    matches = [
+        dict(item)
+        for item in list(surface.get("matches") or [])
+        if isinstance(item, Mapping)
+    ]
+    shared_evidence = dict(surface.get("shared_evidence") or {})
+    support_metadata = build_answer_support_metadata(
+        matches=matches,
+        shared_evidence=shared_evidence,
+        evidence_node_ids=support_ids,
+    )
+    answer = {
+        "answer_text": answer_text,
+        "mode": "llm",
+        "confidence": max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    authored.get("confidence")
+                    or decision.get("confidence")
+                    or 0.0
+                ),
+            ),
+        ),
+        "evidence_node_ids": support_ids,
+        "reasoning_summary": str(authored.get("reasoning_summary") or "").strip(),
+        "insufficient": False,
+        "answerability_state": answerability_state,
+        "evidence_snippets": _build_stream_evidence_snippets(matches),
+        "support_node_count": int(support_metadata.get("support_node_count") or 0),
+        "support_slot_count": int(support_metadata.get("support_slot_count") or 0),
+        "family_attribution_summary": dict(
+            support_metadata.get("family_attribution_summary") or {}
+        ),
+        "contradiction_present": bool(
+            support_metadata.get("contradiction_present")
+        ),
+        "semantic_authority": {
+            "mode": "ai_v2",
+            "revision": "ai_v2_s1",
+            "fallback_used": False,
+            "attested_call_name": "master_judge",
+            "provider": provider,
+            "model": str(attestation.get("model") or "") or None,
+            "response_id": str(attestation.get("response_id") or "") or None,
+            "request_sha256": str(attestation.get("request_sha256") or ""),
+            "output_sha256": str(attestation.get("output_sha256") or ""),
+            "provider_answerability_state": answerability_state,
+            "provider_insufficient": False,
+            "mission_entailment_validation": entailment_validation,
+            "frozen_ledger_digest": search_mission_ledger_digest(
+                dict(frozen_ledger or {})
+            ),
+        },
+    }
+    context_projection: dict[str, Any] | None = None
+    if str(response_mode or "").strip() == "both":
+        context_projection = copy.deepcopy(dict(surface.get("context") or {}))
+        context_projection["context_summary"] = str(
+            authored.get("context_summary") or ""
+        ).strip()
+    return answer, context_projection, "projected_from_master"
+
+
+def _attested_ai_v2_terminal_answer_ready(
+    answer: Mapping[str, Any] | None,
+    master_judgement: Mapping[str, Any] | None,
+) -> bool:
+    """Return true only when both final AI authorities are independently proven."""
+
+    payload = dict(answer or {})
+    master = dict(master_judgement or {})
+    master_authority = dict(master.get("semantic_authority") or {})
+    return bool(
+        _answer_surface_allowed_for_semantic_authority(payload, "ai_v2")
+        and str(dict(payload.get("semantic_authority") or {}).get("provider_answerability_state") or "").strip().lower()
+        == "grounded"
+        and dict(payload.get("semantic_authority") or {}).get("provider_insufficient") is False
+        and str(master.get("master_state") or "").strip().lower() == "terminal"
+        and master.get("terminal_for_client") is True
+        and master.get("final_seal_allowed") is True
+        and master.get("master_ai_used") is True
+        and str(master_authority.get("mode") or "").strip().lower() == "ai_v2"
+        and master_authority.get("master_ai_used") is True
+        and master_authority.get("fallback_used") is False
+        and not list(master.get("missing_goals") or [])
+        and not list(master.get("unresolved_goals") or [])
+        and not list(master.get("partial_goals") or [])
+    )
+
+
+def _answer_evidence_binding_gaps(
+    answer: Mapping[str, Any] | None,
+    *,
+    context_package: Mapping[str, Any] | None,
+    mission_evidence_ledger: Mapping[str, Any] | None,
+) -> dict[str, list[str]]:
+    """Return proof IDs that are not visible in both authoritative products."""
+
+    answer_ids = {
+        str(item).strip()
+        for item in list(dict(answer or {}).get("evidence_node_ids") or [])
+        if str(item).strip()
+    }
+    if not answer_ids:
+        return {"missing_from_package": [], "missing_from_ledger": []}
+    package_ids = _context_package_node_ids(dict(context_package or {}))
+    ledger_ids = _context_package_node_ids(dict(mission_evidence_ledger or {}))
+    return {
+        "missing_from_package": sorted(answer_ids - package_ids),
+        "missing_from_ledger": sorted(answer_ids - ledger_ids),
+    }
+
+
+def _apply_attested_ai_v2_terminal_answer_authority(
+    *,
+    answer: dict[str, Any] | None,
+    master_judgement: dict[str, Any] | None,
+    final_surface_fields: dict[str, Any] | None,
+    context_package: dict[str, Any] | None = None,
+    mission_evidence_ledger: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any], bool]:
+    """Make legacy adequacy diagnostic after both AI authorities approve."""
+
+    payload = dict(answer or {}) if answer else None
+    surface = dict(final_surface_fields or {})
+    if not _attested_ai_v2_terminal_answer_ready(payload, master_judgement):
+        return payload, surface, False
+
+    if context_package is not None or mission_evidence_ledger is not None:
+        binding_gaps = _answer_evidence_binding_gaps(
+            payload,
+            context_package=context_package,
+            mission_evidence_ledger=mission_evidence_ledger,
+        )
+        if binding_gaps["missing_from_package"] or binding_gaps["missing_from_ledger"]:
+            blocker = {
+                "branch_id": "grounded_answer",
+                "planner_family": "ai",
+                "origin_families": ["ai"],
+                "destination_key": "answer_evidence",
+                "destination_id": "answer_evidence",
+                "label": "Answer evidence",
+                "state": "review_required",
+                "state_reason": "answer_evidence_outside_public_ledger",
+                "blockers": ["answer_evidence_outside_public_ledger"],
+                **binding_gaps,
+            }
+            surface["final_closure_ready"] = False
+            surface["closure_state"] = "review_required"
+            surface["answer_surface_state"] = "review_required"
+            surface["final_closure_blockers"] = [
+                *[
+                    dict(item)
+                    for item in list(surface.get("final_closure_blockers") or [])
+                    if isinstance(item, Mapping)
+                    and str(item.get("state_reason") or "") != "answer_evidence_outside_public_ledger"
+                ],
+                blocker,
+            ][:16]
+            surface["unresolved_destination_count"] = len(surface["final_closure_blockers"])
+            # Frozen-ledger authorship alone is insufficient for publication:
+            # every cited ID must also be present on the public package. Keep
+            # the structural review blocker but fail closed on the answer body.
+            return None, surface, False
+
+    adequacy = dict((payload or {}).get("answer_adequacy") or {})
+    if adequacy:
+        adequacy.update(
+            {
+                "diagnostic_only": True,
+                "terminal_authority": "ai_v2_master_and_grounded_answer",
+                "blocked_final_seal": False,
+            }
+        )
+        payload["answer_adequacy"] = adequacy
+    payload["answerability_state"] = "grounded"
+    payload["insufficient"] = False
+
+    retained_blockers = []
+    for blocker in list(surface.get("final_closure_blockers") or []):
+        if not isinstance(blocker, Mapping):
+            continue
+        blocker_payload = dict(blocker)
+        reasons = {
+            str(blocker_payload.get("state_reason") or "").strip(),
+            *{
+                str(item).strip()
+                for item in list(blocker_payload.get("blockers") or [])
+                if str(item).strip()
+            },
+        }
+        reasons.discard("")
+        if reasons and reasons <= {
+            "blocked_ai_final_judge_missing",
+            "blocked_answer_demo_not_approved",
+            "answer_demo_not_approved_secondary",
+        }:
+            continue
+        retained_blockers.append(blocker_payload)
+    surface["final_closure_blockers"] = retained_blockers[:16]
+    if retained_blockers:
+        surface["unresolved_destination_count"] = len(retained_blockers)
+        return payload, surface, False
+    surface.update(
+        {
+            "answer_surface_state": "final_sealed",
+            "closure_state": "final_sealed",
+            "final_closure_ready": True,
+            "unresolved_destination_count": 0,
+            "closure_blocker_reason_histogram": {},
+            "answer_now_before_exploration_complete": False,
+            "final_closure_after_destination_resolution": True,
+        }
+    )
+    return payload, surface, True
+
+
+def _build_search_issue_diagnostics(
+    *,
+    query_text: str,
+    final_surface_fields: dict[str, Any] | None,
+    context_package_contract: dict[str, Any] | None,
+    evidence_reservoir: dict[str, Any] | None,
+    mission_evidence_ledger: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    final_surface = dict(final_surface_fields or {})
+    package_contract = dict(context_package_contract or {})
+    reservoir = dict(evidence_reservoir or {})
+    entries = [dict(item) for item in list(reservoir.get("entries") or []) if isinstance(item, dict)]
+    ledger_rows = [
+        dict(item)
+        for item in list(dict(mission_evidence_ledger or {}).get("rows") or [])
+        if isinstance(item, Mapping)
+    ]
+    ledger_hot_evidence = [
+        dict(item)
+        for row in ledger_rows
+        for item in list(row.get("hot_evidence") or [])
+        if isinstance(item, Mapping)
+    ]
+    ledger_hot_node_ids = {
+        str(item.get("node_id") or "").strip()
+        for item in ledger_hot_evidence
+        if str(item.get("node_id") or "").strip()
+    }
+    promoted_entries = [
+        item
+        for item in entries
+        if str(item.get("promotion_state") or "") in {"promoted", "hot"}
+        or str(item.get("node_id") or "").strip() in ledger_hot_node_ids
+    ]
+    promoted_text = _fold_text(
+        " ".join(
+            " ".join(str(item.get(key) or "") for key in ("topic", "summary", "evidence_snippet", "raw_text", "source_label"))
+            for item in promoted_entries
+        )
+        + " "
+        + " ".join(
+            " ".join(
+                str(item.get(key) or "")
+                for key in ("text", "section", "source_title")
+            )
+            for item in ledger_hot_evidence
+        )
+    )
+    required_entities = _dedupe_limited(
+        [str(item).strip() for item in list(_query_named_targets(query_text) or []) if str(item).strip()],
+        limit=16,
+    )
+    missing_entities = [entity for entity in required_entities if _fold_text(entity) not in promoted_text]
+    unresolved_sections = _dedupe_limited(
+        [
+            str(item).strip()
+            for item in [
+                *list(package_contract.get("unresolved_sections") or []),
+                *list(package_contract.get("diagnostic_unresolved_sections") or []),
+            ]
+            if str(item).strip()
+        ],
+        limit=16,
+    )
+    blockers = [dict(item) for item in list(final_surface.get("final_closure_blockers") or []) if isinstance(item, dict)]
+    blocker_codes = _dedupe_limited(
+        [str(item.get("state_reason") or item.get("state") or "").strip() for item in blockers if str(item.get("state_reason") or item.get("state") or "").strip()],
+        limit=16,
+    )
+    found_not_promoted: list[dict[str, Any]] = []
+    missing_folded = [_fold_text(item) for item in [*missing_entities, *unresolved_sections] if _fold_text(item)]
+    for entry in entries:
+        if (
+            str(entry.get("promotion_state") or "") in {"promoted", "hot"}
+            or str(entry.get("node_id") or "").strip() in ledger_hot_node_ids
+        ):
+            continue
+        entry_text = _fold_text(
+            " ".join(str(entry.get(key) or "") for key in ("topic", "summary", "evidence_snippet", "raw_text", "source_label"))
+        )
+        if missing_folded and not any(item in entry_text for item in missing_folded):
+            continue
+        has_provenance = bool(
+            (isinstance(entry.get("provenance"), Mapping) and dict(entry.get("provenance") or {}))
+            or entry.get("source_label")
+            or entry.get("document_anchor_id")
+            or entry.get("source_type")
+        )
+        if not has_provenance:
+            continue
+        found_not_promoted.append(
+            {
+                "evidence_id": str(entry.get("entry_id") or entry.get("node_id") or "").strip() or None,
+                "node_id": str(entry.get("node_id") or "").strip() or None,
+                "source_label": str(entry.get("source_label") or "").strip() or None,
+                "promotion_state": str(entry.get("promotion_state") or "cold"),
+            }
+        )
+        if len(found_not_promoted) >= 12:
+            break
+
+    issue_present = bool(missing_entities or unresolved_sections or blockers or not package_contract.get("passed", True))
+    if not issue_present:
+        return {
+            "schema_version": "agvm.search_issue_diagnostics.v1",
+            "status": "clear",
+            "issues": [],
+            "correction_guidance": None,
+            "evidence_inspected_count": len(entries),
+        }
+
+    target_labels = missing_entities or unresolved_sections
+    target_summary = ", ".join(target_labels[:4]) or "the unresolved search mission"
+    if found_not_promoted:
+        next_action = "Promote the grounded candidate evidence, then rebuild and re-evaluate the context package."
+    else:
+        next_action = "Continue the unresolved mission, widen or add a destination, and hydrate source-backed evidence before finalization."
+    issue = {
+        "issue_id": "search_semantic_coverage_incomplete",
+        "code": blocker_codes[0] if blocker_codes else "context_package_contract_not_satisfied",
+        "title": f"Grounded coverage is incomplete for {target_summary}",
+        "why": (
+            "The current package does not contain promoted, source-backed evidence for every required entity or answer section."
+        ),
+        "missing_entities": missing_entities,
+        "unresolved_sections": unresolved_sections,
+        "blocker_codes": blocker_codes,
+        "evidence_inspected_count": len(entries),
+        "promoted_evidence_count": len(
+            {
+                str(item.get("node_id") or item.get("entry_id") or "").strip()
+                for item in [*promoted_entries, *ledger_hot_evidence]
+                if str(item.get("node_id") or item.get("entry_id") or "").strip()
+            }
+        ),
+        "found_not_promoted": found_not_promoted,
+        "target": target_summary,
+        "next_action": next_action,
+    }
+    return {
+        "schema_version": "agvm.search_issue_diagnostics.v1",
+        "status": (
+            "warning"
+            if package_contract.get("renderer_diagnostics_only") is True
+            else "review_required"
+        ),
+        "issues": [issue],
+        "correction_guidance": {
+            "issue": issue["title"],
+            "why": issue["why"],
+            "evidence_inspected": len(entries),
+            "target": target_summary,
+            "next_step": next_action,
+            "human_guidance_optional": True,
+        },
+        "evidence_inspected_count": len(entries),
+    }
+
+
 def _route_destination_match_for_node(node_payload: dict[str, Any] | None, destination: dict[str, Any] | None) -> bool:
     node_payload = dict(node_payload or {})
     destination = dict(destination or {})
@@ -4436,11 +8533,10 @@ def _route_destination_match_for_node(node_payload: dict[str, Any] | None, desti
     node_bucket_key = str((node_payload.get("bucket") or {}).get("key") or "").strip()
     if node_bucket_key and node_bucket_key in target_bucket_keys:
         return True
-    active_guide_area = str(destination.get("guide_area") or "").strip().lower()
-    active_memory_type = str(destination.get("memory_type") or "").strip().lower()
-    node_guide_area = str((node_payload.get("provenance") or {}).get("guide_conceptual_area") or node_payload.get("guide_area") or "").strip().lower()
-    node_memory_type = str(node_payload.get("memory_type") or "").strip().lower()
-    return bool((active_guide_area and node_guide_area == active_guide_area) or (active_memory_type and node_memory_type == active_memory_type))
+    # Metadata facets such as guide_area and memory_type are intentionally not
+    # destination authority. They may be displayed/debugged by callers, but they
+    # must not make a node count as having reached a spatial/topological target.
+    return False
 
 
 def _select_route_candidate_for_destination(
@@ -4627,14 +8723,8 @@ def _candidate_destination_progress_gain(candidate_node: dict[str, Any], destina
     target_bucket_keys = {str(item).strip() for item in list(destination.get("target_bucket_keys") or []) if str(item).strip()}
     if bucket_key and bucket_key in target_bucket_keys:
         return 0.9
-    guide_area = str(destination.get("guide_area") or "").strip().lower()
-    memory_type = str(destination.get("memory_type") or "").strip().lower()
-    candidate_guide_area = str((candidate_node.get("provenance") or {}).get("guide_conceptual_area") or candidate_node.get("guide_area") or "").strip().lower()
-    candidate_memory_type = str(candidate_node.get("memory_type") or "").strip().lower()
-    if guide_area and memory_type and candidate_guide_area == guide_area and candidate_memory_type == memory_type:
-        return 0.7
-    if (guide_area and candidate_guide_area == guide_area) or (memory_type and candidate_memory_type == memory_type):
-        return 0.5
+    # Progress is spatial/topological. Legacy metadata facets are retained in
+    # payloads, but they do not count as destination progress.
     return 0.0
 
 
@@ -4661,7 +8751,7 @@ def _route_corroboration_yield(candidate_node: dict[str, Any], branch: dict[str,
         yield_score += 0.1
     if goal_slot and goal_slot not in covered_slots:
         yield_score += 0.1
-    if bool(candidate_node.get("is_document_anchor")) and str(destination.get("memory_type") or "").strip().lower() == "document_anchor":
+    if bool(candidate_node.get("is_document_anchor")):
         yield_score += 0.18
     if bool(candidate_node.get("is_summary")):
         yield_score += 0.06
@@ -4686,12 +8776,15 @@ def _route_topology_efficiency(
     source_efficiency = {
         "highway": 0.92 if destination_progress_gain >= 0.5 else 0.68,
         "highway_neighbor": 0.78 if destination_progress_gain >= 0.5 else 0.62,
+        "evidence_edge_follow": 0.88,
         "link": 0.74,
         "adjacent_bucket": 0.62,
         "nearby_radius": 0.56,
         "goal_support": 0.66,
         "identity_core": 0.64,
         "exact_temporal": 0.82,
+        "server_bound_provenance_recall": 0.78,
+        "server_bound_text_recall": 0.72,
         "document_anchor": 0.7,
         "candidate_pool": 0.5,
     }.get(source_label, 0.5)
@@ -4795,7 +8888,7 @@ def _route_highway_usefulness_memory(branch: dict[str, Any], *, source_label: st
     preference_key = "local"
     if source_label in {"highway", "highway_neighbor"}:
         preference_key = "highway"
-    elif source_label == "link":
+    elif source_label in {"link", "evidence_edge_follow", "document_anchor", "server_bound_provenance_recall"}:
         preference_key = "link"
     value = route_preference_prior.get(preference_key)
     if value is None:
@@ -4834,13 +8927,12 @@ def _route_score_candidate(
     target_bucket_keys = {str(item).strip() for item in list(destination.get("target_bucket_keys") or []) if str(item).strip()}
     target_node_ids = {str(item).strip() for item in list(destination.get("target_node_ids") or []) if str(item).strip()}
     direct_destination_hit = bool((bucket_key and bucket_key in target_bucket_keys) or (str(candidate_node.get("id") or "").strip() in target_node_ids))
+    guide_area_facet_match = bool(guide_area and candidate_guide_area == guide_area)
+    memory_type_facet_match = bool(memory_type and candidate_memory_type == memory_type)
     destination_relevance = (
-        0.34 * max(0.0, min(1.0, routing_similarity))
-        + (0.22 if guide_area and candidate_guide_area == guide_area else 0.0)
-        + (0.18 if memory_type and candidate_memory_type == memory_type else 0.0)
-        + (0.14 if bucket_key and bucket_key in target_bucket_keys else 0.0)
-        + (0.12 if str(candidate_node.get("id") or "").strip() in target_node_ids else 0.0)
-        + (0.08 if bool(candidate_node.get("is_document_anchor")) and memory_type == "document_anchor" else 0.0)
+        0.62 * max(0.0, min(1.0, routing_similarity))
+        + (0.22 if bucket_key and bucket_key in target_bucket_keys else 0.0)
+        + (0.16 if str(candidate_node.get("id") or "").strip() in target_node_ids else 0.0)
     )
     destination_relevance = max(0.0, min(1.0, destination_relevance))
     destination_progress_gain = _candidate_destination_progress_gain(candidate_node, destination)
@@ -4891,10 +8983,21 @@ def _route_score_candidate(
         "highway_usefulness_memory": round(highway_usefulness_memory, 4),
         "source_label": source_label,
         "direct_destination_hit": direct_destination_hit,
+        "guide_area_facet_match": guide_area_facet_match,
+        "memory_type_facet_match": memory_type_facet_match,
+        "metadata_facets_deauthorized": True,
         "lease_conflict": lease_conflict,
         "region_pressure": round(region_pressure, 4),
         "region_id": region_id,
-        "edge_bias": "highway" if source_label in {"highway", "highway_neighbor"} else ("link" if source_label == "link" else "local"),
+        "edge_bias": (
+            "highway"
+            if source_label in {"highway", "highway_neighbor"}
+            else (
+                "link"
+                if source_label in {"link", "evidence_edge_follow", "document_anchor", "server_bound_provenance_recall"}
+                else "local"
+            )
+        ),
     }
 
 
@@ -5043,8 +9146,15 @@ def _region_descriptor_from_probe(
     radial_expectation = str(destination.get("radial_expectation") or probe.get("radial_expectation") or "mid").strip() or "mid"
     label = str(destination.get("label") or guide_area or memory_type or probe.get("goal") or probe.get("label") or "region").strip()
     target_bucket_keys = [str(item) for item in list(destination.get("target_bucket_keys") or bucket_keys or probe.get("target_bucket_keys") or []) if str(item).strip()][:4]
+    landing_position = _spatial_coordinate(probe.get("landing_position")) or _spatial_coordinate(probe.get("base_position"))
+    if target_bucket_keys:
+        region_id = f"bucket::{','.join(sorted(target_bucket_keys))}::{radial_expectation}"
+    elif landing_position:
+        region_id = f"bucket::{position_to_bucket(landing_position)['key']}::{radial_expectation}"
+    else:
+        region_id = f"spatial::{radial_expectation}"
     return {
-        "region_id": f"{str(guide_area or 'unknown').lower()}::{str(memory_type or 'unknown').lower()}::{radial_expectation}",
+        "region_id": region_id,
         "label": label,
         "guide_area": guide_area,
         "memory_type": memory_type,
@@ -5167,14 +9277,23 @@ def _normalize_controller_recommendation(payload: dict[str, Any] | None) -> dict
         return None
     evidence_basis = [str(item).strip() for item in list(payload.get("evidence_basis") or []) if str(item).strip()]
     requested_actions = [str(item).strip() for item in list(payload.get("requested_actions") or []) if str(item).strip()]
+    target_document_id = str(payload.get("target_document_id") or "").strip() or None
+    if target_document_id and (
+        len(target_document_id) > 256
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+~=\-]{0,255}", target_document_id) is None
+    ):
+        return None
     normalized = {
         "action": action,
         "reason": _truncate_prompt_text(str(payload.get("reason") or "").strip(), 180) or None,
         "confidence": max(0.0, min(1.0, float(payload.get("confidence") or 0.0))),
         "target_destination_id": str(payload.get("target_destination_id") or "").strip() or None,
+        "target_document_id": target_document_id,
         "requested_actions": requested_actions[:3],
         "decision_source": str(payload.get("decision_source") or "").strip() or None,
         "controller_kind": str(payload.get("controller_kind") or "").strip() or None,
+        "ai_execution_call_id": str(payload.get("ai_execution_call_id") or "").strip() or None,
+        "ai_execution_attestation": dict(payload.get("ai_execution_attestation") or {}),
         "turn_ms": round(float(payload.get("turn_ms") or 0.0), 2) if payload.get("turn_ms") is not None else None,
         "evidence_basis": evidence_basis[:6],
         "hold_reason": _truncate_prompt_text(str(payload.get("hold_reason") or "").strip(), 160) or None,
@@ -5272,13 +9391,8 @@ def _controller_recommendation_fallback(
 
 
 def _controller_timeout_seconds(*, retrieval_mode: str, query_class: str) -> float:
-    if retrieval_mode == "flash":
-        return 1.4
-    if retrieval_mode == "balanced":
-        return 2.4 if query_class in {"direct_fact", "relation_fact", "style_values"} else 3.0
-    if retrieval_mode == "heavy":
-        return 4.2
-    return 5.0
+    del query_class
+    return _search_ai_stage_timeout_seconds("branch_controller", retrieval_mode)
 
 
 def _should_use_ai_branch_controller(
@@ -5327,6 +9441,7 @@ def llm_branch_controller(
             "reason": {"type": "string"},
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "target_destination_id": {"type": ["string", "null"]},
+            "target_document_id": {"type": ["string", "null"]},
             "requested_actions": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
             "evidence_basis": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
             "hold_reason": {"type": ["string", "null"]},
@@ -5355,16 +9470,30 @@ def llm_branch_controller(
         "status": str(branch.get("status") or ""),
         "evidence_node_ids": list(branch.get("evidence_node_ids") or [])[:6],
         "visited_bucket_keys": list(branch.get("visited_bucket_keys") or [])[:6],
+        "document_candidates": [
+            {
+                "document_id": str(ref.get("document_id") or ref.get("anchor_node_id") or "") or None,
+                "anchor_node_id": str(ref.get("anchor_node_id") or "") or None,
+                "chunk_node_ids": [str(item) for item in list(ref.get("chunk_node_ids") or []) if str(item)][:6],
+                "title": str(ref.get("title") or ref.get("source_label") or "") or None,
+                "raw_available": bool(ref.get("raw_available")),
+            }
+            for ref in list(branch.get("document_refs") or [])[:6]
+            if isinstance(ref, dict)
+        ],
     }
     blackboard_summary = _summarize_blackboard_for_master(blackboard, max_items_per_slot=2)
+    controller_execution: dict[str, Any] = {}
     payload = _run_attested_search_ai_json(
         call_name="branch_controller",
-        model=retrieval_model(),
+        execution_record_out=controller_execution,
+        model=branch_controller_model(),
         system_prompt=(
             "You are an AGVM branch controller. Judge only the local branch state. "
             "You do not answer the query and you do not compute path geometry. "
             "Choose one bounded local recommendation: continue, switch destination, hold, stop, request radius widen, request document hydration, or escalate to master. "
-            "Base your decision on route yield, destination progress, corroboration coverage, contradiction risk, region pressure, and evidence density."
+            "Base your decision on route yield, destination progress, corroboration coverage, contradiction risk, region pressure, and evidence density. "
+            "When requesting document hydration, select exactly one target_document_id from this branch's document_candidates; never invent an id."
         ),
         user_prompt=(
             f"Query: {query_text}\n"
@@ -5377,11 +9506,16 @@ def llm_branch_controller(
         schema_name="agvm_branch_controller",
         schema=schema,
         timeout=_controller_timeout_seconds(retrieval_mode=retrieval_mode, query_class=query_class),
-        role="retrieval",
+        role="branch_controller",
     )
     normalized = _normalize_controller_recommendation(payload)
     if not normalized:
         raise SearchAiExecutionError("branch_controller", "invalid_json")
+    controller_attestation = dict(controller_execution.get("ai_execution_attestation") or {})
+    if not controller_attestation:
+        raise SearchAiExecutionError("branch_controller", "missing_ai_execution_attestation")
+    normalized["ai_execution_call_id"] = str(controller_execution.get("call_id") or "") or None
+    normalized["ai_execution_attestation"] = controller_attestation
     return normalized, None
 
 
@@ -5440,6 +9574,7 @@ def _apply_controller_recommendation(branch: dict[str, Any], recommendation: dic
     updated["controller_kind"] = str(normalized_recommendation.get("controller_kind") or "") or None
     updated["controller_confidence"] = float(normalized_recommendation.get("confidence") or 0.0)
     updated["controller_reason"] = str(normalized_recommendation.get("reason") or "") or None
+    updated["controller_target_document_id"] = str(normalized_recommendation.get("target_document_id") or "") or None
     updated["controller_turn_ms"] = normalized_recommendation.get("turn_ms")
     updated["controller_evidence_basis"] = list(normalized_recommendation.get("evidence_basis") or [])
     updated["controller_decision_source"] = str(normalized_recommendation.get("decision_source") or "") or None
@@ -5706,19 +9841,40 @@ _ALLOWED_NAVIGATION_ACTIONS = {
 
 def _normalize_navigation_actions(actions: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for action in list(actions or []):
         action_type = str(action.get("action") or "").strip()
         if action_type not in _ALLOWED_NAVIGATION_ACTIONS:
             continue
         payload = dict(action.get("payload") or {})
-        normalized.append(
-            {
-                "action": action_type,
-                "payload": payload,
-                "confidence": max(0.0, min(1.0, float(action.get("confidence") or 0.0))),
-                "rationale": str(action.get("rationale") or "").strip(),
-            }
-        )
+        action_id = str(action.get("action_id") or "").strip()
+        identity = action_id or hashlib.sha256(
+            json.dumps(
+                {"action": action_type, "payload": payload},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized_action = {
+            "action": action_type,
+            "payload": payload,
+            "confidence": max(0.0, min(1.0, float(action.get("confidence") or 0.0))),
+            "rationale": str(action.get("rationale") or "").strip(),
+        }
+        if action_id:
+            normalized_action["action_id"] = action_id
+        for key in ("decision_source", "binding_state"):
+            value = str(action.get(key) or "").strip()
+            if value:
+                normalized_action[key] = value
+        attestation = dict(action.get("ai_execution_attestation") or {})
+        if attestation:
+            normalized_action["ai_execution_attestation"] = attestation
+        normalized.append(normalized_action)
     return normalized[:4]
 
 
@@ -7723,7 +11879,11 @@ def _build_ai_materialization_hard_gate(
     answer_demo_state = str(answer_materialization.get("state") or "").strip()
     answer_demo_requested = bool(answer_materialization.get("requested") or answer_demo_state not in {"", "not_requested"})
     answer_demo_ready = (not answer_requested) or answer_demo_state in {"ready", "not_requested"}
-    secondary_answer_demo_only = bool(query_class_text == "document_lookup" and not final_requested)
+    # A validated context package is the Search product; the optional answer
+    # preview is a secondary AI rendering for every query class.  Provider
+    # degradation during that rendering must leave the grounded package
+    # inspectable as review-required, never invert the whole Search to blocked.
+    secondary_answer_demo_only = bool(context_contract_passed)
     answer_demo_requires_final_validation = bool(answer_requested and answer_demo_requested and not secondary_answer_demo_only)
     blockers: list[str] = []
     materialization_blockers = [
@@ -8034,10 +12194,22 @@ def _context_package_node_ids(value: Any) -> set[str]:
     node_ids: set[str] = set()
     if isinstance(value, dict):
         for key, child in value.items():
-            if str(key) in {"node_id", "source_node_id", "memory_node_id", "anchor_node_id"}:
+            if str(key) in {
+                "node_id",
+                "source_node_id",
+                "memory_node_id",
+                "anchor_node_id",
+                "document_id",
+            }:
                 node_id = str(child or "").strip()
                 if node_id:
                     node_ids.add(node_id)
+            elif str(key) in {"node_ids", "chunk_node_ids", "evidence_node_ids"}:
+                node_ids.update(
+                    str(item).strip()
+                    for item in list(child or [])
+                    if str(item).strip()
+                )
             node_ids.update(_context_package_node_ids(child))
     elif isinstance(value, list):
         for child in value:
@@ -8071,6 +12243,53 @@ def _context_payload_integrity_passed(result: dict[str, Any]) -> bool:
         and not missing_alignment_nodes
         and alignment.get("passed", True)
     )
+
+
+def _build_context_payload_integrity(result: dict[str, Any]) -> dict[str, Any]:
+    """Publish the integrity proof consumed by Search clients and Grow.
+
+    MCP projections already derive this proof, but the public Search runtime is
+    also consumed directly by the Grow investigator.  Keeping the proof on the
+    canonical Search result prevents a valid evidence ledger from becoming
+    unusable merely because no MCP projection was requested.
+    """
+
+    answer = dict(result.get("answer") or {}) if isinstance(result.get("answer"), dict) else {}
+    context_package = dict(result.get("context_package") or {})
+    context_contract = dict(context_package.get("contract") or {})
+    alignment = dict(context_contract.get("answer_context_alignment") or {})
+    answer_node_ids = {
+        str(item).strip()
+        for item in list(answer.get("evidence_node_ids") or [])
+        if str(item).strip()
+    }
+    package_node_ids = _context_package_node_ids(context_package)
+    missing_answer_nodes = sorted(answer_node_ids - package_node_ids)
+    missing_alignment_nodes = sorted(
+        {
+            str(item).strip()
+            for item in list(alignment.get("missing_evidence_node_ids") or [])
+            if str(item).strip()
+        }
+    )
+    passed = bool(
+        not missing_answer_nodes
+        and not missing_alignment_nodes
+        and alignment.get("passed", True)
+    )
+    document_refs = list(result.get("document_refs") or context_package.get("document_refs") or [])
+    return {
+        "schema_version": "agvm.search_payload_integrity.v1",
+        "passed": passed,
+        "answer_support_node_count": len(answer_node_ids),
+        "package_node_id_count": len(package_node_ids),
+        "answer_support_node_ids_missing_from_package": missing_answer_nodes[:16],
+        "contract_missing_evidence_node_ids": missing_alignment_nodes[:16],
+        "answer_context_alignment_checked": bool(alignment.get("checked")),
+        "answer_context_alignment_passed": bool(alignment.get("passed", True)),
+        "no_material_returned": not bool(package_node_ids or document_refs),
+        "heuristic_result_exposed": False,
+    }
 
 
 def _provider_is_explicitly_llm_unavailable(result: dict[str, Any]) -> bool:
@@ -8160,8 +12379,59 @@ def _apply_context_ready_ai_unavailable_degradation(result: dict[str, Any]) -> N
     result["completion_contract"] = completion
 
 
+def normalize_route_trace_payload(value: Any) -> dict[str, Any]:
+    """Normalize the top-level route-trace union without losing typed material."""
+
+    if isinstance(value, Mapping):
+        return dict(value)
+    if value in (None, "", [], ()):
+        return {}
+    source_shape = "string" if isinstance(value, str) else "sequence" if isinstance(value, (list, tuple)) else type(value).__name__
+    raw_items = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple)) else [value]
+    events = [dict(item) for item in raw_items if isinstance(item, Mapping)]
+    trace_refs = [str(item).strip() for item in raw_items if isinstance(item, str) and str(item).strip()]
+    unsupported_types = sorted(
+        {
+            type(item).__name__
+            for item in raw_items
+            if not isinstance(item, (Mapping, str))
+        }
+    )
+    return {
+        "schema_version": "agvm.route_trace.normalized.v1",
+        "source_shape": source_shape,
+        "events": events,
+        "branch_route_events": events,
+        "route_event_count": len(events),
+        "trace_refs": trace_refs,
+        "normalization_contract": {
+            "schema_version": "agvm.route_trace_shape_contract.v1",
+            "mapping_events_preserved": len(events),
+            "string_refs_preserved": len(trace_refs),
+            "unsupported_item_types": unsupported_types,
+            "route_truth_requires_mapping_events": True,
+        },
+    }
+
+
 def normalize_retrieve_response_payload(result: dict[str, Any]) -> dict[str, Any]:
     normalized = _normalize_unit_scores(dict(result or {}))
+    # Compatibility for results persisted by the short-lived projection that
+    # leaked an answer-demo diagnostic into the canonical lifecycle field.
+    # Preserve the diagnostic on its own surface while repairing the public
+    # state; unknown future values still fail schema validation instead of
+    # being silently accepted.
+    if str(normalized.get("answer_surface_state") or "").strip() == "secondary_answer_demo_degraded":
+        answer_demo = dict(normalized.get("answer_demo_materialization") or {})
+        answer_demo.setdefault("state", "provider_degraded")
+        answer_demo.setdefault("diagnostic_code", "secondary_answer_demo_degraded")
+        answer_demo.setdefault("answer_demo_is_secondary", True)
+        normalized["answer_demo_materialization"] = answer_demo
+        normalized["answer_demo_degraded"] = True
+        normalized["answer_surface_state"] = "final_sealed"
+    if str(normalized.get("answerability_state") or "").strip() == "context_grounded":
+        normalized["answerability_state"] = "grounded"
+    normalized["route_trace"] = normalize_route_trace_payload(normalized.get("route_trace"))
     if not isinstance(normalized.get("probes"), list):
         normalized["probes"] = []
     if not isinstance(normalized.get("matches"), list):
@@ -8325,6 +12595,10 @@ def normalize_retrieve_response_payload(result: dict[str, Any]) -> dict[str, Any
         list(planner_runtime.get("path_missions") or []),
     )
     normalized.setdefault(
+        "physical_path_executions",
+        list(planner_runtime.get("physical_path_executions") or []),
+    )
+    normalized.setdefault(
         "mission_aware_merge_summary",
         dict(planner_runtime.get("mission_aware_merge_summary") or planner_runtime.get("ai_spatial_merge_summary") or {}),
     )
@@ -8409,6 +12683,14 @@ def normalize_retrieve_response_payload(result: dict[str, Any]) -> dict[str, Any
     planner_runtime.setdefault("path_mission_contract", dict(normalized.get("path_mission_contract") or {}))
     planner_runtime.setdefault("path_missions", list(normalized.get("path_missions") or []))
     planner_runtime.setdefault("path_mission_count", len(list(normalized.get("path_missions") or [])))
+    planner_runtime.setdefault(
+        "physical_path_executions",
+        list(normalized.get("physical_path_executions") or []),
+    )
+    planner_runtime.setdefault(
+        "physical_path_execution_count",
+        len(list(normalized.get("physical_path_executions") or [])),
+    )
     planner_runtime.setdefault("mission_aware_merge_summary", dict(normalized.get("mission_aware_merge_summary") or {}))
     planner_runtime.setdefault("mission_evidence_ledger", dict(normalized.get("mission_evidence_ledger") or {}))
     planner_runtime.setdefault("mission_evidence_ledger_row_count", int(dict(normalized.get("mission_evidence_ledger") or {}).get("row_count") or 0))
@@ -8859,8 +13141,7 @@ def _infer_document_role(node: dict[str, Any]) -> str | None:
     explicit = str(node.get("document_role") or "").strip().lower()
     if explicit in {"anchor", "summary", "chunk", "fact"}:
         return explicit
-    memory_type = str(node.get("memory_type") or "").strip().lower()
-    if bool(node.get("is_document_anchor")) or memory_type == "document_anchor":
+    if bool(node.get("is_document_anchor")):
         return "anchor"
     if bool(node.get("is_summary")):
         return "summary"
@@ -8899,8 +13180,7 @@ def _is_document_catalog_node(node: dict[str, Any]) -> bool:
     provenance = dict(node.get("provenance") or {})
     source_type = str(provenance.get("source_type") or "").strip()
     source_label = str(provenance.get("source_label") or "").strip()
-    memory_type = str(node.get("memory_type") or "").strip().lower()
-    if bool(node.get("is_document_anchor")) or memory_type == "document_anchor":
+    if bool(node.get("is_document_anchor")):
         return True
     if role in {"summary", "chunk"} and (
         bool(node.get("is_summary"))
@@ -9409,7 +13689,6 @@ def _document_evidence_candidate_score(
             node.get("source_unit_kind"),
             node.get("source_unit_role"),
             node.get("document_role"),
-            node.get("memory_type"),
         )
     )
     haystack = _fold_text(" ".join([summary, raw_text, metadata]))
@@ -9432,9 +13711,8 @@ def _document_evidence_candidate_score(
     matched_ratio = len(matched_terms) / denominator
     title_bonus = min(0.22, len(title_matches) * 0.055)
     raw_bonus = 0.06 if len(raw_text) >= 300 else 0.0
-    memory_type = str(node.get("memory_type") or "").strip().lower()
     document_role = str(node.get("document_role") or "").strip().lower()
-    anchor_bonus = 0.08 if bool(node.get("is_document_anchor")) or memory_type == "document_anchor" or document_role == "anchor" else 0.0
+    anchor_bonus = 0.08 if bool(node.get("is_document_anchor")) or document_role == "anchor" else 0.0
     claim_rank_score = 0.0
     try:
         claim_rank_score = float(claim_rank.get("score") or 0.0)
@@ -9501,9 +13779,8 @@ def _document_evidence_expansion_matches(
         if score < 0.2 and len(matched_terms) < 2:
             continue
         provenance = dict(payload.get("provenance") or {})
-        memory_type = str(payload.get("memory_type") or "").strip().lower()
         document_role = str(payload.get("document_role") or "").strip().lower()
-        role = document_role or ("anchor" if bool(payload.get("is_document_anchor")) or memory_type == "document_anchor" else "chunk")
+        role = document_role or ("anchor" if bool(payload.get("is_document_anchor")) else "chunk")
         anchor_id = str(payload.get("document_anchor_id") or "").strip()
         if role == "anchor" and not anchor_id:
             anchor_id = node_id
@@ -10565,6 +14842,8 @@ def _document_packet_source_trace(packet: dict[str, Any], *, limit: int = 24) ->
     anchor_node_id = str(packet.get("anchor_node_id") or "").strip()
     source_label = str(packet.get("source_label") or "").strip() or None
     source_type = str(packet.get("source_type") or "").strip() or None
+    source_uri = str(packet.get("source_uri") or "").strip() or None
+    content_hash = str(packet.get("content_hash") or "").strip() or None
     rows: list[dict[str, Any]] = []
     anchor_raw_text = str(packet.get("anchor_raw_text") or "").strip()
     if anchor_node_id:
@@ -10576,6 +14855,8 @@ def _document_packet_source_trace(packet: dict[str, Any], *, limit: int = 24) ->
                 "title": title,
                 "source_label": source_label,
                 "source_type": source_type,
+                "source_uri": source_uri,
+                "content_hash": content_hash,
                 "chunk_index": None,
                 "source_span_start": None,
                 "source_span_end": None,
@@ -10599,6 +14880,8 @@ def _document_packet_source_trace(packet: dict[str, Any], *, limit: int = 24) ->
                 "title": title,
                 "source_label": source_label,
                 "source_type": source_type,
+                "source_uri": source_uri,
+                "content_hash": content_hash,
                 "chunk_index": chunk.get("chunk_index"),
                 "source_span_start": chunk.get("source_span_start"),
                 "source_span_end": chunk.get("source_span_end"),
@@ -10622,6 +14905,8 @@ def _document_packet_source_trace(packet: dict[str, Any], *, limit: int = 24) ->
                 "title": title,
                 "source_label": source_label,
                 "source_type": source_type,
+                "source_uri": source_uri,
+                "content_hash": content_hash,
                 "chunk_index": None,
                 "source_span_start": None,
                 "source_span_end": None,
@@ -10683,6 +14968,8 @@ def _document_supporting_documents(document_packets: list[dict[str, Any]], *, li
                 "title": str(packet.get("title") or packet.get("source_label") or "Document"),
                 "source_label": packet.get("source_label"),
                 "source_type": packet.get("source_type"),
+                "source_uri": packet.get("source_uri"),
+                "content_hash": packet.get("content_hash"),
                 "query_fit_score": round(query_fit, 6),
                 "exact_match_score": round(exact_match, 6),
                 "document_rank_score": round(float(packet.get("document_rank_score") or 0.0), 6),
@@ -10924,6 +15211,11 @@ def _document_synthesis_packet_closure_ready(
     packets = [dict(packet or {}) for packet in list(document_packets or []) if dict(packet or {})]
     if document_mode != "synthesis" or not packets:
         return False
+    required_entities = [
+        str(item).strip()
+        for item in list(_query_named_targets(query_text) or [])
+        if str(item).strip()
+    ]
     for packet in packets:
         coverage = dict(packet.get("coverage") or {})
         match_count = int(coverage.get("match_count") or 0)
@@ -10935,7 +15227,22 @@ def _document_synthesis_packet_closure_ready(
             or bool(list(packet.get("ordered_chunk_sequence") or []))
             or bool(list(packet.get("supported_fact_text") or []))
         )
-        if has_material and (query_fit >= float(min_fit) or match_count >= 2 or bool(packet.get("complete_text_available"))):
+        packet_text = _fold_text(
+            " ".join(
+                [
+                    str(packet.get("title") or ""),
+                    str(packet.get("source_label") or ""),
+                    str(packet.get("relevance_summary") or ""),
+                    str(packet.get("anchor_raw_text") or ""),
+                    *[str(item) for item in list(packet.get("entity_tags") or [])],
+                    *[str(item) for item in list(packet.get("topic_tags") or [])],
+                    *[str(item.get("raw_text") or item.get("evidence_snippet") or "") for item in list(packet.get("ordered_chunk_sequence") or []) if isinstance(item, dict)],
+                    *[str(item.get("raw_text") or item.get("summary") or "") for item in list(packet.get("supported_fact_text") or []) if isinstance(item, dict)],
+                ]
+            )
+        )
+        entity_coverage = all(_fold_text(entity) in packet_text for entity in required_entities)
+        if has_material and entity_coverage and (query_fit >= float(min_fit) or match_count >= 2):
             return True
     return False
 
@@ -11499,6 +15806,8 @@ def _build_evidence_reservoir(
                 "anchor_node_id": anchor_node_id or str(anchor_entry.get("node_id") or ""),
                 "source_label": packet_source_label,
                 "source_type": packet_source_type,
+                "source_uri": packet.get("source_uri") or anchor_entry.get("source_uri"),
+                "content_hash": packet.get("content_hash") or anchor_entry.get("content_hash"),
                 "source_trust": str(packet.get("source_trust") or anchor_entry.get("source_trust") or "user_asserted"),
                 "claim_status": str(packet.get("claim_status") or anchor_entry.get("claim_status") or "fact"),
                 "answer_eligible": bool(packet.get("answer_eligible", anchor_entry.get("answer_eligible", True))),
@@ -12124,11 +16433,6 @@ def _background_enrichment_budget(
         max_seconds = min(max_seconds, 3.0)
         max_context_updates = min(max_context_updates, 4)
         max_answer_candidates = min(max_answer_candidates, 1)
-    elif query_kind in {"exact_fact", "exact_relation_fact", "company_founding_relation", "company_founding_timeline"}:
-        max_rounds = min(max_rounds, 1)
-        max_seconds = min(max_seconds, 2.5)
-        max_context_updates = min(max_context_updates, 3)
-        max_answer_candidates = min(max_answer_candidates, 1)
     elif query_kind in {"broad_profile", "work_narrative", "narrative", "narrative_relation"}:
         max_rounds = max(max_rounds, 1 if mode in {"flash", "balanced"} else max_rounds)
     return {
@@ -12150,6 +16454,28 @@ def _background_enrichment_budget(
     }
 
 
+def _semantic_expansion_round_budget(
+    *,
+    retrieval_mode: str,
+    configured_rounds: int,
+    has_ai_missions: bool,
+) -> int:
+    """Translate the public runtime deadline into a non-terminal round allowance."""
+    configured = max(1, int(configured_rounds or 1))
+    if not has_ai_missions:
+        return configured
+    mode = str(retrieval_mode or "balanced").strip().lower()
+    nominal_round_seconds = {
+        "flash": 15.0,
+        "balanced": 20.0,
+        "heavy": 24.0,
+        "forensic": 30.0,
+    }.get(mode, 20.0)
+    deadline_seconds = max(1.0, float(search_mode_budget_seconds(mode)))
+    deadline_derived_rounds = max(1, int(math.ceil(deadline_seconds / nominal_round_seconds)))
+    return max(configured, min(32, deadline_derived_rounds))
+
+
 def _client_visible_partial_terminal_budget_seconds(
     *,
     query_text: str,
@@ -12157,33 +16483,90 @@ def _client_visible_partial_terminal_budget_seconds(
     query_class: str | None = None,
     route_truth_required: bool = False,
 ) -> float:
-    """Bound work after the MCP client has already seen a partial context package."""
+    """Bound product-visible searches once useful evidence is already visible.
+
+    Heavy/forensic and route-truth searches keep the public semantic deadline.
+    Flash/balanced product searches may terminalize as a useful reviewable
+    partial after a short post-evidence window so UI clients do not wait for a
+    late Master/finalization pass when the stream has already produced usable
+    material.
+    """
     if route_truth_required:
         return 0.0
-    contract = build_query_contract(query_text, retrieval_mode=retrieval_mode)
-    query_kind = str(contract.get("query_kind") or "")
     mode = str(retrieval_mode or "balanced").strip().lower()
-    if mode == "flash":
-        budget = 1.25
-    elif mode == "balanced":
-        budget = 3.5
-    elif mode == "heavy":
-        budget = 7.5
-    else:
-        budget = 10.0
-    if query_kind == "document_lookup" or str(query_class or "") == "document_lookup":
-        budget = min(budget, 3.0)
-    elif query_kind in {"exact_fact", "exact_relation_fact", "company_founding_relation", "company_founding_timeline"}:
-        budget = min(budget, 2.75)
-    elif query_kind in {"broad_profile", "work_narrative", "narrative", "narrative_relation"} and mode in {"heavy", "forensic"}:
-        budget = max(budget, 7.5)
-    raw_override = os.getenv("AGVM_CLIENT_VISIBLE_PARTIAL_TERMINAL_BUDGET_SECONDS")
-    if raw_override is not None:
+    if mode in {"heavy", "forensic"}:
+        return 0.0
+    raw_override = str(
+        os.getenv(f"AGVM_SEARCH_{mode.upper()}_CLIENT_VISIBLE_PARTIAL_TERMINAL_SECONDS")
+        or os.getenv("AGVM_SEARCH_CLIENT_VISIBLE_PARTIAL_TERMINAL_SECONDS")
+        or ""
+    ).strip()
+    if raw_override:
         try:
-            budget = float(raw_override)
-        except (TypeError, ValueError):
-            pass
-    return max(0.0, float(budget))
+            return max(0.0, float(raw_override))
+        except ValueError:
+            return 0.0
+    contract = build_query_contract(query_text, retrieval_mode=mode)
+    query_kind = str(contract.get("query_kind") or query_class or "").strip().lower()
+    broad_kinds = {"broad_profile", "work_narrative", "narrative", "narrative_relation"}
+    if mode == "flash":
+        return 4.0 if query_kind not in broad_kinds else 6.0
+    if mode == "balanced":
+        return 8.0 if query_kind not in broad_kinds else 12.0
+    return 0.0
+
+
+def _flash_public_partial_before_master_enabled(
+    *,
+    retrieval_mode: str,
+    response_mode: str,
+    plan_first_v3: bool,
+    route_truth_required: bool = False,
+) -> bool:
+    """Allow flash searches to publish usable evidence before the final Master.
+
+    The final Master is still the only final-seal authority.  This gate only
+    affects product-facing flash searches where the engine has already surfaced
+    evidence and waiting for the final Master would turn a useful partial into a
+    slow blocked response.  Route-truth, heavy and forensic searches remain on
+    the strict path.
+    """
+
+    if not plan_first_v3 or route_truth_required:
+        return False
+    mode = str(retrieval_mode or "balanced").strip().lower()
+    if mode == "quick":
+        mode = "flash"
+    if mode != "flash":
+        return False
+    if str(response_mode or "").strip().lower() not in {"answer", "both", "context"}:
+        return False
+    raw = str(os.getenv("AGVM_SEARCH_FLASH_PUBLIC_PARTIAL_BEFORE_MASTER_ENABLED") or "").strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    return True
+
+
+def _plan_first_partial_can_skip_final_master(
+    *,
+    client_visible_partial_terminalized: bool,
+    route_truth_required: bool,
+    terminal_reason: str | None,
+) -> bool:
+    """Only the explicit Flash partial may consume the reserved Master slot.
+
+    Balanced/heavy runs can publish a low-yield partial while their bounded
+    worker wave is ending.  Treating that generic signal like the dedicated
+    Flash early-return path skipped the only plan-first Master and later made
+    the final AI validation gate report ``blocked_ai_final_judge_missing``.
+    """
+
+    return bool(
+        client_visible_partial_terminalized
+        and not route_truth_required
+        and str(terminal_reason or "").strip()
+        == "flash_public_partial_before_master"
+    )
 
 
 def _background_enrichment_yield_policy(
@@ -12619,7 +17002,6 @@ def _post_final_branch_value_report(
                     str(destination.get("destination_key") or ""),
                     str(destination.get("label") or ""),
                     str(destination.get("guide_area") or ""),
-                    str(destination.get("memory_type") or ""),
                 ]
             )
             for destination in destination_queue[:4]
@@ -12838,7 +17220,7 @@ def _semantic_followup_gate(query_text: str, packet: dict[str, Any], determinist
     }
     payload = _run_attested_search_ai_json(
         call_name="followup_continuity_gate",
-        model=retrieval_model(),
+        model=planner_model(),
         system_prompt=(
             "You are the AGVM follow-up gate. Decide only whether the new query should strongly reuse, partially reuse, "
             "or mostly reset the warm thread state. Prefer low continuity when the carryover would be risky."
@@ -12846,8 +17228,8 @@ def _semantic_followup_gate(query_text: str, packet: dict[str, Any], determinist
         user_prompt=f"New query: {query_text}\nWarm packet summary: {_summarize_warm_state(packet)}\nTopic signature: {packet.get('topic_signature')}",
         schema_name="agvm_followup_gate",
         schema=schema,
-        timeout=1.2,
-        role="retrieval",
+        timeout=_search_ai_stage_timeout_seconds("continuity_gate", "balanced"),
+        role="planner",
     )
     state = str(payload.get("continuity_state") or "").strip()
     if state not in {"high_continuity", "medium_continuity", "low_continuity"}:
@@ -13489,6 +17871,7 @@ def _decorate_partial_answer_payload(
 
 
 def _summarize_blackboard_for_master(blackboard: dict[str, Any], *, max_items_per_slot: int = 3) -> dict[str, Any]:
+    final_plan_barrier = str(blackboard.get("master_review_phase") or "") == "final_plan_barrier"
     facts_by_slot = {}
     for slot, values in dict(blackboard.get("facts_by_slot") or {}).items():
         normalized_values = [_truncate_prompt_text(item, 180) for item in list(values or []) if str(item or "").strip()]
@@ -13537,8 +17920,75 @@ def _summarize_blackboard_for_master(blackboard: dict[str, Any], *, max_items_pe
         }
         for snapshot in list(blackboard.get("branch_summaries") or [])[:8]
     ]
+    mission_ledger = dict(blackboard.get("mission_evidence_ledger") or {})
+    required_missions = []
+    for raw_row in list(mission_ledger.get("rows") or []):
+        if not isinstance(raw_row, dict) or raw_row.get("required") is False:
+            continue
+        row = dict(raw_row)
+        judgement = dict(row.get("branch_judgement") or {})
+        required_missions.append(
+            {
+                "mission_id": str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or ""),
+                "path_id": str(row.get("path_id") or "") or None,
+                "goal": _truncate_prompt_text(str(row.get("goal") or ""), 240),
+                "coverage_state": str(row.get("coverage_state") or "unknown"),
+                "coverage_reason": _truncate_prompt_text(str(row.get("coverage_reason") or ""), 220) or None,
+                "branch_judgement": {
+                    "state": str(judgement.get("state") or "unknown"),
+                    "confidence": judgement.get("confidence"),
+                    "current": bool(judgement.get("current")),
+                    "ai_used": bool(judgement.get("ai_branch_controller_used")),
+                    "input_digest": judgement.get("judgement_input_digest"),
+                    "missing_evidence": list(judgement.get("ai_branch_missing_evidence") or [])[:6],
+                    "next_action": judgement.get("next_recommended_action"),
+                },
+                "evidence_excerpt": _compact_branch_autojudge_row(
+                    row,
+                    counts=_branch_judgement_evidence_counts(row),
+                    evidence_limit=32,
+                    blind_semantic_review=final_plan_barrier,
+                ),
+            }
+        )
+    mission_ledger_digest = str(
+        dict(mission_ledger.get("branch_judgement_summary") or {}).get(
+            "mission_ledger_input_digest"
+        )
+        or search_mission_ledger_digest(mission_ledger)
+        or ""
+    )
+    if final_plan_barrier:
+        # Terminal Master receives only the user query (outside this payload),
+        # blind-judge packets and raw mission evidence. Worker prose, slot
+        # facts, planner goals and family diagnostics can reintroduce the
+        # candidate claim that the blind stage removed.
+        return {
+            "retrieval_mode": str(blackboard.get("retrieval_mode") or ""),
+            "master_review_phase": "final_plan_barrier",
+            "bounded_plan_exhausted": bool(blackboard.get("bounded_plan_exhausted")),
+            "further_worker_execution_available": False,
+            "required_missions": [
+                {
+                    "mission_id": str(item.get("mission_id") or ""),
+                    "evidence_excerpt": copy.deepcopy(
+                        dict(item.get("evidence_excerpt") or {})
+                    ),
+                }
+                for item in required_missions
+            ],
+            "evidence_authority": copy.deepcopy(
+                dict(blackboard.get("evidence_authority") or {})
+            ),
+            "mission_ledger_digest": mission_ledger_digest,
+        }
     return {
         "retrieval_mode": str(blackboard.get("retrieval_mode") or ""),
+        "master_review_phase": str(blackboard.get("master_review_phase") or "in_loop"),
+        "bounded_plan_exhausted": bool(blackboard.get("bounded_plan_exhausted")),
+        "further_worker_execution_available": bool(
+            blackboard.get("further_worker_execution_available", True)
+        ),
         "required_slots": list(blackboard.get("required_slots") or []),
         "coverage_by_slot": dict(blackboard.get("coverage_by_slot") or {}),
         "unresolved_slots": list(blackboard.get("unresolved_slots") or []),
@@ -13555,6 +18005,9 @@ def _summarize_blackboard_for_master(blackboard: dict[str, Any], *, max_items_pe
         "family_conflicts": list(blackboard.get("family_conflicts") or [])[:6],
         "family_contribution_summary": dict(blackboard.get("family_contribution_summary") or {}),
         "master_state": dict(blackboard.get("master_state") or {}),
+        "required_missions": required_missions,
+        "evidence_authority": {},
+        "mission_ledger_digest": mission_ledger_digest,
     }
 
 
@@ -13564,26 +18017,861 @@ def _normalize_master_decision(payload: dict[str, Any] | None) -> dict[str, Any]
     decision = str(payload.get("decision") or "").strip()
     if decision not in _ALLOWED_MASTER_DECISIONS:
         return None
+
+    def safe_identifier(key: str) -> str | None:
+        raw = payload.get(key)
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError(f"{key}_not_string")
+        value = raw.strip()
+        if not value or len(value) > 256:
+            raise ValueError(f"{key}_invalid_length")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+~=\-]{0,255}", value) is None:
+            raise ValueError(f"{key}_unsafe")
+        return value
+
+    try:
+        target_worker_id = safe_identifier("target_worker_id")
+        target_branch_id = safe_identifier("target_branch_id")
+        mission_id = safe_identifier("mission_id")
+        path_id = safe_identifier("path_id")
+        document_id = safe_identifier("document_id")
+        document_anchor_id = safe_identifier("document_anchor_id")
+        chunk_node_id = safe_identifier("chunk_node_id")
+    except ValueError:
+        return None
+    grounded_answer: dict[str, Any] | None = None
+    raw_grounded_answer = payload.get("grounded_answer")
+    if raw_grounded_answer is not None:
+        if not isinstance(raw_grounded_answer, Mapping):
+            return None
+        grounded_payload = dict(raw_grounded_answer)
+        answerability_state = str(
+            grounded_payload.get("answerability_state") or ""
+        ).strip().lower()
+        if answerability_state not in {"grounded", "partial", "insufficient"}:
+            return None
+        grounded_answer = {
+            "answer_text": _truncate_prompt_text(
+                str(grounded_payload.get("answer_text") or "").strip(),
+                6000,
+            ),
+            "confidence": max(
+                0.0,
+                min(1.0, float(grounded_payload.get("confidence") or 0.0)),
+            ),
+            "evidence_node_ids": _dedupe_limited(
+                [
+                    str(item).strip()
+                    for item in list(
+                        grounded_payload.get("evidence_node_ids") or []
+                    )
+                    if str(item).strip()
+                ],
+                limit=16,
+            ),
+            "reasoning_summary": _truncate_prompt_text(
+                str(grounded_payload.get("reasoning_summary") or "").strip(),
+                1200,
+            ),
+            "insufficient": bool(grounded_payload.get("insufficient")),
+            "answerability_state": answerability_state,
+            "context_summary": _truncate_prompt_text(
+                str(grounded_payload.get("context_summary") or "").strip(),
+                2400,
+            ),
+        }
+    mission_evidence_assessments: list[dict[str, Any]] = []
+    raw_assessments = payload.get("mission_evidence_assessments")
+    if raw_assessments is not None:
+        if not isinstance(raw_assessments, list) or len(raw_assessments) > 24:
+            return None
+        seen_assessment_ids: set[str] = set()
+        for raw_assessment in raw_assessments:
+            if not isinstance(raw_assessment, Mapping):
+                return None
+            assessment = dict(raw_assessment)
+            assessment_mission_id = str(assessment.get("mission_id") or "").strip()
+            if (
+                not assessment_mission_id
+                or len(assessment_mission_id) > 256
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._:/@+~=\-]{0,255}",
+                    assessment_mission_id,
+                )
+                is None
+                or assessment_mission_id in seen_assessment_ids
+            ):
+                return None
+            seen_assessment_ids.add(assessment_mission_id)
+            mission_evidence_assessments.append(
+                {
+                    "mission_id": assessment_mission_id,
+                    "claim": _truncate_prompt_text(
+                        str(assessment.get("claim") or "").strip(),
+                        1200,
+                    ),
+                    "entailed": bool(assessment.get("entailed")),
+                    "evidence_node_ids": _dedupe_limited(
+                        [
+                            str(item).strip()
+                            for item in list(
+                                assessment.get("evidence_node_ids") or []
+                            )
+                            if str(item).strip()
+                        ],
+                        limit=16,
+                    ),
+                    "explanation": _truncate_prompt_text(
+                        str(assessment.get("explanation") or "").strip(),
+                        1200,
+                    ),
+                    "subject_attribution": _truncate_prompt_text(
+                        str(assessment.get("subject_attribution") or "").strip(),
+                        600,
+                    ),
+                    "subject_attribution_established": bool(
+                        assessment.get("subject_attribution_established")
+                    ),
+                    "direct_mission_fit": bool(
+                        assessment.get("direct_mission_fit")
+                    ),
+                    "success_criteria_satisfied": bool(
+                        assessment.get("success_criteria_satisfied")
+                    ),
+                    "evidence_selection_rationale": _truncate_prompt_text(
+                        str(
+                            assessment.get("evidence_selection_rationale") or ""
+                        ).strip(),
+                        1200,
+                    ),
+                    "unsupported_claims": _dedupe_limited(
+                        [
+                            _truncate_prompt_text(str(item).strip(), 360)
+                            for item in list(
+                                assessment.get("unsupported_claims") or []
+                            )
+                            if str(item).strip()
+                        ],
+                        limit=8,
+                    ),
+                }
+            )
     normalized = {
         "decision": decision,
         "reason": _truncate_prompt_text(str(payload.get("reason") or "").strip(), 220),
-        "target_worker_id": str(payload.get("target_worker_id") or "").strip() or None,
-        "target_branch_id": str(payload.get("target_branch_id") or "").strip() or None,
+        "target_worker_id": target_worker_id,
+        "target_branch_id": target_branch_id,
+        "mission_id": mission_id,
+        "path_id": path_id,
+        "document_id": document_id,
+        "document_anchor_id": document_anchor_id,
+        "chunk_node_id": chunk_node_id,
         "delta": float(payload.get("delta") or 0.0),
         "confidence": max(0.0, min(1.0, float(payload.get("confidence") or 0.0))),
         "goal": str(payload.get("goal") or "").strip() or None,
         "worker_kind": str(payload.get("worker_kind") or "").strip() or None,
         "evidence_topic": str(payload.get("evidence_topic") or "").strip() or None,
+        "evidence_ids": _dedupe_limited(
+            [str(item).strip() for item in list(payload.get("evidence_ids") or []) if str(item).strip()],
+            limit=16,
+        ),
         "directive": str(payload.get("directive") or "").strip() or None,
         "directive_destination": str(payload.get("directive_destination") or "").strip() or None,
+        "destination_reason": _truncate_prompt_text(str(payload.get("destination_reason") or "").strip(), 220) or None,
         "target_family": str(payload.get("target_family") or "").strip() or None,
         "hold_reason": _truncate_prompt_text(str(payload.get("hold_reason") or "").strip(), 160) or None,
         "can_answer_now": bool(payload.get("can_answer_now")),
         "should_continue_expanding": bool(payload.get("should_continue_expanding", decision not in {"stop_all", "emit_answer_final"})),
+        "unresolved_gap": _truncate_prompt_text(str(payload.get("unresolved_gap") or "").strip(), 260) or None,
+        "next_evidence_action": _truncate_prompt_text(str(payload.get("next_evidence_action") or "").strip(), 260) or None,
+        "expected_information_gain": _truncate_prompt_text(str(payload.get("expected_information_gain") or "").strip(), 260) or None,
+        "mission_evidence_assessments": mission_evidence_assessments,
+        "grounded_answer": grounded_answer,
     }
+    if normalized["should_continue_expanding"] and not all(
+        normalized.get(key)
+        for key in ("unresolved_gap", "next_evidence_action", "expected_information_gain")
+    ):
+        return None
     if decision != "widen_radius":
         normalized["delta"] = 0.0
     return normalized
+
+
+def _apply_master_evidence_promotion(
+    evidence_reservoir: dict[str, Any],
+    *,
+    evidence_ids: list[str],
+    evidence_topic: str | None,
+    target_branch: dict[str, Any] | None,
+    reason: str | None,
+) -> list[str]:
+    requested_ids = {str(item).strip() for item in list(evidence_ids or []) if str(item).strip()}
+    topic_key = _fold_text(str(evidence_topic or "").strip())
+    promoted: list[str] = []
+    entries = [dict(item) for item in list(evidence_reservoir.get("entries") or []) if isinstance(item, dict)]
+    target_goal = str((target_branch or {}).get("goal") or "").strip()
+    target_branch_id = str((target_branch or {}).get("branch_id") or "").strip()
+    for entry in entries:
+        node_id = str(entry.get("node_id") or entry.get("entry_id") or "").strip()
+        entry_id = str(entry.get("entry_id") or "").strip()
+        explicit_match = bool(requested_ids.intersection({node_id, entry_id}))
+        topic_text = " ".join(
+            str(entry.get(key) or "")
+            for key in ("topic", "summary", "evidence_snippet", "raw_text", "source_label")
+        )
+        topic_match = bool(topic_key and topic_key in _fold_text(topic_text))
+        if not (explicit_match or topic_match):
+            continue
+        has_provenance = bool(
+            (isinstance(entry.get("provenance"), Mapping) and dict(entry.get("provenance") or {}))
+            or entry.get("source_label")
+            or entry.get("document_anchor_id")
+            or entry.get("source_type")
+        )
+        if not bool(entry.get("answer_eligible", True)) or not has_provenance:
+            continue
+        entry["promotion_state"] = "promoted"
+        entry["promotion_reason"] = _truncate_prompt_text(reason or "master_promote_evidence", 220)
+        if target_goal:
+            entry["branch_goals"] = _dedupe_limited([*list(entry.get("branch_goals") or []), target_goal], limit=12)
+            entry["support_slots"] = _dedupe_limited([*list(entry.get("support_slots") or []), target_goal], limit=12)
+        if target_branch_id:
+            entry["branch_ids"] = _dedupe_limited([*list(entry.get("branch_ids") or []), target_branch_id], limit=12)
+        if node_id:
+            promoted.append(node_id)
+    if not promoted:
+        return []
+    evidence_reservoir["entries"] = entries
+    evidence_reservoir["promotion_manifest"] = [
+        *[dict(item) for item in list(evidence_reservoir.get("promotion_manifest") or []) if isinstance(item, dict)],
+        {
+            "decision": "promote",
+            "node_ids": _dedupe_limited(promoted, limit=32),
+            "target_branch_id": target_branch_id or None,
+            "target_goal": target_goal or None,
+            "reason": _truncate_prompt_text(reason or "master_promote_evidence", 220),
+        },
+    ]
+    if target_branch is not None:
+        target_branch["evidence_node_ids"] = _dedupe_limited(
+            [*list(target_branch.get("evidence_node_ids") or []), *promoted],
+            limit=64,
+        )
+        target_branch["accepted_by_ai_or_master"] = True
+    return _dedupe_limited(promoted, limit=32)
+
+
+def _document_hydration_action_payload(
+    *,
+    action: str,
+    mission_ledger: dict[str, Any] | None,
+    document_packets: list[dict[str, Any]] | None,
+    reason: str,
+    target_mission_id: str | None = None,
+    target_branch_id: str | None = None,
+    target_document_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve one mission's document action to a concrete persisted target."""
+
+    wanted_mission = str(target_mission_id or "").strip()
+    wanted_branch = str(target_branch_id or "").strip()
+    wanted_document = str(target_document_id or "").strip()
+    ledger_rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    for raw_row in list(dict(mission_ledger or {}).get("rows") or []):
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        ledger_rows.append(row)
+        judgement = dict(row.get("branch_judgement") or {})
+        if str(judgement.get("state") or "") not in {"needs_document", "useful_partial", "needs_radius_widen"}:
+            continue
+        if wanted_mission and wanted_mission not in {
+            str(row.get("mission_id") or "").strip(),
+            str(row.get("path_id") or "").strip(),
+        }:
+            continue
+        row_branch = str(row.get("branch_id") or "").strip()
+        if wanted_branch and row_branch and wanted_branch != row_branch:
+            continue
+        rows.append(row)
+
+    packets = [dict(packet) for packet in list(document_packets or []) if isinstance(packet, dict)]
+
+    def identity(candidate: dict[str, Any]) -> set[str]:
+        values = {
+            str(candidate.get(key) or "").strip()
+            for key in ("document_id", "anchor_node_id", "document_anchor_id", "node_id")
+            if str(candidate.get(key) or "").strip()
+        }
+        values.update(
+            str(item or "").strip()
+            for item in list(candidate.get("chunk_node_ids") or [])
+            if str(item or "").strip()
+        )
+        values.update(
+            str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+            for item in list(candidate.get("ordered_chunk_sequence") or [])
+            if isinstance(item, dict)
+            and str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+        )
+        return values
+
+    def payload_for(candidate: dict[str, Any], row: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        bound_row = dict(row or {})
+        chunk_ids = [
+            str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+            for item in list(candidate.get("ordered_chunk_sequence") or [])
+            if isinstance(item, dict)
+        ]
+        chunk_ids.extend(str(item or "").strip() for item in list(candidate.get("chunk_node_ids") or []))
+        chunk_ids = [item for item in chunk_ids if item]
+        chunk_id = wanted_document if wanted_document in chunk_ids else next(iter(chunk_ids), "")
+        anchor_id = str(
+            candidate.get("anchor_node_id")
+            or candidate.get("document_anchor_id")
+            or candidate.get("node_id")
+            or ""
+        ).strip()
+        target_id = chunk_id if action == "read_document_chunk" and chunk_id else anchor_id or chunk_id
+        if not target_id:
+            return None
+        provenance = dict(candidate.get("provenance") or {})
+        payload = {
+            "node_id": target_id,
+            "anchor_node_id": anchor_id or None,
+            "chunk_node_id": chunk_id or None,
+            "document_id": str(candidate.get("document_id") or anchor_id or "").strip() or None,
+            "mission_id": str(bound_row.get("mission_id") or wanted_mission or "").strip() or None,
+            "path_id": str(bound_row.get("path_id") or "").strip() or None,
+            "branch_id": str(bound_row.get("branch_id") or wanted_branch or "").strip() or None,
+            "document_ref": {
+                "title": str(candidate.get("title") or candidate.get("source_label") or "").strip() or None,
+                "source_label": str(candidate.get("source_label") or provenance.get("source_label") or "").strip() or None,
+                "source_uri": str(candidate.get("source_uri") or provenance.get("source_uri") or "").strip() or None,
+                "content_digest": str(candidate.get("content_digest") or candidate.get("digest") or "").strip() or None,
+            },
+            "reason": reason,
+        }
+        return {key: value for key, value in payload.items() if value not in (None, "", {})}
+
+    # A Master action can name a concrete packet that is already present in the
+    # live document workspace while the corresponding ledger row is still
+    # classified as ``missed``.  The target remains authoritative: bind it to
+    # the explicitly selected mission/branch instead of discarding it merely
+    # because the row has not yet transitioned to ``needs_document``.
+    if wanted_document:
+        direct_packet = next((packet for packet in packets if wanted_document in identity(packet)), None)
+        if direct_packet is not None:
+            binding_row = next(
+                (
+                    row
+                    for row in ledger_rows
+                    if (not wanted_mission or wanted_mission in {
+                        str(row.get("mission_id") or "").strip(),
+                        str(row.get("path_id") or "").strip(),
+                    })
+                    and (
+                        not wanted_branch
+                        or not str(row.get("branch_id") or "").strip()
+                        or wanted_branch == str(row.get("branch_id") or "").strip()
+                    )
+                ),
+                None,
+            )
+            direct_payload = payload_for(direct_packet, binding_row)
+            if direct_payload is not None:
+                return direct_payload
+
+    for row in rows:
+        candidates: list[dict[str, Any]] = []
+        for raw_ref in list(row.get("document_refs") or []):
+            if not isinstance(raw_ref, dict):
+                continue
+            ref = dict(raw_ref)
+            ref_ids = identity(ref)
+            if wanted_document and wanted_document not in ref_ids:
+                continue
+            matching_packet = next((packet for packet in packets if identity(packet) & ref_ids), None)
+            candidates.append({**ref, **dict(matching_packet or {})})
+        if wanted_document and not candidates:
+            candidates.extend(packet for packet in packets if wanted_document in identity(packet))
+        for candidate in candidates:
+            payload = payload_for(candidate, row)
+            if payload is not None:
+                return payload
+    return None
+
+
+def _branch_accepts_document_hydration_payload(
+    branch: dict[str, Any], payload: dict[str, Any] | None
+) -> bool:
+    """Keep hydrated document material scoped to its requesting mission."""
+
+    target = dict(payload or {})
+    if not target:
+        return False
+    return _branch_matches_required_mission(
+        branch,
+        {
+            "mission_id": target.get("mission_id"),
+            "path_id": target.get("path_id"),
+            "branch_id": target.get("branch_id"),
+        },
+    )
+
+
+def _document_packet_identity(packet: dict[str, Any] | None) -> set[str]:
+    candidate = dict(packet or {})
+    identities = {
+        str(candidate.get(key) or "").strip()
+        for key in ("document_id", "anchor_node_id", "document_anchor_id", "node_id")
+        if str(candidate.get(key) or "").strip()
+    }
+    identities.update(
+        str(item or "").strip()
+        for item in list(candidate.get("chunk_node_ids") or [])
+        if str(item or "").strip()
+    )
+    identities.update(
+        str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+        for item in list(candidate.get("ordered_chunk_sequence") or [])
+        if isinstance(item, dict)
+        and str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+    )
+    return identities
+
+
+def _llm_select_document_hydration_target(
+    *,
+    branch: dict[str, Any],
+    document_packets: list[dict[str, Any]],
+    retrieval_mode: str,
+    excluded_document_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
+    excluded_ids = {str(item).strip() for item in set(excluded_document_ids or set()) if str(item).strip()}
+    candidates = [
+        {
+            "document_id": str(packet.get("document_id") or packet.get("anchor_node_id") or "") or None,
+            "anchor_node_id": str(packet.get("anchor_node_id") or "") or None,
+            "chunk_node_ids": [str(item) for item in list(packet.get("chunk_node_ids") or []) if str(item)][:8],
+            "title": str(packet.get("title") or packet.get("source_label") or "") or None,
+            "source_label": str(packet.get("source_label") or "") or None,
+            "relevance_summary": _truncate_prompt_text(str(packet.get("relevance_summary") or ""), 260) or None,
+            "coverage": dict(packet.get("coverage") or {}),
+        }
+        for packet in document_packets[:12]
+        if _document_packet_identity(packet)
+        and not (_document_packet_identity(packet) & excluded_ids)
+    ]
+    if not candidates:
+        return None
+    remaining_seconds = _search_deadline_remaining_seconds()
+    master_reserve = _search_ai_stage_timeout_seconds("master_judge", retrieval_mode) + 2.0
+    selector_timeout = _search_ai_stage_timeout_seconds("branch_controller", retrieval_mode)
+    if remaining_seconds is not None:
+        selector_timeout = min(selector_timeout, max(0.0, remaining_seconds - master_reserve))
+    if selector_timeout <= 0.1:
+        return None
+    call_ledger = _SEARCH_AI_CALL_LEDGER.get()
+    ledger_offset = len(call_ledger) if call_ledger is not None else 0
+    payload = _run_attested_search_ai_json(
+        call_name="document_hydration_selector",
+        model=evidence_judge_model(),
+        system_prompt=(
+            "You select one persisted document candidate for an AGVM branch that explicitly requested document hydration. "
+            "Choose only when reading that candidate is expected to resolve the branch's named semantic gap. "
+            "Use only an exact id exposed in candidates and return null when none is relevant. Do not infer from keywords alone."
+        ),
+        user_prompt=json.dumps(
+            {
+                "branch": {
+                    "branch_id": branch.get("branch_id"),
+                    "mission_id": branch.get("mission_id") or branch.get("path_mission_id"),
+                    "path_id": branch.get("path_id") or branch.get("ai_spatial_path_id"),
+                    "semantic_goal": branch.get("semantic_goal") or branch.get("goal"),
+                    "answer_hypothesis": branch.get("answer_hypothesis"),
+                    "controller_reason": branch.get("controller_reason"),
+                    "evidence_node_ids": list(branch.get("evidence_node_ids") or [])[:12],
+                },
+                "document_candidates": candidates,
+            },
+            ensure_ascii=False,
+        ),
+        schema_name="agvm_document_hydration_selector_v1",
+        schema={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target_document_id", "reason", "confidence"],
+            "properties": {
+                "target_document_id": {"type": ["string", "null"]},
+                "reason": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            },
+        },
+        timeout=selector_timeout,
+        role="evidence_judge",
+    )
+    if not isinstance(payload, dict):
+        return None
+    target_id = str(payload.get("target_document_id") or "").strip()
+    public_ids = {identity for packet in document_packets for identity in _document_packet_identity(packet)}
+    if not target_id or target_id not in public_ids:
+        return None
+    attestation = {}
+    if call_ledger is not None:
+        selection_call = next(
+            (
+                dict(item)
+                for item in reversed(call_ledger[ledger_offset:])
+                if str(item.get("call_name") or "") == "document_hydration_selector"
+            ),
+            {},
+        )
+        attestation = dict(selection_call.get("ai_execution_attestation") or {})
+    if not attestation:
+        return None
+    return {
+        "target_document_id": target_id,
+        "reason": _truncate_prompt_text(str(payload.get("reason") or ""), 220) or None,
+        "confidence": max(0.0, min(1.0, float(payload.get("confidence") or 0.0))),
+        "decision_source": "llm_document_hydration_selector",
+        "binding_state": "ai_selected_and_bound",
+        "ai_execution_attestation": attestation,
+    }
+
+
+def _materialize_ai_controller_document_hydration(
+    *,
+    branches: list[dict[str, Any]],
+    mission_ledger: dict[str, Any] | None,
+    document_packets: list[dict[str, Any]] | None,
+    retrieval_mode: str = "balanced",
+) -> dict[str, Any]:
+    """Execute branch-AI document reads against branch-bound public packets.
+
+    This is deliberately not a document-query classifier.  A packet becomes
+    usable only after the LLM controller explicitly requests hydration and
+    names one candidate that was exposed on that same branch.  Missing,
+    unbound, or text-free targets fail closed.
+    """
+
+    packets = [dict(packet) for packet in list(document_packets or []) if isinstance(packet, dict)]
+    actions: list[dict[str, Any]] = []
+    selected_packets: list[dict[str, Any]] = []
+    for branch in branches:
+        recommendation = dict(branch.get("controller_recommendation") or {})
+        if (
+            str(branch.get("controller_decision_source") or recommendation.get("decision_source") or "") != "llm"
+            or str(recommendation.get("action") or "") != "request_doc_hydration"
+        ):
+            continue
+        target_document_id = str(
+            recommendation.get("target_document_id")
+            or branch.get("controller_target_document_id")
+            or ""
+        ).strip()
+        executed_target_ids = {
+            str(dict(action.get("payload") or {}).get(key) or "").strip()
+            for action in list(branch.get("executed_document_hydration_actions") or [])
+            if isinstance(action, dict)
+            for key in ("node_id", "anchor_node_id", "chunk_node_id", "document_id")
+            if str(dict(action.get("payload") or {}).get(key) or "").strip()
+        }
+        if not target_document_id:
+            try:
+                selection = _llm_select_document_hydration_target(
+                    branch=branch,
+                    document_packets=packets,
+                    retrieval_mode=retrieval_mode,
+                    excluded_document_ids=executed_target_ids,
+                )
+            except SearchAiExecutionError as exc:
+                branch["controller_document_hydration_status"] = "blocked_ai_selection_error"
+                branch["controller_document_hydration_error"] = str(exc.provider_error)
+                continue
+            target_document_id = str((selection or {}).get("target_document_id") or "").strip()
+            if not target_document_id:
+                branch["controller_document_hydration_status"] = "blocked_no_ai_selected_target"
+                continue
+            recommendation["target_document_id"] = target_document_id
+            recommendation["document_selection"] = dict(selection or {})
+            branch["controller_recommendation"] = recommendation
+            branch["controller_target_document_id"] = target_document_id
+        if target_document_id in executed_target_ids:
+            branch["controller_document_hydration_status"] = "already_executed_idempotent"
+            continue
+        target_packet = next(
+            (packet for packet in packets if target_document_id in _document_packet_identity(packet)),
+            None,
+        )
+        branch_packet_ids = {
+            identity
+            for packet in list(branch.get("document_packets") or [])
+            if isinstance(packet, dict)
+            for identity in _document_packet_identity(packet)
+        }
+        document_selection = dict(recommendation.get("document_selection") or {})
+        selected_by_followup_ai = bool(
+            str(document_selection.get("decision_source") or "") == "llm_document_hydration_selector"
+            and str(document_selection.get("binding_state") or "") == "ai_selected_and_bound"
+            and dict(document_selection.get("ai_execution_attestation") or {})
+        )
+        controller_attestation = dict(recommendation.get("ai_execution_attestation") or {})
+        if target_packet is None or (target_document_id not in branch_packet_ids and not selected_by_followup_ai):
+            branch["controller_document_hydration_status"] = "blocked_unbound_ai_target"
+            continue
+        if not selected_by_followup_ai and not controller_attestation:
+            branch["controller_document_hydration_status"] = "blocked_missing_controller_attestation"
+            continue
+        packet_chunk_ids = {
+            str(item or "").strip()
+            for item in list(target_packet.get("chunk_node_ids") or [])
+            if str(item or "").strip()
+        }
+        packet_chunk_ids.update(
+            str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+            for item in list(target_packet.get("ordered_chunk_sequence") or [])
+            if isinstance(item, dict)
+            and str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+        )
+        requested_action = "read_document_chunk" if target_document_id in packet_chunk_ids else "read_document_anchor"
+        payload = _document_hydration_action_payload(
+            action=requested_action,
+            mission_ledger=mission_ledger,
+            document_packets=packets,
+            reason=str(recommendation.get("reason") or "ai_controller_requested_document_hydration"),
+            target_mission_id=str(branch.get("mission_id") or branch.get("path_mission_id") or "").strip() or None,
+            target_branch_id=str(branch.get("branch_id") or "").strip() or None,
+            target_document_id=target_document_id,
+        )
+        if payload is None or not _branch_accepts_document_hydration_payload(branch, payload):
+            branch["controller_document_hydration_status"] = "blocked_missing_concrete_target"
+            continue
+        read_target_id = str(payload.get("node_id") or "").strip()
+        read_nodes = [
+            dict(node)
+            for node in fetch_nodes_by_ids([read_target_id], include_raw_text=True)
+            if isinstance(node, dict)
+        ]
+        anchor_id = str(payload.get("anchor_node_id") or target_packet.get("anchor_node_id") or "").strip()
+        if requested_action == "read_document_anchor" and anchor_id:
+            read_nodes.extend(
+                dict(node)
+                for node in fetch_document_child_nodes([anchor_id], limit_per_anchor=18, include_raw_text=True)
+                if isinstance(node, dict)
+            )
+        allowed_packet_ids = _document_packet_identity(target_packet)
+        read_nodes = [
+            node
+            for node in read_nodes
+            if str(node.get("id") or "").strip() in allowed_packet_ids
+            and str(node.get("raw_text") or "").strip()
+        ]
+        raw_node_ids = {str(node.get("id") or "").strip() for node in read_nodes if str(node.get("id") or "").strip()}
+        if not raw_node_ids:
+            branch["controller_document_hydration_status"] = "blocked_target_has_no_material"
+            continue
+        action_id = "document_hydration::" + hashlib.sha256(
+            "|".join(
+                (
+                    str(payload.get("mission_id") or ""),
+                    str(payload.get("branch_id") or ""),
+                    str(payload.get("node_id") or ""),
+                    str(target_packet.get("content_digest") or target_packet.get("digest") or ""),
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        action_record = {
+            "action_id": action_id,
+            "action": requested_action,
+            "payload": {**dict(payload), "state": "executed"},
+            "confidence": max(0.0, min(1.0, float(recommendation.get("confidence") or 0.0))),
+            "rationale": str(recommendation.get("reason") or "ai_controller_requested_document_hydration"),
+            "decision_source": (
+                "llm_document_hydration_selector"
+                if selected_by_followup_ai
+                else "llm_branch_controller"
+            ),
+            "binding_state": "ai_selected_and_bound" if selected_by_followup_ai else "branch_candidate_bound",
+            "ai_execution_attestation": (
+                dict(document_selection.get("ai_execution_attestation") or {})
+                if selected_by_followup_ai
+                else controller_attestation
+            ),
+        }
+        branch["planned_actions"] = _normalize_navigation_actions(
+            [*list(branch.get("planned_actions") or []), action_record]
+        )
+        branch["executed_document_hydration_actions"] = [
+            *[dict(item) for item in list(branch.get("executed_document_hydration_actions") or []) if isinstance(item, dict)],
+            action_record,
+        ][-6:]
+        branch["hydrated_node_ids"] = _dedupe_limited(
+            [*list(branch.get("hydrated_node_ids") or []), *sorted(raw_node_ids)],
+            limit=64,
+        )
+        branch["evidence_node_ids"] = _dedupe_limited(
+            [*list(branch.get("evidence_node_ids") or []), *sorted(raw_node_ids)],
+            limit=64,
+        )
+        branch["document_hydration_state"] = "executed"
+        branch["controller_document_hydration_status"] = "executed"
+        read_by_id = {str(node.get("id") or "").strip(): node for node in read_nodes}
+        selected_packet = {
+            **target_packet,
+            "ai_hydration_selected": True,
+            "mission_id": payload.get("mission_id"),
+            "path_id": payload.get("path_id"),
+            "branch_id": payload.get("branch_id"),
+            "hydration_action": requested_action,
+            "binding_state": action_record["binding_state"],
+            "binding_attestation": dict(action_record.get("ai_execution_attestation") or {}),
+            "hydration_action_id": action_id,
+        }
+        if anchor_id in read_by_id:
+            selected_packet["anchor_raw_text"] = str(read_by_id[anchor_id].get("raw_text") or "").strip()
+        selected_packet["ordered_chunk_sequence"] = [
+            {
+                **dict(item),
+                "raw_text": str(read_by_id.get(str(item.get("node_id") or item.get("chunk_node_id") or ""), {}).get("raw_text") or "").strip(),
+            }
+            for item in list(target_packet.get("ordered_chunk_sequence") or [])
+            if isinstance(item, dict)
+            and str(item.get("node_id") or item.get("chunk_node_id") or "") in read_by_id
+        ]
+        selected_chunk_ids = {
+            str(item.get("node_id") or item.get("chunk_node_id") or "").strip()
+            for item in list(selected_packet.get("ordered_chunk_sequence") or [])
+            if isinstance(item, dict)
+        }
+        for node_id, node in read_by_id.items():
+            if node_id == anchor_id or node_id in selected_chunk_ids:
+                continue
+            selected_packet["ordered_chunk_sequence"].append(
+                {
+                    "node_id": node_id,
+                    "chunk_index": node.get("document_chunk_index"),
+                    "source_span_start": node.get("source_span_start"),
+                    "source_span_end": node.get("source_span_end"),
+                    "raw_text": str(node.get("raw_text") or "").strip(),
+                    "evidence_snippet": _truncate_prompt_text(str(node.get("raw_text") or ""), 280),
+                    "score": 0.0,
+                }
+            )
+        selected_packets.append(selected_packet)
+        actions.append(action_record)
+    return {
+        "actions": actions,
+        "document_packets": selected_packets,
+        "materialized": bool(actions),
+    }
+
+
+def _merge_ai_selected_document_context(
+    fallback_context: dict[str, Any] | None,
+    selected_document_packets: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    base = dict(fallback_context or {})
+    packets = [dict(item) for item in list(selected_document_packets or []) if isinstance(item, dict)]
+    if not packets:
+        return base
+    document_context = _build_document_context(
+        document_mode="synthesis",
+        document_packets=packets,
+        fallback_context={},
+    )
+    base["context_fragments"] = [
+        *[dict(item) for item in list(base.get("context_fragments") or []) if isinstance(item, dict)],
+        *[dict(item) for item in list(document_context.get("context_fragments") or []) if isinstance(item, dict)],
+    ][:24]
+    sections_by_key = {
+        str(item.get("key") or ""): dict(item)
+        for item in list(base.get("structured_sections") or [])
+        if isinstance(item, dict) and str(item.get("key") or "")
+    }
+    for section in list(document_context.get("structured_sections") or []):
+        if not isinstance(section, dict):
+            continue
+        key = str(section.get("key") or "")
+        prior = dict(sections_by_key.get(key) or {})
+        sections_by_key[key] = {
+            **prior,
+            **dict(section),
+            "items": _dedupe_limited([*list(prior.get("items") or []), *list(section.get("items") or [])], limit=12),
+            "evidence_node_ids": _dedupe_limited(
+                [*list(prior.get("evidence_node_ids") or []), *list(section.get("evidence_node_ids") or [])],
+                limit=24,
+            ),
+        }
+    base["structured_sections"] = list(sections_by_key.values())
+    base["evidence_node_ids"] = _dedupe_limited(
+        [*list(base.get("evidence_node_ids") or []), *list(document_context.get("evidence_node_ids") or [])],
+        limit=32,
+    )
+    document_summary = str(document_context.get("context_summary") or "").strip()
+    if document_summary:
+        base["context_summary"] = " ".join(
+            part for part in (str(base.get("context_summary") or "").strip(), document_summary) if part
+        )[:1800]
+    base["ai_selected_document_hydration"] = {
+        "status": "materialized",
+        "document_count": len(packets),
+        "document_ids": [
+            str(packet.get("document_id") or packet.get("anchor_node_id") or "")
+            for packet in packets
+            if str(packet.get("document_id") or packet.get("anchor_node_id") or "")
+        ],
+    }
+    return base
+
+
+def _build_master_spawn_probe(
+    source_probe: dict[str, Any],
+    *,
+    round_index: int,
+    target_goal: str,
+    directive_destination: str | None,
+    reason: str | None,
+    destination_reason: str | None,
+    confidence: float,
+    root_query_text: str,
+) -> dict[str, Any]:
+    spawned_probe = dict(source_probe)
+    semantic_goal = _truncate_prompt_text(target_goal, 240)
+    if not semantic_goal:
+        return spawned_probe
+    spawn_signature = hashlib.sha256(
+        f"{round_index}:{semantic_goal}:{reason or ''}".encode("utf-8")
+    ).hexdigest()[:12]
+    mission_id = f"mission_master_{spawn_signature}"
+    spawned_probe["probe_id"] = f"probe_master_{spawn_signature}"
+    spawned_probe["strand_id"] = mission_id
+    spawned_probe["mission_id"] = mission_id
+    spawned_probe["goal"] = semantic_goal
+    spawned_probe["semantic_goal"] = semantic_goal
+    spawned_probe["goal_taxonomy"] = _canonical_goal_from_context(
+        semantic_goal,
+        root_query_text=root_query_text,
+        probe_query_text=semantic_goal,
+        expected_guide_area=str(spawned_probe.get("expected_guide_area") or ""),
+    )
+    spawned_probe["query_text"] = semantic_goal
+    spawned_probe["answer_hypothesis"] = _truncate_prompt_text(reason or semantic_goal, 360)
+    spawned_probe["expected_answer_field"] = semantic_goal
+    spawned_probe["why_required"] = _truncate_prompt_text(reason or "master_identified_coverage_gap", 360)
+    if directive_destination:
+        spawned_probe["destination_queue"] = [
+            {
+                "label": directive_destination,
+                "rationale": _truncate_prompt_text(destination_reason or reason or semantic_goal, 220),
+                "priority": max(0.55, min(1.0, float(confidence or 0.55))),
+            }
+        ]
+    return spawned_probe
 
 
 def master_judge_llm(
@@ -13597,8 +18885,19 @@ def master_judge_llm(
 ) -> tuple[dict[str, Any] | None, str | None]:
     schema = {
         "type": "object",
-        "additionalProperties": False,
-        "required": ["decision", "reason", "confidence", "can_answer_now", "should_continue_expanding"],
+        "additionalProperties": True,
+        "required": [
+            "decision",
+            "reason",
+            "confidence",
+            "can_answer_now",
+            "should_continue_expanding",
+            "unresolved_gap",
+            "next_evidence_action",
+            "expected_information_gain",
+            "mission_evidence_assessments",
+            "grounded_answer",
+        ],
         "properties": {
             "decision": {"type": "string", "enum": sorted(_ALLOWED_MASTER_DECISIONS)},
             "reason": {"type": "string"},
@@ -13607,14 +18906,105 @@ def master_judge_llm(
             "should_continue_expanding": {"type": "boolean"},
             "target_worker_id": {"type": ["string", "null"]},
             "target_branch_id": {"type": ["string", "null"]},
+            "mission_id": {"type": ["string", "null"]},
+            "path_id": {"type": ["string", "null"]},
+            "document_id": {"type": ["string", "null"]},
+            "document_anchor_id": {"type": ["string", "null"]},
+            "chunk_node_id": {"type": ["string", "null"]},
             "delta": {"type": "number"},
             "goal": {"type": ["string", "null"]},
             "worker_kind": {"type": ["string", "null"]},
             "evidence_topic": {"type": ["string", "null"]},
+            "evidence_ids": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
             "directive": {"type": ["string", "null"]},
             "directive_destination": {"type": ["string", "null"]},
+            "destination_reason": {"type": ["string", "null"]},
             "target_family": {"type": ["string", "null"]},
             "hold_reason": {"type": ["string", "null"]},
+            "unresolved_gap": {"type": ["string", "null"]},
+            "next_evidence_action": {"type": ["string", "null"]},
+            "expected_information_gain": {"type": ["string", "null"]},
+            "mission_evidence_assessments": {
+                "type": "array",
+                "maxItems": 24,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "mission_id",
+                        "claim",
+                        "entailed",
+                        "evidence_node_ids",
+                        "explanation",
+                        "subject_attribution",
+                        "subject_attribution_established",
+                        "direct_mission_fit",
+                        "success_criteria_satisfied",
+                        "evidence_selection_rationale",
+                        "unsupported_claims",
+                    ],
+                    "properties": {
+                        "mission_id": {"type": "string", "maxLength": 256},
+                        "claim": {"type": "string", "maxLength": 1200},
+                        "entailed": {"type": "boolean"},
+                        "evidence_node_ids": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "items": {"type": "string", "maxLength": 256},
+                        },
+                        "explanation": {"type": "string", "maxLength": 1200},
+                        "subject_attribution": {
+                            "type": "string",
+                            "maxLength": 600,
+                        },
+                        "subject_attribution_established": {"type": "boolean"},
+                        "direct_mission_fit": {"type": "boolean"},
+                        "success_criteria_satisfied": {"type": "boolean"},
+                        "evidence_selection_rationale": {
+                            "type": "string",
+                            "maxLength": 1200,
+                        },
+                        "unsupported_claims": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string", "maxLength": 360},
+                        },
+                    },
+                },
+            },
+            "grounded_answer": {
+                "type": ["object", "null"],
+                "additionalProperties": False,
+                "required": [
+                    "answer_text",
+                    "confidence",
+                    "evidence_node_ids",
+                    "reasoning_summary",
+                    "insufficient",
+                    "answerability_state",
+                    "context_summary",
+                ],
+                "properties": {
+                    "answer_text": {"type": "string", "maxLength": 6000},
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                    },
+                    "evidence_node_ids": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {"type": "string", "maxLength": 256},
+                    },
+                    "reasoning_summary": {"type": "string", "maxLength": 1200},
+                    "insufficient": {"type": "boolean"},
+                    "answerability_state": {
+                        "type": "string",
+                        "enum": ["grounded", "partial", "insufficient"],
+                    },
+                    "context_summary": {"type": "string", "maxLength": 2400},
+                },
+            },
         },
     }
     blackboard_summary = _summarize_blackboard_for_master(blackboard)
@@ -13624,47 +19014,93 @@ def master_judge_llm(
         "You do not navigate directly and you do not invent facts. "
         "Prefer semantic sufficiency over budget exhaustion. "
         "You must separately decide whether the system can answer now and whether it should continue expanding after that answer. "
+        "Continue only when you can name a concrete unresolved semantic gap, one executable next evidence action, and the new information that action is expected to add. "
+        "Vague possibilities such as finding more detail are not information gain and require stopping. "
         "Use the retrieval mode policy strictly:\n"
         "- flash: stop quickly when one grounded direct fact is strong.\n"
         "- balanced: allow more evidence when slots remain unresolved.\n"
         "- heavy: prefer richer dossier coverage before stopping.\n"
         "- forensic: require source-backed or document-backed resolution when relevant.\n"
         "Choose only one bounded decision from the allowed list. "
+        "When unresolved semantic coverage requires it, spawn a worker with a new free-form mission goal, append a new destination, "
+        "or promote grounded evidence by its exact evidence/node IDs. "
         "Compare heuristic and ai branch families explicitly when both are active. "
         "When useful, direct a specific branch toward a destination, hold it, stop it, keep a planner family alive, or suppress a redundant family. "
         "You must act as the semantic director, not as a node-by-node navigator."
+        " When master_review_phase is final_plan_barrier, the immutable primary, extension and eligible reserve paths have already run. "
+        "No further worker can be executed in this Search. At that barrier, judge the user's core question rather than demanding optional exhaustiveness: "
+        "emit a final answer when the cited evidence can answer it honestly, allowing the answer to state bounded uncertainty. "
+        "Request more evidence only when the named gap would make any answer materially misleading or ungrounded; that verdict will become an explicit usable partial, never hidden continuation. "
+        "At final_plan_barrier you are also the sole semantic sufficiency judge and grounded answer author. Treat answer_hypothesis and claim_shape only as untrusted questions to verify, never as evidence or text to repeat. "
+        "At that barrier evidence_authority contains the result of an independent blind EvidenceJudge. You may mark a mission entailed only by copying that packet's claim and exact evidence IDs; never upgrade a non-entailed or missing packet. "
+        "Each mission evidence_excerpt includes server_path_truth. Treat it as the sole authority for route traversal and document hydration diagnostics. Never report missing path truth when route_traversed is true, and never report missing document hydration when hydrated_document_ref_count is positive. "
+        "If final_plan_barrier evidence is otherwise relevant but a concrete document_refs_head item has raw_available=false and its primary text is necessary to decide the exact mission, request only that already-discovered document: choose request_doc_anchor or request_doc_chunk, set should_continue_expanding=true, copy the exact mission_id and exact document_id/document_anchor_id/chunk_node_id from the same mission row, and explain the bounded hydration gain. This authorizes one server hydration recovery and never a new Search. Never infer or rewrite an ID. "
+        "For a non-entailed packet, copy its diagnostic evidence IDs into the assessment so the human finding can point to the reviewed source, but do not turn those IDs into support for an answer. "
+        "Return exactly one mission_evidence_assessments item for every required mission. Each item must state a human-verifiable claim, whether that claim is directly entailed by that mission's visible evidence, the exact evidence_node_ids from that same mission row, and a concise explanation. "
+        "For every assessment, first establish subject attribution in subject_attribution: explain why the cited text is a statement about the exact subject and requested relationship, rather than a client, project, example, benchmark, framework participant, source canary, or nearby graph topic. Set subject_attribution_established false when that cannot be proven. "
+        "Then compare the evidence to the exact mission goal in the user's root query. Planner expected_evidence and success_criteria are scope hints, never authority to demand a broader audit than the user requested. Set direct_mission_fit and success_criteria_satisfied true when the cited evidence satisfies that exact mission scope. Explain why the selected citations are the strongest direct mission evidence in evidence_selection_rationale. Prefer primary overview, identity, service-definition or framework-definition evidence over related project examples; examples may corroborate a directly established claim but may not define the subject's services or identity by themselves. "
+        "Never cite AGVM system canaries, diagnostic text, retrieval metadata, or technical test statements as knowledge about the user's subject. Mark entailed false and name unsupported_claims whenever the evidence is merely related, generic, attributed to another actor, or does not prove the proposed claim. "
+        "When can_answer_now is true, every required mission must be entailed and grounded_answer must contain a bounded human-facing answer derived only from those entailed assessments; every grounded_answer evidence_node_id must be copied from the assessment evidence IDs. "
+        "Use answerability_state partial when bounded uncertainty remains. When can_answer_now is false, or outside final_plan_barrier, grounded_answer must be null."
     )
     user_prompt = (
         f"Query: {query_text}\n"
-        f"Query class: {query_class}\n"
+        f"Legacy query-class diagnostic (never a semantic routing or stop authority): {query_class}\n"
         f"Retrieval mode: {retrieval_mode}\n"
         f"Round: {round_index}\n"
         f"Timing: {timing}\n"
         f"Blackboard: {blackboard_summary}\n"
         "Decide whether the context is already enough to answer now, which branch should continue, stop, reroute, or hold, "
-        "whether radius should widen slightly, whether document evidence should be requested, and whether heuristic or ai family should be kept or suppressed."
+        "whether radius should widen slightly, whether document evidence should be requested, whether grounded evidence should be promoted, "
+        "and whether heuristic or ai family should be kept or suppressed. If should_continue_expanding is true, populate unresolved_gap, "
+        "next_evidence_action and expected_information_gain with specific, mutually consistent values; otherwise set all three to null. "
+        "At final_plan_barrier, complete mission_evidence_assessments before authoring grounded_answer. Outside that barrier return an empty assessment list."
     )
-    if retrieval_mode == "flash":
-        timeout = 3.2
-    elif retrieval_mode == "balanced":
-        timeout = 9.0 if query_class in {"direct_fact", "relation_fact", "style_values"} else 10.5
-    elif retrieval_mode == "heavy":
-        timeout = 11.5
-    else:
-        timeout = 13.0
     payload = _run_attested_search_ai_json(
         call_name="master_judge",
-        model=retrieval_model(),
+        model=master_model(),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         schema_name="agvm_master_judge",
         schema=schema,
-        timeout=timeout,
-        role="retrieval",
+        timeout=_search_ai_stage_timeout_seconds("master_judge", retrieval_mode),
+        role="master",
     )
     normalized = _normalize_master_decision(payload)
     if not normalized:
         raise SearchAiExecutionError("master_judge", "invalid_json")
+    if str(blackboard.get("master_review_phase") or "").strip() == "final_plan_barrier":
+        entailment_validation = _validate_master_mission_entailments(
+            normalized,
+            dict(blackboard.get("mission_evidence_ledger") or {}),
+            dict(blackboard.get("evidence_authority") or {}),
+        )
+        normalized["_evidence_authority"] = copy.deepcopy(
+            dict(blackboard.get("evidence_authority") or {})
+        )
+        normalized["mission_entailment_validation"] = entailment_validation
+        if bool(normalized.get("can_answer_now")) and (
+            not str(
+                dict(normalized.get("grounded_answer") or {}).get("answer_text")
+                or ""
+            ).strip()
+            or not bool(entailment_validation.get("valid"))
+        ):
+            # A syntactically valid provider response that cannot bind every
+            # asserted mission claim to its own frozen evidence is a usable
+            # review result, not a provider outage and never a final answer.
+            normalized.update(
+                {
+                    "decision": "emit_answer_partial",
+                    "can_answer_now": False,
+                    "should_continue_expanding": False,
+                    "grounded_answer": None,
+                    "unresolved_gap": "master_mission_entailment_not_certified",
+                    "next_evidence_action": None,
+                    "expected_information_gain": None,
+                    "directive": "review_grounding",
+                }
+            )
     return normalized, None
 
 
@@ -13723,7 +19159,7 @@ def final_answer_approval_llm(
     }
     payload = _run_attested_search_ai_json(
         call_name="final_answer_approval",
-        model=retrieval_model(),
+        model=master_model(),
         system_prompt=(
             "You are the AGVM final answer approval judge. Do not answer the user. "
             "Approve final sealing only when the answer directly addresses every requested point, "
@@ -13733,8 +19169,8 @@ def final_answer_approval_llm(
         user_prompt=json.dumps(prompt_payload, ensure_ascii=False),
         schema_name="agvm_final_answer_approval",
         schema=schema,
-        timeout=8.5 if str(retrieval_mode or "balanced") == "balanced" else 10.5,
-        role="retrieval",
+        timeout=_search_ai_stage_timeout_seconds("final_answer_approval", retrieval_mode),
+        role="master",
         max_output_tokens=700,
     )
     payload = dict(payload)
@@ -13895,6 +19331,651 @@ def _fallback_master_decide(
     }
 
 
+def _unresolved_required_mission_rows(mission_ledger: dict[str, Any] | None) -> list[dict[str, Any]]:
+    unresolved: list[dict[str, Any]] = []
+    ledger = dict(mission_ledger or {})
+    ledger_rows = [dict(row) for row in list(ledger.get("rows") or []) if isinstance(row, dict)]
+    current_ledger_digest = _mission_ledger_autojudge_input_digest(
+        ledger_rows,
+        dict(ledger.get("revision_context") or {}),
+    )
+    for row in ledger_rows:
+        if row.get("required") is False:
+            continue
+        judgement = dict(row.get("branch_judgement") or {})
+        coverage_state = str(row.get("coverage_state") or "unknown").strip().lower()
+        judgement_state = str(judgement.get("state") or "unknown").strip().lower()
+        has_current_ai_judgement = bool(
+            judgement.get("ai_branch_controller_used")
+            and judgement.get("current")
+            and str(judgement.get("judgement_input_digest") or "").startswith("sha256:")
+            and str(judgement.get("mission_ledger_input_digest") or "") == current_ledger_digest
+        )
+        invalidated = bool(
+            row.get("stale")
+            or row.get("invalidated")
+            or row.get("superseded")
+            or judgement.get("stale")
+            or judgement.get("invalidated")
+        )
+        has_authoritative_evidence = bool(
+            list(row.get("hot_evidence") or [])
+            or list(row.get("document_refs") or [])
+            or int(row.get("authoritative_evidence_count") or 0) > 0
+        )
+        if (
+            not invalidated
+            and coverage_state == "resolved"
+            and judgement_state == "resolved"
+            and has_current_ai_judgement
+            and has_authoritative_evidence
+        ):
+            continue
+        unresolved.append(row)
+    return unresolved
+
+
+def _plan_first_structurally_unresolved_required_mission_rows(
+    mission_ledger: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return only server-verifiable blockers for the single final V3 Master."""
+
+    unresolved: list[dict[str, Any]] = []
+    for raw_row in list(dict(mission_ledger or {}).get("rows") or []):
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        if row.get("required") is False:
+            continue
+        judgement = dict(row.get("branch_judgement") or {})
+        invalidated = bool(
+            row.get("stale")
+            or row.get("invalidated")
+            or row.get("superseded")
+            or judgement.get("stale")
+            or judgement.get("invalidated")
+        )
+        has_authoritative_evidence = bool(
+            list(row.get("hot_evidence") or [])
+            or list(row.get("document_refs") or [])
+            or int(row.get("authoritative_evidence_count") or 0) > 0
+        )
+        bound_to_runtime = bool(
+            str(row.get("branch_id") or "").strip()
+            or int(row.get("attempt_count") or 0) > 0
+        ) and str(row.get("coverage_reason") or "").strip() != "path_mission_not_executed_by_runtime"
+        if (
+            not invalidated
+            and has_authoritative_evidence
+            and bound_to_runtime
+        ):
+            continue
+        unresolved.append(row)
+    return unresolved
+
+
+def _search_deadline_remaining_seconds() -> float | None:
+    deadline = _SEARCH_AI_DEADLINE.get()
+    if deadline is None:
+        return None
+    return max(0.0, float(deadline) - time.monotonic())
+
+
+def _search_expansion_deadline_monotonic(
+    retrieval_mode: str,
+    *,
+    response_mode: str = "context",
+) -> float | None:
+    """Return the hard branch-expansion cutoff that preserves the final Master turn."""
+
+    overall_deadline = _SEARCH_AI_DEADLINE.get()
+    if overall_deadline is None:
+        return None
+    # Finalization freezes the ledger/surface consumed by the Master.  It is
+    # part of the reserved terminal phase rather than branch expansion, so it
+    # needs a small explicit allowance of its own.  Without it a completed
+    # worker wave can consume the Master's provider slot while rendering the
+    # same context repeatedly.
+    master_reserve_seconds = _search_final_master_reserve_seconds(
+        retrieval_mode,
+        response_mode=response_mode,
+    )
+    return float(overall_deadline) - master_reserve_seconds
+
+
+def _search_final_master_reserve_seconds(
+    retrieval_mode: str,
+    *,
+    response_mode: str = "context",
+    provider_capacity: int | None = None,
+) -> float:
+    """Reserve freeze + one blind EvidenceJudge + the final Master call."""
+
+    mode_budget = float(search_mode_budget_seconds(retrieval_mode))
+    freeze_cap = min(20.0, max(5.0, mode_budget * 0.05))
+    master_timeout = _search_ai_stage_timeout_seconds("master_judge", retrieval_mode)
+    evidence_judge_timeout = _search_ai_stage_timeout_seconds("master_judge", retrieval_mode)
+    # The attested Master payload is the public answer authority. There is no
+    # provider call after it, so reserving a third grounded-answer turn would
+    # contradict the runtime and unnecessarily starve branch execution.
+    _ = response_mode, provider_capacity
+    terminal_ai_budget = evidence_judge_timeout + master_timeout
+    requested_reserve = terminal_ai_budget + freeze_cap + 5.0
+    # Preserve a minimal evidence wave even when the provider has one slot.
+    return min(max(1.0, mode_budget - 5.0), requested_reserve)
+
+
+def _search_expansion_budget_remaining_seconds(
+    retrieval_mode: str,
+    *,
+    response_mode: str = "context",
+) -> float | None:
+    deadline = _search_expansion_deadline_monotonic(
+        retrieval_mode,
+        response_mode=response_mode,
+    )
+    if deadline is None:
+        return None
+    return max(0.0, float(deadline) - time.monotonic())
+
+
+def _plan_first_expansion_cutoff_blocks_round(
+    expansion_remaining_seconds: float | None,
+    *,
+    round_index: int,
+) -> bool:
+    """Only reserve the terminal Master before follow-up expansion waves."""
+
+    if expansion_remaining_seconds is None:
+        return False
+    if int(round_index or 0) <= 0:
+        return False
+    return float(expansion_remaining_seconds) <= 0.0
+
+
+def _plan_first_terminal_phase_order(
+    *,
+    response_mode: str,
+    provider_capacity: int,
+) -> tuple[str, ...]:
+    """Publicly testable causal order for the bounded terminal pipeline."""
+
+    _ = provider_capacity
+    _ = response_mode
+    return ("ledger_freeze", "evidence_judge_then_master", "context_results_renderer")
+
+
+def _iter_completed_futures_before_deadline(
+    futures: list[Any],
+    *,
+    executor: ThreadPoolExecutor,
+    deadline_monotonic: float | None,
+    minimum_wait_seconds: float = 0.0,
+    search_id: str | None = None,
+    stop_event: threading.Event | None = None,
+):
+    """Yield completed branch work without allowing pending workers to consume Master time."""
+
+    pending = set(futures)
+    completed_all = False
+    effective_deadline = deadline_monotonic
+    if pending and minimum_wait_seconds > 0.0:
+        floor_deadline = time.monotonic() + max(0.0, float(minimum_wait_seconds))
+        effective_deadline = (
+            floor_deadline
+            if effective_deadline is None
+            else max(float(effective_deadline), floor_deadline)
+        )
+    try:
+        while pending:
+            stop_reason = _search_runtime_stop_reason(search_id=search_id, stop_event=stop_event)
+            if stop_reason:
+                _set_search_runtime_stop(stop_event)
+                break
+            timeout_seconds = None
+            if effective_deadline is not None:
+                timeout_seconds = max(0.0, float(effective_deadline) - time.monotonic())
+                if timeout_seconds <= 0.0:
+                    _set_search_runtime_stop(stop_event)
+                    break
+            wait_timeout = timeout_seconds
+            if stop_event is not None:
+                wait_timeout = min(wait_timeout, 0.25) if wait_timeout is not None else 0.25
+            completed, pending = wait(
+                pending,
+                timeout=wait_timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                if (
+                    effective_deadline is None
+                    or time.monotonic() < float(effective_deadline)
+                ) and not _search_runtime_stop_reason(search_id=search_id, stop_event=stop_event):
+                    continue
+                _set_search_runtime_stop(stop_event)
+                break
+            for future in completed:
+                # ``wait`` may return many completed futures at once.  The
+                # caller can spend material time reducing each yielded result,
+                # so the deadline must be rechecked for every yield rather
+                # than only for every wait call.
+                if (
+                    effective_deadline is not None
+                    and time.monotonic() >= float(effective_deadline)
+                ):
+                    _set_search_runtime_stop(stop_event)
+                    pending.add(future)
+                    continue
+                yield future.result()
+        completed_all = not pending
+    finally:
+        if pending:
+            _set_search_runtime_stop(stop_event)
+            for future in pending:
+                future.cancel()
+        executor.shutdown(wait=completed_all, cancel_futures=not completed_all)
+
+
+def _effective_search_deadline_monotonic(
+    query: RetrieveRequest,
+    *,
+    now_epoch_ms: int | None = None,
+    now_monotonic: float | None = None,
+    inherited_deadline: float | None = None,
+    authoritative_deadline_at_ms: int | None = None,
+) -> float:
+    """Return the earliest authoritative client, mode, or inherited deadline."""
+
+    monotonic_now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    epoch_now_ms = int(time.time() * 1000) if now_epoch_ms is None else int(now_epoch_ms)
+    mode_deadline = monotonic_now + float(
+        search_mode_budget_seconds(str(query.retrieval_mode or "balanced"))
+    )
+    deadlines = [mode_deadline]
+    if query.deadline_at_ms is not None:
+        client_remaining_seconds = max(
+            0.0,
+            (int(query.deadline_at_ms) - epoch_now_ms) / 1000.0,
+        )
+        deadlines.append(monotonic_now + client_remaining_seconds)
+    if authoritative_deadline_at_ms is not None:
+        authoritative_remaining_seconds = max(
+            0.0,
+            (int(authoritative_deadline_at_ms) - epoch_now_ms) / 1000.0,
+        )
+        deadlines.append(monotonic_now + authoritative_remaining_seconds)
+    if inherited_deadline is not None:
+        deadlines.append(float(inherited_deadline))
+    return min(deadlines)
+
+
+def _unresolved_missions_have_runtime_budget(
+    mission_ledger: dict[str, Any] | None,
+    budget_remaining_seconds: float | None,
+) -> bool:
+    """Keep mission workers alive until sufficiency or the authoritative deadline."""
+
+    # Runtime entrypoints always install a global deadline. Treat a missing
+    # deadline as non-extendable so direct/internal callers cannot spin forever.
+    has_budget = budget_remaining_seconds is not None and float(budget_remaining_seconds) > 0.05
+    return has_budget and bool(_unresolved_required_mission_rows(mission_ledger))
+
+
+def _master_loop_executable_work(
+    branches: list[dict[str, Any]] | None,
+    mission_ledger: dict[str, Any] | None,
+    *,
+    new_landing_materialized: bool = False,
+) -> dict[str, Any]:
+    """Describe concrete work that can justify another operational round.
+
+    Unresolved ledger rows are not work by themselves. A round is useful only
+    when a worker can run now, a stopped mission branch has an open destination
+    or concrete document target that can be reactivated, or spatial planning
+    has just added a new landing. The final Master verdict runs after the loop
+    and therefore does not need an empty operational round.
+    """
+
+    branch_rows = [dict(branch) for branch in list(branches or []) if isinstance(branch, dict)]
+    active_states = {"active", "running", "pending", "planned", "open"}
+    for branch in branch_rows:
+        if str(branch.get("status") or "").strip().lower() in active_states:
+            return {
+                "executable": True,
+                "reason": "active_worker",
+                "branch_id": str(branch.get("branch_id") or "").strip() or None,
+                "reactivate_branch_id": None,
+            }
+    if new_landing_materialized:
+        return {
+            "executable": True,
+            "reason": "new_landing_materialized",
+            "branch_id": None,
+            "reactivate_branch_id": None,
+        }
+
+    unresolved = _unresolved_required_mission_rows(mission_ledger)
+    for row in unresolved:
+        for branch in branch_rows:
+            if not _branch_matches_required_mission(branch, row):
+                continue
+            planned_actions = [
+                dict(action)
+                for action in [
+                    *list(branch.get("pending_master_actions") or []),
+                    *list(branch.get("planned_actions") or []),
+                ]
+                if isinstance(action, dict)
+            ]
+            hydrated_ids = {
+                str(item).strip()
+                for item in list(branch.get("hydrated_node_ids") or [])
+                if str(item).strip()
+            }
+            document_refs = [
+                dict(item)
+                for source in (
+                    branch.get("document_refs"),
+                    branch.get("document_packets"),
+                    dict(branch.get("document_workspace") or {}).get("document_refs"),
+                    row.get("document_refs"),
+                )
+                for item in list(source or [])
+                if isinstance(item, dict)
+            ]
+            documented_ids = {
+                str(value).strip()
+                for ref in document_refs
+                for value in (
+                    ref.get("node_id"),
+                    ref.get("document_id"),
+                    ref.get("anchor_node_id"),
+                    ref.get("document_anchor_id"),
+                    *list(ref.get("chunk_node_ids") or []),
+                )
+                if str(value or "").strip()
+            }
+            materialized_document_ids = hydrated_ids | documented_ids
+            concrete_hydration = False
+            for action in planned_actions:
+                action_type = str(action.get("action") or action.get("type") or "").strip()
+                if action_type not in {"read_document_anchor", "read_document_chunk"}:
+                    continue
+                payload = dict(action.get("payload") or action)
+                target_ids = {
+                    str(payload.get(key) or "").strip()
+                    for key in ("node_id", "anchor_node_id", "chunk_node_id", "document_id")
+                    if str(payload.get(key) or "").strip()
+                }
+                hydration_state = str(
+                    payload.get("state")
+                    or payload.get("status")
+                    or action.get("state")
+                    or action.get("status")
+                    or branch.get("document_hydration_state")
+                    or ""
+                ).strip().lower()
+                explicitly_pending = hydration_state in {"pending", "queued", "requested", "in_progress", "running"}
+                if target_ids and (bool(target_ids - materialized_document_ids) or explicitly_pending):
+                    concrete_hydration = True
+                    break
+            resolution = {
+                str(key): dict(value or {})
+                for key, value in dict(branch.get("destination_resolution") or {}).items()
+            }
+            open_destination = any(
+                str(entry.get("state") or "pending").strip() not in _TERMINAL_DESTINATION_STATES
+                for entry in resolution.values()
+            )
+            if not resolution:
+                queue, execution_index = _destination_queue_for_execution(branch)
+                open_destination = bool(queue and execution_index < len(queue))
+            if concrete_hydration or open_destination:
+                branch_id = str(branch.get("branch_id") or "").strip() or None
+                return {
+                    "executable": True,
+                    "reason": "concrete_hydration" if concrete_hydration else "reactivatable_branch",
+                    "branch_id": branch_id,
+                    "reactivate_branch_id": branch_id,
+                }
+    return {
+        "executable": False,
+        "reason": "no_executable_worker_hydration_branch_or_landing",
+        "branch_id": None,
+        "reactivate_branch_id": None,
+    }
+
+
+def _should_reserve_final_master_budget(
+    *,
+    completed_rounds: int,
+    mission_ledger: dict[str, Any] | None,
+    budget_remaining_seconds: float | None,
+    retrieval_mode: str,
+) -> bool:
+    """Stop expansion early enough for one authoritative final Master turn."""
+
+    if completed_rounds < 1 or budget_remaining_seconds is None:
+        return False
+    if not _unresolved_required_mission_rows(mission_ledger):
+        return False
+    next_control_wave_ceiling = (
+        _search_ai_stage_timeout_seconds("navigation", retrieval_mode)
+        + _search_ai_stage_timeout_seconds("branch_controller", retrieval_mode)
+        + _search_ai_stage_timeout_seconds("master_judge", retrieval_mode)
+        + 5.0
+    )
+    return float(budget_remaining_seconds) <= next_control_wave_ceiling
+
+
+def _should_run_final_operational_master(
+    *,
+    answer_demo_requested: bool,
+    final_closure_ready: bool,
+    final_master_budget_reserved: bool,
+    provider_enabled: bool,
+    final_llm_approval_present: bool,
+    partial_terminal_fast_materialization: bool,
+    previous_operational_decision: Mapping[str, Any] | None,
+    plan_first_final_master_required: bool = False,
+) -> bool:
+    """Decide whether a fresh final Master must judge the latest snapshot.
+
+    A previous operational decision is intentionally not a reason to skip this
+    call: reserving final-Master budget means the previous decision requested
+    work and a newer bounded state now needs an authoritative terminal review.
+    """
+
+    _ = previous_operational_decision
+    return bool(
+        (
+            (answer_demo_requested and final_closure_ready)
+            or final_master_budget_reserved
+            or plan_first_final_master_required
+        )
+        and provider_enabled
+        and not final_llm_approval_present
+        # Plan-first has no recurrent Master.  A previously exposed partial
+        # surface therefore cannot suppress its single terminal judgement.
+        and (not partial_terminal_fast_materialization or plan_first_final_master_required)
+    )
+
+
+def _master_spawn_goal(master_decision: Mapping[str, Any] | None) -> str:
+    decision = dict(master_decision or {})
+    return str(decision.get("goal") or decision.get("unresolved_gap") or "").strip()
+
+
+def _branch_matches_required_mission(branch: dict[str, Any], row: dict[str, Any]) -> bool:
+    branch_id = str(branch.get("branch_id") or "").strip()
+    row_branch_id = str(row.get("branch_id") or "").strip()
+    if branch_id and row_branch_id and branch_id == row_branch_id:
+        return True
+    row_mission_id = str(row.get("mission_id") or "").strip()
+    branch_mission_ids = {
+        str(branch.get("path_mission_id") or "").strip(),
+        str(branch.get("mission_id") or "").strip(),
+    }
+    if row_mission_id and row_mission_id in branch_mission_ids:
+        return True
+    row_path_id = str(row.get("path_id") or "").strip()
+    branch_path_ids = {
+        str(branch.get("ai_spatial_path_id") or "").strip(),
+        str(branch.get("path_id") or "").strip(),
+    }
+    if row_path_id and row_path_id in branch_path_ids:
+        return True
+    row_strand_id = str(row.get("strand_id") or "").strip()
+    return bool(row_strand_id and row_strand_id == str(branch.get("strand_id") or "").strip())
+
+
+def _mission_guard_replacement_branch(
+    branches: list[dict[str, Any]],
+    *,
+    exclude_branch_id: str | None = None,
+) -> dict[str, Any] | None:
+    candidates = [
+        branch
+        for branch in branches
+        if str(branch.get("status") or "") == "active"
+        and str(branch.get("branch_id") or "").strip() != str(exclude_branch_id or "").strip()
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda branch: (
+            float(branch.get("route_yield") or 0.0),
+            float(branch.get("controller_confidence") or 0.0),
+            float(branch.get("branch_priority") or 0.0),
+            str(branch.get("branch_id") or ""),
+        ),
+    )
+
+
+def _guard_master_against_unresolved_missions(
+    decision: dict[str, Any],
+    *,
+    mission_ledger: dict[str, Any] | None,
+    branches: list[dict[str, Any]],
+    max_total_branches: int,
+    budget_remaining_seconds: float | None,
+    can_spawn_worker: bool = True,
+) -> dict[str, Any]:
+    """Turn premature finalization into concrete work while the global budget remains."""
+
+    guarded = dict(decision or {})
+    unresolved = _unresolved_required_mission_rows(mission_ledger)
+    guarded["required_mission_count"] = int(len(list(dict(mission_ledger or {}).get("rows") or [])))
+    guarded["unresolved_required_mission_count"] = len(unresolved)
+    guarded["unresolved_required_mission_ids"] = [
+        str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "")
+        for row in unresolved[:12]
+        if str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip()
+    ]
+    has_budget = budget_remaining_seconds is not None and float(budget_remaining_seconds) > 0.05
+    decision_name = str(guarded.get("decision") or "").strip()
+    final_requested = decision_name in {"emit_answer_final", "stop_all"} or not bool(
+        guarded.get("should_continue_expanding", True)
+    )
+    if not unresolved or not final_requested:
+        return guarded
+
+    def review_required_stop(reason: str) -> dict[str, Any]:
+        return {
+            **guarded,
+            "decision": "stop_all",
+            "reason": reason,
+            "decision_source": "mission_guard",
+            "guarded_decision_source": str(guarded.get("decision_source") or "").strip() or None,
+            "guarded_decision": decision_name or None,
+            "mission_guard_applied": True,
+            "completion_state": "review_required",
+            "review_required": True,
+            "can_answer_now": bool(guarded.get("can_answer_now")),
+            "should_continue_expanding": False,
+        }
+
+    if not has_budget:
+        return review_required_stop("required_missions_unresolved_at_deadline")
+
+    row = unresolved[0]
+    mission_id = str(row.get("mission_id") or row.get("path_id") or "").strip() or None
+    goal = str(row.get("goal") or row.get("answer_hypothesis") or mission_id or "complete required mission").strip()
+    expected_shape = dict(row.get("expected_evidence_shape") or {})
+    destination = str(
+        expected_shape.get("target_id")
+        or expected_shape.get("claim_shape")
+        or row.get("answer_hypothesis")
+        or goal
+    ).strip()
+    matching_branch = next((branch for branch in branches if _branch_matches_required_mission(branch, row)), None)
+    active_matching = matching_branch if str((matching_branch or {}).get("status") or "") == "active" else None
+    active_count = sum(1 for branch in branches if str(branch.get("status") or "") == "active")
+    at_capacity = active_count >= max(1, int(max_total_branches))
+    prior_source = str(guarded.get("decision_source") or "").strip() or None
+    replacement: dict[str, Any] | None = None
+
+    if active_matching:
+        target = active_matching
+        action = "widen_radius"
+        directive = "continue_branch"
+    elif matching_branch:
+        target = matching_branch
+        action = "continue_worker"
+        directive = "continue_branch"
+        if at_capacity:
+            replacement = _mission_guard_replacement_branch(
+                branches,
+                exclude_branch_id=str(matching_branch.get("branch_id") or ""),
+            )
+            if replacement is None:
+                return review_required_stop(f"required_mission_cannot_reopen:{mission_id or 'unknown'}")
+    elif can_spawn_worker and not at_capacity:
+        target = None
+        action = "spawn_worker"
+        directive = "continue_branch"
+    elif can_spawn_worker:
+        replacement = _mission_guard_replacement_branch(branches)
+        if replacement is None:
+            return review_required_stop(f"required_mission_cannot_replace:{mission_id or 'unknown'}")
+        target = None
+        action = "spawn_worker"
+        directive = "continue_branch"
+    else:
+        return review_required_stop(f"required_mission_has_no_worker:{mission_id or 'unknown'}")
+
+    target_branch_id = str((target or {}).get("branch_id") or "").strip() or None
+    target_worker_id = str((target or {}).get("worker_id") or target_branch_id or "").strip() or None
+    replacement_branch_id = str((replacement or {}).get("branch_id") or "").strip() or None
+    replacement_worker_id = str((replacement or {}).get("worker_id") or replacement_branch_id or "").strip() or None
+    return {
+        **guarded,
+        "decision": action,
+        "reason": f"required_mission_unresolved:{mission_id or 'unknown'}",
+        "decision_source": "mission_guard",
+        "guarded_decision_source": prior_source,
+        "guarded_decision": decision_name or None,
+        "mission_guard_applied": True,
+        "mission_id": mission_id,
+        "goal": goal,
+        "target_branch_id": target_branch_id,
+        "target_worker_id": target_worker_id,
+        "replace_branch_id": replacement_branch_id,
+        "replace_worker_id": replacement_worker_id,
+        "directive": directive,
+        "directive_destination": destination or None,
+        "unresolved_gap": goal or f"Required mission {mission_id or 'unknown'} is unresolved.",
+        "next_evidence_action": directive or action,
+        "expected_information_gain": (
+            f"Obtain evidence that can resolve mission {mission_id or goal or 'unknown'} rather than repeat the current receipt."
+        ),
+        "delta": max(0.02, float(guarded.get("delta") or 0.03)),
+        "can_answer_now": bool(guarded.get("can_answer_now")),
+        "should_continue_expanding": True,
+    }
+
+
 def _master_decide(
     *,
     query_text: str,
@@ -13993,17 +20074,13 @@ def _blend_score_maps(
 
 
 def _default_search_radius(radial_expectation: str, expected_memory_type: str | None) -> float:
+    del expected_memory_type
     base = {
         "core": 0.18,
         "inner": 0.24,
         "mid": 0.30,
         "outer": 0.36,
     }.get(str(radial_expectation or "mid"), 0.28)
-    normalized_type = str(expected_memory_type or "").strip().lower()
-    if normalized_type in {"identity", "relational", "value", "identity_style"}:
-        base = min(base, 0.24)
-    elif normalized_type in {"episodic", "document_anchor"}:
-        base = min(0.42, base + 0.04)
     return base
 
 
@@ -14016,88 +20093,17 @@ def _clamp_search_radius(requested: Any, radial_expectation: str, expected_memor
 
 
 def _goal_type_compatibility(probe: dict[str, Any], candidate: dict[str, Any]) -> float:
-    goal = str(probe.get("goal") or "").strip().lower()
-    candidate_type = str(candidate.get("memory_type") or "").strip().lower()
-    expected_memory_type = str(probe.get("expected_memory_type") or "").strip().lower()
-    is_document_anchor = bool(candidate.get("is_document_anchor"))
-
-    if goal == "name":
-        if candidate_type == "identity":
-            return 1.0
-        if is_document_anchor:
-            return 0.86
-        if candidate_type in {"knowledge", "relational"}:
-            return 0.7
-    if goal in {"birthplace", "residence"}:
-        if candidate_type in {"knowledge", "episodic"}:
-            return 1.0
-        if is_document_anchor:
-            return 0.88
-        if candidate_type == "identity":
-            return 0.72
-    if goal in {"family", "father", "partner", "mentor", "sibling"}:
-        if is_document_anchor:
-            return 1.0
-        if candidate_type == "relational":
-            return 0.82
-        if goal == "father" and candidate_type == "identity":
-            return 0.78
-        if candidate_type in {"identity", "knowledge"}:
-            return 0.58
-    if goal == "role":
-        if candidate_type == "knowledge":
-            return 1.0
-        if is_document_anchor:
-            return 0.92
-        if candidate_type == "technical":
-            return 0.82
-        if candidate_type == "identity":
-            return 0.56
-        if candidate_type == "project":
-            return 0.28
-    if goal == "projects":
-        if candidate_type == "project":
-            return 1.0
-        if is_document_anchor:
-            return 0.82
-        if candidate_type in {"knowledge", "technical"}:
-            return 0.7
-    if goal == "company_founding":
-        if candidate_type == "project":
-            return 1.0
-        if is_document_anchor or candidate_type in {"document_anchor", "document_chunk", "document_fact"}:
-            return 0.94
-        if candidate_type in {"knowledge", "technical"}:
-            return 0.74
-    if goal == "style":
-        if candidate_type == "identity_style":
-            return 1.0
-        if candidate_type == "technical" or is_document_anchor:
-            return 0.78
-        if candidate_type in {"identity", "value"}:
-            return 0.62
-    if goal == "values":
-        if candidate_type == "value":
-            return 1.0
-        if candidate_type == "identity":
-            return 0.76
-        if is_document_anchor:
-            return 0.62
-    if goal == "history":
-        if candidate_type in {"episodic", "document_anchor"} or is_document_anchor:
-            return 1.0
-        if candidate_type in {"identity", "project"}:
-            return 0.64
-    if goal == "documents":
-        if is_document_anchor or candidate_type == "document_anchor":
-            return 1.0
-        if candidate_type in {"knowledge", "relational", "project"}:
-            return 0.52
-        return 0.18
-
-    if expected_memory_type:
-        return 1.0 if expected_memory_type == candidate_type else (0.55 if not expected_memory_type else 0.18)
-    return 0.55
+    del probe
+    # Legacy name retained for score-shape compatibility. This value is now a
+    # neutral provenance hint, not a memory_type/expected_memory_type gate.
+    source_backed = bool(
+        candidate.get("is_document_anchor")
+        or candidate.get("document_anchor_id")
+        or candidate.get("source_ref_id")
+        or candidate.get("source_uri")
+        or dict(candidate.get("provenance") or {}).get("source_uri")
+    )
+    return 0.76 if source_backed else 0.72
 
 
 def _relation_signal_for_probe(probe: dict[str, Any], node: dict[str, Any], identity_context: dict[str, Any] | None) -> float:
@@ -14106,7 +20112,6 @@ def _relation_signal_for_probe(probe: dict[str, Any], node: dict[str, Any], iden
     answer_hypothesis = str(probe.get("answer_hypothesis") or "").lower()
     intent_type = str(probe.get("intent_type") or "").strip()
     goal = str(probe.get("goal") or "").strip().lower()
-    memory_type = str(node.get("memory_type") or "")
     guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or "")
     nucleus = identity_context or {}
 
@@ -14117,7 +20122,7 @@ def _relation_signal_for_probe(probe: dict[str, Any], node: dict[str, Any], iden
         name_candidates = [str(item).lower() for item in list(nucleus.get("self_name_candidates") or []) if item]
         if contains_any(name_candidates, text):
             return 1.0
-        return 0.78 if memory_type == "identity" else 0.0
+        return 0.0
 
     if goal == "birthplace" or intent_type == "birthplace" or any(token in query_text for token in ("nato", "nata", "born", "birth")):
         return 1.0 if any(token in text for token in ("nato", "nata", "born", "birth")) else 0.0
@@ -14140,8 +20145,8 @@ def _relation_signal_for_probe(probe: dict[str, Any], node: dict[str, Any], iden
             return 1.0
         if contains_any(employer_candidates, text) and any(token in text for token in ("inside", "dentro", "works on", "lavora su", "build", "guida")):
             return 0.92
-        if memory_type == "project" and any(token in text for token in ("build", "construct", "progetto", "project", "guida", "works on", "lavora su")):
-            return 0.82
+        if any(token in text for token in ("build", "construct", "progetto", "project", "guida", "works on", "lavora su")):
+            return 0.78
 
     if goal == "company_founding":
         company_signal = _company_affiliation_signal_score(f"{text} {answer_hypothesis}")
@@ -14185,7 +20190,7 @@ def _relation_signal_for_probe(probe: dict[str, Any], node: dict[str, Any], iden
         technical_structure_tokens = ("codice", "code", "architett", "struttura", "dettagli", "sistema", "system", "research", "ricerca", "document")
         if any(token in text for token in ("parla in modo", "stile di comunicazione", "communication style")):
             return 1.0
-        if (guide_area == "Expression" or memory_type == "identity_style") and any(token in text for token in style_descriptor_tokens):
+        if guide_area == "Expression" and any(token in text for token in style_descriptor_tokens):
             return 0.96
         if any(token in text for token in ("diretto", "direct")) and any(token in text for token in ("tecnico", "technical", "architett", "codice", "struttura")):
             return 0.92
@@ -14196,7 +20201,7 @@ def _relation_signal_for_probe(probe: dict[str, Any], node: dict[str, Any], iden
         return 0.0
 
     if goal == "values":
-        if (guide_area == "Values" or memory_type == "value") and any(token in text for token in _VALUE_SIGNAL_TERMS):
+        if guide_area == "Values" and any(token in text for token in _VALUE_SIGNAL_TERMS):
             return 0.94
         if any(token in text for token in _VALUE_SIGNAL_TERMS):
             return 0.88
@@ -15000,8 +21005,7 @@ def compile_landing_position(
         landing = _blend_position(landing, dict(preferred_bucket["centroid"]), min(0.44, centroid_weight))
 
     identity_like = (
-        str(expected_memory_type or "") in {"identity", "relational", "value", "identity_style"}
-        or str(expected_guide_area or "") in {"Identity", "Relationships", "Expression"}
+        str(expected_guide_area or "") in {"Identity", "Relationships", "Expression"}
         or goal in {"identity_name", "partner_name", "birthplace", "workplace"}
     )
     if identity_like:
@@ -15334,7 +21338,7 @@ def llm_retrieval_plan(
             "destination_queue": [dict(destination) for destination in list(item.get("destination_queue") or [])[:4]],
             "priority": float(item.get("priority") or 0.0),
         }
-        for item in list(answer_strands or [])[: int(query.max_total_branches)]
+        for item in list(answer_strands or [])
     ]
     user_prompt = (
         f"Query: {query.query_text}\n"
@@ -15346,15 +21350,327 @@ def llm_retrieval_plan(
     )
     payload = _run_attested_search_ai_json(
         call_name="retrieval_planner",
-        model=retrieval_model(),
+        model=planner_model(),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         schema_name="agvm_retrieval_planner",
         schema=schema,
-        timeout=25.0,
-        role="retrieval",
+        timeout=_search_ai_stage_timeout_seconds("planner", effective_retrieval_mode),
+        role="planner",
     )
     return payload, None
+
+
+def _navigation_model_context_tokens(model: str) -> int:
+    configured = str(os.getenv("AGVM_SEARCH_NAVIGATION_MODEL_CONTEXT_TOKENS") or "").strip()
+    if configured:
+        try:
+            return max(8_000, min(1_000_000, int(configured)))
+        except ValueError:
+            pass
+    normalized = str(model or "").strip().lower()
+    if normalized.startswith("gpt-4.1"):
+        return 1_000_000
+    if normalized.startswith("gpt-5"):
+        return 400_000
+    if normalized.startswith(("o3", "o4")):
+        return 200_000
+    if normalized.startswith(("gpt-4o", "gpt-4-turbo")):
+        return 128_000
+    return 32_000
+
+
+def _navigation_prompt_budget_chars(model: str, retrieval_mode: str) -> int:
+    mode = str(retrieval_mode or "balanced").strip().lower()
+    configured = str(
+        os.getenv(f"AGVM_SEARCH_NAVIGATION_{mode.upper()}_PROMPT_MAX_CHARS")
+        or os.getenv("AGVM_SEARCH_NAVIGATION_PROMPT_MAX_CHARS")
+        or ""
+    ).strip()
+    if configured:
+        try:
+            return max(8_000, min(256_000, int(configured)))
+        except ValueError:
+            pass
+    context_tokens = _navigation_model_context_tokens(model)
+    mode_fraction = {"flash": 0.08, "balanced": 0.12, "heavy": 0.16, "forensic": 0.20}.get(mode, 0.12)
+    # Three chars/token is deliberately conservative for mixed prose and JSON.
+    return max(12_000, min(64_000, int(context_tokens * mode_fraction * 3.0)))
+
+
+_NAVIGATION_REFERENCE_ID_KEYS = (
+    "node_id",
+    "document_id",
+    "source_id",
+    "anchor_node_id",
+    "memory_id",
+    "evidence_id",
+    "ref_id",
+)
+_NAVIGATION_REFERENCE_DIGEST_KEYS = (
+    "digest",
+    "sha256",
+    "content_digest",
+    "source_digest",
+    "evidence_digest",
+    "document_digest",
+)
+
+
+def _compact_navigation_reference(value: Mapping[str, Any]) -> dict[str, Any] | None:
+    reference: dict[str, Any] = {}
+    for key in (*_NAVIGATION_REFERENCE_ID_KEYS, *_NAVIGATION_REFERENCE_DIGEST_KEYS):
+        item = value.get(key)
+        if item not in (None, ""):
+            reference[key] = str(item)
+    if not reference:
+        return None
+    for key in ("title", "source_uri", "uri", "source", "relationship", "state"):
+        item = value.get(key)
+        if item not in (None, ""):
+            reference[key] = _truncate_prompt_text(item, 160)
+    temporal_context = _evidence_temporal_context(dict(value))
+    if temporal_context:
+        reference["temporal_context"] = temporal_context
+    return reference
+
+
+def _collect_navigation_references(value: Any) -> list[dict[str, Any]]:
+    references: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def visit(item: Any, depth: int) -> None:
+        if depth > 12:
+            return
+        if isinstance(item, Mapping):
+            reference = _compact_navigation_reference(item)
+            if reference:
+                identity = json.dumps(reference, ensure_ascii=False, sort_keys=True, default=str)
+                if identity not in seen:
+                    seen.add(identity)
+                    references.append(reference)
+            for key, nested in item.items():
+                if str(key).lower() in {"raw_text", "full_text", "content", "body", "text"}:
+                    continue
+                visit(nested, depth + 1)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested, depth + 1)
+
+    visit(value, 0)
+    return references
+
+
+def _compact_navigation_value(value: Any, *, text_limit: int = 240, depth: int = 0) -> Any:
+    if depth > 10:
+        return None
+    if isinstance(value, Mapping):
+        compact: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key).lower()
+            if normalized_key in {"raw_text", "full_text", "content", "body", "source_text"}:
+                if item:
+                    compact[f"{key}_digest"] = hashlib.sha256(str(item).encode("utf-8")).hexdigest()
+                continue
+            nested = _compact_navigation_value(item, text_limit=text_limit, depth=depth + 1)
+            if nested not in (None, "", [], {}):
+                compact[str(key)] = nested
+        return compact
+    if isinstance(value, (list, tuple)):
+        return [
+            compact
+            for item in value
+            if (compact := _compact_navigation_value(item, text_limit=text_limit, depth=depth + 1))
+            not in (None, "", [], {})
+        ]
+    if isinstance(value, str):
+        return _truncate_prompt_text(value, text_limit)
+    return value
+
+
+def _build_navigation_prompt_material(
+    *,
+    query: RetrieveRequest,
+    probe: dict[str, Any],
+    branch: dict[str, Any],
+    blackboard: dict[str, Any],
+    atlas_shortlist: list[dict[str, Any]],
+    retrieval_mode: str,
+    model: str,
+) -> dict[str, Any]:
+    budget_chars = _navigation_prompt_budget_chars(model, retrieval_mode)
+    raw_ledger = blackboard.get("mission_evidence_ledger")
+    ledger = dict(raw_ledger) if isinstance(raw_ledger, Mapping) else {}
+    mission_rows = [dict(item) for item in list(ledger.get("rows") or []) if isinstance(item, Mapping)]
+    unresolved_rows = [
+        dict(item)
+        for item in list(blackboard.get("unresolved_required_missions") or [])
+        if isinstance(item, Mapping)
+    ]
+    all_references = _collect_navigation_references({"probe": probe, "branch": branch, "blackboard": blackboard})
+
+    def selected(source: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+        return {key: source.get(key) for key in keys if source.get(key) not in (None, "", [], {})}
+
+    def compact_mission_rows(rows: list[dict[str, Any]], *, text_limit: int) -> list[dict[str, Any]]:
+        """Keep every mission, but never send its recursively-expanded runtime payload.
+
+        Mission ledger rows can contain hydrated evidence, route events and a copy of
+        the branch judgement.  Sending those structures back to the navigator is both
+        redundant (references are supplied separately) and can exceed the model prompt
+        before the provider is called.  Identity, goal, coverage and next-action facts
+        are the complete decision surface needed by this turn.
+        """
+        compact_rows: list[dict[str, Any]] = []
+        for row in rows:
+            compact_row = selected(
+                row,
+                (
+                    "mission_id", "path_id", "branch_id", "strand_id", "goal",
+                    "coverage_state", "coverage_reason", "missing_reason",
+                    "required", "planner_family",
+                ),
+            )
+            judgement = dict(row.get("branch_judgement") or {})
+            compact_judgement = selected(
+                judgement,
+                (
+                    "state", "reason_codes", "missing_reason",
+                    "next_recommended_action", "ai_branch_controller_required",
+                    "ai_branch_controller_used",
+                ),
+            )
+            if compact_judgement:
+                compact_row["branch_judgement"] = compact_judgement
+            compact_rows.append(
+                _compact_navigation_value(compact_row, text_limit=text_limit)
+            )
+        return compact_rows
+
+    def reference_core(reference: Mapping[str, Any]) -> dict[str, Any]:
+        return selected(
+            reference,
+            (*_NAVIGATION_REFERENCE_ID_KEYS, *_NAVIGATION_REFERENCE_DIGEST_KEYS),
+        )
+
+    def compose(*, text_limit: int, include_optional: bool) -> dict[str, Any]:
+        material = {
+            "query": _truncate_prompt_text(query.query_text, min(4_000, text_limit * 12)),
+            "retrieval_mode": retrieval_mode,
+            "response_mode": query.response_mode,
+            "decision_time_utc": utc_timestamp(),
+            "probe": _compact_navigation_value(
+                selected(
+                    probe,
+                    (
+                        "probe_id", "mission_id", "path_mission_id", "path_id", "strand_id", "goal",
+                        "answer_hypothesis", "expected_answer_field", "expected_guide_area", "expected_memory_type",
+                        "radial_expectation", "search_radius", "priority", "routing_semantic_scores", "routing_facets",
+                        "destination_queue", "expected_stop_condition",
+                    ),
+                ),
+                text_limit=text_limit,
+            ),
+            "branch": _compact_navigation_value(
+                selected(
+                    branch,
+                    (
+                        "branch_id", "mission_id", "path_mission_id", "path_id", "probe_ids", "goal",
+                        "answer_hypothesis", "status", "stop_reason", "route_state", "lifecycle_stage", "route_yield",
+                        "active_destination", "destination_queue", "visited_node_ids", "visited_bucket_keys",
+                        "evidence_node_ids", "hydrated_node_ids", "reservoir_only_node_ids", "controller_recommendation",
+                        "planned_actions",
+                    ),
+                ),
+                text_limit=text_limit,
+            ),
+            "mission_ledger": _compact_navigation_value(
+                {
+                    **selected(
+                        ledger,
+                        (
+                            "schema_version", "status", "row_count", "mission_count", "resolved_count",
+                            "partial_count", "missed_count", "revision_context", "brain_revision",
+                        ),
+                    ),
+                    "rows": compact_mission_rows(mission_rows, text_limit=text_limit),
+                },
+                text_limit=text_limit,
+            ),
+            "unresolved_required_missions": compact_mission_rows(
+                unresolved_rows,
+                text_limit=text_limit,
+            ),
+            "evidence_refs": all_references,
+            "allowed_actions": sorted(_ALLOWED_NAVIGATION_ACTIONS),
+            "prompt_contract": {
+                "all_missions_preserved": True,
+                "long_text_compacted": True,
+                "model": model,
+                "max_chars": budget_chars,
+                "temporal_policy": {
+                    "semantic_validity_event_or_observation_time_and_lifecycle_guide_current_or_as_of": True,
+                    "publication_time_is_source_chronology_not_claim_validity": True,
+                    "audit_timestamps_do_not_imply_truth_or_recency": True,
+                },
+            },
+        }
+        if include_optional:
+            material["blackboard_state"] = _compact_navigation_value(
+                selected(
+                    blackboard,
+                    (
+                        "covered_goals", "fulfilled_goals", "coverage_by_slot", "unresolved_slots",
+                        "confidence_by_goal", "shared_node_ids", "shared_bucket_keys", "master_state",
+                        "unresolved_required_mission_count",
+                    ),
+                ),
+                text_limit=text_limit,
+            )
+            material["atlas_shortlist"] = _compact_navigation_value(atlas_shortlist, text_limit=text_limit)
+        return material
+
+    material = compose(text_limit=240, include_optional=True)
+    encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(encoded) > budget_chars:
+        material = compose(text_limit=96, include_optional=False)
+        material["prompt_contract"]["optional_detail_reduced"] = True
+        encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(encoded) > budget_chars:
+        # Evidence references are an index for the navigator, not hydrated
+        # evidence.  Retain compact IDs/digests and pack as many as fit while
+        # recording the complete-set digest.  Mission rows are never dropped.
+        compact_references = [
+            compact
+            for reference in all_references
+            if (compact := reference_core(reference))
+        ]
+        material["evidence_refs"] = []
+        material["evidence_reference_summary"] = {
+            "total_count": len(compact_references),
+            "included_count": 0,
+            "set_digest": hashlib.sha256(
+                json.dumps(compact_references, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+            "hydrated_evidence_not_embedded": True,
+        }
+        for reference in compact_references:
+            material["evidence_refs"].append(reference)
+            material["evidence_reference_summary"]["included_count"] = len(material["evidence_refs"])
+            encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), default=str)
+            if len(encoded) > budget_chars:
+                material["evidence_refs"].pop()
+                material["evidence_reference_summary"]["included_count"] = len(material["evidence_refs"])
+                break
+        material["prompt_contract"]["evidence_refs_packed_to_budget"] = True
+        encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), default=str)
+        while len(encoded) > budget_chars and material["evidence_refs"]:
+            material["evidence_refs"].pop()
+            material["evidence_reference_summary"]["included_count"] = len(material["evidence_refs"])
+            encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(encoded) > budget_chars:
+        raise SearchAiExecutionError("navigation_actions", "navigation_prompt_budget_exceeded_after_compaction")
+    return material
 
 
 def llm_navigation_actions(
@@ -15388,25 +21704,31 @@ def llm_navigation_actions(
             }
         },
     }
+    navigation_material = _build_navigation_prompt_material(
+        query=query,
+        probe=probe,
+        branch=branch,
+        blackboard=blackboard,
+        atlas_shortlist=atlas_shortlist,
+        retrieval_mode=retrieval_mode,
+        model=retrieval_model(),
+    )
     payload = _run_attested_search_ai_json(
         call_name="navigation_actions",
         model=retrieval_model(),
         system_prompt=(
             "You are an AGVM navigation worker. Choose only discrete retrieval actions. "
-            "Do not invent nodes or prose plans. Prioritize local bucket inspection, controlled radius growth, and document-anchor reads when relevant."
+            "Do not invent nodes or prose plans. Prioritize local bucket inspection, controlled radius growth, and document-anchor reads when relevant. "
+            "For current or as-of goals, use semantic validity, explicitly sourced event/observation time, and lifecycle/supersession metadata when present. "
+            "Treat publication time separately as source chronology; it can date the source but cannot establish claim validity, currentness, or truth. "
+            "Treat created_at, recorded_at, acquired_at, retrieved_at and ingested_at only as audit or source-handling timestamps, never as proof that a claim is newer, current, or truer."
         ),
-        user_prompt=(
-            f"Query: {query.query_text}\n"
-            f"Probe: {probe}\n"
-            f"Branch: {branch}\n"
-            f"Blackboard: {blackboard}\n"
-            f"Atlas shortlist: {atlas_shortlist[:3]}\n"
-            f"Allowed actions: {sorted(_ALLOWED_NAVIGATION_ACTIONS)}"
-        ),
+        user_prompt=json.dumps(navigation_material, ensure_ascii=False, separators=(",", ":")),
         schema_name="agvm_navigation_actions",
         schema=schema,
-        timeout=2.0 if retrieval_mode == "balanced" else (2.8 if retrieval_mode == "heavy" else 3.8),
+        timeout=_search_ai_stage_timeout_seconds("navigation", retrieval_mode),
         role="retrieval",
+        max_output_tokens=800,
     )
     actions = _normalize_navigation_actions(list(payload.get("actions") or []))
     if not actions:
@@ -15424,8 +21746,176 @@ def build_probe_from_spec(
 ) -> dict[str, Any]:
     piece = str(spec.get("query_text") or "").strip()
     classification_text = " ".join(part for part in (root_query_text.strip(), piece) if part).strip()
-    query_class = _query_class(classification_text)
     probe_query_text = piece or classification_text
+    planner_family = str(spec.get("planner_family") or "").strip().lower() or (
+        "ai" if str(spec.get("landing_basis") or "").strip().lower().startswith("llm") else "heuristic"
+    )
+    semantic_authority_v2 = planner_family == "ai" and _record_uses_semantic_authority_v2(spec)
+    semantic_goal = _truncate_prompt_text(
+        spec.get("semantic_goal") or spec.get("goal") or probe_query_text,
+        360,
+    )
+    if semantic_authority_v2:
+        bound_named_targets = _merge_server_bound_named_targets(
+            _server_bound_named_target_spans(root_query_text),
+            spec.get("server_bound_named_targets"),
+            spec.get("required_named_concept_spans"),
+        )
+        required_entities = _merge_required_entities_with_bound_targets(
+            [str(item).strip() for item in list(spec.get("required_entities") or []) if str(item).strip()],
+            bound_named_targets,
+        )
+        expected_evidence = [str(item).strip() for item in list(spec.get("expected_evidence") or []) if str(item).strip()]
+        success_criteria = [str(item).strip() for item in list(spec.get("success_criteria") or []) if str(item).strip()]
+        routing_intent = _truncate_prompt_text(
+            spec.get("routing_intent")
+            or spec.get("routing_hint_goal")
+            or spec.get("goal")
+            or semantic_goal
+            or probe_query_text,
+            360,
+        )
+        routing_hint_goal = str(spec.get("routing_hint_goal") or spec.get("goal_taxonomy") or "").strip() or None
+        radial_expectation = str(spec.get("radial_expectation") or "mid").strip() or "mid"
+        routing_scores = {field: 0.5 for field in ROUTING_FIELDS}
+        routing_facets = {field: 0.5 for field in FACET_FIELDS}
+        provided_position = _spatial_coordinate(spec.get("landing_position")) or _spatial_coordinate(spec.get("base_position"))
+        if provided_position:
+            routing_brainhex = position_to_topology_brainhex(provided_position)
+            base_position = dict(provided_position)
+        else:
+            routing_brainhex = quantize_to_brainhex(
+                0.0,
+                0.0,
+                compute_radius_value(
+                    routing_scores,
+                    routing_facets,
+                    granularity=0.5,
+                    novelty=0.5,
+                    radial_policy={"target_band": radial_expectation, "band_bias": 0.5},
+                ),
+            )
+            base_position = brainhex_to_position(routing_brainhex)
+        landing_position = dict(provided_position or base_position)
+        target_bucket_keys = [
+            str(item).strip()
+            for item in list(spec.get("target_bucket_keys") or [])
+            if str(item).strip()
+        ][:4]
+        if not target_bucket_keys and landing_position:
+            target_bucket_keys = [position_to_bucket(landing_position)["key"]]
+        branch_priority = round(max(0.0, min(1.0, float(spec.get("priority") or spec.get("weight") or 0.72))), 4)
+        expected_answer_field = str(
+            spec.get("expected_answer_field")
+            or spec.get("answer_field")
+            or semantic_goal
+            or routing_intent
+        ).strip() or "knowledge"
+        destination_specs = [
+            dict(item)
+            for item in list(spec.get("destination_queue") or [])
+            if isinstance(item, dict)
+        ]
+        if destination_specs:
+            destination_queue = _normalize_destination_queue(
+                spec_destinations=destination_specs,
+                goal=routing_intent or semantic_goal or f"Landing {index}",
+                probe_label=f"landing_{index}",
+                fallback_guide_area=str(spec.get("expected_guide_area") or "").strip() or None,
+                fallback_memory_type=str(spec.get("expected_memory_type") or "").strip() or None,
+                fallback_radial_expectation=radial_expectation,
+                fallback_color_hex=None,
+                fallback_bucket_keys=target_bucket_keys,
+            )
+        else:
+            destination_queue = [
+                {
+                    "destination_id": f"dest_landing_{index}_v2",
+                    "destination_key": f"{index}::server_bound_v2::{position_to_bucket(landing_position)['key']}",
+                    "label": routing_intent or semantic_goal or f"Landing {index}",
+                    "guide_area": str(spec.get("expected_guide_area") or "").strip() or None,
+                    "memory_type": str(spec.get("expected_memory_type") or "").strip() or None,
+                    "radial_expectation": radial_expectation,
+                    "semantic_color_hint": None,
+                    "target_bucket_keys": target_bucket_keys,
+                    "target_node_ids": [],
+                    "rationale": _truncate_prompt_text(
+                        str(spec.get("why_required") or spec.get("inverse_rationale") or routing_intent or semantic_goal).strip(),
+                        180,
+                    ),
+                    "priority": branch_priority,
+                    "execution_role": "primary",
+                    "activation_condition": None,
+                    "activates_for_mission_id": None,
+                    "activation_predicate": None,
+                    "max_execution_stops": None,
+                    "expected_discovery": None,
+                    "hydration_policy": None,
+                    "hydration_capabilities": [],
+                }
+            ]
+        probe = {
+            "probe_id": f"probe_{index}",
+            "label": f"Landing {index}",
+            "root_query_text": str(root_query_text or "").strip(),
+            "query_text": piece,
+            "strand_id": str(spec.get("strand_id") or "").strip() or None,
+            "mission_id": str(spec.get("mission_id") or spec.get("strand_id") or "").strip() or None,
+            "query_class": "semantic_v2_mission",
+            "legacy_query_class_authority": False,
+            "answer_hypothesis": str(spec.get("answer_hypothesis") or "").strip(),
+            "weight": round(float(spec.get("weight") or 1.0), 6),
+            "intent_type": "server_bound_semantic_intent",
+            "routing_intent": routing_intent,
+            "goal": semantic_goal,
+            "semantic_goal": semantic_goal,
+            "routing_hint_goal": routing_hint_goal,
+            "goal_taxonomy": None,
+            "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2,
+            "semantic_authority_v2": True,
+            "why_required": str(spec.get("why_required") or "").strip() or None,
+            "required_entities": required_entities,
+            "server_bound_named_targets": bound_named_targets,
+            "required_named_concept_spans": bound_named_targets,
+            "expected_evidence": expected_evidence,
+            "success_criteria": success_criteria,
+            "mission_metadata": dict(spec.get("mission_metadata") or {}) if isinstance(spec.get("mission_metadata") or {}, Mapping) else {},
+            "expected_guide_area": str(spec.get("expected_guide_area") or "").strip() or None,
+            "expected_memory_type": str(spec.get("expected_memory_type") or "").strip() or None,
+            "landing_basis": str(spec.get("landing_basis") or "server_bound_semantic_mission"),
+            "inverse_rationale": spec.get("inverse_rationale"),
+            "radial_expectation": radial_expectation,
+            "routing_semantic_scores": routing_scores,
+            "routing_facets": routing_facets,
+            "routing_brainhex": routing_brainhex,
+            "base_position": base_position,
+            "landing_position": landing_position,
+            "semantic_color": color_from_brainhex(routing_brainhex),
+            "search_radius": _clamp_search_radius(spec.get("search_radius"), radial_expectation, str(spec.get("expected_memory_type") or "")),
+            "success_min_confidence": max(0.58, min(0.92, float(spec.get("success_min_confidence") or 0.78))),
+            "max_text_chars": max(900, min(2600, int(spec.get("max_text_chars") or 1600))),
+            "target_bucket_keys": target_bucket_keys,
+            "crowding_penalty": 0.0,
+            "expected_answer_field": expected_answer_field,
+            "corroboration_needs": [str(item).strip() for item in list(spec.get("corroboration_needs") or expected_evidence) if str(item).strip()][:6],
+            "branch_priority": branch_priority,
+            "expected_stop_condition": str(spec.get("expected_stop_condition") or (success_criteria[0] if success_criteria else "")).strip() or "mission_evidence_satisfied",
+            "destination_queue": destination_queue,
+            "route_preference_prior": dict(spec.get("route_preference_prior") or {}),
+            "crowding_penalty_factor": float(spec.get("crowding_penalty_factor") or 1.0),
+            "calibration_scope_keys": [str(item) for item in list(spec.get("calibration_scope_keys") or []) if str(item).strip()],
+            "calibration_applied": bool(spec.get("calibration_applied")),
+            "compiled_prior_applied": False,
+            "compiled_prior_template": {},
+        }
+        return _annotate_probe_family(
+            probe,
+            planner_family=planner_family,
+            family_plan_id=str(spec.get("family_plan_id") or "").strip() or None,
+            family_plan_confidence=float(spec.get("family_plan_confidence") or branch_priority),
+        )
+
+    query_class = _query_class(classification_text)
     preliminary_goal = (
         _canonical_goal_from_context(
             str(spec.get("goal") or ""),
@@ -15504,32 +21994,41 @@ def build_probe_from_spec(
         probe_query_text=probe_query_text,
         expected_guide_area=expected_guide_area,
     )
+    routing_hint_goal = goal
     expected_guide_area = _guide_area_for_query_text(
         probe_query_text,
-        _guide_area_for_goal(goal) or expected_guide_area,
+        _guide_area_for_goal(routing_hint_goal) or expected_guide_area,
     )
     landing_position = compile_landing_position(
         base_position=base_position,
         expected_guide_area=expected_guide_area,
         expected_memory_type=expected_memory_type,
-        goal=goal,
+        goal=routing_hint_goal,
         radial_expectation=radial_expectation,
         atlas_payload=atlas_payload,
         identity_context=identity_context,
     )
-    expected_answer_field = str(spec.get("expected_answer_field") or _expected_answer_field_for_goal(goal)).strip() or _goal_to_slot(goal)
+    expected_answer_field = str(
+        spec.get("expected_answer_field") or _expected_answer_field_for_goal(routing_hint_goal)
+    ).strip() or _goal_to_slot(routing_hint_goal)
     corroboration_needs = list(
         dict.fromkeys(
             str(item).strip()
-            for item in list(spec.get("corroboration_needs") or _corroboration_needs_for_goal(goal, query_class=query_class))
+            for item in list(
+                spec.get("corroboration_needs")
+                or _corroboration_needs_for_goal(routing_hint_goal, query_class=query_class)
+            )
             if str(item).strip()
         )
     )[:6]
     branch_priority = round(max(0.0, min(1.0, float(spec.get("priority") or spec.get("weight") or 0.72))), 4)
-    expected_stop_condition = str(spec.get("expected_stop_condition") or _expected_stop_condition_for_goal(goal, query_class=query_class)).strip()
+    expected_stop_condition = str(
+        spec.get("expected_stop_condition")
+        or _expected_stop_condition_for_goal(routing_hint_goal, query_class=query_class)
+    ).strip()
     destination_queue = _normalize_destination_queue(
         spec_destinations=list(spec.get("destination_queue") or []),
-        goal=goal,
+        goal=routing_hint_goal,
         probe_label=f"landing_{index}",
         fallback_guide_area=expected_guide_area,
         fallback_memory_type=expected_memory_type,
@@ -15537,17 +22036,28 @@ def build_probe_from_spec(
         fallback_color_hex=str((color_from_brainhex(routing_brainhex) or {}).get("hex") or ""),
     )
     destination_queue = reorder_destination_queue(destination_queue, dict(spec.get("calibration_destination_weights") or {}))
-    planner_family = str(spec.get("planner_family") or "").strip().lower() or ("ai" if str(spec.get("landing_basis") or "").strip().lower().startswith("llm") else "heuristic")
+    goal = semantic_goal if semantic_authority_v2 and semantic_goal else routing_hint_goal
     probe = {
         "probe_id": f"probe_{index}",
         "label": f"Landing {index}",
         "query_text": piece,
         "strand_id": str(spec.get("strand_id") or "").strip() or None,
+        "mission_id": str(spec.get("mission_id") or spec.get("strand_id") or "").strip() or None,
         "query_class": query_class,
         "answer_hypothesis": answer_hypothesis,
         "weight": round(float(spec.get("weight") or 1.0), 6),
         "intent_type": detect_query_intent(classification_text),
         "goal": goal,
+        "semantic_goal": semantic_goal or goal,
+        "routing_hint_goal": routing_hint_goal,
+        "goal_taxonomy": routing_hint_goal,
+        "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2 if semantic_authority_v2 else "legacy_compatible",
+        "semantic_authority_v2": semantic_authority_v2,
+        "why_required": str(spec.get("why_required") or "").strip() or None,
+        "required_entities": [str(item).strip() for item in list(spec.get("required_entities") or []) if str(item).strip()],
+        "expected_evidence": [str(item).strip() for item in list(spec.get("expected_evidence") or []) if str(item).strip()],
+        "success_criteria": [str(item).strip() for item in list(spec.get("success_criteria") or []) if str(item).strip()],
+        "mission_metadata": dict(spec.get("mission_metadata") or {}) if isinstance(spec.get("mission_metadata") or {}, Mapping) else {},
         "expected_guide_area": expected_guide_area,
         "expected_memory_type": expected_memory_type,
         "landing_basis": str(spec.get("landing_basis") or "inverse_like_estimation"),
@@ -15870,6 +22380,9 @@ def _materialize_attested_seed_probes(
     for index, raw_spec in enumerate(raw_specs, start=1):
         spec = dict(raw_spec)
         spec["planner_family"] = "ai"
+        if _search_semantic_authority_v2_enabled():
+            spec["semantic_authority"] = SEARCH_SEMANTIC_AUTHORITY_V2
+            spec["semantic_authority_v2"] = True
         spec["family_plan_id"] = str(spec.get("family_plan_id") or "ai_family_plan")
         spec["search_radius"] = float(spec.get("search_radius") or 0.22)
         spec["success_min_confidence"] = float(spec.get("success_min_confidence") or 0.8)
@@ -15994,9 +22507,7 @@ def _spatial_region_centroid(
             str(bucket.get(key) or "")
             for key in (
                 "bucket_key",
-                "dominant_guide_area",
                 "dominant_area",
-                "guide_area",
                 "label",
                 "region_ref",
             )
@@ -16010,7 +22521,7 @@ def _spatial_region_centroid(
                 "source": "metamemory_atlas_bucket",
                 "region_ref": region_ref,
                 "bucket_key": str(bucket.get("bucket_key") or "").strip() or position_to_bucket(centroid)["key"],
-                "matched_ref": str(bucket.get("bucket_key") or bucket.get("dominant_guide_area") or region_ref),
+                "matched_ref": str(bucket.get("bucket_key") or bucket.get("region_ref") or region_ref),
             }
 
     for gateway in list((metamemory_spatial_brief or {}).get("highway_gateways") or []):
@@ -16018,7 +22529,7 @@ def _spatial_region_centroid(
             continue
         gateway_text = " ".join(
             str(gateway.get(key) or "")
-            for key in ("bucket_key", "guide_area", "dominant_guide_area", "label", "region_ref")
+            for key in ("bucket_key", "label", "region_ref")
         )
         if not token_matches(gateway_text):
             continue
@@ -16029,9 +22540,264 @@ def _spatial_region_centroid(
                 "source": "metamemory_highway_gateway",
                 "region_ref": region_ref,
                 "bucket_key": str(gateway.get("bucket_key") or "").strip() or position_to_bucket(centroid)["key"],
-                "matched_ref": str(gateway.get("bucket_key") or gateway.get("guide_area") or region_ref),
+                "matched_ref": str(gateway.get("bucket_key") or gateway.get("region_ref") or region_ref),
             }
     return {}
+
+
+def _ai_spatial_destination_has_location(destination: Any) -> bool:
+    payload = dict(destination or {}) if isinstance(destination, Mapping) else {}
+    return bool(
+        str(payload.get("region_ref") or "").strip()
+        or _spatial_coordinate(payload.get("coordinate"))
+        or str(payload.get("novel_region_candidate") or "").strip()
+    )
+
+
+def _planner_seed_location_hints(answer_strands: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    hints: list[dict[str, Any]] = []
+    for strand in [dict(item) for item in list(answer_strands or []) if isinstance(item, Mapping)]:
+        strand_keys = {
+            _fold_text(strand.get("strand_id")),
+            _fold_text(strand.get("mission_id")),
+            _fold_text(strand.get("answer_field")),
+            _fold_text(strand.get("goal")),
+            _fold_text(strand.get("semantic_goal")),
+        }
+        strand_keys.discard("")
+        destination_rows = [
+            dict(item)
+            for item in list(
+                strand.get("execution_destination_queue")
+                or strand.get("semantic_destination_queue")
+                or strand.get("destination_queue")
+                or []
+            )
+            if isinstance(item, Mapping)
+        ]
+        for destination in destination_rows:
+            region_ref = str(
+                destination.get("region_ref")
+                or destination.get("landing_region_ref")
+                or ""
+            ).strip()
+            coordinate = _spatial_coordinate(
+                destination.get("coordinate")
+                or destination.get("landing_coordinate")
+                or destination.get("position")
+            )
+            novel_region = str(
+                destination.get("novel_region_candidate")
+                or destination.get("novel_region")
+                or destination.get("region_candidate")
+                or ""
+            ).strip()
+            if not (region_ref or coordinate or novel_region):
+                continue
+            keys = set(strand_keys)
+            keys.update(
+                {
+                    _fold_text(destination.get("destination_id")),
+                    _fold_text(destination.get("label")),
+                    _fold_text(destination.get("destination_key")),
+                }
+            )
+            keys.discard("")
+            hints.append(
+                {
+                    "region_ref": region_ref or None,
+                    "coordinate": coordinate,
+                    "novel_region_candidate": novel_region or None,
+                    "radius": destination.get("radius"),
+                    "priority": destination.get("priority"),
+                    "keys": keys,
+                }
+            )
+    return hints
+
+
+def _repair_ai_spatial_contract_locations_from_planner_seed(
+    contract: dict[str, Any] | None,
+    *,
+    answer_strands: list[dict[str, Any]] | None,
+    metamemory_spatial_brief: dict[str, Any],
+    atlas_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Repair missing spatial locations using only attested planner destinations.
+
+    Provider spatial output is still authoritative when it provides executable
+    coordinates/regions.  This repair covers the narrow failure mode where the
+    provider produced paths and destinations but omitted location fields that
+    are already present in the planner seed destination queue.
+    """
+
+    payload = copy.deepcopy(dict(contract or {}))
+    missing_reasons = [
+        str(item).strip()
+        for item in list(payload.get("missing_reasons") or [])
+        if str(item).strip()
+    ]
+    if bool(payload.get("materialized")):
+        return payload
+    if not any(
+        reason.startswith("path_destinations_missing_location")
+        or reason == "landing_region_or_coordinate_missing"
+        for reason in missing_reasons
+    ):
+        return payload
+    paths = [dict(item) for item in list(payload.get("inverse_answer_paths") or []) if isinstance(item, Mapping)]
+    if not paths:
+        return payload
+    hints = _planner_seed_location_hints(answer_strands)
+    if not hints:
+        return payload
+
+    def choose_hint(path: Mapping[str, Any], destination: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+        keys = {
+            _fold_text(path.get("strand_id")),
+            _fold_text(path.get("mission_id")),
+            _fold_text(path.get("answer_field")),
+            _fold_text(path.get("goal")),
+        }
+        if destination is not None:
+            keys.update(
+                {
+                    _fold_text(destination.get("destination_id")),
+                    _fold_text(destination.get("label")),
+                    _fold_text(destination.get("destination_key")),
+                }
+            )
+        keys.discard("")
+        for hint in hints:
+            if keys and keys.intersection(set(hint.get("keys") or set())):
+                return hint
+        if len(hints) == 1 or len(paths) == 1:
+            return hints[0]
+        return None
+
+    repair_events: list[dict[str, Any]] = []
+    repaired_paths: list[dict[str, Any]] = []
+    for path_index, path in enumerate(paths, start=1):
+        destinations = [
+            dict(item)
+            for item in list(path.get("destinations") or path.get("destination_queue") or [])
+            if isinstance(item, Mapping)
+        ]
+        if not destinations:
+            hint = choose_hint(path)
+            if hint:
+                destinations = [
+                    {
+                        "destination_id": str(path.get("path_id") or f"P{path_index}:planner_seed_location"),
+                        "label": str(path.get("goal") or path.get("answer_field") or "planner seed destination"),
+                        "reason": "Planner seed supplied the missing spatial destination.",
+                        "execution_role": "primary",
+                    }
+                ]
+        repaired_destinations: list[dict[str, Any]] = []
+        for destination in destinations:
+            repaired = dict(destination)
+            if not _ai_spatial_destination_has_location(repaired):
+                hint = choose_hint(path, repaired)
+                if hint:
+                    region_ref = str(hint.get("region_ref") or "").strip()
+                    coordinate = _spatial_coordinate(hint.get("coordinate"))
+                    snap = (
+                        _spatial_region_centroid(
+                            region_ref=region_ref,
+                            metamemory_spatial_brief=metamemory_spatial_brief,
+                            atlas_payload=atlas_payload,
+                        )
+                        if region_ref and not coordinate
+                        else {}
+                    )
+                    snapped_coordinate = dict(snap.get("position") or {}) if isinstance(snap, Mapping) else {}
+                    coordinate = coordinate or _spatial_coordinate(snapped_coordinate)
+                    if region_ref or coordinate:
+                        repaired["region_ref"] = repaired.get("region_ref") or region_ref or None
+                        repaired["coordinate"] = repaired.get("coordinate") or coordinate
+                        repaired["radius"] = repaired.get("radius") or hint.get("radius") or 0.22
+                        repaired["priority"] = repaired.get("priority") or hint.get("priority") or 0.72
+                        metadata = dict(repaired.get("metadata") or {})
+                        metadata["location_repair_source"] = "planner_seed_destination_queue"
+                        metadata["location_repair_snap_source"] = str(snap.get("source") or "") if isinstance(snap, Mapping) else None
+                        repaired["metadata"] = {key: value for key, value in metadata.items() if value is not None}
+                        repair_events.append(
+                            {
+                                "path_id": str(path.get("path_id") or f"P{path_index}"),
+                                "destination_id": str(repaired.get("destination_id") or ""),
+                                "region_ref": repaired.get("region_ref"),
+                                "coordinate_present": bool(repaired.get("coordinate")),
+                                "snap_source": str(snap.get("source") or "") if isinstance(snap, Mapping) else None,
+                            }
+                        )
+            repaired_destinations.append(repaired)
+        path["destinations"] = repaired_destinations
+        path["destination_queue"] = repaired_destinations
+        primary = next((item for item in repaired_destinations if _ai_spatial_destination_has_location(item)), None)
+        if primary:
+            path["landing_region_ref"] = path.get("landing_region_ref") or primary.get("region_ref")
+            path["landing_coordinate"] = path.get("landing_coordinate") or primary.get("coordinate")
+        repaired_paths.append(path)
+
+    unlocated_paths = [
+        str(path.get("path_id") or "unknown")
+        for path in repaired_paths
+        if not any(_ai_spatial_destination_has_location(destination) for destination in list(path.get("destinations") or []))
+    ]
+    if unlocated_paths:
+        return payload
+
+    coordinate_count = sum(
+        1
+        for path in repaired_paths
+        for destination in list(path.get("destinations") or [])
+        if _spatial_coordinate(dict(destination or {}).get("coordinate"))
+    )
+    region_count = sum(
+        1
+        for path in repaired_paths
+        for destination in list(path.get("destinations") or [])
+        if str(dict(destination or {}).get("region_ref") or "").strip()
+    )
+    destination_count = sum(len(list(path.get("destinations") or [])) for path in repaired_paths)
+    waypoint_count = sum(len(list(path.get("waypoints") or [])) for path in repaired_paths)
+    payload["inverse_answer_paths"] = repaired_paths
+    payload["missing_reasons"] = [
+        reason
+        for reason in missing_reasons
+        if not (
+            reason.startswith("path_destinations_missing_location")
+            or reason == "landing_region_or_coordinate_missing"
+        )
+    ]
+    payload["materialized"] = bool(repaired_paths and not payload["missing_reasons"])
+    payload["certifiable"] = bool(payload["materialized"])
+    payload["status"] = "materialized" if payload["materialized"] else "blocked"
+    payload["materialization_state"] = payload["status"]
+    metrics = dict(payload.get("metrics") or {})
+    metrics.update(
+        {
+            "ai_landing_count": destination_count,
+            "destination_count": destination_count,
+            "waypoint_count": waypoint_count,
+            "planned_primary_point_count": destination_count + waypoint_count,
+            "coordinate_landing_count": coordinate_count,
+            "region_landing_count": region_count,
+        }
+    )
+    payload["metrics"] = metrics
+    cache = dict(payload.get("cache") or {})
+    cache["validity"] = "valid" if payload["materialized"] else "not_valid"
+    payload["cache"] = cache
+    payload["location_repair"] = {
+        "schema_version": "agvm.public_v1_landing_location_repair.v1",
+        "applied": True,
+        "source": "planner_seed_destination_queue",
+        "event_count": len(repair_events),
+        "events": repair_events[:16],
+    }
+    return payload
 
 
 def _build_ai_spatial_probe_destinations(
@@ -16042,8 +22808,134 @@ def _build_ai_spatial_probe_destinations(
     memory_type: str | None,
     radial_expectation: str,
     target_bucket_keys: list[str],
+    retrieval_mode: str = "balanced",
+    semantic_authority_v2: bool = False,
 ) -> list[dict[str, Any]]:
-    destinations: list[dict[str, Any]] = [
+    mode = str(retrieval_mode or "balanced").strip().lower()
+    primary_limit = {"flash": 1, "balanced": 2, "heavy": 3, "forensic": 4}.get(mode, 2)
+
+    def materialize_destination(
+        raw: Mapping[str, Any],
+        *,
+        index: int,
+        execution_role: str,
+    ) -> dict[str, Any]:
+        coordinate = _spatial_coordinate(raw.get("coordinate"))
+        bucket_keys = [position_to_bucket(coordinate)["key"]] if coordinate else []
+        if semantic_authority_v2 and not bucket_keys:
+            bucket_keys = [str(item).strip() for item in list(target_bucket_keys or []) if str(item).strip()][:4]
+        region_ref = str(raw.get("region_ref") or "").strip()
+        routing_intent = _truncate_prompt_text(
+            raw.get("routing_intent")
+            or raw.get("semantic_routing_intent")
+            or path.get("routing_intent")
+            or path.get("semantic_routing_intent")
+            or raw.get("expected_discovery")
+            or goal,
+            360,
+        )
+        label = str(
+            raw.get("label")
+            or raw.get("expected_discovery")
+            or raw.get("destination_id")
+            or f"destination_{index}"
+        ).strip()
+        destination_goal = goal
+        destination_guide = guide_area
+        destination_memory = memory_type
+        if not semantic_authority_v2:
+            destination_goal = _canonical_goal_from_context(
+                label or goal,
+                root_query_text=str(path.get("answer_hypothesis") or ""),
+                probe_query_text=label or goal,
+                expected_guide_area=_guide_area_from_spatial_region(
+                    region_ref,
+                    fallback_goal=goal,
+                )
+                or guide_area,
+            )
+            destination_guide = (
+                _guide_area_from_spatial_region(region_ref, fallback_goal=destination_goal)
+                or guide_area
+            )
+            templates = _semantic_destination_templates_for_goal(destination_goal)
+            destination_memory = str(
+                (templates[0] if templates else {}).get("memory_type")
+                or memory_type
+                or ""
+            ).strip() or None
+        return {
+            "destination_id": str(
+                raw.get("destination_id")
+                or f"ai_spatial_{str(path.get('path_id') or 'path').lower()}_d{index}"
+            ),
+            "label": label,
+            "guide_area": destination_guide,
+            "memory_type": destination_memory,
+            "radial_expectation": _radial_expectation_from_radius(raw.get("radius")),
+            "target_bucket_keys": bucket_keys,
+            "priority": max(0.0, min(1.0, float(raw.get("priority") or 0.62))),
+            "rationale": str(
+                raw.get("reason")
+                or raw.get("expected_discovery")
+                or path.get("spatial_rationale")
+                or "AI spatial destination"
+            ),
+            "expected_discovery": str(raw.get("expected_discovery") or "").strip() or None,
+            "hydration_policy": str(raw.get("hydration_policy") or "").strip() or None,
+            "hydration_capabilities": sorted(
+                _provider_authored_hydration_capabilities(raw)
+            ),
+            "execution_role": execution_role,
+            "activation_condition": str(raw.get("activation_condition") or "").strip() or None,
+            "activates_for_mission_id": str(raw.get("activates_for_mission_id") or "").strip() or None,
+            "activation_predicate": (
+                str(raw.get("activation_predicate") or "").strip().lower()
+                if str(raw.get("activation_predicate") or "").strip().lower()
+                in {
+                    "mission_unresolved",
+                    "no_evidence",
+                    "wrong_region",
+                    "document_reference_not_materialized",
+                }
+                else None
+            ),
+            "max_execution_stops": 1 if execution_role in {"reserve", "conditional_extension"} else None,
+            "routing_intent": routing_intent or None,
+            "server_geometry_authority": "server_translated_or_validated" if semantic_authority_v2 else None,
+            "ai_spatial_region_ref": region_ref or None,
+            "ai_spatial_coordinate": coordinate if not semantic_authority_v2 else None,
+            "ai_spatial_coordinate_hint": coordinate if semantic_authority_v2 else None,
+        }
+
+    authored_destinations = [
+        dict(item)
+        for item in list(path.get("destinations") or path.get("destination_queue") or [])
+        if isinstance(item, Mapping)
+    ]
+    authored_primary = [
+        item
+        for item in authored_destinations
+        if str(item.get("execution_role") or "primary").strip().lower() != "reserve"
+    ]
+    authored_reserve = next(
+        (
+            item
+            for item in authored_destinations
+            if str(item.get("execution_role") or "").strip().lower() == "reserve"
+        ),
+        None,
+    )
+    if isinstance(path.get("reserve_destination"), Mapping):
+        authored_reserve = dict(path.get("reserve_destination") or {})
+
+    if authored_primary:
+        destinations = [
+            materialize_destination(item, index=index, execution_role="primary")
+            for index, item in enumerate(authored_primary[:primary_limit], start=1)
+        ]
+    else:
+        destinations = [
         {
             "destination_id": f"ai_spatial_{str(path.get('path_id') or 'path').lower()}_landing",
             "label": str(path.get("answer_field") or goal or "ai_landing"),
@@ -16052,24 +22944,34 @@ def _build_ai_spatial_probe_destinations(
             "radial_expectation": radial_expectation,
             "target_bucket_keys": target_bucket_keys,
             "priority": max(0.55, min(1.0, float(path.get("confidence") or 0.72))),
-            "rationale": str(path.get("spatial_rationale") or path.get("stop_condition") or "AI spatial landing"),
-        }
-    ]
-    for waypoint_index, waypoint in enumerate(list(path.get("waypoints") or [])[:3], start=1):
+                "rationale": str(path.get("spatial_rationale") or path.get("stop_condition") or "AI spatial landing"),
+                "routing_intent": _truncate_prompt_text(path.get("routing_intent") or path.get("semantic_routing_intent") or goal, 360) or None,
+                "server_geometry_authority": "server_translated_or_validated" if semantic_authority_v2 else None,
+                "execution_role": "primary",
+                "activation_condition": None,
+            }
+        ]
+    for waypoint_index, waypoint in enumerate(
+        list(path.get("waypoints") or [])[: max(0, primary_limit - len(destinations))],
+        start=1,
+    ):
         if not isinstance(waypoint, dict):
             continue
         waypoint_coord = _spatial_coordinate(waypoint.get("coordinate"))
         waypoint_bucket_keys = [position_to_bucket(waypoint_coord)["key"]] if waypoint_coord else []
         waypoint_region = str(waypoint.get("region_ref") or "").strip()
-        waypoint_goal = _canonical_goal_from_context(
-            str(waypoint.get("phrase") or goal or ""),
-            root_query_text=str(path.get("answer_hypothesis") or ""),
-            probe_query_text=str(waypoint.get("phrase") or goal or ""),
-            expected_guide_area=_guide_area_from_spatial_region(waypoint_region, fallback_goal=goal) or guide_area,
-        )
-        waypoint_guide = _guide_area_from_spatial_region(waypoint_region, fallback_goal=waypoint_goal) or guide_area
-        waypoint_templates = _semantic_destination_templates_for_goal(waypoint_goal)
-        waypoint_memory = str((waypoint_templates[0] if waypoint_templates else {}).get("memory_type") or memory_type or "").strip() or None
+        waypoint_guide = guide_area
+        waypoint_memory = memory_type
+        if not semantic_authority_v2:
+            waypoint_goal = _canonical_goal_from_context(
+                str(waypoint.get("phrase") or goal or ""),
+                root_query_text=str(path.get("answer_hypothesis") or ""),
+                probe_query_text=str(waypoint.get("phrase") or goal or ""),
+                expected_guide_area=_guide_area_from_spatial_region(waypoint_region, fallback_goal=goal) or guide_area,
+            )
+            waypoint_guide = _guide_area_from_spatial_region(waypoint_region, fallback_goal=waypoint_goal) or guide_area
+            waypoint_templates = _semantic_destination_templates_for_goal(waypoint_goal)
+            waypoint_memory = str((waypoint_templates[0] if waypoint_templates else {}).get("memory_type") or memory_type or "").strip() or None
         destinations.append(
             {
                 "destination_id": f"ai_spatial_{str(path.get('path_id') or 'path').lower()}_w{waypoint_index}",
@@ -16080,9 +22982,45 @@ def _build_ai_spatial_probe_destinations(
                 "target_bucket_keys": waypoint_bucket_keys,
                 "priority": max(0.35, 0.86 - (waypoint_index * 0.12)),
                 "rationale": str(waypoint.get("rationale") or "AI spatial waypoint"),
+                "hydration_capabilities": sorted(
+                    _provider_authored_hydration_capabilities(waypoint)
+                ),
+                "routing_intent": _truncate_prompt_text(
+                    waypoint.get("routing_intent")
+                    or waypoint.get("semantic_routing_intent")
+                    or waypoint.get("phrase")
+                    or goal,
+                    360,
+                )
+                or None,
+                "server_geometry_authority": "server_translated_or_validated" if semantic_authority_v2 else None,
+                "execution_role": "primary",
+                "activation_condition": None,
             }
         )
-    return destinations[:4]
+    if isinstance(path.get("conditional_extension"), Mapping):
+        extension = materialize_destination(
+            dict(path.get("conditional_extension") or {}),
+            index=len(destinations) + 1,
+            execution_role="conditional_extension",
+        )
+        extension["activates_for_mission_id"] = str(
+            extension.get("activates_for_mission_id") or ""
+        ).strip() or None
+        extension["max_execution_stops"] = 1
+        destinations.append(extension)
+    if authored_reserve:
+        reserve = materialize_destination(
+            authored_reserve,
+            index=len(destinations) + 1,
+            execution_role="reserve",
+        )
+        reserve["activates_for_mission_id"] = str(
+            reserve.get("activates_for_mission_id") or ""
+        ).strip() or None
+        reserve["max_execution_stops"] = 1
+        destinations.append(reserve)
+    return destinations
 
 
 def _mission_text(value: Any, *, limit: int = 500) -> str:
@@ -16104,6 +23042,9 @@ def _mission_strings(values: Any, *, limit: int = 12, item_limit: int = 160) -> 
 
 
 def _path_mission_id(path: dict[str, Any], *, index: int) -> str:
+    provider_mission_id = _mission_text(path.get("mission_id"), limit=120)
+    if provider_mission_id:
+        return provider_mission_id
     raw = _mission_text(path.get("path_id") or path.get("strand_id") or f"P{index}", limit=80)
     slug = re.sub(r"[^A-Za-z0-9_:-]+", "_", raw).strip("_") or f"P{index}"
     return f"mission_{slug}"
@@ -16111,19 +23052,61 @@ def _path_mission_id(path: dict[str, Any], *, index: int) -> str:
 
 def _semantic_expected_evidence_rows(semantic_contract: dict[str, Any] | None) -> list[dict[str, Any]]:
     contract = dict(semantic_contract or {})
+    mission_plan = dict(contract.get("mission_plan_v2") or {})
+    mission_by_strand = {
+        str(item.get("strand_id") or "").strip(): dict(item)
+        for item in list(mission_plan.get("missions") or [])
+        if isinstance(item, Mapping) and str(item.get("strand_id") or "").strip()
+    }
+    mission_by_id = {
+        str(item.get("mission_id") or "").strip(): dict(item)
+        for item in list(mission_plan.get("missions") or [])
+        if isinstance(item, Mapping) and str(item.get("mission_id") or "").strip()
+    }
     rows: list[dict[str, Any]] = []
     for index, item in enumerate(list(contract.get("expected_evidence") or contract.get("expected_evidence_targets") or []), start=1):
         if not isinstance(item, dict):
             continue
         target_id = _mission_text(item.get("target_id") or item.get("id") or f"target_{index}", limit=120)
+        required_fields = list(item.get("required_fields") or [])
+        negative_conditions = list(item.get("negative_conditions") or [])
+        origin_strand_id = _mission_text(item.get("origin_strand_id") or "", limit=80) or None
+        origin_mission_id = _mission_text(item.get("origin_mission_id") or "", limit=80) or None
+        mission = dict(
+            mission_by_id.get(str(origin_mission_id or ""))
+            or mission_by_strand.get(str(origin_strand_id or ""))
+            or {}
+        )
         rows.append(
             {
                 "goal_id": target_id or f"target_{index}",
                 "target_id": target_id or None,
+                "origin_strand_id": origin_strand_id,
+                "origin_mission_id": origin_mission_id,
+                "semantic_goal": _mission_text(mission.get("semantic_goal") or "", limit=360) or None,
+                "required_entities": _mission_strings(mission.get("required_entities"), limit=12),
+                "root_query_text": _mission_text(
+                    item.get("root_query_text") or mission.get("root_query_text") or contract.get("root_query_text") or "",
+                    limit=500,
+                )
+                or None,
+                "server_bound_named_targets": _merge_server_bound_named_targets(
+                    item.get("server_bound_named_targets"),
+                    mission.get("server_bound_named_targets"),
+                    contract.get("server_bound_named_targets"),
+                ),
+                "expected_evidence": _mission_strings(mission.get("expected_evidence"), limit=12, item_limit=360),
+                "success_criteria": _mission_strings(mission.get("success_criteria"), limit=12, item_limit=360),
                 "claim_shape": _mission_text(item.get("claim_shape") or item.get("shape") or "", limit=320),
-                "required_fields": _mission_strings(item.get("required_fields"), limit=10),
-                "negative_conditions": _mission_strings(item.get("negative_conditions"), limit=10),
+                "required_fields": _mission_strings(required_fields, limit=max(1, len(required_fields))),
+                "negative_conditions": _mission_strings(negative_conditions, limit=max(1, len(negative_conditions))),
                 "success_question": _mission_text(item.get("success_question") or "", limit=320),
+                # These are structured semantic-contract inputs.  Preserve
+                # them so path missions never need to infer evidence intent
+                # from words in a goal, query, or claim.
+                "document_requested": item.get("document_requested") if isinstance(item.get("document_requested"), bool) else None,
+                "evidence_intent": dict(item.get("evidence_intent") or {}) if isinstance(item.get("evidence_intent"), Mapping) else {},
+                "minimum_support": dict(item.get("minimum_support") or {}) if isinstance(item.get("minimum_support"), Mapping) else {},
                 "source": "semantic_expected_evidence",
                 "required": True,
             }
@@ -16166,7 +23149,7 @@ def _semantic_expected_evidence_rows(semantic_contract: dict[str, Any] | None) -
             }
         )
         existing.add(folded)
-    return rows[:24]
+    return rows
 
 
 def _semantic_answerability_goals(
@@ -16196,7 +23179,7 @@ def _semantic_answerability_goals(
             }
         )
         seen.add(folded)
-    return goals[:24]
+    return goals
 
 
 def _semantic_no_match_criteria(semantic_contract: dict[str, Any] | None) -> dict[str, Any]:
@@ -16234,32 +23217,20 @@ def _mission_expected_target_for_path(
     path: dict[str, Any],
     expected_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    path_terms = _fold_text(
-        " ".join(
-            _mission_text(path.get(key), limit=240)
-            for key in ("answer_field", "goal", "answer_hypothesis", "stop_condition")
-        )
-    )
-    best: dict[str, Any] = {}
-    best_score = 0
+    path_mission_id = _mission_text(path.get("mission_id") or "", limit=80)
+    path_strand_id = _mission_text(path.get("strand_id") or "", limit=80)
+    if not path_mission_id and not path_strand_id:
+        return {}
     for row in expected_rows:
-        row_terms = _fold_text(
-            " ".join(
-                _mission_text(row.get(key), limit=240)
-                for key in ("goal_id", "target_id", "claim_shape", "success_question")
-            )
-        )
-        if not row_terms:
-            continue
-        score = len(set(path_terms.split()) & set(row_terms.split()))
-        target_id = _fold_text(row.get("target_id") or "")
-        answer_field = _fold_text(path.get("answer_field") or "")
-        if target_id and answer_field and (target_id == answer_field or target_id in path_terms):
-            score += 6
-        if score > best_score:
-            best_score = score
-            best = row
-    return best
+        origin_mission_id = _mission_text(row.get("origin_mission_id") or "", limit=80)
+        origin_strand_id = _mission_text(row.get("origin_strand_id") or "", limit=80)
+        if path_mission_id and origin_mission_id and path_mission_id == origin_mission_id:
+            return row
+        if path_strand_id and origin_strand_id and path_strand_id == origin_strand_id:
+            return row
+    # Text overlap is routing metadata, not semantic authority.  A planner path
+    # without an exact server-carried mission/strand binding remains unbound.
+    return {}
 
 
 def _mission_document_requested(
@@ -16268,20 +23239,46 @@ def _mission_document_requested(
     semantic_contract: dict[str, Any] | None,
     expected_target: dict[str, Any],
 ) -> bool:
-    text = _fold_text(
-        " ".join(
-            [
-                _mission_text(path.get("answer_field"), limit=160),
-                _mission_text(path.get("goal"), limit=160),
-                _mission_text(path.get("answer_hypothesis"), limit=320),
-                _mission_text(expected_target.get("target_id"), limit=160),
-                _mission_text(expected_target.get("claim_shape"), limit=320),
-                _mission_text(dict(semantic_contract or {}).get("document_mode"), limit=120),
-                _mission_text(dict(dict(semantic_contract or {}).get("document_contract") or {}).get("mode"), limit=120),
-            ]
-        )
+    semantic = dict(semantic_contract or {})
+    path_metadata = dict(path.get("metadata") or {}) if isinstance(path.get("metadata"), Mapping) else {}
+    intent_sources = (path, path_metadata, expected_target)
+
+    # A path-specific structured declaration is the most precise authority and
+    # may explicitly opt out of a broader semantic-contract document mode.
+    for source in intent_sources:
+        requested = source.get("document_requested")
+        if isinstance(requested, bool):
+            return requested
+        evidence_intent = source.get("evidence_intent")
+        if isinstance(evidence_intent, Mapping):
+            for key in ("document_requested", "requires_document"):
+                value = evidence_intent.get(key)
+                if isinstance(value, bool):
+                    return value
+
+    minimum_support = expected_target.get("minimum_support")
+    if isinstance(minimum_support, Mapping):
+        try:
+            if int(minimum_support.get("document_chunk_count") or 0) > 0:
+                return True
+            if int(minimum_support.get("source_trace_count") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    semantic_intent = semantic.get("intent")
+    if isinstance(semantic_intent, Mapping) and isinstance(semantic_intent.get("requires_document_mode"), bool):
+        if semantic_intent.get("requires_document_mode"):
+            return True
+
+    document_contract = semantic.get("document_contract")
+    contract_modes = [semantic.get("document_mode")]
+    if isinstance(document_contract, Mapping):
+        contract_modes.insert(0, document_contract.get("mode"))
+    return any(
+        mode is not None and str(mode).strip().lower() not in {"", "none"}
+        for mode in contract_modes
     )
-    return any(token in text for token in ("document", "documento", "source", "fonte", "raw", "testo integrale"))
 
 
 def _path_mission_expected_evidence_shape(
@@ -16320,6 +23317,26 @@ def _path_mission_expected_evidence_shape(
         "goal": goal or None,
         "target_id": expected_target.get("target_id"),
         "claim_shape": _mission_text(expected_target.get("claim_shape") or path.get("answer_hypothesis") or "", limit=420),
+        "semantic_quality_contract_required": bool(
+            expected_target.get("semantic_goal")
+            or expected_target.get("required_entities")
+            or expected_target.get("server_bound_named_targets")
+            or expected_target.get("expected_evidence")
+            or expected_target.get("success_criteria")
+        ),
+        "required_entities": _mission_strings(expected_target.get("required_entities"), limit=12),
+        "root_query_text": _mission_text(
+            expected_target.get("root_query_text") or path.get("root_query_text") or "",
+            limit=500,
+        )
+        or None,
+        "server_bound_named_targets": _merge_server_bound_named_targets(
+            expected_target.get("server_bound_named_targets"),
+            path.get("server_bound_named_targets"),
+            path.get("required_named_concept_spans"),
+        ),
+        "expected_evidence": _mission_strings(expected_target.get("expected_evidence"), limit=12, item_limit=360),
+        "success_criteria": _mission_strings(expected_target.get("success_criteria"), limit=12, item_limit=360),
         "required_fields": _mission_strings(expected_target.get("required_fields"), limit=10),
         "negative_conditions": _mission_strings(expected_target.get("negative_conditions"), limit=10),
         "success_question": _mission_text(expected_target.get("success_question") or path.get("stop_condition") or "", limit=360),
@@ -16342,10 +23359,51 @@ def build_path_mission_contract(
     spatial = dict(ai_spatial_landing_contract or {})
     paths = [dict(item) for item in list(spatial.get("inverse_answer_paths") or []) if isinstance(item, dict)]
     expected_rows = _semantic_expected_evidence_rows(semantic)
+    mission_paths = [dict(path) for path in paths]
+    represented_expected_targets: set[str] = set()
+    for path in paths:
+        expected_target = _mission_expected_target_for_path(path, expected_rows)
+        represented_key = str(
+            expected_target.get("origin_strand_id")
+            or expected_target.get("target_id")
+            or expected_target.get("goal_id")
+            or ""
+        ).strip()
+        if represented_key:
+            represented_expected_targets.add(represented_key)
+    unplanned_expected_evidence: list[dict[str, Any]] = []
+    for expected_index, expected_target in enumerate(expected_rows, start=1):
+        if str(expected_target.get("source") or "") != "semantic_expected_evidence":
+            continue
+        expected_key = str(
+            expected_target.get("origin_strand_id")
+            or expected_target.get("target_id")
+            or expected_target.get("goal_id")
+            or f"expected_{expected_index}"
+        ).strip()
+        if expected_key in represented_expected_targets:
+            continue
+        # Expected evidence is semantic planning input, not an executable
+        # mission by itself.  Promoting an expectation with no AI-authored
+        # inverse path created a required ledger row that no runtime branch
+        # could ever execute.  Preserve it as an explicit diagnostic so the
+        # planner/UI can explain the omitted expectation, but never let it
+        # become Master sufficiency debt without a real primary or one-shot
+        # reserve path.
+        unplanned_expected_evidence.append(
+            {
+                **dict(expected_target),
+                "required": False,
+                "execution_eligible": False,
+                "planning_state": "diagnostic_unplanned_expected_evidence",
+                "planning_reason": "ai_spatial_inverse_path_not_materialized",
+                "may_become_required_when": "ai_authored_primary_or_one_shot_reserve_path_exists",
+            }
+        )
     no_match = _semantic_no_match_criteria(semantic)
     missions: list[dict[str, Any]] = []
-    for index, path in enumerate(paths, start=1):
-        expected_target = _mission_expected_target_for_path(path, expected_rows)
+    for index, path in enumerate(mission_paths, start=1):
+        expected_target = dict(path.get("_semantic_expected_target") or {}) or _mission_expected_target_for_path(path, expected_rows)
         expected_shape = _path_mission_expected_evidence_shape(
             path=path,
             semantic_contract=semantic,
@@ -16366,8 +23424,26 @@ def build_path_mission_contract(
             {
                 "schema_version": PATH_MISSION_SCHEMA_VERSION,
                 "mission_id": mission_id,
+                "required": True,
                 "path_id": _mission_text(path.get("path_id") or f"P{index}", limit=80),
                 "strand_id": _mission_text(path.get("strand_id") or "", limit=80) or None,
+                "root_query_text": _mission_text(
+                    expected_shape.get("root_query_text") or semantic.get("root_query_text") or query_text,
+                    limit=500,
+                ),
+                "server_bound_named_targets": _merge_server_bound_named_targets(
+                    expected_shape.get("server_bound_named_targets"),
+                    path.get("server_bound_named_targets"),
+                    semantic.get("server_bound_named_targets"),
+                ),
+                "routing_intent": _mission_text(
+                    path.get("routing_intent")
+                    or path.get("semantic_routing_intent")
+                    or path.get("goal")
+                    or "",
+                    limit=360,
+                )
+                or None,
                 "goal": _mission_text(path.get("goal") or expected_shape.get("goal") or "", limit=180),
                 "answer_hypothesis": _mission_text(path.get("answer_hypothesis") or "", limit=520),
                 "expected_evidence_shape": expected_shape,
@@ -16414,7 +23490,7 @@ def build_path_mission_contract(
                     "retrieve_does_not_mutate_geometry": True,
                     "ledger_required_before_package_certification": True,
                 },
-                "execution_state": "planned",
+                "execution_state": str(path.get("_execution_state") or "planned"),
             }
         )
     materialized = bool(spatial.get("materialized") and spatial.get("certifiable") and missions)
@@ -16441,10 +23517,13 @@ def build_path_mission_contract(
         ),
         "no_match_criteria": no_match,
         "path_missions": missions,
+        "unplanned_expected_evidence": unplanned_expected_evidence,
         "mission_count": len(missions),
         "metrics": {
             "mission_count": len(missions),
             "ai_inverse_path_count": len(paths),
+            "unassigned_required_mission_count": 0,
+            "unplanned_expected_evidence_count": len(unplanned_expected_evidence),
             "document_mission_count": sum(1 for mission in missions if bool(dict(mission.get("expected_evidence_shape") or {}).get("document_requested"))),
             "mission_with_coordinate_count": sum(1 for mission in missions if bool(mission.get("landing_coordinate"))),
             "mission_with_waypoint_count": sum(1 for mission in missions if list(mission.get("waypoints") or [])),
@@ -16505,37 +23584,113 @@ def _build_ai_spatial_probes_from_contract(
 
     probes: list[dict[str, Any]] = []
     snap_events: list[dict[str, Any]] = []
-    max_paths = max(1, min(int(query.max_total_branches), int(query.max_probe_count), len(paths)))
-    for path_index, path in enumerate(paths[:max_paths], start=1):
+    missing_reasons: list[str] = []
+    semantic_authority_v2 = _search_semantic_authority_v2_enabled()
+    plan_first_v3 = bool(
+        semantic_authority_v2 and _search_plan_first_v3_enabled()
+    )
+    # V3 limits concurrent workers, not admitted AI missions.  Truncating the
+    # path list here left required MissionPlan rows with no possible runtime
+    # branch.  ThreadPoolExecutor already queues the admitted probes behind the
+    # configured worker cap, so retain every AI-authored path for V3 while
+    # preserving the legacy admission policy when semantic authority is off.
+    selected_paths = (
+        paths
+        if plan_first_v3
+        else paths[
+            : max(
+                1,
+                min(
+                    int(query.max_total_branches),
+                    int(query.max_probe_count),
+                    len(paths),
+                ),
+            )
+        ]
+    )
+    for path_index, path in enumerate(selected_paths, start=1):
         mission_id = _path_mission_id(path, index=path_index)
         raw_goal = str(path.get("goal") or path.get("answer_field") or "").strip()
-        goal = _canonical_goal_from_context(
-            raw_goal,
-            root_query_text=query.query_text,
-            probe_query_text=str(path.get("answer_hypothesis") or raw_goal or query.query_text),
-            expected_guide_area=_guide_area_from_spatial_region(str(path.get("landing_region_ref") or ""), fallback_goal=raw_goal),
+        bound_named_targets = _merge_server_bound_named_targets(
+            _server_bound_named_target_spans(query.query_text),
+            path.get("server_bound_named_targets"),
+            path.get("required_named_concept_spans"),
         )
-        region_ref = str(path.get("landing_region_ref") or "").strip() or None
-        ai_coordinate = _spatial_coordinate(path.get("landing_coordinate"))
-        region_snap = (
-            {}
-            if ai_coordinate
-            else _spatial_region_centroid(
-                region_ref=region_ref,
+        routing_intent = _truncate_prompt_text(
+            path.get("routing_intent")
+            or path.get("semantic_routing_intent")
+            or raw_goal
+            or path.get("answer_hypothesis")
+            or query.query_text,
+            360,
+        )
+        routing_hint_goal = raw_goal
+        if not semantic_authority_v2:
+            routing_hint_goal = _canonical_goal_from_context(
+                raw_goal,
+                root_query_text=query.query_text,
+                probe_query_text=str(path.get("answer_hypothesis") or raw_goal or query.query_text),
+                expected_guide_area=_guide_area_from_spatial_region(str(path.get("landing_region_ref") or ""), fallback_goal=raw_goal),
+            )
+        goal = raw_goal if semantic_authority_v2 and raw_goal else routing_hint_goal
+        provider_primary_destinations = [
+            dict(item)
+            for item in list(path.get("destinations") or path.get("destination_queue") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("execution_role") or "primary").strip().lower()
+            == "primary"
+        ]
+        provider_landing = dict(provider_primary_destinations[0] if provider_primary_destinations else {})
+        region_ref = str(
+            provider_landing.get("region_ref")
+            or path.get("landing_region_ref")
+            or ""
+        ).strip() or None
+        ai_coordinate = _spatial_coordinate(
+            provider_landing.get("coordinate") or path.get("landing_coordinate")
+        )
+        server_region_ref = region_ref or routing_intent
+        if semantic_authority_v2:
+            region_snap = _spatial_region_centroid(
+                region_ref=server_region_ref,
                 metamemory_spatial_brief=metamemory_spatial_brief,
                 atlas_payload=atlas_payload,
             )
+        elif ai_coordinate:
+            region_snap = {}
+        else:
+            region_snap = _spatial_region_centroid(
+                region_ref=server_region_ref,
+                metamemory_spatial_brief=metamemory_spatial_brief,
+                atlas_payload=atlas_payload,
+            )
+        snapped_position = dict(region_snap.get("position") or {}) or ai_coordinate or {}
+        snap_source = (
+            str(region_snap.get("source") or "server_validated_coordinate_hint")
+            if semantic_authority_v2
+            else ("ai_coordinate" if ai_coordinate else str(region_snap.get("source") or "backend_projection_fallback"))
         )
-        snapped_position = ai_coordinate or dict(region_snap.get("position") or {})
-        snap_source = "ai_coordinate" if ai_coordinate else str(region_snap.get("source") or "backend_projection_fallback")
         snap_status = "snapped"
         if not snapped_position:
-            snap_status = "fallback_projection"
-        guide_area = _guide_area_from_spatial_region(region_ref, fallback_goal=goal)
-        templates = _semantic_destination_templates_for_goal(goal)
-        template = dict(templates[0] if templates else {})
-        memory_type = str(template.get("memory_type") or "").strip() or None
-        radial_expectation = _radial_expectation_from_radius(path.get("radius"))
+            missing_reason_code = (
+                "provider_path_location_not_resolvable"
+                if semantic_authority_v2
+                else "path_location_hint_not_resolvable"
+            )
+            missing_reasons.append(
+                f"{missing_reason_code}:{str(path.get('path_id') or path_index)}"
+            )
+            continue
+        guide_area = None
+        memory_type = None
+        if not semantic_authority_v2:
+            guide_area = _guide_area_from_spatial_region(region_ref, fallback_goal=routing_hint_goal)
+            templates = _semantic_destination_templates_for_goal(routing_hint_goal)
+            template = dict(templates[0] if templates else {})
+            memory_type = str(template.get("memory_type") or "").strip() or None
+        radial_expectation = _radial_expectation_from_radius(
+            provider_landing.get("radius") or path.get("radius")
+        )
         bucket_key = (
             position_to_bucket(snapped_position)["key"]
             if ai_coordinate and snapped_position
@@ -16546,19 +23701,40 @@ def _build_ai_spatial_probes_from_contract(
         target_bucket_keys = [bucket_key] if bucket_key else []
         destination_queue = _build_ai_spatial_probe_destinations(
             path=path,
-            goal=goal,
+            goal=routing_hint_goal,
             guide_area=guide_area,
             memory_type=memory_type,
             radial_expectation=radial_expectation,
             target_bucket_keys=target_bucket_keys,
+            retrieval_mode=str(query.retrieval_mode or "balanced"),
+            semantic_authority_v2=semantic_authority_v2,
         )
         spec = {
             "query_text": str(path.get("answer_hypothesis") or query.query_text).strip(),
+            "root_query_text": str(query.query_text or "").strip(),
             "strand_id": str(path.get("strand_id") or path.get("path_id") or f"ai_spatial_{path_index}").strip(),
             "answer_hypothesis": str(path.get("answer_hypothesis") or "").strip(),
             "answer_field": str(path.get("answer_field") or "").strip(),
             "goal": goal,
-            "expected_answer_field": str(path.get("answer_field") or _expected_answer_field_for_goal(goal)).strip(),
+            "semantic_goal": raw_goal or goal,
+            "routing_hint_goal": routing_hint_goal,
+            "routing_intent": routing_intent,
+            "goal_taxonomy": routing_hint_goal,
+            "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2 if semantic_authority_v2 else "legacy_compatible",
+            "semantic_authority_v2": semantic_authority_v2,
+            "mission_id": mission_id,
+            "why_required": str(path.get("why_required") or path.get("spatial_rationale") or "").strip() or None,
+            "required_entities": _merge_required_entities_with_bound_targets(
+                [str(item).strip() for item in list(path.get("required_entities") or []) if str(item).strip()],
+                bound_named_targets,
+            ),
+            "server_bound_named_targets": bound_named_targets,
+            "required_named_concept_spans": bound_named_targets,
+            "expected_evidence": [str(item).strip() for item in list(path.get("expected_evidence") or []) if str(item).strip()],
+            "success_criteria": [str(item).strip() for item in list(path.get("success_criteria") or []) if str(item).strip()],
+            "expected_answer_field": str(
+                path.get("answer_field") or _expected_answer_field_for_goal(routing_hint_goal)
+            ).strip(),
             "expected_guide_area": guide_area,
             "expected_memory_type": memory_type,
             "radial_expectation": radial_expectation,
@@ -16580,13 +23756,69 @@ def _build_ai_spatial_probes_from_contract(
                 "path_mission_id": mission_id,
             },
         }
-        probe = build_probe_from_spec(
-            spec,
-            start_index + path_index,
-            root_query_text=query.query_text,
-            atlas_payload=atlas_payload,
-            identity_context=identity_context,
-        )
+        if semantic_authority_v2:
+            routing_brainhex = position_to_topology_brainhex(dict(snapped_position))
+            neutral_routing_scores = {field: 0.5 for field in ROUTING_FIELDS}
+            neutral_routing_facets = {field: 0.5 for field in FACET_FIELDS}
+            probe = {
+                "probe_id": f"probe_{start_index + path_index}",
+                "label": f"Landing {start_index + path_index}",
+                "query_text": str(path.get("answer_hypothesis") or "").strip(),
+                "root_query_text": str(query.query_text or "").strip(),
+                "strand_id": str(path.get("strand_id") or "").strip() or None,
+                "mission_id": mission_id,
+                "query_class": "provider_authored_plan",
+                "legacy_query_class_authority": False,
+                "answer_hypothesis": str(path.get("answer_hypothesis") or "").strip(),
+                "weight": round(float(path.get("confidence") or 0.72), 6),
+                "intent_type": "server_bound_semantic_intent",
+                "routing_intent": routing_intent,
+                "goal": raw_goal,
+                "semantic_goal": raw_goal,
+                "routing_hint_goal": raw_goal,
+                "goal_taxonomy": None,
+                "semantic_authority": SEARCH_SEMANTIC_AUTHORITY_V2,
+                "semantic_authority_v2": True,
+                "why_required": str(path.get("spatial_rationale") or "").strip() or None,
+                "required_entities": _merge_required_entities_with_bound_targets(
+                    [str(item).strip() for item in list(path.get("required_entities") or []) if str(item).strip()],
+                    bound_named_targets,
+                ),
+                "server_bound_named_targets": bound_named_targets,
+                "required_named_concept_spans": bound_named_targets,
+                "expected_evidence": [str(item).strip() for item in list(path.get("expected_evidence") or []) if str(item).strip()],
+                "success_criteria": [str(item).strip() for item in list(path.get("success_criteria") or []) if str(item).strip()],
+                "expected_guide_area": None,
+                "expected_memory_type": None,
+                "landing_basis": "llm::ai_spatial_contract",
+                "inverse_rationale": str(path.get("spatial_rationale") or path.get("stop_condition") or "").strip() or None,
+                "radial_expectation": radial_expectation,
+                "routing_semantic_scores": neutral_routing_scores,
+                "routing_facets": neutral_routing_facets,
+                "routing_brainhex": routing_brainhex,
+                "base_position": dict(snapped_position),
+                "landing_position": dict(snapped_position),
+                "semantic_color": color_from_brainhex(routing_brainhex),
+                "search_radius": max(0.05, min(0.5, float(provider_landing.get("radius") or path.get("radius") or 0.22))),
+                "success_min_confidence": max(0.58, min(0.92, float(path.get("confidence") or 0.78))),
+                "max_text_chars": max(900, min(2600, int(query.max_total_text_chars or 1600))),
+                "target_bucket_keys": target_bucket_keys,
+                "crowding_penalty": 0.0,
+                "expected_answer_field": str(path.get("answer_field") or "").strip() or raw_goal,
+                "corroboration_needs": [str(item).strip() for item in list(path.get("expected_evidence") or []) if str(item).strip()][:6],
+                "branch_priority": round(max(0.0, min(1.0, float(path.get("confidence") or 0.72))), 4),
+                "expected_stop_condition": str(path.get("stop_condition") or "").strip() or None,
+                "destination_queue": destination_queue,
+                "route_preference_prior": dict(spec.get("route_preference_prior") or {}),
+            }
+        else:
+            probe = build_probe_from_spec(
+                spec,
+                start_index + path_index,
+                root_query_text=query.query_text,
+                atlas_payload=atlas_payload,
+                identity_context=identity_context,
+            )
         if snapped_position:
             probe["base_position"] = dict(snapped_position)
             probe["landing_position"] = dict(snapped_position)
@@ -16596,17 +23828,33 @@ def _build_ai_spatial_probes_from_contract(
         probe["family_plan_id"] = "ai_spatial_contract"
         probe["landing_basis"] = "llm::ai_spatial_contract"
         probe["path_mission_id"] = mission_id
+        probe["semantic_goal"] = raw_goal or goal
+        probe["routing_hint_goal"] = routing_hint_goal
+        probe["routing_intent"] = routing_intent
+        probe["root_query_text"] = str(query.query_text or "").strip()
+        probe["server_bound_named_targets"] = bound_named_targets
+        probe["required_named_concept_spans"] = bound_named_targets
+        probe["goal_taxonomy"] = None if semantic_authority_v2 else routing_hint_goal
+        probe["semantic_authority"] = SEARCH_SEMANTIC_AUTHORITY_V2 if semantic_authority_v2 else "legacy_compatible"
+        probe["semantic_authority_v2"] = semantic_authority_v2
         probe["ai_spatial_path_id"] = str(path.get("path_id") or f"P{path_index}")
         probe["ai_spatial_strand_id"] = str(path.get("strand_id") or "").strip() or None
         probe["ai_spatial_landing_region_ref"] = region_ref
-        probe["ai_spatial_landing_coordinate"] = dict(ai_coordinate or {}) if ai_coordinate else None
+        probe["ai_spatial_landing_coordinate"] = (
+            None
+            if semantic_authority_v2
+            else (dict(ai_coordinate or {}) if ai_coordinate else None)
+        )
+        probe["ai_spatial_landing_coordinate_hint"] = (
+            dict(ai_coordinate or {}) if semantic_authority_v2 and ai_coordinate else None
+        )
         probe["ai_spatial_waypoints"] = [dict(item) for item in list(path.get("waypoints") or []) if isinstance(item, dict)]
         probe["ai_spatial_bridge_targets"] = [str(item) for item in list(path.get("bridge_targets") or []) if str(item).strip()][:6]
         probe["ai_spatial_preferred_edges"] = [str(item) for item in list(path.get("preferred_edges") or []) if str(item).strip()][:8]
         probe["ai_spatial_stop_condition"] = str(path.get("stop_condition") or "").strip() or None
         probe["ai_spatial_rationale"] = str(path.get("spatial_rationale") or "").strip() or None
         probe["target_bucket_keys"] = target_bucket_keys
-        probe["destination_queue"] = _normalize_destination_queue(
+        normalized_destination_queue = _normalize_destination_queue(
             spec_destinations=destination_queue,
             goal=goal,
             probe_label=str(probe.get("label") or probe.get("probe_id") or "ai_spatial"),
@@ -16616,6 +23864,44 @@ def _build_ai_spatial_probes_from_contract(
             fallback_color_hex=str(((probe.get("semantic_color") or {}).get("hex")) or ""),
             fallback_bucket_keys=target_bucket_keys,
         )
+        primary_destinations = [
+            dict(item)
+            for item in normalized_destination_queue
+            if str(item.get("execution_role") or "primary") == "primary"
+        ]
+        conditional_extension_destinations = [
+            dict(item)
+            for item in normalized_destination_queue
+            if str(item.get("execution_role") or "") == "conditional_extension"
+        ][:1]
+        for extension_destination in conditional_extension_destinations:
+            extension_destination["max_execution_stops"] = 1
+        reserve_destinations = [
+            dict(item)
+            for item in normalized_destination_queue
+            if str(item.get("execution_role") or "") == "reserve"
+        ][:1]
+        for reserve_destination in reserve_destinations:
+            # Preserve the provider binding exactly. A mismatch remains
+            # ineligible at the structural activation gate; never repair it.
+            reserve_destination["activates_for_mission_id"] = str(
+                reserve_destination.get("activates_for_mission_id") or ""
+            ).strip() or None
+        probe["destination_queue"] = primary_destinations
+        probe["plan_first_primary_destinations"] = primary_destinations
+        probe["plan_first_conditional_extension_destinations"] = (
+            conditional_extension_destinations
+        )
+        probe["plan_first_reserve_destinations"] = reserve_destinations
+        probe["plan_first_execution"] = {
+            "schema_version": "agvm.search_plan_first.v3",
+            "primary_stop_count": len(primary_destinations),
+            "conditional_extension_stop_count": len(
+                conditional_extension_destinations
+            ),
+            "reserve_stop_count": len(reserve_destinations),
+            "reserve_policy": "one_shot_after_primary_barrier",
+        }
         snap_event = {
             "schema_version": "agvm.spatial_snap.v1",
             "mission_id": mission_id,
@@ -16624,8 +23910,16 @@ def _build_ai_spatial_probes_from_contract(
             "strand_id": str(path.get("strand_id") or "").strip() or None,
             "status": snap_status,
             "source": snap_source,
-            "ai_coordinate": dict(ai_coordinate or {}) if ai_coordinate else None,
+            "ai_coordinate": (
+                None
+                if semantic_authority_v2
+                else (dict(ai_coordinate or {}) if ai_coordinate else None)
+            ),
+            "ai_coordinate_hint": dict(ai_coordinate or {}) if semantic_authority_v2 and ai_coordinate else None,
+            "server_geometry_authority": "server_translated_or_validated" if semantic_authority_v2 else None,
             "landing_region_ref": region_ref,
+            "routing_intent": routing_intent,
+            "server_bound_named_targets": bound_named_targets,
             "snapped_position": dict(snapped_position or {}) if snapped_position else None,
             "bucket_key": bucket_key or None,
             "snap_delta": round(distance(ai_coordinate, snapped_position), 6) if ai_coordinate and snapped_position else 0.0,
@@ -16648,7 +23942,11 @@ def _build_ai_spatial_probes_from_contract(
         "status": "materialized" if probes else "blocked",
         "probes": probes,
         "snap_events": snap_events,
-        "missing_reasons": [] if probes else ["no_ai_spatial_probes_created"],
+        "missing_reasons": (
+            []
+            if probes
+            else missing_reasons or ["no_ai_spatial_probes_created"]
+        ),
     }
 
 
@@ -16677,6 +23975,17 @@ def _consolidate_broad_ai_spatial_probes(
 ) -> list[dict[str, Any]]:
     rows = [dict(item) for item in list(probes or []) if isinstance(item, dict)]
     if not _is_broad_summary_query(query_text):
+        return rows
+    if _search_plan_first_v3_enabled() and any(
+        _record_uses_semantic_authority_v2(row) for row in rows
+    ):
+        # Under plan-first V3 each required MissionPlan path must retain a
+        # concrete executable branch.  Slot consolidation is a legacy
+        # throughput optimization; applying it to AI V2 paths can collapse
+        # several required mission IDs into one branch and later manufacture
+        # path_mission_not_executed_by_runtime rows.  The executor already
+        # bounds concurrency and queues every admitted path, so preserving the
+        # paths does not require a larger worker budget.
         return rows
     consolidated: list[dict[str, Any]] = []
     index_by_slot: dict[str, int] = {}
@@ -16731,7 +24040,7 @@ def _reserve_capacity_for_ai_spatial_probes(
     current = [dict(item) for item in list(current_probes or []) if isinstance(item, dict)]
     ai_rows = [dict(item) for item in list(ai_spatial_probes or []) if isinstance(item, dict)]
     branch_cap = max(1, int(max_total_branches or 1))
-    if not ai_rows or len(current) + len(ai_rows) <= branch_cap:
+    if not ai_rows:
         return current, {
             "schema_version": "agvm.public_v1_landing_capacity_reservation.v1",
             "reserved": False,
@@ -16742,20 +24051,25 @@ def _reserve_capacity_for_ai_spatial_probes(
             "dropped_heuristic_probe_count": 0,
             "dropped_heuristic_probe_ids": [],
             "reserved_ai_probe_slots": 0,
-            "reserved_path_mission_ids": [
-                mission_id
-                for mission_id in (
-                    _probe_path_mission_id(probe)
-                    for probe in ai_rows
-                )
-                if mission_id
-            ],
+            "reserved_path_mission_ids": [],
         }
-    reserved_ai_slots = min(len(ai_rows), max(1, branch_cap // 2))
-    heuristic_keep = max(0, branch_cap - reserved_ai_slots)
+    # ``max_total_branches`` is the worker/concurrency cap, not an admission
+    # cap for AI-authored missions. ThreadPoolExecutor queues the remaining
+    # probes in the same bounded wave; dropping them here makes the canonical
+    # mission ledger report work that runtime was never allowed to execute.
+    reserved_ai_slots = len(ai_rows)
+    current_ai_indices = {
+        index
+        for index, probe in enumerate(current)
+        if _planner_family_for_probe(probe) == "ai"
+    }
+    heuristic_keep = max(
+        0,
+        branch_cap - min(branch_cap, len(current_ai_indices) + len(ai_rows)),
+    )
     ai_slots = {
         _goal_to_slot(str(probe.get("goal") or ""))
-        for probe in ai_rows[:reserved_ai_slots]
+        for probe in ai_rows
         if str(probe.get("goal") or "").strip()
     }
     broad_goal_order = {
@@ -16764,7 +24078,11 @@ def _reserve_capacity_for_ai_spatial_probes(
     }
     broad_required_slots = set(_required_slots_for_query(query_text)) if _is_broad_summary_query(query_text) else set()
     ranked_current = sorted(
-        enumerate(current),
+        (
+            (index, probe)
+            for index, probe in enumerate(current)
+            if index not in current_ai_indices
+        ),
         key=lambda item: (
             int(
                 _is_broad_summary_query(query_text)
@@ -16781,7 +24099,9 @@ def _reserve_capacity_for_ai_spatial_probes(
             item[0],
         ),
     )
-    kept_indices = {index for index, _probe in ranked_current[:heuristic_keep]}
+    kept_indices = current_ai_indices | {
+        index for index, _probe in ranked_current[:heuristic_keep]
+    }
     kept = [probe for index, probe in enumerate(current) if index in kept_indices]
     dropped_probe_ids = [
         str(probe.get("probe_id") or "").strip()
@@ -16803,10 +24123,12 @@ def _reserve_capacity_for_ai_spatial_probes(
             mission_id
             for mission_id in (
                 _probe_path_mission_id(probe)
-                for probe in ai_rows[:reserved_ai_slots]
+                for probe in ai_rows
             )
             if mission_id
         ],
+        "execution_wave_capacity": branch_cap,
+        "queued_ai_probe_count": max(0, len(ai_rows) - branch_cap),
     }
 
 
@@ -16963,11 +24285,6 @@ def rank_candidate(
 ) -> dict[str, Any]:
     routing_similarity = semantic_similarity(probe["routing_semantic_scores"], candidate["routing_semantic_scores"], ROUTING_FIELDS)
     facet_similarity = semantic_similarity(probe["routing_facets"], candidate["routing_facets"], FACET_FIELDS)
-    retrieval_surface = _node_retrieval_surface(candidate)
-    summary_grounding = lexical_overlap(
-        str(probe.get("answer_hypothesis") or probe["query_text"]),
-        retrieval_surface,
-    )
     spatial_fit = max(
         0.0,
         1.0 - min(
@@ -16977,24 +24294,57 @@ def rank_candidate(
         ),
     )
     source_reliability_fit = float(candidate["routing_facets"].get("source_reliability", 0.0))
-    goal = str(probe.get("goal") or "").strip().lower()
-    candidate_text = retrieval_surface.lower()
-    temporal_exact_fit = _temporal_exact_match_score(str(probe.get("query_text") or ""), candidate_text)
-    identifier_exact_fit = _identifier_exact_match_score(str(probe.get("query_text") or ""), retrieval_surface)
-    candidate_area = str(candidate["provenance"].get("guide_conceptual_area") or "")
-    guide_area_alignment = (
-        1.0
-        if probe.get("expected_guide_area")
-        and probe.get("expected_guide_area") == candidate["provenance"].get("guide_conceptual_area")
-        else 0.45
-    )
-    type_compatibility = _goal_type_compatibility(probe, candidate)
-    identity_fit = _relation_signal_for_probe(probe, candidate, identity_context)
     confidence_fit = max(
         float(candidate.get("memory_confidence") or 0.0),
         float(candidate.get("evidence_confidence") or 0.0),
         float(candidate.get("identity_resolution_confidence") or 0.0),
     )
+    if _record_uses_semantic_authority_v2(probe):
+        # Return before constructing any lexical surface or running any
+        # taxonomy helper: those signals are not part of V2 authority.
+        raw_score = (
+            0.44 * routing_similarity
+            + 0.20 * facet_similarity
+            + 0.25 * spatial_fit
+            + 0.06 * source_reliability_fit
+            + 0.05 * confidence_fit
+        )
+        raw_score = max(0.0, min(1.0, raw_score))
+        return {
+            "node_id": candidate["id"],
+            "summary": candidate["summary"],
+            "score": round(raw_score * float(probe["weight"]), 6),
+            "raw_score": round(raw_score, 6),
+            "identifier_exact_fit": 0.0,
+            "probe_id": probe["probe_id"],
+            "label": probe["label"],
+            "reason": (
+                f"provider_plan_embedding={routing_similarity:.2f}; "
+                f"facet={facet_similarity:.2f}; spatial={spatial_fit:.2f}; "
+                f"source={source_reliability_fit:.2f}; confidence={confidence_fit:.2f}"
+            ),
+            "sources": sources,
+            "evidence_snippet": None,
+            "node": candidate,
+            "ranking_authority": "provider_authored_plan_v2",
+        }
+    retrieval_surface = _node_retrieval_surface(candidate)
+    summary_grounding = lexical_overlap(
+        str(probe.get("answer_hypothesis") or probe["query_text"]),
+        retrieval_surface,
+    )
+    goal = str(probe.get("goal") or "").strip().lower()
+    candidate_text = retrieval_surface.lower()
+    temporal_exact_fit = _temporal_exact_match_score(str(probe.get("query_text") or ""), candidate_text)
+    identifier_exact_fit = _identifier_exact_match_score(str(probe.get("query_text") or ""), retrieval_surface)
+    candidate_area = str(candidate["provenance"].get("guide_conceptual_area") or "")
+    # Keep the legacy score shape stable without letting guide_area become a
+    # routing/ranking authority. Semantic V2 returns above this block; legacy
+    # retrieval may still display guide_area, but it must not hard-boost a
+    # candidate solely because the facet label matches.
+    guide_area_alignment = 0.72
+    type_compatibility = _goal_type_compatibility(probe, candidate)
+    identity_fit = _relation_signal_for_probe(probe, candidate, identity_context)
     source_prior = _source_prior_for_probe(probe, candidate, sources)
     support_bonus = 0.0
     if "goal_support" in sources:
@@ -17026,19 +24376,13 @@ def rank_candidate(
     if goal == "style":
         if candidate_area == "Expression":
             raw_score += 0.18
-        if str(candidate.get("memory_type") or "") == "identity_style":
-            raw_score += 0.12
         if any(token in candidate_text for token in ("dirett", "tecnic", "strutturat", "lucid", "chiar", "concis", "essenzial", "analitic", "ridond")):
             raw_score += 0.16
         if any(token in candidate_text for token in ("codice", "code", "architett", "struttura", "dettagli")):
             raw_score += 0.08
-        if str(candidate.get("memory_type") or "") == "identity" and candidate_area not in {"Expression", "Media Signals"}:
-            raw_score -= 0.1
     elif goal == "values":
         if candidate_area == "Values":
             raw_score += 0.14
-        if str(candidate.get("memory_type") or "") == "value":
-            raw_score += 0.12
         if any(token in candidate_text for token in (*_VALUE_SIGNAL_TERMS, "coerenza architetturale")):
             raw_score += 0.12
     elif goal == "documents":
@@ -17112,6 +24456,59 @@ def rerank_hydrated_matches(
     max_nodes_fulltext: int,
     identity_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    if _record_uses_semantic_authority_v2(probe):
+        capabilities = _provider_authored_hydration_capabilities(probe)
+        permits_fulltext = bool(
+            capabilities.intersection(
+                {"node_fulltext", "document_anchor", "document_chunks"}
+            )
+        )
+        bounded_hydrate_limit = min(
+            len(matches),
+            max(0, min(int(hydrate_limit), int(max_nodes_fulltext))),
+        )
+        hydrate_ids = (
+            [str(match.get("node_id") or "") for match in matches[:bounded_hydrate_limit]]
+            if permits_fulltext
+            else []
+        )
+        hydrated = {
+            node["id"]: node
+            for node in (
+                fetch_nodes_by_ids(hydrate_ids, include_raw_text=True)
+                if hydrate_ids
+                else []
+            )
+        }
+        reranked: list[dict[str, Any]] = []
+        for match in matches:
+            node = hydrated.get(str(match.get("node_id") or ""), match["node"])
+            reranked.append(
+                {
+                    **match,
+                    "summary": str(node.get("summary") or match["summary"]),
+                    "evidence_snippet": (
+                        _evidence_snippet("", "", str(node.get("raw_text") or ""))
+                        if str(match.get("node_id") or "") in hydrated
+                        else None
+                    ),
+                    "node": node,
+                    "hydration_confirmed": str(match.get("node_id") or "") in hydrated,
+                    "hydration_authority": (
+                        "provider_authored_hydration_policy"
+                        if permits_fulltext
+                        else "provider_policy_metadata_only"
+                    ),
+                }
+            )
+        reranked.sort(
+            key=lambda item: (
+                -float(item.get("raw_score") or 0.0),
+                str(item.get("node_id") or ""),
+            )
+        )
+        return reranked
+
     hydrate_cap = max(hydrate_limit, max_nodes_fulltext + 6)
     hydrate_ids = [match["node_id"] for match in matches[:hydrate_limit]]
     for match in matches:
@@ -17184,8 +24581,6 @@ def rerank_hydrated_matches(
             guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or "")
             if guide_area == "Expression":
                 raw_score += 0.24
-            if str(node.get("memory_type") or "") == "identity_style":
-                raw_score += 0.12
             if any(token in node_text for token in ("dirett", "tecnic", "strutturat", "lucid", "chiar", "concis", "essenzial", "analitic", "ridond")):
                 raw_score += 0.22
             if any(token in node_text for token in ("codice", "code", "architett", "struttura", "dettagli", "research", "ricerca", "document")):
@@ -17196,8 +24591,6 @@ def rerank_hydrated_matches(
             guide_area = str((node.get("provenance") or {}).get("guide_conceptual_area") or "")
             if guide_area == "Values":
                 raw_score += 0.18
-            if str(node.get("memory_type") or "") == "value":
-                raw_score += 0.12
             if any(token in node_text for token in (*_VALUE_SIGNAL_TERMS, "coerenza architetturale")):
                 raw_score += 0.16
         if goal == "documents":
@@ -17245,6 +24638,7 @@ def rerank_hydrated_matches(
                     str(node.get("raw_text") or node.get("summary") or ""),
                 ),
                 "node": node,
+                "hydration_confirmed": match["node_id"] in hydrated,
             }
         )
     reranked.sort(key=lambda item: (-float(item.get("identifier_exact_fit") or 0.0), -item["raw_score"], item["node_id"]))
@@ -17331,6 +24725,23 @@ def retrieve(
                 "visited_bucket_keys": [],
                 "evidence_node_ids": [],
                 "stop_reason": None,
+                "sphere_scan_attempt_count": 0,
+                "sphere_scan_yield_count": 0,
+                "sphere_scan_node_ids": [],
+                "path_tube_scan_attempt_count": 0,
+                "path_tube_scan_yield_count": 0,
+                "path_tube_scan_node_ids": [],
+                "local_link_walk_attempt_count": 0,
+                "local_link_walk_yield_count": 0,
+                "local_link_walk_node_ids": [],
+                "highway_jump_attempt_count": 0,
+                "highway_jump_yield_count": 0,
+                "highway_jump_node_ids": [],
+                "evidence_edge_follow_attempt_count": 0,
+                "evidence_edge_follow_yield_count": 0,
+                "evidence_edge_follow_node_ids": [],
+                "route_commitments": _route_commitment_rows_from_counts(_route_primitive_counts_seed()),
+                "route_trace": [],
             }
         )
 
@@ -17375,10 +24786,81 @@ def retrieve(
                 "highway_expansion_ids": [],
             }
             candidate_map = {candidate["id"]: candidate for candidate in candidates}
+            sphere_ids = [str(candidate["id"]) for candidate in candidates if str(candidate.get("id") or "").strip()]
+            branch["sphere_scan_attempt_count"] = int(branch.get("sphere_scan_attempt_count") or 0) + 1
+            branch["sphere_scan_yield_count"] = int(branch.get("sphere_scan_yield_count") or 0) + len(sphere_ids)
+            branch["sphere_scan_node_ids"] = _dedupe_limited(list(branch.get("sphere_scan_node_ids") or []) + sphere_ids, limit=24)
+            path_tube_bucket_keys = _dedupe_limited([str(item) for item in list(probe.get("target_bucket_keys") or []) if str(item).strip()], limit=8)
+            if path_tube_bucket_keys:
+                path_tube_ids: list[str] = []
+                for bucket_key in path_tube_bucket_keys:
+                    for node_id in list((index_payload.get("bucket_index") or {}).get(bucket_key, []))[: int(branch["budget"]["max_candidate_reads"])]:
+                        node = (index_payload.get("spatial_index") or {}).get(node_id)
+                        if not node or not is_answer_eligible(node):
+                            continue
+                        candidate_map.setdefault(str(node_id), node)
+                        debug.setdefault("candidate_sources", {}).setdefault(str(node_id), []).append("path_tube_scan")
+                        path_tube_ids.append(str(node_id))
+                branch["path_tube_scan_attempt_count"] = int(branch.get("path_tube_scan_attempt_count") or 0) + 1
+                branch["path_tube_scan_yield_count"] = int(branch.get("path_tube_scan_yield_count") or 0) + len(dict.fromkeys(path_tube_ids))
+                branch["path_tube_scan_node_ids"] = _dedupe_limited(list(branch.get("path_tube_scan_node_ids") or []) + path_tube_ids, limit=24)
             if query.allow_adjacent_bucket_expansion:
                 for bucket in atlas_shortlists[probe["probe_id"]][:2]:
                     for node_id in (index_payload.get("bucket_index") or {}).get(bucket["bucket_key"], []):
                         candidate_map.setdefault(node_id, (index_payload.get("spatial_index") or {}).get(node_id))
+                        debug.setdefault("candidate_sources", {}).setdefault(str(node_id), []).append("adjacent_bucket")
+            link_targets: list[str] = []
+            highway_targets: list[str] = []
+            for candidate in [dict(item) for item in list(candidate_map.values()) if isinstance(item, dict)]:
+                link_targets.extend(_route_edge_target_ids([candidate], edge_field="links", limit=8))
+                highway_targets.extend(_route_edge_target_ids([candidate], edge_field="highways", limit=8))
+            if link_targets:
+                link_ids: list[str] = []
+                for node_id in list(dict.fromkeys(link_targets))[:12]:
+                    node = (index_payload.get("spatial_index") or {}).get(node_id)
+                    if node and is_answer_eligible(node):
+                        candidate_map.setdefault(str(node_id), node)
+                        debug.setdefault("candidate_sources", {}).setdefault(str(node_id), []).append("route_link")
+                        link_ids.append(str(node_id))
+                branch["local_link_walk_attempt_count"] = int(branch.get("local_link_walk_attempt_count") or 0) + 1
+                branch["local_link_walk_yield_count"] = int(branch.get("local_link_walk_yield_count") or 0) + len(dict.fromkeys(link_ids))
+                branch["local_link_walk_node_ids"] = _dedupe_limited(list(branch.get("local_link_walk_node_ids") or []) + link_ids, limit=24)
+            if query.allow_highway_expansion:
+                highway_ids: list[str] = []
+                for node_id in list(dict.fromkeys(highway_targets))[:12]:
+                    node = (index_payload.get("spatial_index") or {}).get(node_id)
+                    if node and is_answer_eligible(node):
+                        candidate_map.setdefault(str(node_id), node)
+                        debug.setdefault("candidate_sources", {}).setdefault(str(node_id), []).append("highway_neighbor")
+                        highway_ids.append(str(node_id))
+                branch["highway_jump_attempt_count"] = int(branch.get("highway_jump_attempt_count") or 0) + 1
+                branch["highway_jump_yield_count"] = int(branch.get("highway_jump_yield_count") or 0) + len(dict.fromkeys(highway_ids))
+                branch["highway_jump_node_ids"] = _dedupe_limited(list(branch.get("highway_jump_node_ids") or []) + highway_ids, limit=24)
+            document_anchor_ids = [
+                str(node_id)
+                for node_id in list(debug.get("document_anchor_candidate_ids") or [])
+                if str(node_id).strip()
+            ]
+            if _record_uses_semantic_authority_v2(probe):
+                document_anchor_ids = _dedupe_limited(
+                    [
+                        *document_anchor_ids,
+                        *_evidence_anchor_ids_from_candidates(
+                            [dict(item) for item in list(candidate_map.values()) if isinstance(item, dict)],
+                            limit=6,
+                        ),
+                    ],
+                    limit=12,
+                )
+                for anchor_id in list(document_anchor_ids):
+                    anchor_node = (index_payload.get("spatial_index") or {}).get(anchor_id)
+                    if anchor_node and is_answer_eligible(anchor_node):
+                        candidate_map.setdefault(str(anchor_id), anchor_node)
+                        debug.setdefault("candidate_sources", {}).setdefault(str(anchor_id), []).append("evidence_edge_follow")
+            if document_anchor_ids:
+                branch["evidence_edge_follow_attempt_count"] = int(branch.get("evidence_edge_follow_attempt_count") or 0) + 1
+                branch["evidence_edge_follow_yield_count"] = int(branch.get("evidence_edge_follow_yield_count") or 0) + len(dict.fromkeys(document_anchor_ids))
+                branch["evidence_edge_follow_node_ids"] = _dedupe_limited(list(branch.get("evidence_edge_follow_node_ids") or []) + document_anchor_ids, limit=24)
             ranked = []
             for candidate in [candidate for candidate in candidate_map.values() if candidate]:
                 sources = list((debug.get("candidate_sources") or {}).get(candidate["id"], []))
@@ -17415,6 +24897,27 @@ def retrieve(
                 branch["status"] = "satisfied"
                 step_stop_reason = "shared_stop_threshold_met"
                 branch["stop_reason"] = step_stop_reason
+            branch["route_commitments"] = _route_commitment_rows_from_counts(_route_primitive_counts_for_branch(branch))
+            route_trace = [dict(item) for item in list(branch.get("route_trace") or []) if isinstance(item, dict)]
+            route_trace.append(
+                {
+                    "source_node_id": branch["visited_node_ids"][-1] if branch["visited_node_ids"] else None,
+                    "target_node_id": None,
+                    "edge_type": "local",
+                    "move_type": "study",
+                    "navigation_action": "inspect_local_neighbors",
+                    "candidate_source": "nearby_radius",
+                    "route_primitive": "sphere_scan",
+                    "travel_performed": False,
+                    "yielded_match_count": len(top_matches),
+                    "yielded_match_ids": [str(match.get("node_id") or "") for match in top_matches if str(match.get("node_id") or "").strip()][:8],
+                    "studied_node_ids": [str(match.get("node_id") or "") for match in top_matches if str(match.get("node_id") or "").strip()][:8],
+                    "hydrated_node_ids": [],
+                    "destination_reached": False,
+                    "route_commitments": [dict(item) for item in list(branch.get("route_commitments") or [])],
+                }
+            )
+            branch["route_trace"] = route_trace[:24]
             all_steps.append(
                 {
                     "probe_id": probe["probe_id"],
@@ -17429,6 +24932,8 @@ def retrieve(
                     "matches": top_matches[:6],
                     "satisfaction_score": satisfaction,
                     "stop_reason": step_stop_reason,
+                    "route_commitments": [dict(item) for item in list(branch.get("route_commitments") or [])],
+                    "route_trace": [dict(item) for item in list(branch.get("route_trace") or [])[-6:]],
                 }
             )
 
@@ -17542,16 +25047,15 @@ def _summary_section_key(match: dict[str, Any]) -> str:
         or provenance.get("guide_conceptual_area")
         or ""
     )
-    memory_type = str(node.get("memory_type") or "")
-    if guide_area in {"Relationships"} or memory_type in {"relational", "relation", "relationship"}:
+    if guide_area in {"Relationships"}:
         return "relationships"
-    if guide_area in {"Projects", "Operational"} or memory_type in {"project", "knowledge"}:
+    if guide_area in {"Projects", "Operational"}:
         return "work"
-    if guide_area in {"Expression"} or memory_type == "identity_style":
+    if guide_area in {"Expression"}:
         return "style"
-    if guide_area in {"Values"} or memory_type == "value":
+    if guide_area in {"Values"}:
         return "values"
-    if guide_area in {"History", "Media Signals"} or memory_type in {"episodic", "document_anchor"}:
+    if guide_area in {"History", "Media Signals"}:
         return "history"
     return "identity"
 
@@ -17604,13 +25108,51 @@ def _apply_probe_shortlists(
             fallback_color_hex=str(((probe.get("semantic_color") or {}).get("hex")) or ""),
             fallback_bucket_keys=list(probe.get("target_bucket_keys") or []),
         )
-        probe["destination_queue"] = reorder_destination_queue(
-            list(probe.get("destination_queue") or []),
-            dict(probe.get("calibration_destination_weights") or {}),
+        plan_first_probe = bool(
+            _search_plan_first_v3_enabled()
+            and _record_uses_semantic_authority_v2(probe)
         )
+        if not plan_first_probe:
+            probe["destination_queue"] = reorder_destination_queue(
+                list(probe.get("destination_queue") or []),
+                dict(probe.get("calibration_destination_weights") or {}),
+            )
+        probe["plan_first_primary_destinations"] = [
+            dict(item) for item in list(probe.get("destination_queue") or [])
+        ]
+        probe["plan_first_conditional_extension_destinations"] = _normalize_destination_queue(
+            spec_destinations=[
+                dict(item)
+                for item in list(
+                    probe.get("plan_first_conditional_extension_destinations") or []
+                )[:1]
+                if isinstance(item, dict)
+            ],
+            goal=str(probe.get("goal") or ""),
+            probe_label=str(probe.get("label") or probe.get("probe_id") or "extension"),
+            fallback_guide_area=str(probe.get("expected_guide_area") or ""),
+            fallback_memory_type=str(probe.get("expected_memory_type") or ""),
+            fallback_radial_expectation=str(probe.get("radial_expectation") or "mid"),
+            fallback_color_hex=str(((probe.get("semantic_color") or {}).get("hex")) or ""),
+            fallback_bucket_keys=list(probe.get("target_bucket_keys") or []),
+        )[:1] if list(probe.get("plan_first_conditional_extension_destinations") or []) else []
+        probe["plan_first_reserve_destinations"] = _normalize_destination_queue(
+            spec_destinations=[
+                dict(item)
+                for item in list(probe.get("plan_first_reserve_destinations") or [])[:1]
+                if isinstance(item, dict)
+            ],
+            goal=str(probe.get("goal") or ""),
+            probe_label=str(probe.get("label") or probe.get("probe_id") or "reserve"),
+            fallback_guide_area=str(probe.get("expected_guide_area") or ""),
+            fallback_memory_type=str(probe.get("expected_memory_type") or ""),
+            fallback_radial_expectation=str(probe.get("radial_expectation") or "mid"),
+            fallback_color_hex=str(((probe.get("semantic_color") or {}).get("hex")) or ""),
+            fallback_bucket_keys=list(probe.get("target_bucket_keys") or []),
+        )[:1] if list(probe.get("plan_first_reserve_destinations") or []) else []
         primary_bucket = shortlist[0] if shortlist else None
         crowding_penalty = 0.0
-        if primary_bucket:
+        if primary_bucket and not plan_first_probe:
             region_summary = fetch_region_summary(str(primary_bucket.get("bucket_key") or ""))
             region_density = int(((region_summary or {}).get("density") or {}).get("node_count") or primary_bucket.get("node_count") or 0)
             crowding_penalty_factor = max(0.7, min(1.35, float(probe.get("crowding_penalty_factor") or 1.0)))
@@ -17900,9 +25442,17 @@ def _fast_model_profile(
             "planner_seed_deferred": bool(planner_seed.get("planner_seed_deferred")),
             "first_answer_sla_split": bool(first_answer_sla_split if first_answer_sla_split is not None else planner_seed.get("first_answer_sla_split")),
         },
+        "planner": {
+            "model": planner_model(),
+            "role": "planner",
+        },
         "judge": {
-            "model": retrieval_model(),
-            "role": "retrieval",
+            "model": evidence_judge_model(),
+            "role": "evidence_judge",
+        },
+        "master": {
+            "model": master_model(),
+            "role": "master",
         },
         "answer": {
             "model": answer_model(),
@@ -18049,7 +25599,11 @@ def _allow_ai_navigation_worker_on_round(
     goal: str,
     first_answer_sla_split: bool,
     answer_first_ms: float | None,
+    ai_attested_mission: bool = False,
 ) -> bool:
+    if ai_attested_mission and _search_semantic_authority_v2_enabled():
+        remaining_seconds = _search_deadline_remaining_seconds()
+        return bool(llm_enabled() and (remaining_seconds is None or remaining_seconds > 0.05))
     if first_answer_sla_split and answer_first_ms is None:
         return False
     if (
@@ -18066,6 +25620,300 @@ def _allow_ai_navigation_worker_on_round(
         round_index=round_index,
         goal=goal,
     )
+
+
+def _candidate_lane_policy(
+    *,
+    semantic_authority_v2: bool,
+    query_class: str,
+    routing_hint_goal: str,
+    has_bucket_keys: bool,
+    candidate_count: int,
+    max_matches: int,
+    allow_adjacent_bucket_expansion: bool,
+    allow_document_anchor_expansion: bool,
+    has_temporal_terms: bool,
+    provider_hydration_capabilities: set[str] | None = None,
+) -> dict[str, bool]:
+    capabilities = set(provider_hydration_capabilities or set())
+    if semantic_authority_v2:
+        # The server-bound V2 mission and its translated/snap-validated
+        # geometry own routing. Query words and the legacy goal taxonomy cannot
+        # open extra lanes.
+        return {
+            "adjacent_bucket": bool(
+                allow_adjacent_bucket_expansion and has_bucket_keys
+            ),
+            "document_anchor": bool(
+                allow_document_anchor_expansion
+                and has_bucket_keys
+                and capabilities.intersection(
+                    {"document_refs", "document_anchor", "document_chunks"}
+                )
+            ),
+            "identity_support": False,
+            "exact_temporal": False,
+            "query_text": False,
+        }
+    legacy_identity_goals = {
+        "name",
+        "birthplace",
+        "residence",
+        "family",
+        "father",
+        "partner",
+        "mentor",
+        "sibling",
+        "role",
+        "projects",
+        "style",
+        "values",
+        "history",
+    }
+    legacy_document_goals = {
+        "history",
+        "family",
+        "father",
+        "partner",
+        "mentor",
+        "sibling",
+        "company_founding",
+        "documents",
+    }
+    return {
+        "adjacent_bucket": bool(
+            allow_adjacent_bucket_expansion
+            and has_bucket_keys
+            and (
+                semantic_authority_v2
+                or query_class in {"broad_summary", "document_lookup"}
+                or candidate_count < max(8, max_matches)
+            )
+        ),
+        "document_anchor": bool(
+            allow_document_anchor_expansion
+            and has_bucket_keys
+            and (
+                semantic_authority_v2
+                or query_class in {"relation_fact", "style_values", "broad_summary", "document_lookup"}
+                or routing_hint_goal in legacy_document_goals
+            )
+        ),
+        "identity_support": bool(semantic_authority_v2 or routing_hint_goal in legacy_identity_goals),
+        "exact_temporal": bool(has_temporal_terms and (semantic_authority_v2 or routing_hint_goal == "history")),
+        "query_text": bool(semantic_authority_v2 or routing_hint_goal == "generic_context" or query_class == "direct_fact"),
+    }
+
+
+def _route_path_tube_bucket_keys(
+    *,
+    branch: dict[str, Any],
+    probe: dict[str, Any],
+    active_destination: dict[str, Any] | None = None,
+    blackboard: dict[str, Any] | None = None,
+    limit: int = 8,
+) -> list[str]:
+    keys: list[str] = []
+
+    def add_bucket(value: Any) -> None:
+        key = str(value or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+
+    def add_bucket_fields(payload: dict[str, Any]) -> None:
+        for field in (
+            "bucket_key",
+            "from_bucket_key",
+            "to_bucket_key",
+            "center_bucket_key",
+            "landing_bucket_key",
+            "target_bucket_key",
+        ):
+            add_bucket(payload.get(field))
+        for field in (
+            "bucket_keys",
+            "target_bucket_keys",
+            "corridor_bucket_keys",
+            "path_bucket_keys",
+            "waypoint_bucket_keys",
+            "intermediate_bucket_keys",
+            "visited_bucket_keys",
+        ):
+            for item in list(payload.get(field) or []):
+                add_bucket(item)
+
+    add_bucket_fields(dict(active_destination or {}))
+    add_bucket_fields(dict(probe or {}))
+    add_bucket_fields(dict(branch or {}))
+
+    branch_refs = {
+        str(branch.get("branch_id") or "").strip(),
+        str(branch.get("family_branch_id") or "").strip(),
+        str(branch.get("path_mission_id") or "").strip(),
+        str(branch.get("ai_spatial_path_id") or "").strip(),
+        str(branch.get("strand_id") or "").strip(),
+        str(probe.get("probe_id") or "").strip(),
+        str(probe.get("strand_id") or "").strip(),
+        str(probe.get("ai_spatial_path_id") or "").strip(),
+    }
+    branch_refs = {item for item in branch_refs if item}
+    path_corridors = dict((blackboard or {}).get("path_corridors") or {})
+    for path in [
+        dict(item)
+        for item in [
+            *list(path_corridors.get("paths") or []),
+            *list(path_corridors.get("planned_paths") or []),
+            *list(path_corridors.get("path_rows") or []),
+        ]
+        if isinstance(item, dict)
+    ]:
+        path_refs = {
+            str(path.get("path_id") or "").strip(),
+            str(path.get("branch_id") or "").strip(),
+            str(path.get("source_branch_id") or "").strip(),
+            str(path.get("origin_landing_id") or "").strip(),
+            str(path.get("from_landing_id") or "").strip(),
+            str(path.get("target_landing_id") or "").strip(),
+            str(path.get("to_landing_id") or "").strip(),
+            *[str(item or "").strip() for item in list(path.get("runtime_branch_ids") or [])],
+        }
+        path_refs = {item for item in path_refs if item}
+        if branch_refs and path_refs and branch_refs.isdisjoint(path_refs):
+            continue
+        add_bucket_fields(path)
+        for event in list(path.get("route_events") or []):
+            if isinstance(event, dict):
+                add_bucket_fields(dict(event))
+    return _dedupe_limited(keys, limit=max(1, int(limit)))
+
+
+def _route_edge_target_ids(
+    candidates: list[dict[str, Any]],
+    *,
+    edge_field: str,
+    limit: int,
+) -> list[str]:
+    target_ids: list[str] = []
+    for candidate in list(candidates or []):
+        for edge in list(dict(candidate or {}).get(edge_field) or []):
+            if not isinstance(edge, dict):
+                continue
+            target = str(edge.get("target_node_id") or edge.get("node_id") or edge.get("target") or "").strip()
+            if target and target not in target_ids:
+                target_ids.append(target)
+            if len(target_ids) >= max(1, int(limit)):
+                return target_ids
+    return target_ids
+
+
+_EVIDENCE_PROVENANCE_EDGE_TOKENS = frozenset(
+    {
+        "anchor",
+        "citation",
+        "derived",
+        "document",
+        "evidence",
+        "provenance",
+        "source",
+        "support",
+    }
+)
+
+
+def _is_evidence_provenance_edge(edge: Mapping[str, Any] | None) -> bool:
+    payload = dict(edge or {})
+    raw_type = str(
+        payload.get("edge_type")
+        or payload.get("type")
+        or payload.get("kind")
+        or payload.get("relation")
+        or payload.get("role")
+        or ""
+    ).strip().lower()
+    if not raw_type:
+        return True
+    return any(token in raw_type for token in _EVIDENCE_PROVENANCE_EDGE_TOKENS)
+
+
+def _evidence_anchor_ids_from_candidates(candidates: list[dict[str, Any]], *, limit: int = 6) -> list[str]:
+    anchor_ids: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in anchor_ids:
+            anchor_ids.append(text)
+
+    def add_ref_ids(payload: Mapping[str, Any], *, exclude_id: str | None = None) -> None:
+        for field in (
+            "document_anchor_id",
+            "_matched_document_anchor_id",
+            "anchor_node_id",
+            "source_anchor_node_id",
+            "source_unit_id",
+            "document_id",
+        ):
+            value = str(dict(payload or {}).get(field) or "").strip()
+            if value and value != exclude_id:
+                add(value)
+
+    for candidate in list(candidates or []):
+        node = dict(candidate or {})
+        node_id = str(node.get("id") or "").strip()
+        document_role = str(node.get("document_role") or "").strip().lower()
+        if node_id and (bool(node.get("is_document_anchor")) or document_role == "anchor"):
+            add(node_id)
+        add_ref_ids(node, exclude_id=node_id)
+        for field in ("document_refs", "document_refs_seen", "source_trace"):
+            for ref in list(node.get(field) or []):
+                if isinstance(ref, Mapping):
+                    add_ref_ids(ref, exclude_id=node_id)
+                    add(dict(ref).get("node_id"))
+        for field in ("graph_edges", "edges", "evidence_edges", "source_edges"):
+            for edge in list(node.get(field) or []):
+                if not isinstance(edge, Mapping) or not _is_evidence_provenance_edge(edge):
+                    continue
+                edge_payload = dict(edge)
+                add_ref_ids(edge_payload, exclude_id=node_id)
+                for edge_id_field in ("target_node_id", "target_id", "target", "node_id", "source_node_id", "source_id", "source"):
+                    edge_id = str(edge_payload.get(edge_id_field) or "").strip()
+                    if edge_id and edge_id != node_id:
+                        add(edge_id)
+        if len(anchor_ids) >= max(1, int(limit)):
+            break
+    return anchor_ids[: max(1, int(limit))]
+
+
+_PROVIDER_HYDRATION_CAPABILITIES = frozenset(
+    {
+        "metadata_only",
+        "node_summary",
+        "node_fulltext",
+        "linked_nodes",
+        "document_refs",
+        "document_anchor",
+        "document_chunks",
+    }
+)
+
+
+def _provider_authored_hydration_capabilities(
+    *records: Mapping[str, Any] | None,
+) -> set[str]:
+    """Return only explicit machine capabilities authored in the AI plan.
+
+    Free-form ``hydration_policy`` prose is preserved for audit but is never
+    parsed or interpreted as a routing instruction.
+    """
+
+    capabilities: set[str] = set()
+    for raw in records:
+        record = dict(raw or {})
+        values = list(record.get("hydration_capabilities") or [])
+        for value in values:
+            normalized = str(value or "").strip().lower().replace("-", "_")
+            if normalized in _PROVIDER_HYDRATION_CAPABILITIES:
+                capabilities.add(normalized)
+    return capabilities
 
 
 def _annotate_probe_family(
@@ -18215,8 +26063,12 @@ def _landing_neighborhood_similarity(left_probe: dict[str, Any], right_probe: di
 def _probe_merge_basis(ai_probe: dict[str, Any], heuristic_probe: dict[str, Any]) -> str | None:
     ai_strand_id = str(ai_probe.get("strand_id") or "").strip()
     heuristic_strand_id = str(heuristic_probe.get("strand_id") or "").strip()
-    if ai_strand_id and heuristic_strand_id:
-        return "strand_id" if ai_strand_id == heuristic_strand_id else None
+    if ai_strand_id and heuristic_strand_id and ai_strand_id == heuristic_strand_id:
+        return "strand_id"
+    ai_hypothesis = _fold_text(str(ai_probe.get("answer_hypothesis") or "")).strip()
+    existing_hypothesis = _fold_text(str(heuristic_probe.get("answer_hypothesis") or "")).strip()
+    if ai_hypothesis and existing_hypothesis and ai_hypothesis == existing_hypothesis:
+        return "answer_hypothesis"
     ai_field = str(ai_probe.get("expected_answer_field") or "").strip().lower()
     heuristic_field = str(heuristic_probe.get("expected_answer_field") or "").strip().lower()
     if ai_field and heuristic_field:
@@ -18260,7 +26112,7 @@ def _mission_merge_score_bonus(
     bonus = 0.0
     if _probe_path_mission_id(ai_probe):
         reasons.append("ai_path_mission_present")
-    if basis in {"strand_id", "answer_field"}:
+    if basis in {"strand_id", "answer_hypothesis", "answer_field"}:
         bonus += 0.08
         reasons.append(f"mission_basis_overlap:{basis}")
     elif basis == "goal":
@@ -18310,22 +26162,11 @@ def _probe_merge_similarity(ai_probe: dict[str, Any], heuristic_probe: dict[str,
     components["goal_match"] = goal_match
     if goal_match >= 1.0:
         reasons.append("goal_match")
-    ai_area = str(ai_probe.get("expected_guide_area") or "").strip().lower()
-    heuristic_area = str(heuristic_probe.get("expected_guide_area") or "").strip().lower()
-    if ai_area and heuristic_area:
-        components["expected_guide_area_match"] = 1.0 if ai_area == heuristic_area else 0.0
-    else:
-        components["expected_guide_area_match"] = 0.5
-    if components["expected_guide_area_match"] > 0.0:
-        reasons.append("guide_area_compatible")
-    ai_memory_type = str(ai_probe.get("expected_memory_type") or "").strip().lower()
-    heuristic_memory_type = str(heuristic_probe.get("expected_memory_type") or "").strip().lower()
-    if ai_memory_type and heuristic_memory_type:
-        components["expected_memory_type_match"] = 1.0 if ai_memory_type == heuristic_memory_type else 0.0
-    else:
-        components["expected_memory_type_match"] = 0.5
-    if components["expected_memory_type_match"] > 0.0:
-        reasons.append("memory_type_compatible")
+    # Legacy guide-area facets remain available for display/debug only.  They
+    # must not make two missions more mergeable than their coordinate/path,
+    # destination, radial and answer-hypothesis evidence allows.
+    components["expected_guide_area_match"] = 0.0
+    components["expected_memory_type_match"] = 0.0
     components["radial_expectation_match"] = _radial_expectation_similarity(
         str(ai_probe.get("radial_expectation") or ""),
         str(heuristic_probe.get("radial_expectation") or ""),
@@ -18341,14 +26182,21 @@ def _probe_merge_similarity(ai_probe: dict[str, Any], heuristic_probe: dict[str,
     components["landing_neighborhood_similarity"] = _landing_neighborhood_similarity(ai_probe, heuristic_probe)
     if components["landing_neighborhood_similarity"] > 0.0:
         reasons.append("landing_neighborhood_overlap")
+    ai_hypothesis = _fold_text(str(ai_probe.get("answer_hypothesis") or "")).strip()
+    existing_hypothesis = _fold_text(str(heuristic_probe.get("answer_hypothesis") or "")).strip()
+    hypothesis_match = 1.0 if ai_hypothesis and ai_hypothesis == existing_hypothesis else 0.0
+    components["answer_hypothesis_match"] = hypothesis_match
+    if hypothesis_match:
+        reasons.append("answer_hypothesis_match")
     weighted_score = (
-        components["goal_match"] * 0.25
-        + components["expected_guide_area_match"] * 0.15
-        + components["expected_memory_type_match"] * 0.15
+        components["goal_match"] * 0.15
+        + components["answer_hypothesis_match"] * 0.30
         + components["radial_expectation_match"] * 0.10
-        + components["destination_queue_prefix_similarity"] * 0.20
-        + components["landing_neighborhood_similarity"] * 0.15
+        + components["destination_queue_prefix_similarity"] * 0.15
+        + components["landing_neighborhood_similarity"] * 0.20
     )
+    if hypothesis_match:
+        weighted_score = max(weighted_score, 0.84)
     return round(max(0.0, min(1.0, weighted_score)), 6), reasons, components
 
 
@@ -18360,8 +26208,6 @@ def _merge_semantic_destination_queue(
     existing_keys = {
         (
             str(item.get("label") or "").strip().lower(),
-            str(item.get("guide_area") or "").strip().lower(),
-            str(item.get("memory_type") or "").strip().lower(),
             str(item.get("radial_expectation") or "").strip().lower(),
         )
         for item in merged
@@ -18371,8 +26217,6 @@ def _merge_semantic_destination_queue(
         normalized = dict(item)
         key = (
             str(normalized.get("label") or "").strip().lower(),
-            str(normalized.get("guide_area") or "").strip().lower(),
-            str(normalized.get("memory_type") or "").strip().lower(),
             str(normalized.get("radial_expectation") or "").strip().lower(),
         )
         if key in existing_keys:
@@ -18430,12 +26274,12 @@ def _ai_refinement_delta(
     if ai_corroboration:
         delta["corroboration_needs"] = ai_corroboration
         reasons.append("corroboration_delta")
-    for key in ("expected_guide_area", "expected_memory_type", "radial_expectation", "expected_answer_field", "answer_hypothesis", "expected_stop_condition"):
+    for key in ("expected_guide_area", "radial_expectation", "expected_answer_field", "answer_hypothesis", "expected_stop_condition"):
         heuristic_value = str(heuristic_probe.get(key) or "").strip()
         ai_value = str(ai_probe.get(key) or "").strip()
         if ai_value and ai_value != heuristic_value:
             delta[key] = {"heuristic": heuristic_value or None, "ai": ai_value}
-            if key in {"expected_guide_area", "expected_memory_type", "radial_expectation"}:
+            if key in {"expected_guide_area", "radial_expectation"}:
                 reasons.append(key)
     if float(components.get("landing_neighborhood_similarity") or 0.0) < 1.0:
         delta["landing_neighborhood_similarity"] = round(float(components.get("landing_neighborhood_similarity") or 0.0), 4)
@@ -18500,6 +26344,191 @@ def _route_richness_score_for_branch(branch: dict[str, Any]) -> float:
     return round(max(0.0, min(1.0, score)), 4)
 
 
+_ROUTE_COMMITMENT_PRIMITIVES = (
+    "sphere_scan",
+    "path_tube_scan",
+    "local_link_walk",
+    "highway_jump",
+    "evidence_edge_follow",
+)
+
+
+def _route_primitive_counts_seed() -> dict[str, dict[str, Any]]:
+    return {
+        primitive: {
+            "attempt_count": 0,
+            "yield_count": 0,
+            "node_ids": [],
+        }
+        for primitive in _ROUTE_COMMITMENT_PRIMITIVES
+    }
+
+
+def _route_primitive_counter_field(primitive: str, suffix: str) -> str:
+    return f"{primitive}_{suffix}"
+
+
+def _route_event_primitive(entry: dict[str, Any]) -> str | None:
+    entry = dict(entry or {})
+    explicit = str(entry.get("route_primitive") or entry.get("primitive") or "").strip().lower()
+    if explicit in _ROUTE_COMMITMENT_PRIMITIVES:
+        return explicit
+    tokens = {
+        str(entry.get("candidate_source") or "").strip().lower(),
+        str(entry.get("navigation_action") or "").strip().lower(),
+        str(entry.get("move_type") or "").strip().lower(),
+        str(entry.get("edge_type") or "").strip().lower(),
+        str(entry.get("event_source") or "").strip().lower(),
+    }
+    tokens.update(str(item or "").strip().lower() for item in list(entry.get("candidate_sources") or []) if str(item or "").strip())
+    if tokens.intersection({"sphere_scan", "nearby_radius", "route_anchor_radius", "adjacent_bucket"}):
+        return "sphere_scan"
+    if any("path_tube" in token or "path_corridor" in token or token == "inspect_corridor" for token in tokens):
+        return "path_tube_scan"
+    if tokens.intersection({"document_anchor", "evidence_edge_follow", "server_bound_provenance_recall", "follow_evidence_edge"}):
+        return "evidence_edge_follow"
+    if tokens.intersection({"route_highway", "action_highway", "highway_neighbor", "follow_highway", "highway_jump", "highway"}):
+        return "highway_jump"
+    if tokens.intersection({"route_link", "action_link", "follow_local_link", "local_link_walk", "link"}):
+        return "local_link_walk"
+    return None
+
+
+def _route_commitment_rows_from_counts(counts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for primitive in _ROUTE_COMMITMENT_PRIMITIVES:
+        payload = dict(counts.get(primitive) or {})
+        node_ids = _dedupe_limited(
+            [
+                str(item)
+                for item in list(payload.get("node_ids") or payload.get("yielded_node_ids") or [])
+                if str(item).strip()
+            ],
+            limit=24,
+        )
+        attempt_count = max(0, int(payload.get("attempt_count") or 0))
+        yield_count = max(max(0, int(payload.get("yield_count") or 0)), len(node_ids))
+        rows.append(
+            {
+                "primitive": primitive,
+                "attempted": attempt_count > 0,
+                "attempt_count": attempt_count,
+                "yield_count": yield_count,
+                "node_ids": node_ids[:12],
+                "satisfied": attempt_count > 0 and yield_count > 0,
+            }
+        )
+    return rows
+
+
+def _route_primitive_counts_for_branch(branch: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    branch = dict(branch or {})
+    counts = _route_primitive_counts_seed()
+    for primitive in _ROUTE_COMMITMENT_PRIMITIVES:
+        counts[primitive]["attempt_count"] = max(
+            counts[primitive]["attempt_count"],
+            int(branch.get(_route_primitive_counter_field(primitive, "attempt_count")) or 0),
+        )
+        counts[primitive]["yield_count"] = max(
+            counts[primitive]["yield_count"],
+            int(branch.get(_route_primitive_counter_field(primitive, "yield_count")) or 0),
+        )
+        counts[primitive]["node_ids"] = _dedupe_limited(
+            [
+                *list(counts[primitive].get("node_ids") or []),
+                *[
+                    str(item)
+                    for item in list(branch.get(_route_primitive_counter_field(primitive, "node_ids")) or [])
+                    if str(item).strip()
+                ],
+            ],
+            limit=24,
+        )
+
+    nested_counts = _route_primitive_counts_seed()
+    event_counts = _route_primitive_counts_seed()
+    for entry in [dict(item) for item in list(branch.get("route_trace") or []) if isinstance(item, dict)]:
+        for commitment in list(entry.get("route_commitments") or []):
+            if not isinstance(commitment, dict):
+                continue
+            primitive = str(commitment.get("primitive") or "").strip().lower()
+            if primitive not in nested_counts:
+                continue
+            nested_counts[primitive]["attempt_count"] = max(
+                nested_counts[primitive]["attempt_count"],
+                int(commitment.get("attempt_count") or (1 if bool(commitment.get("attempted")) else 0)),
+            )
+            nested_counts[primitive]["yield_count"] = max(
+                nested_counts[primitive]["yield_count"],
+                int(commitment.get("yield_count") or 0),
+            )
+            nested_counts[primitive]["node_ids"] = _dedupe_limited(
+                [
+                    *list(nested_counts[primitive].get("node_ids") or []),
+                    *[str(item) for item in list(commitment.get("node_ids") or []) if str(item).strip()],
+                ],
+                limit=24,
+            )
+        primitive = _route_event_primitive(entry)
+        if primitive not in event_counts:
+            continue
+        event_counts[primitive]["attempt_count"] += 1
+        yielded_ids = [
+            str(item)
+            for item in list(entry.get("yielded_match_ids") or entry.get("node_ids") or [])
+            if str(item).strip()
+        ]
+        yielded_count = int(entry.get("yielded_match_count") or 0)
+        if yielded_ids:
+            event_counts[primitive]["node_ids"] = _dedupe_limited(
+                [*list(event_counts[primitive].get("node_ids") or []), *yielded_ids],
+                limit=24,
+            )
+        event_counts[primitive]["yield_count"] += max(yielded_count, len(yielded_ids))
+
+    branch_commitments = _route_primitive_counts_seed()
+    for commitment in list(branch.get("route_commitments") or []):
+        if not isinstance(commitment, dict):
+            continue
+        primitive = str(commitment.get("primitive") or "").strip().lower()
+        if primitive not in branch_commitments:
+            continue
+        branch_commitments[primitive]["attempt_count"] = max(
+            branch_commitments[primitive]["attempt_count"],
+            int(commitment.get("attempt_count") or (1 if bool(commitment.get("attempted")) else 0)),
+        )
+        branch_commitments[primitive]["yield_count"] = max(
+            branch_commitments[primitive]["yield_count"],
+            int(commitment.get("yield_count") or 0),
+        )
+        branch_commitments[primitive]["node_ids"] = _dedupe_limited(
+            [
+                *list(branch_commitments[primitive].get("node_ids") or []),
+                *[str(item) for item in list(commitment.get("node_ids") or []) if str(item).strip()],
+            ],
+            limit=24,
+        )
+
+    for primitive in _ROUTE_COMMITMENT_PRIMITIVES:
+        for source_counts in (nested_counts[primitive], branch_commitments[primitive], event_counts[primitive]):
+            counts[primitive]["attempt_count"] = max(
+                counts[primitive]["attempt_count"],
+                int(source_counts.get("attempt_count") or 0),
+            )
+            counts[primitive]["yield_count"] = max(
+                counts[primitive]["yield_count"],
+                int(source_counts.get("yield_count") or 0),
+            )
+            counts[primitive]["node_ids"] = _dedupe_limited(
+                [
+                    *list(counts[primitive].get("node_ids") or []),
+                    *[str(item) for item in list(source_counts.get("node_ids") or []) if str(item).strip()],
+                ],
+                limit=24,
+            )
+    return counts
+
+
 def _route_runtime_summary(branches: list[dict[str, Any]]) -> dict[str, Any]:
     branch_rows = [dict(branch) for branch in list(branches or []) if isinstance(branch, dict)]
     route_entries = [
@@ -18523,6 +26552,7 @@ def _route_runtime_summary(branches: list[dict[str, Any]]) -> dict[str, Any]:
     reached_branch_ids: set[str] = set()
     execution_reorder_reasons: dict[str, int] = defaultdict(int)
     execution_reorder_count = 0
+    route_primitive_counts = _route_primitive_counts_seed()
     for branch, entry in route_entries:
         family_attribution = str(entry.get("family_attribution") or _route_family_attribution(branch) or "heuristic")
         if family_attribution in family_step_counts:
@@ -18579,6 +26609,19 @@ def _route_runtime_summary(branches: list[dict[str, Any]]) -> dict[str, Any]:
         hydrated_node_count,
         sum(int(branch.get("hydrated_node_count") or len(list(branch.get("hydrated_node_ids") or []))) for branch in branch_rows),
     )
+    for branch in branch_rows:
+        branch_primitive_counts = _route_primitive_counts_for_branch(branch)
+        for primitive in _ROUTE_COMMITMENT_PRIMITIVES:
+            route_primitive_counts[primitive]["attempt_count"] += int(branch_primitive_counts[primitive].get("attempt_count") or 0)
+            route_primitive_counts[primitive]["yield_count"] += int(branch_primitive_counts[primitive].get("yield_count") or 0)
+            route_primitive_counts[primitive]["node_ids"] = _dedupe_limited(
+                [
+                    *list(route_primitive_counts[primitive].get("node_ids") or []),
+                    *[str(item) for item in list(branch_primitive_counts[primitive].get("node_ids") or []) if str(item).strip()],
+                ],
+                limit=48,
+            )
+    route_commitments = _route_commitment_rows_from_counts(route_primitive_counts)
     branch_scores = [_route_richness_score_for_branch(branch) for branch in branch_rows if dict(branch)]
     return {
         "route_step_count": total_entries,
@@ -18599,6 +26642,19 @@ def _route_runtime_summary(branches: list[dict[str, Any]]) -> dict[str, Any]:
         "destination_reached_ratio": round(len(reached_branch_ids) / max(1, len(branch_rows)), 6) if branch_rows else 0.0,
         "execution_reorder_count": execution_reorder_count,
         "execution_reorder_reasons": dict(execution_reorder_reasons),
+        "route_commitments": route_commitments,
+        "route_commitment_count": len(route_commitments),
+        "route_commitment_satisfied_count": sum(1 for item in route_commitments if bool(item.get("satisfied"))),
+        "sphere_scan_attempt_count": int(route_primitive_counts["sphere_scan"].get("attempt_count") or 0),
+        "sphere_scan_yield_count": int(route_primitive_counts["sphere_scan"].get("yield_count") or 0),
+        "path_tube_scan_attempt_count": int(route_primitive_counts["path_tube_scan"].get("attempt_count") or 0),
+        "path_tube_scan_yield_count": int(route_primitive_counts["path_tube_scan"].get("yield_count") or 0),
+        "local_link_walk_attempt_count": int(route_primitive_counts["local_link_walk"].get("attempt_count") or 0),
+        "local_link_walk_yield_count": int(route_primitive_counts["local_link_walk"].get("yield_count") or 0),
+        "highway_jump_attempt_count": int(route_primitive_counts["highway_jump"].get("attempt_count") or 0),
+        "highway_jump_yield_count": int(route_primitive_counts["highway_jump"].get("yield_count") or 0),
+        "evidence_edge_follow_attempt_count": int(route_primitive_counts["evidence_edge_follow"].get("attempt_count") or 0),
+        "evidence_edge_follow_yield_count": int(route_primitive_counts["evidence_edge_follow"].get("yield_count") or 0),
     }
 
 
@@ -18687,6 +26743,23 @@ def _route_truth_summary(
         "highway_not_used_count": int(route_runtime.get("highway_not_used_count") or 0),
         "link_traversed_count": int(route_runtime.get("link_traversed_count") or 0),
         "local_traversed_count": int(route_runtime.get("local_traversed_count") or 0),
+        "route_commitments": [
+            dict(item)
+            for item in list(route_runtime.get("route_commitments") or [])
+            if isinstance(item, dict)
+        ],
+        "route_commitment_count": int(route_runtime.get("route_commitment_count") or 0),
+        "route_commitment_satisfied_count": int(route_runtime.get("route_commitment_satisfied_count") or 0),
+        "sphere_scan_attempt_count": int(route_runtime.get("sphere_scan_attempt_count") or 0),
+        "sphere_scan_yield_count": int(route_runtime.get("sphere_scan_yield_count") or 0),
+        "path_tube_scan_attempt_count": int(route_runtime.get("path_tube_scan_attempt_count") or 0),
+        "path_tube_scan_yield_count": int(route_runtime.get("path_tube_scan_yield_count") or 0),
+        "local_link_walk_attempt_count": int(route_runtime.get("local_link_walk_attempt_count") or 0),
+        "local_link_walk_yield_count": int(route_runtime.get("local_link_walk_yield_count") or 0),
+        "highway_jump_attempt_count": int(route_runtime.get("highway_jump_attempt_count") or 0),
+        "highway_jump_yield_count": int(route_runtime.get("highway_jump_yield_count") or 0),
+        "evidence_edge_follow_attempt_count": int(route_runtime.get("evidence_edge_follow_attempt_count") or 0),
+        "evidence_edge_follow_yield_count": int(route_runtime.get("evidence_edge_follow_yield_count") or 0),
         "studied_node_count": int(route_runtime.get("studied_node_count") or 0),
         "hydrated_node_count": int(route_runtime.get("hydrated_node_count") or 0),
         "candidate_node_count": branch_node_count("candidate_node_ids"),
@@ -18868,8 +26941,24 @@ def _ledger_document_refs(*sources: Any, limit: int = 12) -> list[dict[str, Any]
             "matched_entities": _ledger_id_list(payload.get("matched_entities"), limit=12),
             "score_components": _ledger_dict(payload.get("score_components") or payload.get("document_evidence_score_components")),
             "retrieve_document_call": _ledger_dict(payload.get("retrieve_document_call")),
+            "source_uri": str(
+                payload.get("source_uri")
+                or _ledger_dict(payload.get("provenance")).get("source_uri")
+                or ""
+            ).strip()
+            or None,
+            "content_digest": str(
+                payload.get("content_digest")
+                or payload.get("digest")
+                or _ledger_dict(payload.get("provenance")).get("content_digest")
+                or ""
+            ).strip()
+            or None,
             "source": source or str(payload.get("source") or "runtime_document_ref"),
         }
+        temporal_context = _evidence_temporal_context(payload)
+        if temporal_context:
+            row["temporal_context"] = temporal_context
         rows.append({key: value for key, value in row.items() if value not in (None, [], {})})
 
     def visit(value: Any, *, source: str | None = None) -> None:
@@ -19002,90 +27091,50 @@ def _ledger_text_key(value: Any) -> str:
 
 
 def _ledger_mission_match_keys(mission: dict[str, Any], branch: dict[str, Any] | None = None) -> set[str]:
-    expected_shape = _ledger_dict(mission.get("expected_evidence_shape"))
+    """Return structural route identities only, never semantic word aliases."""
+
     branch = dict(branch or {})
     raw_values = [
         mission.get("mission_id"),
         mission.get("path_id"),
-        mission.get("goal"),
-        mission.get("answer_hypothesis"),
-        expected_shape.get("target_id"),
-        expected_shape.get("answer_field"),
-        expected_shape.get("support_slot"),
-        expected_shape.get("section_key"),
-        branch.get("goal"),
-        branch.get("answer_hypothesis"),
-        branch.get("expected_answer_field"),
-        branch.get("support_slot"),
-        branch.get("section_key"),
+        mission.get("strand_id"),
+        mission.get("branch_id"),
+        branch.get("mission_id"),
+        branch.get("canonical_mission_id"),
+        branch.get("path_mission_id"),
+        branch.get("path_id"),
+        branch.get("canonical_path_id"),
+        branch.get("ai_spatial_path_id"),
+        branch.get("strand_id"),
+        branch.get("ai_spatial_strand_id"),
+        branch.get("branch_id"),
     ]
-    keys: set[str] = set()
-    for value in raw_values:
-        key = _ledger_text_key(value)
-        if not key:
-            continue
-        keys.add(key)
-        keys.add(_ledger_text_key(_goal_to_slot(key)))
-        keys.add(_ledger_text_key(_canonical_required_slot(key)))
-        for token in re.split(r"[^a-z0-9]+", key):
-            if len(token) >= 3:
-                keys.add(token)
-                keys.add(_ledger_text_key(_goal_to_slot(token)))
-                keys.add(_ledger_text_key(_canonical_required_slot(token)))
-    slot_aliases = {
-        "identity": {"identity", "name", "profile", "bio", "person", "subject"},
-        "work": {"work", "role", "project", "projects", "company", "companies", "organization", "business"},
-        "relationships": {"relationships", "relationship", "family", "father", "mother", "partner", "mentor", "sibling"},
-        "history": {"history", "timeline", "date", "milestone", "career", "past"},
-        "values": {"values", "principles", "beliefs", "mission"},
-        "style": {"style", "tone", "voice", "communication"},
-        "documents": {"documents", "document", "source", "sources", "raw", "file"},
-    }
-    canonical_slots = {
-        key
-        for key in list(keys)
-        if key in slot_aliases
-    }
-    for slot in canonical_slots:
-        keys.update(slot_aliases.get(slot, set()))
-    keys.discard("")
-    return keys
+    return {_ledger_text_key(value) for value in raw_values if _ledger_text_key(value)}
 
 
 def _ledger_entry_match_keys(entry: dict[str, Any]) -> set[str]:
     raw_values: list[Any] = [
-        entry.get("node_id"),
-        entry.get("goal"),
-        entry.get("section"),
-        entry.get("section_key"),
-        entry.get("support_slot"),
-        entry.get("target_id"),
-        entry.get("answer_field"),
-        entry.get("memory_type"),
-        entry.get("topic"),
-        entry.get("document_role"),
+        entry.get("mission_id"),
+        entry.get("canonical_mission_id"),
+        entry.get("path_mission_id"),
+        entry.get("path_id"),
+        entry.get("canonical_path_id"),
+        entry.get("ai_spatial_path_id"),
+        entry.get("physical_path_id"),
+        entry.get("strand_id"),
+        entry.get("ai_spatial_strand_id"),
+        entry.get("branch_id"),
     ]
-    raw_values.extend(_ledger_list(entry.get("support_slots")))
-    raw_values.extend(_ledger_list(entry.get("branch_goals")))
-    raw_values.extend(_ledger_list(entry.get("mission_goals")))
-    keys: set[str] = set()
-    for value in raw_values:
-        key = _ledger_text_key(value)
-        if not key:
-            continue
-        keys.add(key)
-        keys.add(_ledger_text_key(_goal_to_slot(key)))
-        keys.add(_ledger_text_key(_canonical_required_slot(key)))
-        for token in re.split(r"[^a-z0-9]+", key):
-            if len(token) >= 3:
-                keys.add(token)
-                keys.add(_ledger_text_key(_goal_to_slot(token)))
-                keys.add(_ledger_text_key(_canonical_required_slot(token)))
-    keys.discard("")
-    return keys
+    raw_values.extend(_ledger_list(entry.get("path_aliases")))
+    return {_ledger_text_key(value) for value in raw_values if _ledger_text_key(value)}
 
 
 def _ledger_evidence_text(entry: dict[str, Any], *, limit: int = 700) -> str:
+    raw_text = _mission_text(entry.get("raw_text") or "", limit=max(limit, 900))
+    # Raw hydrated source is always the semantic authority when it exists.
+    if raw_text:
+        return _mission_text(raw_text, limit=limit)
+
     explicit = (
         entry.get("text")
         or entry.get("evidence_snippet")
@@ -19094,20 +27143,8 @@ def _ledger_evidence_text(entry: dict[str, Any], *, limit: int = 700) -> str:
     )
     if explicit:
         return _mission_text(explicit, limit=limit)
-
     summary = _mission_text(entry.get("summary") or "", limit=limit)
-    raw_text = _mission_text(entry.get("raw_text") or "", limit=max(limit, 900))
-    if raw_text and summary:
-        summary_folded = _ledger_text_key(summary)
-        raw_folded = _ledger_text_key(raw_text)
-        summary_incomplete = bool("..." in summary or "\u2026" in summary)
-        summary_incomplete = summary_incomplete or bool(len(summary) < 320 and len(raw_text) > len(summary) + 80)
-        if summary_incomplete:
-            if summary_folded and summary_folded not in raw_folded:
-                return _mission_text(f"{summary}. {raw_text}", limit=limit)
-            return _mission_text(raw_text, limit=limit)
-
-    return _mission_text(summary or raw_text or entry.get("label") or "", limit=limit)
+    return _mission_text(summary or entry.get("label") or "", limit=limit)
 
 
 def _ledger_node_evidence_entry(node: dict[str, Any], *, node_id: str, source: str) -> dict[str, Any]:
@@ -19168,6 +27205,8 @@ def _ledger_compact_evidence_row(
         or ""
     ).strip()
     text = _ledger_evidence_text(entry, limit=700)
+    raw_text = _mission_text(entry.get("raw_text") or "", limit=900)
+    navigation_summary = _mission_text(entry.get("summary") or "", limit=420)
     if not (node_id or text):
         return {}
     promotion_state = str(entry.get("promotion_state") or default_promotion_state or "").strip().lower()
@@ -19175,6 +27214,14 @@ def _ledger_compact_evidence_row(
         "node_id": node_id or None,
         "section": str(entry.get("section") or entry.get("section_key") or entry.get("support_slot") or "").strip() or None,
         "text": text or None,
+        "text_source": "raw_text" if raw_text else "reviewed_claim_or_summary",
+        # Kept for UI/navigation diagnostics only.  Final semantic prompts use
+        # ``text`` and deliberately omit this field.
+        "navigation_summary": (
+            navigation_summary
+            if navigation_summary and _ledger_text_key(navigation_summary) != _ledger_text_key(text)
+            else None
+        ),
         "source": source,
         "promotion_state": promotion_state or None,
         "support_slot": str(entry.get("support_slot") or "").strip() or None,
@@ -19183,6 +27230,9 @@ def _ledger_compact_evidence_row(
         "confidence": entry.get("confidence"),
         "reason": _mission_text(entry.get("reason") or "", limit=220) or None,
     }
+    temporal_context = _evidence_temporal_context(entry)
+    if temporal_context:
+        row["temporal_context"] = temporal_context
     return {key: value for key, value in row.items() if value not in (None, "", [], {})}
 
 
@@ -19265,18 +27315,174 @@ def _ledger_collect_evidence_entries(
     return rows[:limit]
 
 
+def _ledger_select_bounded_branch_evidence_ids(
+    node_ids: Any,
+    *,
+    entries: list[dict[str, Any]],
+    branch: dict[str, Any] | None = None,
+    limit: int = 32,
+) -> list[str]:
+    """Keep the strongest branch-owned evidence without chronological bias.
+
+    Branches accumulate evidence across route stops, so list position records
+    discovery time rather than evidence quality. The selector never imports a
+    node from another branch and never performs semantic classification. It
+    only orders already-admitted branch IDs by structured retrieval,
+    hydration and provenance signals emitted by the executed path. Original
+    order and node ID provide stable tie-breaks when those signals are equal.
+    """
+
+    raw_values = (
+        sorted(node_ids)
+        if isinstance(node_ids, set)
+        else list(node_ids or [])
+        if isinstance(node_ids, (list, tuple))
+        else [node_ids]
+    )
+    admitted_ids = _ledger_id_list(
+        raw_values,
+        limit=max(int(limit), len(raw_values)),
+    )
+    if len(admitted_ids) <= int(limit):
+        return admitted_ids
+
+    admitted = set(admitted_ids)
+    original_index = {
+        node_id: index for index, node_id in enumerate(admitted_ids)
+    }
+    branch_payload = dict(branch or {})
+    branch_refs = {
+        str(branch_payload.get(key) or "").strip()
+        for key in (
+            "path_id",
+            "ai_spatial_path_id",
+            "mission_id",
+            "path_mission_id",
+            "strand_id",
+            "ai_spatial_strand_id",
+        )
+        if str(branch_payload.get(key) or "").strip()
+    }
+    signals_by_id: dict[str, dict[str, Any]] = {
+        node_id: {
+            "retrieval_score": None,
+            "path_bound": False,
+            "hydrated": False,
+            "provenance": False,
+            "answer_eligible": False,
+            "promoted": False,
+        }
+        for node_id in admitted_ids
+    }
+
+    for raw_entry in entries:
+        entry = dict(raw_entry or {})
+        node_id = str(
+            entry.get("node_id")
+            or entry.get("target_node_id")
+            or entry.get("source_node_id")
+            or ""
+        ).strip()
+        if node_id not in admitted:
+            continue
+        signals = signals_by_id[node_id]
+        score_values: list[float] = []
+        for key in (
+            "score",
+            "raw_score",
+            "rerank_score",
+            "semantic_score",
+            "similarity",
+            "document_evidence_score",
+        ):
+            try:
+                value = float(entry.get(key))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                score_values.append(value)
+        if score_values:
+            best_score = max(score_values)
+            previous = signals.get("retrieval_score")
+            if previous is None or best_score > float(previous):
+                signals["retrieval_score"] = best_score
+
+        entry_refs = {
+            str(entry.get(key) or "").strip()
+            for key in (
+                "path_id",
+                "ai_spatial_path_id",
+                "mission_id",
+                "path_mission_id",
+                "strand_id",
+                "ai_spatial_strand_id",
+            )
+            if str(entry.get(key) or "").strip()
+        }
+        signals["path_bound"] = bool(
+            signals["path_bound"]
+            or (branch_refs and branch_refs.intersection(entry_refs))
+        )
+        signals["hydrated"] = bool(
+            signals["hydrated"]
+            or entry.get("hydration_confirmed")
+            or entry.get("hydrated_from_node_store")
+            or entry.get("raw_available")
+        )
+        provenance = _ledger_dict(entry.get("provenance"))
+        signals["provenance"] = bool(
+            signals["provenance"]
+            or provenance
+            or str(
+                entry.get("document_id")
+                or entry.get("document_anchor_id")
+                or entry.get("source_ref")
+                or entry.get("source_title")
+                or entry.get("source_label")
+                or ""
+            ).strip()
+        )
+        signals["answer_eligible"] = bool(
+            signals["answer_eligible"] or entry.get("answer_eligible") is True
+        )
+        signals["promoted"] = bool(
+            signals["promoted"]
+            or str(entry.get("promotion_state") or "").strip().lower()
+            in {"hot", "promoted", "audit"}
+        )
+
+    def selection_key(node_id: str) -> tuple[Any, ...]:
+        signals = signals_by_id[node_id]
+        score = signals.get("retrieval_score")
+        return (
+            0 if score is not None else 1,
+            -float(score) if score is not None else 0.0,
+            -int(bool(signals.get("path_bound"))),
+            -int(bool(signals.get("hydrated"))),
+            -int(bool(signals.get("provenance"))),
+            -int(bool(signals.get("answer_eligible"))),
+            -int(bool(signals.get("promoted"))),
+            int(original_index[node_id]),
+            node_id,
+        )
+
+    return sorted(admitted_ids, key=selection_key)[: max(1, int(limit))]
+
+
 def _ledger_entry_matches_mission(entry: dict[str, Any], mission: dict[str, Any], branch: dict[str, Any] | None = None) -> bool:
+    """Bind fallback evidence through routing metadata, never evidence prose.
+
+    Text similarity is not semantic authority and must not import a nearby node
+    into a mission merely because its prose repeats a goal word. The final
+    blind EvidenceJudge owns semantic fit after the structurally routed ledger
+    has been frozen.
+    """
+
     mission_keys = _ledger_mission_match_keys(mission, branch)
     if not mission_keys:
         return False
     entry_keys = _ledger_entry_match_keys(entry)
-    if mission_keys.intersection(entry_keys):
-        return True
-    text_key = _ledger_text_key(_ledger_evidence_text(entry, limit=900))
-    if not text_key:
-        return False
-    strong_keys = {key for key in mission_keys if len(key) >= 5 and key not in {"source", "document", "documents"}}
-    return any(key in text_key for key in strong_keys)
+    return bool(mission_keys.intersection(entry_keys))
 
 
 def _ledger_select_support_evidence(
@@ -19415,6 +27621,7 @@ def _ledger_resolve_branch_mission(
     branch_index: int,
     mission_by_id: dict[str, dict[str, Any]],
     mission_by_path_id: dict[str, dict[str, Any]],
+    mission_by_strand_id: dict[str, dict[str, Any]],
     missions: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
     mission_id = _branch_path_mission_id(branch, mission_by_path_id=mission_by_path_id)
@@ -19424,6 +27631,12 @@ def _ledger_resolve_branch_mission(
     path_id = str(branch.get("ai_spatial_path_id") or branch.get("path_id") or "").strip()
     if path_id and path_id in mission_by_path_id:
         mission = dict(mission_by_path_id[path_id])
+        return str(mission.get("mission_id") or "").strip(), mission
+    strand_id = str(
+        branch.get("strand_id") or branch.get("ai_spatial_strand_id") or ""
+    ).strip()
+    if strand_id and strand_id in mission_by_strand_id:
+        mission = dict(mission_by_strand_id[strand_id])
         return str(mission.get("mission_id") or "").strip(), mission
     branch_keys = _ledger_mission_match_keys(
         {
@@ -19635,17 +27848,100 @@ def _branch_autojudge_next_action(state: str, *, fallback: str | None = None) ->
     return None
 
 
-def _compact_branch_autojudge_row(row: dict[str, Any], *, counts: dict[str, int]) -> dict[str, Any]:
-    expected = dict(row.get("expected_evidence_shape") or {})
+_BLIND_REVIEW_QUERY_BOUND_GOAL_TOKENS = {
+    "about",
+    "activity",
+    "activities",
+    "address",
+    "answer",
+    "client",
+    "clients",
+    "company",
+    "context",
+    "define",
+    "describe",
+    "direct",
+    "does",
+    "entity",
+    "evidence",
+    "explain",
+    "identity",
+    "identify",
+    "main",
+    "offering",
+    "offerings",
+    "offers",
+    "organization",
+    "organisation",
+    "provide",
+    "provides",
+    "relationship",
+    "requested",
+    "scope",
+    "service",
+    "services",
+    "subject",
+    "support",
+    "supports",
+    "verify",
+    "what",
+    "whether",
+    "who",
+}
 
-    def evidence_head(values: Any, *, limit: int = 3) -> list[dict[str, Any]]:
+
+def _blind_review_goal_bound_to_query(
+    *,
+    goal: str,
+    root_query_text: str,
+    bound_named_targets: Sequence[Mapping[str, Any]] | None,
+) -> bool:
+    goal_tokens = set(re.findall(r"[a-z0-9][a-z0-9_'-]{2,}", _ledger_text_key(goal)))
+    if not goal_tokens:
+        return False
+    root_tokens = set(
+        re.findall(r"[a-z0-9][a-z0-9_'-]{2,}", _ledger_text_key(root_query_text))
+    )
+    target_text = " ".join(
+        str(
+            dict(target).get("text")
+            or dict(target).get("surface")
+            or dict(target).get("target")
+            or ""
+        )
+        for target in list(bound_named_targets or [])
+        if isinstance(target, Mapping)
+    )
+    target_tokens = set(
+        re.findall(r"[a-z0-9][a-z0-9_'-]{2,}", _ledger_text_key(target_text))
+    )
+    allowed = root_tokens | target_tokens | _BLIND_REVIEW_QUERY_BOUND_GOAL_TOKENS
+    return all(token in allowed for token in goal_tokens)
+
+
+def _compact_branch_autojudge_row(
+    row: dict[str, Any],
+    *,
+    counts: dict[str, int],
+    evidence_limit: int = 3,
+    blind_semantic_review: bool = False,
+    root_query_text_fallback: str | None = None,
+) -> dict[str, Any]:
+    expected = dict(row.get("expected_evidence_shape") or {})
+    evidence_text_limit = 900 if blind_semantic_review else 260
+    blind_seen_node_ids: set[str] = set()
+
+    def evidence_head(values: Any, *, limit: int = evidence_limit) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
         for item in list(values or []):
             if not isinstance(item, dict):
                 continue
+            node_id = str(item.get("node_id") or item.get("id") or "").strip()[:80]
+            if blind_semantic_review and node_id and node_id in blind_seen_node_ids:
+                continue
             output.append(
                 {
-                    "node_id": str(item.get("node_id") or item.get("id") or "").strip()[:80] or None,
+                    "node_id": node_id or None,
                     "source": str(item.get("source") or item.get("source_type") or "").strip()[:80] or None,
                     "text": str(
                         item.get("text")
@@ -19653,22 +27949,54 @@ def _compact_branch_autojudge_row(row: dict[str, Any], *, counts: dict[str, int]
                         or item.get("claim")
                         or item.get("evidence_snippet")
                         or ""
-                    ).strip()[:260],
+                    ).strip()[:evidence_text_limit],
+                    "provenance": {
+                        key: value
+                        for key, value in dict(item.get("provenance") or {}).items()
+                        if key in {"source_label", "source_type", "source_uri", "page", "content_digest"}
+                        and value not in (None, "")
+                    },
+                    "temporal_context": _evidence_temporal_context(item) or None,
                 }
             )
+            if blind_semantic_review and node_id:
+                blind_seen_node_ids.add(node_id)
             if len(output) >= limit:
                 break
         return [{k: v for k, v in payload.items() if v not in (None, "")} for payload in output]
 
-    return {
+    root_query_text = _mission_text(
+        row.get("root_query_text")
+        or expected.get("root_query_text")
+        or root_query_text_fallback
+        or "",
+        limit=500,
+    )
+    bound_named_targets = _merge_server_bound_named_targets(
+        row.get("server_bound_named_targets"),
+        expected.get("server_bound_named_targets"),
+        row.get("required_named_concept_spans"),
+    )
+    raw_goal = str(row.get("goal") or "").strip()[:260]
+    blind_goal = raw_goal
+    if not _blind_review_goal_bound_to_query(
+        goal=raw_goal,
+        root_query_text=root_query_text,
+        bound_named_targets=bound_named_targets,
+    ):
+        blind_goal = root_query_text or ""
+
+    payload = {
         "mission_id": str(row.get("mission_id") or row.get("branch_id") or "").strip()[:100],
         "path_id": str(row.get("path_id") or "").strip()[:100],
-        "goal": str(row.get("goal") or "").strip()[:260],
-        "answer_hypothesis": str(row.get("answer_hypothesis") or "").strip()[:360],
+        "goal": raw_goal,
         "answer_field": str(expected.get("answer_field") or expected.get("target_id") or "").strip()[:120],
-        "claim_shape": str(expected.get("claim_shape") or row.get("expected_claim_shape") or "").strip()[:260],
-        "coverage_state": str(row.get("coverage_state") or "").strip()[:100],
-        "coverage_reason": str(row.get("coverage_reason") or row.get("missing_reason") or "").strip()[:260],
+        "required_entities": _mission_strings(expected.get("required_entities"), limit=12),
+        "root_query_text": root_query_text or None,
+        "server_bound_named_targets": bound_named_targets,
+        "expected_evidence": _mission_strings(expected.get("expected_evidence"), limit=12, item_limit=360),
+        "success_criteria": _mission_strings(expected.get("success_criteria"), limit=12, item_limit=360),
+        "success_question": _mission_text(expected.get("success_question") or "", limit=360) or None,
         "counts": dict(counts),
         "hot_evidence_head": evidence_head(row.get("hot_evidence")),
         "cold_evidence_head": evidence_head(row.get("cold_evidence")),
@@ -19677,58 +28005,172 @@ def _compact_branch_autojudge_row(row: dict[str, Any], *, counts: dict[str, int]
                 "document_id": str(dict(item).get("document_id") or dict(item).get("id") or "").strip()[:100],
                 "title": str(dict(item).get("title") or dict(item).get("document_title") or "").strip()[:180],
                 "raw_available": bool(dict(item).get("raw_available") or dict(item).get("raw_ready")),
+                "anchor_node_id": str(dict(item).get("anchor_node_id") or "").strip()[:100] or None,
+                "chunk_node_ids": [
+                    str(node_id).strip()[:100]
+                    for node_id in list(dict(item).get("chunk_node_ids") or [])[:3]
+                    if str(node_id).strip()
+                ],
+                "source_uri": str(dict(item).get("source_uri") or "").strip()[:240] or None,
+                "content_digest": str(dict(item).get("content_digest") or dict(item).get("digest") or "").strip()[:100] or None,
+                "temporal_context": _evidence_temporal_context(dict(item)) or None,
             }
             for item in list(row.get("document_refs") or [])[:3]
             if isinstance(item, dict)
         ],
         "route_event_count": counts.get("route_events", 0),
         "visited_node_count": counts.get("visited_nodes", 0),
+        "server_path_truth": {
+            "path_id": str(row.get("path_id") or "").strip() or None,
+            "route_event_count": int(counts.get("route_events", 0) or 0),
+            "route_traversed": bool(int(counts.get("route_events", 0) or 0) > 0),
+            "visited_node_count": int(counts.get("visited_nodes", 0) or 0),
+            "document_ref_count": len(
+                [item for item in list(row.get("document_refs") or []) if isinstance(item, dict)]
+            ),
+            "hydrated_document_ref_count": sum(
+                1
+                for item in list(row.get("document_refs") or [])
+                if isinstance(item, dict)
+                and bool(item.get("raw_available") or item.get("raw_ready") or item.get("raw_text"))
+            ),
+            "authority": "server_attested_ledger_projection",
+        },
         "heuristic_support_only": bool(row.get("heuristic_support_only")),
-        "accepted_by_ai_or_master": bool(row.get("accepted_by_ai_or_master")),
     }
+    if not blind_semantic_review:
+        payload.update(
+            {
+                "answer_hypothesis": str(row.get("answer_hypothesis") or "").strip()[:360],
+                "claim_shape": str(expected.get("claim_shape") or row.get("expected_claim_shape") or "").strip()[:260],
+                "coverage_state": str(row.get("coverage_state") or "").strip()[:100],
+                "coverage_reason": str(row.get("coverage_reason") or row.get("missing_reason") or "").strip()[:260],
+                "accepted_by_ai_or_master": bool(row.get("accepted_by_ai_or_master")),
+            }
+        )
+    else:
+        # The exact query and mission goal define what must be judged. Planner
+        # hypotheses and success criteria remain hidden because they may be
+        # broader than the user's request.
+        payload = {
+            key: payload[key]
+            for key in (
+                "mission_id",
+                "goal",
+                "root_query_text",
+                "server_bound_named_targets",
+                "counts",
+                "hot_evidence_head",
+                "cold_evidence_head",
+                "document_refs_head",
+                "server_path_truth",
+                "route_event_count",
+                "visited_node_count",
+            )
+            if key in payload
+        }
+        if blind_goal:
+            payload["goal"] = blind_goal
+    return payload
 
 
 def _ai_branch_autojudge_timeout_seconds(retrieval_mode: str) -> float:
-    mode = str(retrieval_mode or "balanced").strip().lower()
-    if mode == "flash":
-        return 1.6
-    if mode == "balanced":
-        return 2.4
-    if mode == "heavy":
-        return 3.6
-    return 4.2
+    return _search_ai_stage_timeout_seconds("branch_autojudge", retrieval_mode)
 
 
 def _normalize_ai_branch_autojudge_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     data = dict(payload or {})
-    state = str(data.get("state") or data.get("branch_state") or "").strip().lower()
+    raw_state = str(
+        data.get("state")
+        or data.get("branch_state")
+        or data.get("verdict")
+        or data.get("sufficiency_state")
+        or data.get("status")
+        or ""
+    ).strip().lower().replace("-", "_").replace(" ", "_")
+    state_aliases = {
+        "complete": "resolved",
+        "completed": "resolved",
+        "sufficient": "resolved",
+        "satisfied": "resolved",
+        "goal_satisfied": "resolved",
+        "partial": "useful_partial",
+        "incomplete": "useful_partial",
+        "review_required": "useful_partial",
+        "needs_more_evidence": "useful_partial",
+        "hydrate_document": "needs_document",
+        "document_required": "needs_document",
+        "needs_document_hydration": "needs_document",
+        "expand": "needs_radius_widen",
+        "widen": "needs_radius_widen",
+        "continue_search": "needs_radius_widen",
+        "needs_more_search": "needs_radius_widen",
+        "misrouted": "wrong_region",
+        "wrong_landing": "wrong_region",
+        "halt": "stop",
+        "exhausted": "stop",
+        "timeout": "provider_degraded",
+        "unavailable": "provider_degraded",
+        "provider_error": "provider_degraded",
+    }
+    state = state_aliases.get(raw_state, raw_state)
     if state not in _AI_BRANCH_AUTOJUDGE_STATES:
         return None
-    confidence = data.get("confidence")
+    confidence = data.get("confidence", data.get("score", data.get("probability")))
     try:
         confidence_value = float(confidence)
     except (TypeError, ValueError):
         confidence_value = 0.72
-    reason_codes = [
-        str(item or "").strip()
-        for item in list(data.get("reason_codes") or data.get("reasons") or [])
-        if str(item or "").strip()
-    ]
-    reason = str(data.get("reason") or "").strip()
+
+    def string_items(value: Any) -> list[str]:
+        values = value if isinstance(value, list) else [value]
+        return [str(item or "").strip() for item in values if str(item or "").strip()]
+
+    reason_codes = string_items(data.get("reason_codes") or data.get("codes") or data.get("reasons") or [])
+    reason = str(data.get("reason") or data.get("rationale") or data.get("explanation") or "").strip()
+    if not reason:
+        return None
     if reason and "ai_branch_reason" not in reason_codes:
         reason_codes.insert(0, "ai_branch_reason")
-    missing = [
-        str(item or "").strip()
-        for item in list(data.get("missing_evidence") or data.get("expected_missing_evidence") or [])
-        if str(item or "").strip()
-    ]
+    missing = string_items(
+        data.get("missing_evidence")
+        or data.get("expected_missing_evidence")
+        or data.get("gaps")
+        or []
+    )
+    raw_action = str(
+        data.get("next_recommended_action")
+        or data.get("recommended_action")
+        or data.get("action")
+        or ""
+    ).strip().lower().replace("-", "_").replace(" ", "_")
+    action_aliases = {
+        "hydrate_document": "retrieve_document",
+        "read_document": "retrieve_document",
+        "continue_search": "continue_ai_guided_branch_search",
+        "expand_branch": "continue_ai_guided_branch_search",
+        "widen_radius": "continue_ai_guided_branch_search",
+        "inspect_corridor": "inspect_path_corridor",
+        "retry_provider": "retry_retrieve_after_provider_recovers",
+        "halt": "stop",
+    }
+    next_action = action_aliases.get(raw_action, raw_action)
+    if next_action not in {
+        "retrieve_document",
+        "continue_ai_guided_branch_search",
+        "rerun_ai_spatial_or_matrix_calibration_preview",
+        "inspect_path_corridor",
+        "retry_retrieve_after_provider_recovers",
+        "stop",
+    }:
+        next_action = ""
     return {
         "state": state,
         "confidence": round(max(0.0, min(1.0, confidence_value)), 3),
         "reason": reason[:360] or None,
         "reason_codes": _dedupe_limited(reason_codes or [f"ai_branch_{state}"], limit=8),
         "missing_evidence": _dedupe_limited(missing, limit=6),
-        "next_recommended_action": str(data.get("next_recommended_action") or "").strip() or None,
+        "next_recommended_action": next_action or None,
     }
 
 
@@ -19742,32 +28184,31 @@ def _run_ai_branch_autojudge(
 ) -> tuple[dict[str, Any] | None, str | None, float]:
     schema = {
         "type": "object",
-        "additionalProperties": False,
-        "required": ["state", "confidence", "reason"],
+        "additionalProperties": True,
         "properties": {
-            "state": {"type": "string", "enum": sorted(_AI_BRANCH_AUTOJUDGE_STATES)},
+            "state": {"type": "string"},
+            "branch_state": {"type": "string"},
+            "verdict": {"type": "string"},
+            "sufficiency_state": {"type": "string"},
+            "status": {"type": "string"},
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "score": {"type": "number"},
+            "probability": {"type": "number"},
             "reason": {"type": "string"},
+            "rationale": {"type": "string"},
+            "explanation": {"type": "string"},
             "reason_codes": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
             "missing_evidence": {"type": "array", "maxItems": 6, "items": {"type": "string"}},
-            "next_recommended_action": {
-                "type": ["string", "null"],
-                "enum": [
-                    None,
-                    "retrieve_document",
-                    "continue_ai_guided_branch_search",
-                    "rerun_ai_spatial_or_matrix_calibration_preview",
-                    "inspect_path_corridor",
-                    "retry_retrieve_after_provider_recovers",
-                    "stop",
-                ],
-            },
+            "next_recommended_action": {"type": ["string", "null"]},
+            "recommended_action": {"type": ["string", "null"]},
+            "action": {"type": ["string", "null"]},
         },
     }
     prompt_payload = {
         "schema_version": AI_BRANCH_AUTOJUDGE_SCHEMA_VERSION,
         "query": str(query_text or "")[:500],
         "retrieval_mode": str(retrieval_mode or "balanced"),
+        "decision_time_utc": utc_timestamp(),
         "revision_context": {
             key: value
             for key, value in dict(revision_context or {}).items()
@@ -19781,29 +28222,44 @@ def _run_ai_branch_autojudge(
                 "calibration_revision",
             }
         },
-        "branch": _compact_branch_autojudge_row(row, counts=counts),
+        "branch": {
+            **_compact_branch_autojudge_row(row, counts=counts),
+            "current_evidence_digest": search_mission_ledger_digest(
+                {"row": row, "revision_context": dict(revision_context or {})}
+            ),
+        },
         "policy": {
             "judge_only_this_branch": True,
             "no_raw_document_bodies": True,
             "resolved_requires_visible_provenance": True,
             "heuristic_support_cannot_certify_without_ai_or_master_acceptance": True,
+            "temporal_semantics": {
+                "semantic_validity_event_or_observation_time_and_lifecycle_guide_current_or_as_of": True,
+                "publication_time_is_source_chronology_not_claim_validity": True,
+                "compare_temporal_scopes_before_calling_evidence_contradictory": True,
+                "superseded_evidence_can_explain_evolution_without_being_current": True,
+                "created_recorded_acquired_retrieved_and_ingested_are_nonsemantic_audit_time": True,
+            },
         },
     }
     started_at = time.perf_counter()
     payload = _run_attested_search_ai_json(
         call_name="branch_autojudge",
-        model=retrieval_model(),
+        model=evidence_judge_model(),
         system_prompt=(
             "You are AGVM's branch evidence judge. Judge only this compact branch ledger. "
             "Do not answer the user and do not invent missing facts. Decide whether this branch is resolved, useful partial, "
             "needs document hydration, needs radius widening, landed in the wrong region, should stop, or is provider degraded. "
-            "Visible provenance is mandatory for a resolved branch."
+            "Visible provenance is mandatory for a resolved branch. For current or as-of questions, reason from semantic validity, "
+            "explicitly sourced event/observation time, and lifecycle or supersession when present. Treat publication time separately as source chronology: "
+            "it can date the source but cannot by itself establish when the claim was true, current, or newer. Distinguish genuine contradiction from "
+            "evolution across time. created_at, recorded_at, acquired_at, retrieved_at and ingested_at are audit or source-handling time only and never make evidence newer, current, or truer."
         ),
         user_prompt=json.dumps(prompt_payload, ensure_ascii=False),
         schema_name="agvm_ai_branch_autojudge_v1",
         schema=schema,
         timeout=_ai_branch_autojudge_timeout_seconds(retrieval_mode),
-        role="retrieval",
+        role="evidence_judge",
         max_output_tokens=260,
     )
     elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 3)
@@ -19842,7 +28298,17 @@ def _branch_autojudge_row(
     has_provenance = _branch_judgement_has_provenance(row)
     document_requested = _branch_judgement_document_requested(row)
     private_or_off_contract = _branch_judgement_private_or_off_contract(row)
-    ai_required = _branch_judgement_ai_required(row, query_text=query_text, retrieval_mode=retrieval_mode)
+    # Every required mission is semantically closed by the grounded AI judge.
+    # Deterministic checks may stop unsafe or exhausted work, but they never
+    # certify that a required mission has enough evidence.
+    required_mission = bool(
+        row.get("required") is not False
+        and str(row.get("mission_id") or row.get("path_id") or row.get("branch_id") or "").strip()
+    )
+    ai_required = bool(
+        required_mission
+        or _branch_judgement_ai_required(row, query_text=query_text, retrieval_mode=retrieval_mode)
+    )
     next_action: str | None = None
     reason_codes: list[str] = []
     state = "stop"
@@ -19950,6 +28416,11 @@ def _branch_autojudge_row(
         next_action = None
         reason_codes.append("off_contract_evidence_excluded")
 
+    semantic_resolution_requires_ai = bool(ai_required and state == "resolved")
+    if semantic_resolution_requires_ai:
+        deterministic_clear = False
+        reason_codes.append("semantic_resolution_requires_ai_branch_judgement")
+
     controller_source = "deterministic_evidence_gate"
     controller_state = "deterministic_clear" if deterministic_clear else "deterministic_fallback_ai_controller_recommended"
     if ai_required and not deterministic_clear:
@@ -19962,13 +28433,18 @@ def _branch_autojudge_row(
     ai_controller_turn_ms = 0.0
     ai_controller_used = False
     if ai_required and not deterministic_clear and allow_ai_branch_controller:
-        ai_controller_payload, ai_controller_error, ai_controller_turn_ms = _run_ai_branch_autojudge(
-            row,
-            query_text=query_text,
-            retrieval_mode=retrieval_mode,
-            counts=counts,
-            revision_context=revision_context,
-        )
+        try:
+            ai_controller_payload, ai_controller_error, ai_controller_turn_ms = _run_ai_branch_autojudge(
+                row,
+                query_text=query_text,
+                retrieval_mode=retrieval_mode,
+                counts=counts,
+                revision_context=revision_context,
+            )
+        except Exception as exc:
+            ai_controller_payload = None
+            ai_controller_error = str(getattr(exc, "code", None) or type(exc).__name__ or "branch_autojudge_failed")[:160]
+            ai_controller_turn_ms = 0.0
         if ai_controller_payload:
             requested_state = str(ai_controller_payload.get("state") or "").strip().lower()
             ai_controller_used = True
@@ -19997,8 +28473,18 @@ def _branch_autojudge_row(
             controller_source = "deterministic_fallback_after_ai_branch_controller_error"
             controller_state = "ai_controller_error_fallback"
             reason_codes.append("ai_branch_controller_unavailable")
+            if state == "resolved":
+                state = "useful_partial"
+                confidence = min(confidence, 0.68)
+                next_action = next_action or "continue_ai_guided_branch_search"
+                reason_codes.append("semantic_resolution_not_certified")
     elif ai_required and not deterministic_clear:
         reason_codes.append("ai_branch_controller_not_enabled_for_call_site")
+        if state == "resolved":
+            state = "useful_partial"
+            confidence = min(confidence, 0.68)
+            next_action = next_action or "continue_ai_guided_branch_search"
+            reason_codes.append("semantic_resolution_not_certified")
 
     result = {
         "schema_version": BRANCH_JUDGEMENT_SCHEMA_VERSION,
@@ -20021,15 +28507,35 @@ def _branch_autojudge_row(
         "branch_controller_source": controller_source,
         "judge_source": controller_source,
         "cache_key": key[:16],
+        "judgement_input_digest": f"sha256:{key}",
+        "required_mission": required_mission,
         "cache_hit": False,
         "independent_from_answer_demo": True,
     }
     result = {k: v for k, v in result.items() if v not in (None, [], {})}
-    with _BRANCH_AUTOJUDGE_CACHE_LOCK:
-        if len(_BRANCH_AUTOJUDGE_CACHE) >= _BRANCH_AUTOJUDGE_CACHE_MAX:
-            _BRANCH_AUTOJUDGE_CACHE.clear()
-        _BRANCH_AUTOJUDGE_CACHE[key] = dict(result)
+    # Do not pin transient provider/contract failures for the rest of the
+    # search. A later bounded round may retry the same grounded mission.
+    if not ai_controller_error:
+        with _BRANCH_AUTOJUDGE_CACHE_LOCK:
+            if len(_BRANCH_AUTOJUDGE_CACHE) >= _BRANCH_AUTOJUDGE_CACHE_MAX:
+                _BRANCH_AUTOJUDGE_CACHE.clear()
+            _BRANCH_AUTOJUDGE_CACHE[key] = dict(result)
     return result
+
+
+def _mission_ledger_autojudge_input_digest(
+    rows: list[dict[str, Any]],
+    revision_context: dict[str, Any] | None,
+) -> str:
+    return search_mission_ledger_digest(
+        {
+            "rows": [
+                {key: value for key, value in row.items() if key != "branch_judgement"}
+                for row in rows
+            ],
+            "revision_context": dict(revision_context or {}),
+        }
+    )
 
 
 def apply_branch_autojudge_to_mission_ledger(
@@ -20039,6 +28545,7 @@ def apply_branch_autojudge_to_mission_ledger(
     retrieval_mode: str = "balanced",
     revision_context: dict[str, Any] | None = None,
     allow_ai_branch_controller: bool = False,
+    semantic_certification_owner: str = "branch_controller",
     max_workers: int | None = None,
 ) -> dict[str, Any]:
     ledger = dict(mission_evidence_ledger or {})
@@ -20054,7 +28561,8 @@ def apply_branch_autojudge_to_mission_ledger(
         }
         return ledger
 
-    worker_count = max(1, min(int(max_workers or 6), len(rows)))
+    provider_capacity = max(1, int(llm_provider_concurrency_limit()))
+    worker_count = max(1, min(int(max_workers or provider_capacity), provider_capacity, len(rows)))
     judged_by_index: dict[int, dict[str, Any]] = {}
     if worker_count == 1:
         for index, row in enumerate(rows):
@@ -20091,6 +28599,38 @@ def apply_branch_autojudge_to_mission_ledger(
     controller_sources: dict[str, int] = {}
     for index, row in enumerate(rows):
         judgement = dict(judged_by_index.get(index) or {})
+        if semantic_certification_owner == "terminal_master":
+            # Plan-first V3 deliberately has no recurrent branch semantic
+            # controller. Branch checks remain structural diagnostics; the
+            # single terminal Master owns semantic sufficiency.
+            reason_codes = [
+                str(reason)
+                for reason in list(judgement.get("reason_codes") or [])
+                if str(reason)
+                not in {
+                    "semantic_resolution_requires_ai_branch_judgement",
+                    "ai_branch_controller_not_enabled_for_call_site",
+                    "semantic_resolution_not_certified",
+                }
+            ]
+            judgement.update(
+                {
+                    "semantic_certification_owner": "terminal_master",
+                    "semantic_certification_state": "pending_terminal_master",
+                    "state_scope": "structural_evidence_only",
+                    "ai_branch_controller_required": False,
+                    "ai_branch_controller_used": False,
+                    "ai_branch_controller_state": "not_applicable_terminal_master_owned",
+                    "branch_controller_source": "terminal_master_owned_plan_first",
+                    "judge_source": "terminal_master_owned_plan_first",
+                    "reason_codes": _dedupe_limited(reason_codes, limit=12),
+                }
+            )
+            if (
+                str(row.get("coverage_state") or "").strip().lower() == "resolved"
+                and bool(judgement.get("has_visible_provenance"))
+            ):
+                judgement["state"] = "resolved"
         state = str(judgement.get("state") or "unknown")
         state_counts[state] = state_counts.get(state, 0) + 1
         cache_hits += int(bool(judgement.get("cache_hit")))
@@ -20102,6 +28642,31 @@ def apply_branch_autojudge_to_mission_ledger(
         if source:
             controller_sources[source] = controller_sources.get(source, 0) + 1
         row["branch_judgement"] = judgement
+        if (
+            row.get("required") is not False
+            and str(row.get("coverage_state") or "").strip().lower()
+            == "resolved"
+            and state != "resolved"
+        ):
+            # Evidence presence is a structural fact, not semantic
+            # sufficiency. Preserve the original observation for diagnostics
+            # while preventing an unjudged evidence shape from becoming a
+            # resolved mission.
+            row["structural_coverage_state"] = "resolved"
+            row["structural_coverage_reason"] = str(
+                row.get("coverage_reason") or "mission_evidence_shape_satisfied"
+            )
+            row["coverage_state"] = "partially_resolved"
+            row["coverage_reason"] = "semantic_resolution_not_certified"
+            row["missing_reason"] = "semantic_resolution_not_certified"
+            correction_signal = dict(row.get("correction_signal") or {})
+            correction_signal.update(
+                {
+                    "state": "partially_resolved",
+                    "needs_review": True,
+                }
+            )
+            row["correction_signal"] = correction_signal
         rows[index] = row
 
     accepted_states = {"resolved", "useful_partial", "needs_document"}
@@ -20137,14 +28702,415 @@ def apply_branch_autojudge_to_mission_ledger(
         "parallel_worker_count": worker_count,
         "judge_timing_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
         "source": "mission_evidence_ledger",
+        "semantic_certification_owner": semantic_certification_owner,
         "independent_from_answer_demo": True,
     }
     ledger["rows"] = rows
+    coverage_state_counts: dict[str, int] = {}
+    for row in rows:
+        coverage_state = str(row.get("coverage_state") or "unknown")
+        coverage_state_counts[coverage_state] = (
+            coverage_state_counts.get(coverage_state, 0) + 1
+        )
+    ledger["coverage_state_counts"] = coverage_state_counts
+    ledger["resolved_count"] = coverage_state_counts.get("resolved", 0)
+    ledger["partial_count"] = coverage_state_counts.get(
+        "partially_resolved", 0
+    )
+    ledger["near_miss_count"] = coverage_state_counts.get("near_miss", 0)
+    ledger["missed_count"] = coverage_state_counts.get("missed", 0)
+    current_judgement_digest = _mission_ledger_autojudge_input_digest(rows, revision_context)
+    for row in rows:
+        judgement = dict(row.get("branch_judgement") or {})
+        judgement["mission_ledger_input_digest"] = current_judgement_digest
+        judgement["current"] = bool(judgement.get("ai_branch_controller_used"))
+        row["branch_judgement"] = judgement
+    summary["mission_ledger_input_digest"] = current_judgement_digest
+    summary["required_ai_judgement_count"] = sum(
+        1 for row in rows if bool(dict(row.get("branch_judgement") or {}).get("required_mission"))
+    )
+    summary["current_required_ai_judgement_count"] = sum(
+        1
+        for row in rows
+        if bool(dict(row.get("branch_judgement") or {}).get("required_mission"))
+        and bool(dict(row.get("branch_judgement") or {}).get("ai_branch_controller_used"))
+        and bool(dict(row.get("branch_judgement") or {}).get("current"))
+    )
+    if semantic_certification_owner == "terminal_master":
+        summary["required_ai_judgement_count"] = 0
+        summary["current_required_ai_judgement_count"] = 0
     ledger["branch_judgement_summary"] = summary
     ledger["branch_judge_timing_ms"] = summary["judge_timing_ms"]
     ledger["branch_judge_state_counts"] = state_counts
     ledger["branch_judge_ready"] = status in {"ready", "no_actionable_branch", "provider_degraded"}
     return ledger
+
+
+def _consolidate_mission_ledger_attempts(ledger: dict[str, Any]) -> dict[str, Any]:
+    """Expose one authoritative row per mission while retaining path attempts."""
+
+    payload = dict(ledger or {})
+    raw_rows = [dict(row) for row in list(payload.get("rows") or []) if isinstance(row, dict)]
+    if len(raw_rows) < 2:
+        return payload
+
+    state_priority = {
+        "resolved": 8,
+        "needs_document": 7,
+        "useful_partial": 6,
+        "partially_resolved": 5,
+        "near_miss": 4,
+        "needs_radius_widen": 3,
+        "wrong_region": 2,
+        "provider_degraded": 1,
+        "missed": 0,
+    }
+
+    def row_state(row: dict[str, Any]) -> str:
+        judgement = _ledger_dict(row.get("branch_judgement"))
+        return str(judgement.get("state") or row.get("coverage_state") or "unknown").strip().lower()
+
+    def evidence_count(row: dict[str, Any]) -> int:
+        return sum(
+            len(_ledger_list(row.get(key)))
+            for key in ("hot_evidence", "cold_evidence", "document_refs", "route_events", "visited_node_ids")
+        )
+
+    def attempt_revision(row: dict[str, Any]) -> int:
+        for key in ("attempt_revision", "mission_revision", "branch_revision", "result_revision"):
+            raw_value = row.get(key)
+            if raw_value in {None, ""}:
+                continue
+            try:
+                return int(raw_value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def dedupe_rows(values: list[Any], *, limit: int) -> list[Any]:
+        result: list[Any] = []
+        seen: set[str] = set()
+        for value in values:
+            if isinstance(value, dict):
+                identity = str(
+                    value.get("node_id")
+                    or value.get("document_id")
+                    or value.get("event_id")
+                    or value.get("edge_id")
+                    or value.get("title")
+                    or json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+                )
+            else:
+                identity = str(value)
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            result.append(value)
+            if len(result) >= limit:
+                break
+        return result
+
+    def row_identity_keys(row: dict[str, Any]) -> set[str]:
+        keys: set[str] = set()
+
+        def add_route(value: Any) -> None:
+            key = _ledger_text_key(value)
+            if key:
+                keys.add(f"route:{key}")
+
+        def add_branch(value: Any) -> None:
+            key = _ledger_text_key(value)
+            if key:
+                keys.add(f"branch:{key}")
+
+        # AI spatial paths and their runtime branches can carry different
+        # generated identifiers even though both are projections of the same
+        # authored mission.  Bind them only when the complete semantic
+        # identity is exactly equal after canonical whitespace/case folding.
+        # This is an identity check, never fuzzy matching or keyword authority.
+        expected_shape = _ledger_dict(row.get("expected_evidence_shape"))
+        semantic_identity = (
+            _ledger_text_key(row.get("root_query_text")),
+            _ledger_text_key(row.get("semantic_goal") or row.get("goal")),
+            _ledger_text_key(
+                row.get("answer_hypothesis")
+                or expected_shape.get("claim_shape")
+            ),
+        )
+        if all(semantic_identity):
+            keys.add(
+                "semantic:"
+                + hashlib.sha256(
+                    json.dumps(
+                        semantic_identity,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+
+        for key in (
+            "mission_id",
+            "canonical_mission_id",
+            "path_mission_id",
+            "path_id",
+            "canonical_path_id",
+            "ai_spatial_path_id",
+            "physical_path_id",
+            "strand_id",
+            "ai_spatial_strand_id",
+        ):
+            add_route(row.get(key))
+        for value in _ledger_list(row.get("path_aliases")):
+            add_route(value)
+        correction = _ledger_dict(row.get("correction_signal"))
+        add_route(correction.get("path_mission_id"))
+        for raw_attempt in _ledger_list(row.get("attempts")):
+            attempt = _ledger_dict(raw_attempt)
+            for key in (
+                "mission_id",
+                "path_mission_id",
+                "path_id",
+                "canonical_path_id",
+                "strand_id",
+            ):
+                add_route(attempt.get(key))
+            add_branch(attempt.get("branch_id"))
+        add_branch(row.get("branch_id"))
+        add_branch(row.get("worker_id"))
+        return keys
+
+    def row_execution_keys(row: dict[str, Any]) -> set[str]:
+        keys: set[str] = set()
+
+        def add(value: Any, prefix: str = "route") -> None:
+            key = _ledger_text_key(value)
+            if key:
+                keys.add(f"{prefix}:{key}")
+
+        for key in (
+            "path_mission_id",
+            "path_id",
+            "canonical_path_id",
+            "ai_spatial_path_id",
+            "physical_path_id",
+            "strand_id",
+            "ai_spatial_strand_id",
+        ):
+            add(row.get(key))
+        correction = _ledger_dict(row.get("correction_signal"))
+        add(correction.get("path_mission_id"))
+        add(row.get("branch_id"), "branch")
+        add(row.get("worker_id"), "branch")
+        return keys
+
+    def invalidated_attempt(row: dict[str, Any]) -> bool:
+        judgement = _ledger_dict(row.get("branch_judgement"))
+        return bool(
+            row.get("stale")
+            or row.get("invalidated")
+            or row.get("superseded")
+            or judgement.get("stale")
+            or judgement.get("invalidated")
+        )
+
+    def evidence_available(row: dict[str, Any]) -> bool:
+        return bool(
+            _ledger_list(row.get("hot_evidence"))
+            or _ledger_list(row.get("document_refs"))
+            or int(row.get("authoritative_evidence_count") or 0) > 0
+        )
+
+    def cold_evidence_available(row: dict[str, Any]) -> bool:
+        return bool(_ledger_list(row.get("cold_evidence")))
+
+    def execution_evidence_matches_authority(authoritative: dict[str, Any], attempts: list[dict[str, Any]]) -> bool:
+        authoritative_keys = row_execution_keys(authoritative)
+        if not authoritative_keys:
+            return False
+        for attempt in attempts:
+            if not (evidence_available(attempt) or cold_evidence_available(attempt)):
+                continue
+            if authoritative_keys.intersection(row_execution_keys(attempt)):
+                return True
+        return False
+
+    def refresh_structural_state_from_merged_evidence(
+        authoritative: dict[str, Any],
+        attempts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if invalidated_attempt(authoritative):
+            return authoritative
+        current_state = str(authoritative.get("coverage_state") or "").strip().lower()
+        if current_state not in {"missed", "near_miss", "duplicate_only", "forbidden", "provider_degraded", ""}:
+            return authoritative
+        if not execution_evidence_matches_authority(authoritative, attempts):
+            return authoritative
+        previous_state = authoritative.get("coverage_state")
+        previous_reason = authoritative.get("coverage_reason") or authoritative.get("missing_reason")
+        if evidence_available(authoritative):
+            authoritative["coverage_state"] = "resolved"
+            authoritative["coverage_reason"] = "mission_evidence_shape_satisfied"
+            authoritative.pop("missing_reason", None)
+        elif cold_evidence_available(authoritative):
+            authoritative["coverage_state"] = "partially_resolved"
+            authoritative["coverage_reason"] = "cold_answer_material_found_not_promoted"
+            authoritative["missing_reason"] = "cold_answer_material_found_not_promoted"
+        else:
+            return authoritative
+        authoritative["structural_coverage_state"] = previous_state
+        authoritative["structural_coverage_reason"] = previous_reason
+        correction = _ledger_dict(authoritative.get("correction_signal"))
+        if correction:
+            correction["state"] = authoritative["coverage_state"]
+            correction["needs_review"] = authoritative["coverage_state"] != "resolved"
+            authoritative["correction_signal"] = correction
+        return authoritative
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    key_to_group: dict[str, str] = {}
+    order: list[str] = []
+    for index, row in enumerate(raw_rows, start=1):
+        row["_ledger_attempt_order"] = index
+        identity_keys = row_identity_keys(row) or {f"row:{index}"}
+        overlapping_groups = []
+        for key in sorted(identity_keys):
+            group_key = key_to_group.get(key)
+            if group_key and group_key not in overlapping_groups:
+                overlapping_groups.append(group_key)
+        if overlapping_groups:
+            mission_key = min(
+                overlapping_groups,
+                key=lambda group_key: order.index(group_key) if group_key in order else len(order),
+            )
+            for other_key in list(overlapping_groups):
+                if other_key == mission_key:
+                    continue
+                grouped.setdefault(mission_key, []).extend(grouped.pop(other_key, []))
+                for key, group_key in list(key_to_group.items()):
+                    if group_key == other_key:
+                        key_to_group[key] = mission_key
+                if other_key in order:
+                    order.remove(other_key)
+        else:
+            mission_key = f"mission_group_{index}"
+            grouped[mission_key] = []
+            order.append(mission_key)
+        grouped.setdefault(mission_key, []).append(row)
+        for key in identity_keys:
+            key_to_group[key] = mission_key
+
+    consolidated: list[dict[str, Any]] = []
+    for mission_key in order:
+        attempts = grouped[mission_key]
+
+        def attempt_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+            completed_at = str(row.get("completed_at") or row.get("updated_at") or "")
+            attempt_order = int(row.get("_ledger_attempt_order") or 0)
+            if completed_at:
+                # Rows produced by the same atomic ledger snapshot share one
+                # timestamp. Prefer its evidence-bearing execution over a
+                # later diagnostic shadow row. Across snapshots, time remains
+                # authoritative.
+                return (
+                    attempt_revision(row),
+                    1,
+                    completed_at,
+                    state_priority.get(row_state(row), -1),
+                    evidence_count(row),
+                    attempt_order,
+                )
+            # Legacy rows without a comparable revision/timestamp retain
+            # append order as their only server-authored recency signal.
+            return (
+                attempt_revision(row),
+                0,
+                "",
+                attempt_order,
+                state_priority.get(row_state(row), -1),
+                evidence_count(row),
+            )
+
+        attempts.sort(
+            key=attempt_sort_key,
+            reverse=True,
+        )
+        authoritative = dict(attempts[0])
+        authoritative.pop("_ledger_attempt_order", None)
+        for key, limit in (
+            ("hot_evidence", 32),
+            ("cold_evidence", 24),
+            ("document_refs", 24),
+            ("document_refs_seen", 24),
+            ("route_events", 48),
+            ("visited_node_ids", 96),
+            ("traversed_edges", 48),
+        ):
+            authoritative[key] = dedupe_rows(
+                [item for row in attempts for item in _ledger_list(row.get(key))],
+                limit=limit,
+            )
+        authoritative = refresh_structural_state_from_merged_evidence(
+            authoritative,
+            attempts,
+        )
+        authoritative["attempt_count"] = len(attempts)
+        authoritative["attempts"] = [
+            {
+                "branch_id": row.get("branch_id"),
+                "path_id": row.get("path_id"),
+                "coverage_state": row.get("coverage_state"),
+                "branch_state": row_state(row),
+                "coverage_reason": row.get("coverage_reason"),
+                "hot_evidence_count": len(_ledger_list(row.get("hot_evidence"))),
+                "cold_evidence_count": len(_ledger_list(row.get("cold_evidence"))),
+                "document_ref_count": len(_ledger_list(row.get("document_refs"))),
+                "route_event_count": len(_ledger_list(row.get("route_events"))),
+            }
+            for row in attempts
+        ]
+        consolidated.append(authoritative)
+
+    state_counts: dict[str, int] = {}
+    branch_state_counts: dict[str, int] = {}
+    for row in consolidated:
+        coverage = str(row.get("coverage_state") or "unknown")
+        state_counts[coverage] = state_counts.get(coverage, 0) + 1
+        state = row_state(row)
+        branch_state_counts[state] = branch_state_counts.get(state, 0) + 1
+
+    payload["rows"] = consolidated
+    payload["row_count"] = len(consolidated)
+    payload["attempt_row_count"] = len(raw_rows)
+    payload["coverage_state_counts"] = state_counts
+    payload["resolved_count"] = state_counts.get("resolved", 0)
+    payload["partial_count"] = state_counts.get("partially_resolved", 0)
+    payload["near_miss_count"] = state_counts.get("near_miss", 0)
+    payload["missed_count"] = state_counts.get("missed", 0)
+    payload["hot_evidence_count"] = sum(len(_ledger_list(row.get("hot_evidence"))) for row in consolidated)
+    payload["cold_evidence_count"] = sum(len(_ledger_list(row.get("cold_evidence"))) for row in consolidated)
+    payload["route_event_count"] = sum(len(_ledger_list(row.get("route_events"))) for row in consolidated)
+    payload["document_ref_count"] = len(
+        {
+            str(ref.get("document_id") or ref.get("title") or ref.get("anchor_node_id") or "")
+            for row in consolidated
+            for ref in _ledger_list(row.get("document_refs"))
+            if isinstance(ref, dict) and str(ref.get("document_id") or ref.get("title") or ref.get("anchor_node_id") or "").strip()
+        }
+    )
+    summary = _ledger_dict(payload.get("branch_judgement_summary"))
+    if summary:
+        summary["row_count"] = len(consolidated)
+        summary["attempt_row_count"] = len(raw_rows)
+        summary["state_counts"] = branch_state_counts
+        summary["resolved_count"] = branch_state_counts.get("resolved", 0)
+        summary["useful_partial_count"] = branch_state_counts.get("useful_partial", 0)
+        summary["needs_document_count"] = branch_state_counts.get("needs_document", 0)
+        summary["needs_radius_widen_count"] = branch_state_counts.get("needs_radius_widen", 0)
+        summary["wrong_region_count"] = branch_state_counts.get("wrong_region", 0)
+        payload["branch_judgement_summary"] = summary
+        payload["branch_judge_state_counts"] = branch_state_counts
+    return payload
 
 
 def build_mission_evidence_ledger(
@@ -20163,6 +29129,7 @@ def build_mission_evidence_ledger(
     retrieval_mode: str = "balanced",
     revision_context: dict[str, Any] | None = None,
     allow_ai_branch_controller: bool = False,
+    semantic_certification_owner: str = "branch_controller",
 ) -> dict[str, Any]:
     contract = dict(path_mission_contract or {})
     missions = [dict(item) for item in list(contract.get("path_missions") or []) if isinstance(item, dict)]
@@ -20176,6 +29143,14 @@ def build_mission_evidence_ledger(
         for mission in missions
         if str(mission.get("path_id") or "").strip()
     }
+    mission_by_strand_id: dict[str, dict[str, Any]] = {}
+    for mission in missions:
+        strand_id = str(mission.get("strand_id") or "").strip()
+        if not strand_id:
+            continue
+        existing = mission_by_strand_id.get(strand_id)
+        if existing is None or str(mission.get("path_id") or "").startswith("semantic::"):
+            mission_by_strand_id[strand_id] = dict(mission)
     global_document_refs = _ledger_document_refs(document_refs or [], document_workspace or {}, limit=24)
     document_evidence_lane = _ledger_dict((document_workspace or {}).get("document_evidence_lane"))
     semantic_runtime = dict(semantic_contract_runtime or {})
@@ -20192,12 +29167,39 @@ def build_mission_evidence_ledger(
         matches=matches or [],
         path_corridors=path_corridors,
     )
+    semantic_authority_v2 = _record_uses_semantic_authority_v2(semantic_runtime)
+    path_corridor_branch_inputs = _ledger_path_corridor_branches(path_corridors)
+    technical_path_corridor_ids: list[str] = []
+    if semantic_authority_v2:
+        # Path corridors are execution/trace records, not additional semantic
+        # missions.  Only a corridor explicitly bound to a MissionPlanV2 path
+        # may contribute a ledger attempt for that mission.  Runtime-inferred
+        # P1/P2/... corridors remain available in ``path_corridors`` for Trace,
+        # but must never become Master completion obligations of their own.
+        bound_corridors: list[dict[str, Any]] = []
+        for corridor_branch in path_corridor_branch_inputs:
+            explicit_mission_id = _branch_path_mission_id(
+                corridor_branch,
+                mission_by_path_id=mission_by_path_id,
+            )
+            if explicit_mission_id and explicit_mission_id in mission_by_id:
+                bound_corridors.append(corridor_branch)
+                continue
+            technical_path_corridor_ids.append(
+                str(
+                    corridor_branch.get("ai_spatial_path_id")
+                    or corridor_branch.get("path_id")
+                    or corridor_branch.get("branch_id")
+                    or ""
+                ).strip()
+            )
+        path_corridor_branch_inputs = bound_corridors
     branch_inputs = [
         dict(item)
         for item in list(branches or [])
         if isinstance(item, dict)
     ]
-    branch_inputs.extend(_ledger_path_corridor_branches(path_corridors))
+    branch_inputs.extend(path_corridor_branch_inputs)
     for branch_index, raw_branch in enumerate(branch_inputs, start=1):
         if not isinstance(raw_branch, dict):
             continue
@@ -20207,11 +29209,17 @@ def build_mission_evidence_ledger(
             branch_index=branch_index,
             mission_by_id=mission_by_id,
             mission_by_path_id=mission_by_path_id,
+            mission_by_strand_id=mission_by_strand_id,
             missions=missions,
         )
         seen_missions.add(mission_id)
         route_trace = [_ledger_dict(item) for item in _ledger_list(branch.get("route_trace")) if _ledger_dict(item)]
-        hot_node_ids = _ledger_id_list(branch.get("evidence_node_ids"), limit=32)
+        hot_node_ids = _ledger_select_bounded_branch_evidence_ids(
+            branch.get("evidence_node_ids"),
+            entries=runtime_evidence_entries,
+            branch=branch,
+            limit=32,
+        )
         cold_node_ids = _ledger_id_list(
             branch.get("reservoir_only_node_ids"),
             branch.get("cold_node_ids"),
@@ -20249,11 +29257,76 @@ def build_mission_evidence_ledger(
             limit=12,
         )
         expected_shape = _ledger_dict(mission.get("expected_evidence_shape"))
+        row_bound_named_targets = _merge_server_bound_named_targets(
+            mission.get("server_bound_named_targets"),
+            expected_shape.get("server_bound_named_targets"),
+            branch.get("server_bound_named_targets"),
+            branch.get("required_named_concept_spans"),
+        )
         if not row_document_refs and bool(expected_shape.get("document_requested")):
             row_document_refs = global_document_refs[:8]
         route_events = _ledger_route_events(route_trace, limit=18)
         traversed_edges = _ledger_traversed_edges(branch, route_trace, limit=24)
         hot_evidence_rows = _ledger_evidence_rows_from_node_ids(hot_node_ids, source="branch.evidence_node_ids")
+        runtime_entry_by_node_id = {
+            str(entry.get("node_id") or "").strip(): dict(entry)
+            for entry in runtime_evidence_entries
+            if str(entry.get("node_id") or "").strip()
+        }
+        hot_evidence_rows = [
+            {
+                **_ledger_compact_evidence_row(
+                    runtime_entry_by_node_id.get(
+                        str(row.get("node_id") or "").strip(),
+                        {},
+                    ),
+                    source="runtime_evidence_binding",
+                    default_promotion_state="hot",
+                ),
+                **row,
+            }
+            for row in hot_evidence_rows
+        ]
+        for packet in list(branch.get("document_packets") or []):
+            if not isinstance(packet, dict):
+                continue
+            packet_provenance = {
+                "source_label": packet.get("source_label"),
+                "source_type": packet.get("source_type"),
+                "source_uri": packet.get("source_uri"),
+                "content_digest": packet.get("content_digest") or packet.get("digest"),
+            }
+            raw_entries = []
+            anchor_text = str(packet.get("anchor_raw_text") or "").strip()
+            if anchor_text:
+                raw_entries.append(
+                    {
+                        "node_id": str(packet.get("anchor_node_id") or ""),
+                        "text": anchor_text,
+                    }
+                )
+            raw_entries.extend(
+                {
+                    "node_id": str(chunk.get("node_id") or ""),
+                    "text": str(chunk.get("raw_text") or chunk.get("evidence_snippet") or "").strip(),
+                }
+                for chunk in list(packet.get("ordered_chunk_sequence") or [])[:3]
+                if isinstance(chunk, dict)
+                and str(chunk.get("raw_text") or chunk.get("evidence_snippet") or "").strip()
+            )
+            for raw_entry in raw_entries[:3]:
+                hot_evidence_rows.append(
+                    {
+                        "node_id": raw_entry["node_id"],
+                        "source": "hydrated_document_packet",
+                        "text": raw_entry["text"],
+                        "provenance": {
+                            key: value
+                            for key, value in packet_provenance.items()
+                            if value not in (None, "")
+                        },
+                    }
+                )
         if not hot_evidence_rows:
             hot_evidence_rows = _ledger_select_support_evidence(
                 mission=mission,
@@ -20281,6 +29354,18 @@ def build_mission_evidence_ledger(
             for row in cold_evidence_rows:
                 row["cold_answer_signal"] = True
             cold_node_ids = _ledger_id_list([row.get("node_id") for row in cold_evidence_rows], limit=32)
+        # Reviewed memory nodes retain their real source document identity.
+        # Project those existing refs into the ledger without hydrating or
+        # inventing a document surface after the Master.
+        row_document_refs = _ledger_document_refs(
+            row_document_refs,
+            [
+                row
+                for row in hot_evidence_rows
+                if str(row.get("document_id") or "").strip()
+            ],
+            limit=12,
+        )
         duplicate_evidence_rows = _ledger_evidence_rows_from_node_ids(duplicate_node_ids, source="duplicate_or_warm_material")
         if not duplicate_evidence_rows:
             duplicate_evidence_rows = _ledger_select_support_evidence(
@@ -20323,10 +29408,22 @@ def build_mission_evidence_ledger(
             "schema_version": MISSION_LEDGER_ROW_SCHEMA_VERSION,
             "mission_id": mission_id,
             "path_id": str(mission.get("path_id") or branch.get("ai_spatial_path_id") or "").strip() or None,
+            "strand_id": str(mission.get("strand_id") or branch.get("strand_id") or branch.get("ai_spatial_strand_id") or "").strip() or None,
             "branch_id": str(branch.get("branch_id") or "").strip() or None,
             "started_at": str(branch.get("started_at") or branch.get("created_at") or "").strip() or None,
             "completed_at": str(branch.get("completed_at") or ledger_completed_at).strip(),
             "stage_timings": _ledger_dict(branch.get("stage_timings") or branch.get("runtime_stage_timing")),
+            "root_query_text": _mission_text(
+                mission.get("root_query_text") or branch.get("root_query_text") or query_text,
+                limit=500,
+            ),
+            "server_bound_named_targets": row_bound_named_targets,
+            "required_named_concept_spans": row_bound_named_targets,
+            "routing_intent": _mission_text(
+                mission.get("routing_intent") or branch.get("routing_intent") or "",
+                limit=360,
+            )
+            or None,
             "goal": _mission_text(mission.get("goal") or branch.get("goal") or "", limit=240),
             "answer_hypothesis": _mission_text(mission.get("answer_hypothesis") or branch.get("answer_hypothesis") or "", limit=520) or None,
             "expected_evidence_shape": expected_shape,
@@ -20381,12 +29478,21 @@ def build_mission_evidence_ledger(
         if not mission_id or mission_id in seen_missions:
             continue
         expected_shape = _ledger_dict(mission.get("expected_evidence_shape"))
+        row_bound_named_targets = _merge_server_bound_named_targets(
+            mission.get("server_bound_named_targets"),
+            expected_shape.get("server_bound_named_targets"),
+        )
         row = {
             "schema_version": MISSION_LEDGER_ROW_SCHEMA_VERSION,
             "mission_id": mission_id,
             "path_id": str(mission.get("path_id") or "").strip() or None,
+            "strand_id": str(mission.get("strand_id") or "").strip() or None,
             "completed_at": ledger_completed_at,
             "stage_timings": {},
+            "root_query_text": _mission_text(mission.get("root_query_text") or query_text, limit=500),
+            "server_bound_named_targets": row_bound_named_targets,
+            "required_named_concept_spans": row_bound_named_targets,
+            "routing_intent": _mission_text(mission.get("routing_intent") or "", limit=360) or None,
             "goal": _mission_text(mission.get("goal") or "", limit=240),
             "answer_hypothesis": _mission_text(mission.get("answer_hypothesis") or "", limit=520) or None,
             "expected_evidence_shape": expected_shape,
@@ -20536,6 +29642,15 @@ def build_mission_evidence_ledger(
         },
         "document_evidence_row_count": len([row for row in rows if bool(row.get("document_evidence_row"))]),
         "route_event_count": sum(len(list(row.get("route_events") or [])) for row in rows),
+        "technical_trace_contract": {
+            "path_corridors_remain_trace_visible": True,
+            "path_corridors_are_semantic_obligations": not semantic_authority_v2,
+            "excluded_unbound_path_corridor_count": len(technical_path_corridor_ids),
+            "excluded_unbound_path_corridor_ids": _dedupe_limited(
+                technical_path_corridor_ids,
+                limit=24,
+            ),
+        },
         "route_runtime": dict(route_runtime or {}),
         "renderer_contract": {
             "package_builder_should_use_ledger_only": True,
@@ -20545,15 +29660,242 @@ def build_mission_evidence_ledger(
         },
         "master_inputs_ready": bool(rows),
         "blockers": _dedupe_limited(blockers, limit=12),
-        "rows": rows[:24],
+        "rows": rows,
     }
+    consolidated_ledger = _consolidate_mission_ledger_attempts(ledger_payload)
     return apply_branch_autojudge_to_mission_ledger(
-        ledger_payload,
+        consolidated_ledger,
         query_text=query_text,
         retrieval_mode=retrieval_mode,
         revision_context=revision_context,
         allow_ai_branch_controller=allow_ai_branch_controller,
+        semantic_certification_owner=semantic_certification_owner,
     )
+
+
+def _build_public_search_mission_path_projection(
+    *,
+    path_mission_contract: dict[str, Any] | None,
+    mission_evidence_ledger: dict[str, Any] | None,
+    branches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Separate canonical semantic missions from physical route executions.
+
+    ``path_mission_contract`` is the immutable planning surface and can contain
+    both AI inverse paths and temporary semantic obligations.  The final ledger
+    is the canonical semantic surface judged by Master.  Branches, meanwhile,
+    are physical execution records and can contain multiple snapshots for the
+    same worker.  Mixing those three identities made the public mission count
+    disagree with the ledger and made Trace look as if synthetic obligations
+    were additional executed paths.
+    """
+
+    contract = dict(path_mission_contract or {})
+    planned_missions = [
+        dict(item)
+        for item in list(contract.get("path_missions") or [])
+        if isinstance(item, dict)
+    ]
+    planned_by_mission_id = {
+        str(item.get("mission_id") or "").strip(): dict(item)
+        for item in planned_missions
+        if str(item.get("mission_id") or "").strip()
+    }
+    planned_by_path_id = {
+        str(item.get("path_id") or "").strip(): dict(item)
+        for item in planned_missions
+        if str(item.get("path_id") or "").strip()
+    }
+    ledger_rows = [
+        dict(item)
+        for item in list(dict(mission_evidence_ledger or {}).get("rows") or [])
+        if isinstance(item, dict)
+    ]
+
+    canonical_missions: list[dict[str, Any]] = []
+    canonical_by_branch_id: dict[str, str] = {}
+    canonical_ids_by_route_key: dict[str, set[str]] = {}
+    for index, row in enumerate(ledger_rows, start=1):
+        mission_id = str(row.get("mission_id") or "").strip()
+        path_id = str(row.get("path_id") or "").strip()
+        if not mission_id:
+            mission_id = _path_mission_id(
+                {"path_id": path_id or f"ledger_row_{index}"},
+                index=index,
+            )
+        planned = dict(
+            planned_by_mission_id.get(mission_id)
+            or planned_by_path_id.get(path_id)
+            or {}
+        )
+        attempts = [
+            dict(item)
+            for item in list(row.get("attempts") or [])
+            if isinstance(item, dict)
+        ]
+        attempt_branch_ids = _dedupe_limited(
+            [
+                str(item.get("branch_id") or "").strip()
+                for item in attempts
+                if str(item.get("branch_id") or "").strip()
+            ]
+            + ([str(row.get("branch_id") or "").strip()] if str(row.get("branch_id") or "").strip() else []),
+            limit=48,
+        )
+        coverage_state = str(row.get("coverage_state") or "unknown").strip() or "unknown"
+        public_mission = {
+            **planned,
+            "mission_id": mission_id,
+            "path_id": path_id or str(planned.get("path_id") or "").strip() or None,
+            "strand_id": row.get("strand_id") or planned.get("strand_id"),
+            "goal": row.get("goal") or planned.get("goal"),
+            "required": bool(row.get("required", planned.get("required", True))),
+            "execution_state": "executed" if attempt_branch_ids else str(planned.get("execution_state") or "not_executed"),
+            "coverage_state": coverage_state,
+            "coverage_reason": row.get("coverage_reason") or row.get("missing_reason"),
+            "attempt_count": int(row.get("attempt_count") or len(attempts) or len(attempt_branch_ids)),
+            "attempt_branch_ids": attempt_branch_ids,
+            "ledger_row_index": index - 1,
+            "ledger_projection": True,
+        }
+        canonical_missions.append(
+            {key: value for key, value in public_mission.items() if value not in (None, [], {})}
+        )
+        for branch_id in attempt_branch_ids:
+            canonical_by_branch_id[branch_id] = mission_id
+        for route_key in (
+            path_id,
+            str(row.get("strand_id") or "").strip(),
+        ):
+            if route_key:
+                canonical_ids_by_route_key.setdefault(route_key, set()).add(mission_id)
+
+    planning_by_route_key: dict[str, set[str]] = {}
+    for mission in planned_missions:
+        planned_id = str(mission.get("mission_id") or "").strip()
+        if not planned_id:
+            continue
+        for route_key in (
+            str(mission.get("path_id") or "").strip(),
+            str(mission.get("strand_id") or "").strip(),
+        ):
+            if route_key:
+                planning_by_route_key.setdefault(route_key, set()).add(planned_id)
+
+    canonical_path_by_mission_id = {
+        str(item.get("mission_id") or "").strip(): str(
+            item.get("path_id") or ""
+        ).strip()
+        for item in canonical_missions
+        if str(item.get("mission_id") or "").strip()
+        and str(item.get("path_id") or "").strip()
+    }
+
+    physical_by_execution_id: dict[str, dict[str, Any]] = {}
+    physical_order: list[str] = []
+    for snapshot_index, raw_branch in enumerate(list(branches or [])):
+        if not isinstance(raw_branch, dict):
+            continue
+        branch = dict(raw_branch)
+        execution_id = str(
+            branch.get("branch_id")
+            or branch.get("worker_id")
+            or branch.get("family_branch_id")
+            or ""
+        ).strip()
+        if not execution_id:
+            continue
+        route_keys = _dedupe_limited(
+            [
+                str(branch.get("path_id") or "").strip(),
+                str(branch.get("ai_spatial_path_id") or "").strip(),
+                str(branch.get("strand_id") or "").strip(),
+            ],
+            limit=3,
+        )
+        canonical_mission_id = canonical_by_branch_id.get(execution_id)
+        if not canonical_mission_id:
+            exact_canonical_ids = {
+                candidate_id
+                for route_key in route_keys
+                for candidate_id in canonical_ids_by_route_key.get(route_key, set())
+            }
+            if len(exact_canonical_ids) == 1:
+                canonical_mission_id = next(iter(exact_canonical_ids))
+        exact_planning_ids = {
+            candidate_id
+            for route_key in route_keys
+            for candidate_id in planning_by_route_key.get(route_key, set())
+        }
+        planning_candidate_mission_id = (
+            next(iter(exact_planning_ids)) if len(exact_planning_ids) == 1 else None
+        )
+        runtime_physical_path_id = str(
+            branch.get("ai_spatial_path_id")
+            or branch.get("path_id")
+            or branch.get("strand_id")
+            or ""
+        ).strip()
+        canonical_path_id = str(
+            canonical_path_by_mission_id.get(canonical_mission_id or "") or ""
+        ).strip()
+        path_aliases = _dedupe_limited(
+            [runtime_physical_path_id, canonical_path_id],
+            limit=2,
+        )
+        previous = dict(physical_by_execution_id.get(execution_id) or {})
+        summary = {
+            "schema_version": "agvm.physical_path_execution.v1",
+            "execution_id": execution_id,
+            "branch_id": str(branch.get("branch_id") or execution_id),
+            "worker_id": branch.get("worker_id"),
+            "worker_kind": branch.get("worker_kind"),
+            "planner_family": branch.get("planner_family"),
+            "strand_id": branch.get("strand_id"),
+            "physical_path_id": runtime_physical_path_id or None,
+            "canonical_path_id": canonical_path_id or None,
+            "path_aliases": path_aliases,
+            "path_alias_binding": (
+                "runtime_execution_to_canonical_plan"
+                if runtime_physical_path_id
+                and canonical_path_id
+                and runtime_physical_path_id != canonical_path_id
+                else "exact"
+            ),
+            "canonical_mission_id": canonical_mission_id,
+            "planning_candidate_mission_id": planning_candidate_mission_id,
+            "goal": branch.get("goal"),
+            "status": branch.get("status") or branch.get("lifecycle_stage"),
+            "stop_reason": branch.get("stop_reason"),
+            "route_state": branch.get("route_state"),
+            "route_event_count": len([item for item in list(branch.get("route_trace") or []) if isinstance(item, dict)]),
+            "visited_node_count": len(_ledger_id_list(branch.get("visited_node_ids"), limit=100000)),
+            "hydrated_node_count": len(_ledger_id_list(branch.get("hydrated_node_ids"), limit=100000)),
+            "evidence_node_count": len(_ledger_id_list(branch.get("evidence_node_ids"), limit=100000)),
+            "destination_count": len([item for item in list(branch.get("destination_queue") or []) if isinstance(item, dict)]),
+            "first_snapshot_index": int(previous.get("first_snapshot_index", snapshot_index)),
+            "last_snapshot_index": snapshot_index,
+            "snapshot_count": int(previous.get("snapshot_count") or 0) + 1,
+            "trace_ref": {"surface": "branches", "branch_id": str(branch.get("branch_id") or execution_id)},
+        }
+        physical_by_execution_id[execution_id] = {
+            key: value for key, value in summary.items() if value not in (None, [], {})
+        }
+        if execution_id not in physical_order:
+            physical_order.append(execution_id)
+
+    physical_executions = [physical_by_execution_id[item] for item in physical_order]
+    return {
+        "schema_version": "agvm.public_search_mission_path_projection.v1",
+        "path_missions": canonical_missions,
+        "physical_path_executions": physical_executions,
+        "metrics": {
+            "canonical_mission_count": len(canonical_missions),
+            "planning_candidate_count": len(planned_missions),
+            "physical_path_execution_count": len(physical_executions),
+            "physical_branch_snapshot_count": len([item for item in list(branches or []) if isinstance(item, dict)]),
+        },
+    }
 
 
 def _mission_learning_int(value: Any) -> int:
@@ -21223,6 +30565,29 @@ def _create_branch_from_probe(query: RetrieveRequest, probe: dict[str, Any]) -> 
     branch = {
         "branch_id": branch_id,
         "strand_id": str(probe.get("strand_id") or "").strip() or None,
+        "mission_id": str(probe.get("mission_id") or probe.get("strand_id") or "").strip() or None,
+        "root_query_text": str(probe.get("root_query_text") or query.query_text or "").strip() or None,
+        "semantic_goal": str(probe.get("semantic_goal") or probe.get("goal") or "").strip() or None,
+        "routing_hint_goal": str(probe.get("routing_hint_goal") or probe.get("goal_taxonomy") or "").strip() or None,
+        "routing_intent": str(probe.get("routing_intent") or "").strip() or None,
+        "goal_taxonomy": str(probe.get("goal_taxonomy") or "").strip() or None,
+        "semantic_authority": str(probe.get("semantic_authority") or "legacy_compatible").strip(),
+        "semantic_authority_v2": bool(probe.get("semantic_authority_v2")),
+        "why_required": str(probe.get("why_required") or "").strip() or None,
+        "required_entities": list(probe.get("required_entities") or []),
+        "server_bound_named_targets": _merge_server_bound_named_targets(
+            probe.get("server_bound_named_targets"),
+            probe.get("required_named_concept_spans"),
+            _server_bound_named_target_spans(query.query_text),
+        ),
+        "required_named_concept_spans": _merge_server_bound_named_targets(
+            probe.get("server_bound_named_targets"),
+            probe.get("required_named_concept_spans"),
+            _server_bound_named_target_spans(query.query_text),
+        ),
+        "expected_evidence": list(probe.get("expected_evidence") or []),
+        "mission_success_criteria": list(probe.get("success_criteria") or []),
+        "mission_metadata": dict(probe.get("mission_metadata") or {}) if isinstance(probe.get("mission_metadata") or {}, Mapping) else {},
         "merge_outcome": probe.get("merge_outcome"),
         "dual_origin": bool(probe.get("dual_origin")),
         "origin_families": origin_families,
@@ -21282,6 +30647,27 @@ def _create_branch_from_probe(query: RetrieveRequest, probe: dict[str, Any]) -> 
         "current_node_id": None,
         "destination_queue": destination_queue,
         "execution_destination_queue": execution_destination_queue,
+        "plan_first_primary_destinations": [
+            dict(item)
+            for item in list(probe.get("plan_first_primary_destinations") or destination_queue)
+            if isinstance(item, dict)
+        ],
+        "plan_first_conditional_extension_destinations": [
+            dict(item)
+            for item in list(
+                probe.get("plan_first_conditional_extension_destinations") or []
+            )[:1]
+            if isinstance(item, dict)
+        ],
+        "plan_first_reserve_destinations": [
+            dict(item)
+            for item in list(probe.get("plan_first_reserve_destinations") or [])[:1]
+            if isinstance(item, dict)
+        ],
+        "plan_first_execution": dict(probe.get("plan_first_execution") or {}),
+        "plan_first_phase": "primary",
+        "plan_first_conditional_extension_activated": False,
+        "plan_first_reserve_activated": False,
         "destination_execution_index": 0,
         "destination_reorder_reason": None,
         "destination_reorder_history": [],
@@ -21310,6 +30696,22 @@ def _create_branch_from_probe(query: RetrieveRequest, probe: dict[str, Any]) -> 
         "link_traversed_count": 0,
         "local_traversed_count": 0,
         "considered_highway_count": 0,
+        "sphere_scan_attempt_count": 0,
+        "sphere_scan_yield_count": 0,
+        "sphere_scan_node_ids": [],
+        "path_tube_scan_attempt_count": 0,
+        "path_tube_scan_yield_count": 0,
+        "path_tube_scan_node_ids": [],
+        "local_link_walk_attempt_count": 0,
+        "local_link_walk_yield_count": 0,
+        "local_link_walk_node_ids": [],
+        "highway_jump_attempt_count": 0,
+        "highway_jump_yield_count": 0,
+        "highway_jump_node_ids": [],
+        "evidence_edge_follow_attempt_count": 0,
+        "evidence_edge_follow_yield_count": 0,
+        "evidence_edge_follow_node_ids": [],
+        "route_commitments": _route_commitment_rows_from_counts(_route_primitive_counts_seed()),
         "studied_node_count": 0,
         "hydrated_node_count": 0,
         "route_richness_score": 0.0,
@@ -21360,6 +30762,469 @@ def _create_branch_from_probe(query: RetrieveRequest, probe: dict[str, Any]) -> 
             execution_index=0,
         )
     return branch
+
+
+def _plan_first_reserve_activation_state(
+    branch: Mapping[str, Any],
+    reserve: Mapping[str, Any],
+    *,
+    mission_evidence_row: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate only server-observable reserve predicates.
+
+    This deliberately does not infer meaning from query text, destination
+    labels or evidence prose. Semantic sufficiency remains the final Master's
+    job; this gate only decides whether the pre-authored fallback stop runs.
+    """
+
+    branch_payload = dict(branch or {})
+    reserve_payload = dict(reserve or {})
+    branch_mission_id = str(
+        branch_payload.get("mission_id")
+        or branch_payload.get("path_mission_id")
+        or ""
+    ).strip()
+    target_mission_id = str(
+        reserve_payload.get("activates_for_mission_id") or ""
+    ).strip()
+    predicate = str(reserve_payload.get("activation_predicate") or "").strip().lower()
+    max_execution_stops = int(reserve_payload.get("max_execution_stops") or 0)
+    mission_bound = bool(
+        branch_mission_id
+        and target_mission_id
+        and branch_mission_id == target_mission_id
+    )
+    bounded = max_execution_stops == 1
+
+    evidence_row = dict(mission_evidence_row or {})
+    evidence_row_mission_id = str(evidence_row.get("mission_id") or "").strip()
+    exact_evidence_row = bool(
+        branch_mission_id
+        and evidence_row_mission_id
+        and branch_mission_id == evidence_row_mission_id
+    )
+    mission_structurally_unresolved = True
+    if exact_evidence_row:
+        mission_structurally_unresolved = bool(
+            _plan_first_structurally_unresolved_required_mission_rows(
+                {"rows": [evidence_row]}
+            )
+        )
+    certified_hot_evidence_count = (
+        len(
+            [
+                item
+                for item in list(evidence_row.get("hot_evidence") or [])
+                if isinstance(item, Mapping)
+                and str(item.get("node_id") or item.get("document_id") or "").strip()
+            ]
+        )
+        if exact_evidence_row
+        else 0
+    )
+    document_refs = [
+        dict(item)
+        for item in list(
+            (
+                evidence_row.get("document_refs")
+                if exact_evidence_row
+                else branch_payload.get("document_refs")
+            )
+            or []
+        )
+        if isinstance(item, Mapping)
+    ]
+    document_packets = [
+        dict(item)
+        for item in list(
+            branch_payload.get("document_packets")
+            or dict(branch_payload.get("document_workspace") or {}).get("document_packets")
+            or []
+        )
+        if isinstance(item, Mapping)
+    ]
+    resolution_states = {
+        str(dict(item or {}).get("state") or "").strip().lower()
+        for item in dict(branch_payload.get("destination_resolution") or {}).values()
+        if isinstance(item, Mapping)
+    }
+    wrong_region = bool(
+        "wrong_region" in resolution_states
+        or str(branch_payload.get("route_state") or "").strip().lower()
+        == "wrong_region"
+        or bool(branch_payload.get("wrong_region_signal"))
+    )
+    materialized_document_ref_count = len(
+        [
+            item
+            for item in document_refs
+            if str(
+                item.get("document_id")
+                or item.get("anchor_node_id")
+                or item.get("node_id")
+                or item.get("source_ref")
+                or ""
+            ).strip()
+            or bool(item.get("chunk_node_ids") or item.get("ordered_chunk_sequence"))
+        ]
+    )
+    no_certified_material = bool(
+        certified_hot_evidence_count == 0
+        and materialized_document_ref_count == 0
+    )
+    predicate_satisfied = bool(
+        (predicate == "no_evidence" and no_certified_material)
+        or (
+            predicate == "wrong_region"
+            and mission_structurally_unresolved
+            and wrong_region
+        )
+        or (
+            predicate == "document_reference_not_materialized"
+            and mission_structurally_unresolved
+            and bool(document_refs)
+            and not document_packets
+        )
+    )
+    return {
+        "eligible": bool(mission_bound and bounded and predicate_satisfied),
+        "mission_bound": mission_bound,
+        "bounded": bounded,
+        "predicate": predicate or None,
+        "predicate_satisfied": predicate_satisfied,
+        "mission_evidence_row_exact": exact_evidence_row,
+        "mission_structurally_unresolved": mission_structurally_unresolved,
+        "certified_hot_evidence_count": certified_hot_evidence_count,
+        "materialized_document_ref_count": materialized_document_ref_count,
+        "evidence_authority": "mission_evidence_ledger" if exact_evidence_row else "unresolved_without_exact_ledger_row",
+        "activates_for_mission_id": target_mission_id or None,
+        "reason": (
+            "eligible"
+            if mission_bound and bounded and predicate_satisfied
+            else "mission_binding_mismatch"
+            if not mission_bound
+            else "reserve_not_one_shot"
+            if not bounded
+            else "activation_predicate_not_satisfied"
+        ),
+    }
+
+
+def _mark_plan_first_reserve_complete(branch: Mapping[str, Any]) -> dict[str, Any]:
+    """Close a reserve without ever permitting a second execution stop."""
+
+    updated = dict(branch or {})
+    updated["plan_first_reserve_completed"] = True
+    updated["plan_first_reserve_execution_count"] = 1
+    updated["active_destination"] = {}
+    return updated
+
+
+def _activate_plan_first_conditional_extension_wave(
+    branches: list[dict[str, Any]],
+    mission_evidence_ledger: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Activate one machine-predicated provider extension after primaries."""
+
+    activated: list[str] = []
+    rows = {
+        str(item.get("mission_id") or "").strip(): dict(item)
+        for item in list(dict(mission_evidence_ledger or {}).get("rows") or [])
+        if isinstance(item, Mapping) and str(item.get("mission_id") or "").strip()
+    }
+    for branch in branches:
+        if bool(branch.get("plan_first_conditional_extension_activated")):
+            continue
+        extensions = [
+            dict(item)
+            for item in list(
+                branch.get("plan_first_conditional_extension_destinations") or []
+            )[:1]
+            if isinstance(item, Mapping)
+        ]
+        if not extensions:
+            continue
+        extension = extensions[0]
+        mission_id = str(
+            branch.get("mission_id") or branch.get("path_mission_id") or ""
+        ).strip()
+        row = dict(rows.get(mission_id) or {})
+        predicate = str(extension.get("activation_predicate") or "").strip().lower()
+        if predicate == "mission_unresolved":
+            mission_bound = bool(
+                mission_id
+                and str(extension.get("activates_for_mission_id") or "").strip()
+                == mission_id
+            )
+            predicate_satisfied = bool(
+                _plan_first_structurally_unresolved_required_mission_rows(
+                    {"rows": [row]}
+                )
+            ) if row else True
+            activation = {
+                "eligible": bool(
+                    mission_bound
+                    and int(extension.get("max_execution_stops") or 0) == 1
+                    and predicate_satisfied
+                ),
+                "predicate": predicate,
+                "predicate_satisfied": predicate_satisfied,
+                "mission_bound": mission_bound,
+            }
+        else:
+            activation = _plan_first_reserve_activation_state(
+                branch,
+                extension,
+                mission_evidence_row=row,
+            )
+        branch["plan_first_conditional_extension_activation"] = dict(activation)
+        if not bool(activation.get("eligible")):
+            continue
+        branch["plan_first_conditional_extension_activated"] = True
+        branch["plan_first_conditional_extension_completed"] = False
+        branch["plan_first_phase"] = "conditional_extension"
+        branch["execution_destination_queue"] = extensions
+        branch["destination_execution_index"] = 0
+        branch["active_destination"] = dict(extension)
+        branch["status"] = "active"
+        branch["stop_reason"] = None
+        branch["route_state"] = "routing"
+        branch["lifecycle_stage"] = "routing"
+        branch["local_stop_recommendation"] = None
+        _set_destination_resolution_state(
+            branch,
+            extension,
+            state="active",
+            state_reason="plan_first_primary_barrier_released_conditional_extension",
+            round_index=int(branch.get("last_round_index") or 0),
+            execution_index=0,
+        )
+        activated.append(str(branch.get("branch_id") or ""))
+    return [item for item in activated if item]
+
+
+def _activate_plan_first_reserve_wave(
+    branches: list[dict[str, Any]],
+    mission_evidence_ledger: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Activate at most one AI-authored reserve stop per exhausted primary path.
+
+    Activation is deliberately structural and mission-bound. Semantic
+    sufficiency remains exclusively the final Master's decision.
+    """
+
+    activated: list[str] = []
+    evidence_rows_by_mission_id = {
+        str(item.get("mission_id") or "").strip(): dict(item)
+        for item in list(dict(mission_evidence_ledger or {}).get("rows") or [])
+        if isinstance(item, Mapping)
+        and str(item.get("mission_id") or "").strip()
+    }
+    for branch in branches:
+        if bool(branch.get("plan_first_reserve_activated")):
+            continue
+        reserve = [
+            dict(item)
+            for item in list(branch.get("plan_first_reserve_destinations") or [])[:1]
+            if isinstance(item, dict)
+        ]
+        if not reserve:
+            continue
+        branch_mission_id = str(
+            branch.get("mission_id") or branch.get("path_mission_id") or ""
+        ).strip()
+        activation = _plan_first_reserve_activation_state(
+            branch,
+            reserve[0],
+            mission_evidence_row=evidence_rows_by_mission_id.get(branch_mission_id),
+        )
+        branch["plan_first_reserve_activation"] = dict(activation)
+        if not bool(activation.get("eligible")):
+            continue
+        branch["plan_first_reserve_activated"] = True
+        branch["plan_first_reserve_eligible"] = True
+        branch["plan_first_reserve_completed"] = False
+        branch["plan_first_reserve_execution_count"] = 0
+        branch["plan_first_phase"] = "reserve"
+        branch["execution_destination_queue"] = reserve
+        branch["destination_execution_index"] = 0
+        branch["active_destination"] = dict(reserve[0])
+        branch["status"] = "active"
+        branch["stop_reason"] = None
+        branch["route_state"] = "routing"
+        branch["lifecycle_stage"] = "routing"
+        branch["local_stop_recommendation"] = None
+        _set_destination_resolution_state(
+            branch,
+            reserve[0],
+            state="active",
+            state_reason="plan_first_primary_barrier_released_reserve",
+            round_index=int(branch.get("last_round_index") or 0),
+            execution_index=0,
+        )
+        activated.append(str(branch.get("branch_id") or ""))
+    return [item for item in activated if item]
+
+
+def _plan_first_execution_plan_digest(probes: list[dict[str, Any]]) -> str:
+    """Digest only the immutable AI-authored execution plan."""
+
+    return search_mission_ledger_digest(
+        {
+            "schema_version": "agvm.search_plan_first.execution_plan.v1",
+            "missions": [
+                {
+                    "probe_id": str(probe.get("probe_id") or ""),
+                    "mission_id": str(
+                        probe.get("mission_id")
+                        or probe.get("path_mission_id")
+                        or ""
+                    ),
+                    "primary_destinations": [
+                        {
+                            "destination_id": str(item.get("destination_id") or ""),
+                            "region_ref": str(item.get("ai_spatial_region_ref") or item.get("guide_area") or ""),
+                            "coordinate": dict(item.get("ai_spatial_coordinate") or {}),
+                        }
+                        for item in list(probe.get("plan_first_primary_destinations") or [])
+                        if isinstance(item, Mapping)
+                    ],
+                    "conditional_extension_destinations": [
+                        {
+                            "destination_id": str(item.get("destination_id") or ""),
+                            "activates_for_mission_id": str(item.get("activates_for_mission_id") or ""),
+                            "activation_predicate": str(item.get("activation_predicate") or ""),
+                            "max_execution_stops": int(item.get("max_execution_stops") or 0),
+                        }
+                        for item in list(
+                            probe.get("plan_first_conditional_extension_destinations") or []
+                        )[:1]
+                        if isinstance(item, Mapping)
+                    ],
+                    "reserve_destinations": [
+                        {
+                            "destination_id": str(item.get("destination_id") or ""),
+                            "activates_for_mission_id": str(item.get("activates_for_mission_id") or ""),
+                            "activation_predicate": str(item.get("activation_predicate") or ""),
+                            "max_execution_stops": int(item.get("max_execution_stops") or 0),
+                        }
+                        for item in list(probe.get("plan_first_reserve_destinations") or [])[:1]
+                        if isinstance(item, Mapping)
+                    ],
+                }
+                for probe in probes
+                if isinstance(probe, Mapping)
+            ],
+        }
+    )
+
+
+def _ensure_plan_first_execution_plan_digest(
+    plan_first_runtime: dict[str, Any],
+    probes: list[dict[str, Any]],
+) -> str:
+    """Bind a plan-first runtime to its immutable plan before Master attestation."""
+
+    existing = str(plan_first_runtime.get("plan_digest") or "").strip()
+    if existing:
+        return existing
+    digest = _plan_first_execution_plan_digest(probes)
+    plan_first_runtime["plan_digest"] = digest
+    return digest
+
+
+def _plan_first_no_match_certification(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Fail-closed execution proof required before V3 may claim no-match."""
+
+    payload = dict(result or {})
+    planner_runtime = dict(payload.get("planner_runtime") or {})
+    runtime = dict(
+        payload.get("plan_first_runtime")
+        or planner_runtime.get("plan_first_runtime")
+        or {}
+    )
+    master = dict(
+        payload.get("master_judgement")
+        or dict(payload.get("context_package") or {}).get("master_judgement")
+        or {}
+    )
+    ledger = dict(
+        payload.get("mission_evidence_ledger")
+        or dict(payload.get("context_package") or {}).get("mission_evidence_ledger")
+        or {}
+    )
+    computed_plan_digest = _plan_first_execution_plan_digest(
+        [dict(item) for item in list(payload.get("probes") or []) if isinstance(item, Mapping)]
+    )
+    computed_ledger_digest = search_mission_ledger_digest(ledger)
+    runtime_plan_digest = str(runtime.get("plan_digest") or "").strip()
+    runtime_ledger_digest = str(runtime.get("ledger_digest") or "").strip()
+    runtime_surface_digest = str(runtime.get("frozen_surface_digest") or "").strip()
+    master_plan_digest = str(master.get("plan_first_plan_digest") or "").strip()
+    master_ledger_digest = str(master.get("mission_ledger_digest") or "").strip()
+    master_surface_digest = str(master.get("frozen_surface_digest") or "").strip()
+    eligible = {
+        str(item).strip()
+        for item in list(runtime.get("reserve_eligible_branch_ids") or [])
+        if str(item).strip()
+    }
+    completed = {
+        str(item).strip()
+        for item in list(runtime.get("reserve_completed_branch_ids") or [])
+        if str(item).strip()
+    }
+    attestation_valid = False
+    try:
+        validate_ai_execution_attestation(
+            dict(master.get("ai_execution_attestation") or {})
+        )
+        attestation_valid = True
+    except (AiModuleContractError, TypeError, ValueError):
+        attestation_valid = False
+    plan_digest_matches = bool(
+        computed_plan_digest
+        and runtime_plan_digest == computed_plan_digest
+        and master_plan_digest == computed_plan_digest
+    )
+    ledger_digest_matches = bool(
+        computed_ledger_digest
+        and runtime_ledger_digest == computed_ledger_digest
+        and master_ledger_digest == computed_ledger_digest
+    )
+    frozen_surface_digest_matches = bool(
+        runtime_surface_digest
+        and master_surface_digest == runtime_surface_digest
+    )
+    requirements = {
+        "plan_first_active": bool(
+            runtime.get("schema_version") == "agvm.search_plan_first.v3"
+            and runtime.get("enabled") is True
+        ),
+        "primary_barrier_reached": runtime.get("primary_barrier_reached") is True,
+        "eligible_reserves_completed": eligible.issubset(completed),
+        "single_final_master": bool(
+            int(runtime.get("final_master_attempt_count") or 0) == 1
+            and int(runtime.get("final_master_attested_count") or 0) == 1
+            and attestation_valid
+        ),
+        "plan_digest_matches": plan_digest_matches,
+        "ledger_digest_matches": ledger_digest_matches,
+        "frozen_surface_digest_matches": frozen_surface_digest_matches,
+    }
+    certified = all(requirements.values())
+    return {
+        "schema_version": "agvm.search_plan_first_no_match.v1",
+        "certified": certified,
+        "requirements": requirements,
+        "plan_digest": computed_plan_digest or None,
+        "ledger_digest": computed_ledger_digest or None,
+        "frozen_surface_digest": runtime_surface_digest or None,
+        "reserve_eligible_branch_ids": sorted(eligible),
+        "reserve_completed_branch_ids": sorted(completed),
+        "failure_reasons": [
+            key for key, passed in requirements.items() if not passed
+        ],
+    }
 
 
 def _merge_planner_probes(
@@ -21414,6 +31279,7 @@ def _merge_planner_probes(
             "blockers": [] if ai_mission_ids else ["ai_mission_missing"],
         },
     }
+    claimed_semantic_ai_probe_ids: set[str] = set()
     for ai_probe in list(new_probes or []):
         ai_family = _planner_family_for_probe(ai_probe)
         if ai_family != "ai":
@@ -21424,7 +31290,15 @@ def _merge_planner_probes(
             continue
         candidates: list[tuple[float, list[str], dict[str, float], dict[str, Any], str]] = []
         for heuristic_probe in merged:
-            if _planner_family_for_probe(heuristic_probe) != "heuristic":
+            existing_family = _planner_family_for_probe(heuristic_probe)
+            existing_probe_id = str(heuristic_probe.get("probe_id") or "").strip()
+            existing_semantic_ai = bool(
+                existing_family == "ai"
+                and _record_uses_semantic_authority_v2(heuristic_probe)
+            )
+            if existing_family != "heuristic" and not existing_semantic_ai:
+                continue
+            if existing_semantic_ai and existing_probe_id in claimed_semantic_ai_probe_ids:
                 continue
             basis = _probe_merge_basis(ai_probe, heuristic_probe)
             if not basis:
@@ -21443,18 +31317,6 @@ def _merge_planner_probes(
             candidates.append((merge_score, merge_reasons, components, heuristic_probe, basis))
         best_candidate = max(candidates, key=lambda item: item[0], default=None)
         if best_candidate is None or best_candidate[0] < 0.55:
-            if len(merged) >= int(query.max_total_branches):
-                merge_summary["dropped_ai_mission_count"] += 1
-                merge_summary["learning_signals"].append(
-                    _mission_merge_learning_signal(
-                        ai_probe=ai_probe,
-                        outcome="dropped_ai_mission",
-                        reason="branch_capacity_exhausted_after_reserved_slots",
-                        best_score=float(best_candidate[0]) if best_candidate else 0.0,
-                        heuristic_probe=dict(best_candidate[3]) if best_candidate else None,
-                    )
-                )
-                continue
             forked_probe = dict(ai_probe)
             forked_probe["merge_outcome"] = "fork_new_branch"
             forked_probe["dual_origin"] = False
@@ -21500,28 +31362,20 @@ def _merge_planner_probes(
             ai_probe,
             components=components,
         )
-        if basis not in {"strand_id", "answer_field"}:
+        existing_semantic_ai = bool(
+            _planner_family_for_probe(heuristic_probe) == "ai"
+            and _record_uses_semantic_authority_v2(heuristic_probe)
+        )
+        if basis not in {"strand_id", "answer_hypothesis", "answer_field"}:
             material_delta = True
             delta_reasons = list(delta_reasons) + ["goal_only_match_requires_fork"]
-        if merge_score >= 0.82 and not material_delta and basis in {"strand_id", "answer_field"}:
+        if merge_score >= 0.82 and not material_delta and basis in {"strand_id", "answer_hypothesis", "answer_field"}:
             outcome = "reuse_branch"
-        elif basis in {"strand_id", "answer_field"}:
+        elif basis in {"strand_id", "answer_hypothesis", "answer_field"}:
             outcome = "enrich_branch"
         else:
             outcome = "fork_new_branch"
         if outcome == "fork_new_branch":
-            if len(merged) >= int(query.max_total_branches):
-                merge_summary["dropped_ai_mission_count"] += 1
-                merge_summary["learning_signals"].append(
-                    _mission_merge_learning_signal(
-                        ai_probe=ai_probe,
-                        outcome="dropped_ai_mission",
-                        reason="branch_capacity_exhausted_after_ai_fork_required",
-                        best_score=float(merge_score),
-                        heuristic_probe=heuristic_probe,
-                    )
-                )
-                continue
             forked_probe = dict(ai_probe)
             forked_probe["merge_outcome"] = "fork_new_branch"
             forked_probe["dual_origin"] = False
@@ -21562,6 +31416,8 @@ def _merge_planner_probes(
             )
             continue
         heuristic_probe_id = str(heuristic_probe.get("probe_id") or "")
+        if existing_semantic_ai and heuristic_probe_id:
+            claimed_semantic_ai_probe_ids.add(heuristic_probe_id)
         heuristic_index = probe_id_to_index.get(heuristic_probe_id)
         if heuristic_index is None:
             continue
@@ -21574,21 +31430,67 @@ def _merge_planner_probes(
             for key, value in dict(updated_probe.get("source_probe_ids_by_family") or {}).items()
             if str(key).strip().lower() in {"heuristic", "ai"} and str(value).strip()
         }
-        source_probe_ids_by_family.setdefault("heuristic", heuristic_probe_id)
-        source_probe_ids_by_family["ai"] = str(ai_probe.get("probe_id") or "").strip()
+        if existing_semantic_ai:
+            # Both records are AI-authored views of the same mission: the
+            # existing probe owns semantic intent, while ``ai_probe`` only
+            # contributes its spatial route.  Do not mislabel this as an
+            # AI/heuristic merge or replace the semantic probe's provenance.
+            source_probe_ids_by_family["ai"] = heuristic_probe_id
+        else:
+            source_probe_ids_by_family.setdefault("heuristic", heuristic_probe_id)
+            source_probe_ids_by_family["ai"] = str(ai_probe.get("probe_id") or "").strip()
         origin_destination_queues = {
             str(key).strip().lower(): [dict(item) for item in list(value or [])]
             for key, value in dict(updated_probe.get("origin_destination_queues") or {}).items()
             if str(key).strip().lower() in {"heuristic", "ai"}
         }
-        origin_destination_queues.setdefault("heuristic", [dict(item) for item in heuristic_queue])
-        origin_destination_queues["ai"] = [dict(item) for item in ai_queue]
+        if existing_semantic_ai:
+            origin_destination_queues["ai"] = [dict(item) for item in semantic_destination_queue]
+        else:
+            origin_destination_queues.setdefault("heuristic", [dict(item) for item in heuristic_queue])
+            origin_destination_queues["ai"] = [dict(item) for item in ai_queue]
         updated_probe["merge_outcome"] = outcome
-        updated_probe["dual_origin"] = True
-        updated_probe["origin_families"] = ["heuristic", "ai"]
+        updated_probe["dual_origin"] = not existing_semantic_ai
+        updated_probe["origin_families"] = ["ai"] if existing_semantic_ai else ["heuristic", "ai"]
         updated_probe["source_probe_ids_by_family"] = source_probe_ids_by_family
         updated_probe["semantic_destination_queue"] = semantic_destination_queue
         updated_probe["origin_destination_queues"] = origin_destination_queues
+        if _record_uses_semantic_authority_v2(ai_probe) and not existing_semantic_ai:
+            semantic_goal = str(ai_probe.get("semantic_goal") or ai_probe.get("goal") or "").strip()
+            if semantic_goal:
+                updated_probe["goal"] = semantic_goal
+                updated_probe["semantic_goal"] = semantic_goal
+            for key in (
+                "mission_id",
+                "strand_id",
+                "routing_hint_goal",
+                "goal_taxonomy",
+                "semantic_authority",
+                "why_required",
+            ):
+                ai_value = ai_probe.get(key)
+                if ai_value not in (None, ""):
+                    updated_probe[key] = ai_value
+            updated_probe["semantic_authority_v2"] = True
+            for key in ("required_entities", "expected_evidence", "success_criteria"):
+                updated_probe[key] = [
+                    str(item).strip()
+                    for item in list(ai_probe.get(key) or [])
+                    if str(item).strip()
+                ]
+            updated_probe["mission_metadata"] = (
+                dict(ai_probe.get("mission_metadata") or {})
+                if isinstance(ai_probe.get("mission_metadata") or {}, Mapping)
+                else {}
+            )
+        elif existing_semantic_ai:
+            # V2 semantic probes already carry the free-form mission. The
+            # sharded spatial planner supplies navigation for that mission; it
+            # must not fork a second semantic branch or replace the mission's
+            # goal with a renderer-oriented route label.
+            updated_probe["ai_spatial_source_probe_id"] = str(
+                ai_probe.get("probe_id") or ""
+            ).strip() or None
         for ai_spatial_key in (
             "path_mission_id",
             "spatial_snap",
@@ -21673,6 +31575,31 @@ def _merge_planner_probes(
     for probe in merged:
         existing_branch = branch_by_probe_id.get(str(probe["probe_id"]))
         if existing_branch:
+            if _record_uses_semantic_authority_v2(probe):
+                semantic_goal = str(probe.get("semantic_goal") or probe.get("goal") or "").strip()
+                if semantic_goal:
+                    existing_branch["goal"] = semantic_goal
+                    existing_branch["semantic_goal"] = semantic_goal
+                for key in (
+                    "mission_id",
+                    "strand_id",
+                    "routing_hint_goal",
+                    "goal_taxonomy",
+                    "semantic_authority",
+                    "why_required",
+                ):
+                    probe_value = probe.get(key)
+                    if probe_value not in (None, ""):
+                        existing_branch[key] = probe_value
+                existing_branch["semantic_authority_v2"] = True
+                existing_branch["required_entities"] = list(probe.get("required_entities") or [])
+                existing_branch["expected_evidence"] = list(probe.get("expected_evidence") or [])
+                existing_branch["mission_success_criteria"] = list(probe.get("success_criteria") or [])
+                existing_branch["mission_metadata"] = (
+                    dict(probe.get("mission_metadata") or {})
+                    if isinstance(probe.get("mission_metadata") or {}, Mapping)
+                    else {}
+                )
             existing_branch["search_radius"] = probe["search_radius"]
             existing_branch["worker_kind"] = existing_branch.get("worker_kind") or _branch_kind_for_probe(probe)
             existing_branch["planner_family"] = str(existing_branch.get("planner_family") or _planner_family_for_probe(probe))
@@ -21716,7 +31643,16 @@ def _merge_planner_probes(
             existing_branch["start_region"] = _region_descriptor_from_probe(probe)
             destination_queue = _normalize_destination_queue(
                 spec_destinations=list(probe.get("destination_queue") or existing_branch.get("destination_queue") or []),
-                goal=str(probe.get("goal") or existing_branch.get("goal") or ""),
+                goal=str(
+                    (
+                        probe.get("routing_hint_goal")
+                        or probe.get("goal")
+                        or existing_branch.get("goal")
+                        or ""
+                    )
+                    if _record_uses_semantic_authority_v2(probe)
+                    else probe.get("goal") or existing_branch.get("goal") or ""
+                ),
                 probe_label=str(probe.get("label") or existing_branch.get("branch_id") or "landing"),
                 fallback_guide_area=str(probe.get("expected_guide_area") or ""),
                 fallback_memory_type=str(probe.get("expected_memory_type") or ""),
@@ -22076,7 +32012,7 @@ def materialize_ai_spatial_contract_into_plan(
     return updated
 
 
-def prepare_runtime_plan(
+def _prepare_runtime_plan_impl(
     query: RetrieveRequest,
     atlas_payload: dict[str, Any],
     identity_nucleus: dict[str, Any],
@@ -22095,8 +32031,15 @@ def prepare_runtime_plan(
     def mark_stage(key: str, started_at: float) -> None:
         stage_timings_ms[key] = round((time.perf_counter() - started_at) * 1000.0, 3)
 
+    semantic_authority_v2_enabled = _search_semantic_authority_v2_enabled()
+    target_bound_identity_nucleus = search_identity_nucleus_for_named_targets(
+        query.query_text,
+        identity_nucleus,
+        semantic_authority_v2=semantic_authority_v2_enabled,
+    )
+
     phase_started = time.perf_counter()
-    identity_context = build_identity_context(identity_nucleus)
+    identity_context = build_identity_context(target_bound_identity_nucleus)
     mark_stage("identity_nucleus_ms", phase_started)
 
     phase_started = time.perf_counter()
@@ -22104,7 +32047,7 @@ def prepare_runtime_plan(
     merge_window_seconds = _planner_merge_window_seconds(retrieval_mode=selected_retrieval_mode)
     probe_limit_reason = "broad_summary" if _is_broad_summary_query(query.query_text) else "aspect_count"
     reserved_llm_slots = max(0, min(query.max_total_branches, query.max_probe_count) - _initial_probe_limit(query))
-    query_class = _query_class(query.query_text)
+    legacy_query_class = _query_class(query.query_text)
     legacy_query_contract = build_query_contract(query.query_text, retrieval_mode=selected_retrieval_mode)
     semantic_brain_revision = _semantic_contract_brain_revision(query, atlas_payload)
     mark_stage("request_setup_ms", phase_started)
@@ -22131,7 +32074,7 @@ def prepare_runtime_plan(
         brain_id=active_brain_id,
         brain_revision=semantic_brain_revision,
         atlas_payload=atlas_payload,
-        identity_nucleus=identity_nucleus,
+        identity_nucleus=target_bound_identity_nucleus,
         calibration_snapshot=heuristic_calibration_snapshot,
         mode_budget=retrieval_mode_budget,
     )
@@ -22174,14 +32117,21 @@ def prepare_runtime_plan(
         admission=admitted_search,
     )
     mark_stage("semantic_ai_ms", phase_started)
+    semantic_authority_v2 = bool(semantic_contract.get("semantic_authority_v2"))
     semantic_identity_hints = sanitize_identity_hints(semantic_contract.get("identity_hints") or {})
-    runtime_identity_hints = sanitize_identity_hints(identity_context)
+    runtime_identity_hints = _semantic_identity_hints_for_named_targets(
+        query_text=query.query_text,
+        identity_hints=identity_context,
+        semantic_authority_v2=semantic_authority_v2,
+        semantic_contract=semantic_contract,
+    )
     if not semantic_identity_hints.get("core_name") and runtime_identity_hints.get("core_name"):
         semantic_contract = {**dict(semantic_contract or {}), "identity_hints": runtime_identity_hints}
     elif "identity_hints" not in dict(semantic_contract or {}):
         semantic_contract = {**dict(semantic_contract or {}), "identity_hints": runtime_identity_hints}
     else:
         semantic_contract = {**dict(semantic_contract or {}), "identity_hints": semantic_identity_hints}
+    query_class = "semantic_v2_mission" if semantic_authority_v2 else legacy_query_class
     seed_max_probe_count = _planner_seed_max_items(query.query_text, query.max_probe_count, query.max_total_branches)
     planner_seed_enabled = bool(llm_enabled())
     planner_seed_deferred = bool(planner_seed_enabled and defer_planner_seed)
@@ -22216,7 +32166,10 @@ def prepare_runtime_plan(
         ]
     if admitted_search:
         planner_seed_payload = dict(admitted_search.get("planner_seed_payload") or {})
-        answer_strands = [dict(item) for item in list(admitted_search.get("answer_strands") or [])]
+        answer_strands = _preserve_authoritative_ai_missions(
+            list(admitted_search.get("answer_strands") or []),
+            max_probe_count=seed_max_probe_count,
+        )
         if not planner_seed_payload or not answer_strands:
             raise ValueError("search_ai_admission_material_missing")
         planner_seed_source = "llm"
@@ -22238,15 +32191,19 @@ def prepare_runtime_plan(
             retrieval_mode=selected_retrieval_mode,
         )
         if planner_seed_payload and not planner_seed_error:
-            answer_strands = _normalize_answer_strands(
-                list(planner_seed_payload.get("answer_strands") or []),
+            raw_ai_strands = [
+                dict(item)
+                for item in list(planner_seed_payload.get("answer_strands") or [])
+                if isinstance(item, dict)
+            ]
+            normalized_ai_strands = _normalize_answer_strands(
+                raw_ai_strands,
                 query_text=query.query_text,
-                max_probe_count=seed_max_probe_count,
+                max_probe_count=max(1, len(raw_ai_strands)),
                 planner_family="ai",
             )
-            answer_strands = _select_answer_strands_for_query(
-                answer_strands,
-                query_text=query.query_text,
+            answer_strands = _preserve_authoritative_ai_missions(
+                normalized_ai_strands,
                 max_probe_count=seed_max_probe_count,
             )
         if answer_strands:
@@ -22263,20 +32220,24 @@ def prepare_runtime_plan(
                 planner_seed_attempt_count += 1
                 retry_payload, retry_error = _run_fast_planner_seed_request(
                     query,
-                    identity_source=identity_nucleus,
+                    identity_source=target_bound_identity_nucleus,
                     retrieval_mode=selected_retrieval_mode,
                     minimal=True,
                     timeout_override=retry_budget,
                 )
+                raw_retry_strands = [
+                    dict(item)
+                    for item in list((retry_payload or {}).get("answer_strands") or [])
+                    if isinstance(item, dict)
+                ]
                 retry_answer_strands = _normalize_answer_strands(
-                    list((retry_payload or {}).get("answer_strands") or []),
+                    raw_retry_strands,
                     query_text=query.query_text,
-                    max_probe_count=seed_max_probe_count,
+                    max_probe_count=max(1, len(raw_retry_strands)),
                     planner_family="ai",
                 )
-                retry_answer_strands = _select_answer_strands_for_query(
+                retry_answer_strands = _preserve_authoritative_ai_missions(
                     retry_answer_strands,
-                    query_text=query.query_text,
                     max_probe_count=seed_max_probe_count,
                 )
                 if retry_answer_strands:
@@ -22306,10 +32267,9 @@ def prepare_runtime_plan(
             query_text=query.query_text,
             max_probe_count=seed_max_probe_count,
         )
-    elif admitted_search:
-        answer_strands = _select_answer_strands_for_query(
+    elif admitted_search or planner_seed_source == "llm" or semantic_contract_ai_seed:
+        answer_strands = _preserve_authoritative_ai_missions(
             answer_strands,
-            query_text=query.query_text,
             max_probe_count=seed_max_probe_count,
         )
     else:
@@ -22329,6 +32289,11 @@ def prepare_runtime_plan(
         str((planner_seed_payload or {}).get("seed_query_class") or query_class).strip() or query_class
     )
     planner_seed_runtime = {
+        "semantic_authority": str(semantic_contract.get("semantic_authority") or "legacy_compatible"),
+        "semantic_authority_v2": semantic_authority_v2,
+        "legacy_query_class_authority": not semantic_authority_v2,
+        "legacy_query_class_diagnostic": legacy_query_class,
+        "mission_plan_v2": dict(semantic_contract.get("mission_plan_v2") or {}),
         "planner_seed_enabled": planner_seed_enabled,
         "planner_seed_status": planner_seed_status,
         "planner_seed_ms": planner_seed_ms,
@@ -22371,12 +32336,18 @@ def prepare_runtime_plan(
         "semantic_contract_brain_revision": semantic_brain_revision,
     }
     ai_spatial_initial_mode_budget = dict(retrieval_mode_budget)
-    if planner_seed_deferred:
+    # Query-plan preflight must not spend another provider planning window after
+    # Search admission has already produced the authoritative semantic seed.
+    # Keep those AI-authored missions in the plan, but let the runtime
+    # materialize AI spatial before route execution through the normal
+    # navigation-stage contract.
+    defer_initial_ai_spatial = bool(defer_planner_seed)
+    if defer_initial_ai_spatial:
         ai_spatial_initial_mode_budget["source"] = "preflight_initial_plan"
         ai_spatial_initial_mode_budget["cache_only"] = True
         ai_spatial_initial_mode_budget["first_payload_deferred_initial_plan"] = True
     ai_spatial_initial_deferred = bool(
-        planner_seed_deferred
+        defer_initial_ai_spatial
         and (
             not _semantic_contract_is_ai_material(semantic_contract_runtime)
             or bool(ai_spatial_initial_mode_budget.get("first_payload_deferred_initial_plan"))
@@ -22397,6 +32368,12 @@ def prepare_runtime_plan(
         deferred=ai_spatial_initial_deferred,
         cache_scope="retrieve_ai_spatial_contract",
         structured_json_fn=_attested_search_ai_provider("ai_spatial_landing"),
+    )
+    ai_spatial_landing_contract = _repair_ai_spatial_contract_locations_from_planner_seed(
+        ai_spatial_landing_contract,
+        answer_strands=answer_strands,
+        metamemory_spatial_brief=active_metamemory_spatial_brief,
+        atlas_payload=atlas_payload,
     )
     if (
         not ai_spatial_initial_deferred
@@ -22587,6 +32564,8 @@ def prepare_runtime_plan(
         "compiled_prior_count": len(dict((heuristic_calibration_snapshot or {}).get("compiled_priors") or {})),
         "compiled_summary": heuristic_calibration_summary,
         "query_class": query_class,
+        "legacy_query_class_authority": not semantic_authority_v2,
+        "legacy_query_class_diagnostic": legacy_query_class,
         "event_count": int((heuristic_calibration_snapshot or {}).get("event_count") or 0),
         "hot_path_recent_events_loaded": bool((heuristic_calibration_snapshot or {}).get("recent_events")),
         "hot_path_recent_landing_corrections_loaded": bool((heuristic_calibration_snapshot or {}).get("recent_landing_correction_events")),
@@ -22608,6 +32587,9 @@ def prepare_runtime_plan(
     )
     phase_timings = _runtime_stage_phase_timings(runtime_stage_timing)
     runtime_plan = {
+        "semantic_authority": str(semantic_contract.get("semantic_authority") or "legacy_compatible"),
+        "semantic_authority_v2": bool(semantic_contract.get("semantic_authority_v2")),
+        "mission_plan_v2": dict(semantic_contract.get("mission_plan_v2") or {}),
         "identity_context": identity_context,
         "search_ai_admission": {
             key: value
@@ -22640,6 +32622,9 @@ def prepare_runtime_plan(
         "decomposition_mode": decomposition_mode,
         "stop_threshold": stop_threshold,
         "planner_runtime": {
+            "semantic_authority": str(semantic_contract.get("semantic_authority") or "legacy_compatible"),
+            "semantic_authority_v2": bool(semantic_contract.get("semantic_authority_v2")),
+            "mission_plan_v2": dict(semantic_contract.get("mission_plan_v2") or {}),
             "planner_mode": planner_mode,
             "decomposition_mode": decomposition_mode,
             "branch_count": len(branches),
@@ -22650,7 +32635,9 @@ def prepare_runtime_plan(
             ),
             "probe_limit_reason": probe_limit_reason,
             "broad_summary_query": _is_broad_summary_query(query.query_text),
-            "query_class": _query_class(query.query_text),
+            "query_class": query_class,
+            "legacy_query_class_authority": not semantic_authority_v2,
+            "legacy_query_class_diagnostic": legacy_query_class,
             "query_contract": legacy_query_contract,
             "semantic_contract": semantic_contract,
             "semantic_contract_runtime": semantic_contract_runtime,
@@ -22755,6 +32742,36 @@ def prepare_runtime_plan(
     return runtime_plan
 
 
+def prepare_runtime_plan(
+    query: RetrieveRequest,
+    atlas_payload: dict[str, Any],
+    identity_nucleus: dict[str, Any],
+    *,
+    defer_planner_seed: bool = False,
+    ai_admission: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the plan without resetting the deadline established at admission."""
+
+    admission = dict(ai_admission or {})
+    deadline_token = _SEARCH_AI_DEADLINE.set(
+        _effective_search_deadline_monotonic(
+            query,
+            inherited_deadline=_SEARCH_AI_DEADLINE.get(),
+            authoritative_deadline_at_ms=admission.get("runtime_deadline_at_ms"),
+        )
+    )
+    try:
+        return _prepare_runtime_plan_impl(
+            query,
+            atlas_payload,
+            identity_nucleus,
+            defer_planner_seed=defer_planner_seed,
+            ai_admission=ai_admission,
+        )
+    finally:
+        _SEARCH_AI_DEADLINE.reset(deadline_token)
+
+
 def _process_branch_round(
     *,
     query: RetrieveRequest,
@@ -22767,6 +32784,9 @@ def _process_branch_round(
     mode_config: dict[str, Any],
     navigation_actions: list[dict[str, Any]] | None = None,
     blackboard: dict[str, Any] | None = None,
+    plan_first_v3: bool = False,
+    search_id: str | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     round_started_at = time.perf_counter()
     blackboard = dict(blackboard or {})
@@ -22816,19 +32836,62 @@ def _process_branch_round(
         elif action_type == "hydrate_nodes":
             action_hydrate_ids.extend(str(target or "").strip() for target in list(payload.get("node_ids") or []))
         elif action_type in {"read_document_anchor", "read_document_chunk"}:
-            target = str(payload.get("node_id") or "").strip()
-            if target:
+            target = str(
+                payload.get("chunk_node_id")
+                if action_type == "read_document_chunk"
+                else payload.get("anchor_node_id")
+                or payload.get("node_id")
+                or payload.get("document_id")
+                or ""
+            ).strip()
+            if not target:
+                target = str(
+                    payload.get("node_id")
+                    or payload.get("anchor_node_id")
+                    or payload.get("chunk_node_id")
+                    or payload.get("document_id")
+                    or ""
+                ).strip()
+            remaining_seconds = _search_deadline_remaining_seconds()
+            if target and (remaining_seconds is None or remaining_seconds > 0.05):
                 action_hydrate_ids.append(target)
         elif action_type == "terminate_branch":
             terminate_reason = str(payload.get("reason") or action.get("rationale") or "terminate_branch").strip() or "terminate_branch"
             break
-    query_class = _query_class(f"{query.query_text} {probe['query_text']}")
-    goal = _canonical_goal_from_context(
-        str(branch.get("goal") or probe.get("goal") or ""),
-        root_query_text=query.query_text,
-        probe_query_text=str(probe.get("query_text") or query.query_text),
-        expected_guide_area=str(probe.get("expected_guide_area") or ""),
-    ) or str(branch.get("goal") or probe.get("goal") or _goal_for_query_text(f"{query.query_text} {probe['query_text']}", probe.get("expected_guide_area")))
+    semantic_authority_v2 = bool(
+        _record_uses_semantic_authority_v2(branch)
+        or _record_uses_semantic_authority_v2(probe)
+    )
+    query_class = (
+        "semantic_v2_mission"
+        if semantic_authority_v2
+        else _query_class(f"{query.query_text} {probe['query_text']}")
+    )
+    semantic_goal = str(
+        branch.get("semantic_goal")
+        or branch.get("goal")
+        or probe.get("semantic_goal")
+        or probe.get("goal")
+        or ""
+    ).strip()
+    routing_hint_goal = str(
+        branch.get("routing_hint_goal")
+        or probe.get("routing_hint_goal")
+        or branch.get("goal_taxonomy")
+        or probe.get("goal_taxonomy")
+        or ""
+    ).strip()
+    if not routing_hint_goal:
+        routing_hint_goal = _canonical_goal_from_context(
+            semantic_goal,
+            root_query_text=query.query_text,
+            probe_query_text=str(probe.get("query_text") or query.query_text),
+            expected_guide_area=str(probe.get("expected_guide_area") or ""),
+        ) or _goal_for_query_text(
+            f"{query.query_text} {probe['query_text']}",
+            probe.get("expected_guide_area"),
+        )
+    goal = routing_hint_goal
     semantic_destination_queue = [
         dict(item)
         for item in list(branch.get("semantic_destination_queue") or branch.get("destination_queue") or [])
@@ -22842,6 +32905,11 @@ def _process_branch_round(
         dict(execution_destination_queue[destination_execution_index])
         if execution_destination_queue and destination_execution_index < len(execution_destination_queue)
         else {}
+    )
+    provider_hydration_capabilities = _provider_authored_hydration_capabilities(
+        probe,
+        branch,
+        active_destination,
     )
     _ensure_branch_destination_resolution(branch, round_index=round_index)
     if active_destination:
@@ -22945,6 +33013,16 @@ def _process_branch_round(
             "applied_actions": applied_actions,
         }
 
+    def _stopped_branch_if_requested() -> dict[str, Any] | None:
+        reason = _search_runtime_stop_reason(search_id=search_id, stop_event=stop_event)
+        if not reason:
+            return None
+        _set_search_runtime_stop(stop_event)
+        return _terminal_branch(reason)
+
+    requested_stop = _stopped_branch_if_requested()
+    if requested_stop is not None:
+        return requested_stop
     if terminate_reason:
         return _terminal_branch(terminate_reason)
     if not active_destination:
@@ -23041,16 +33119,45 @@ def _process_branch_round(
 
     candidate_sources: dict[str, list[str]] = defaultdict(list)
     candidate_map: dict[str, dict[str, Any]] = {}
+    route_primitive_counts = _route_primitive_counts_for_branch(branch)
 
-    def _register_candidates(items: list[dict[str, Any]], source_label: str) -> None:
+    def _register_candidates(items: list[dict[str, Any]], source_label: str) -> list[str]:
+        registered_ids: list[str] = []
         for candidate in list(items or []):
             node_id = str(candidate.get("id") or "").strip()
             if not node_id or not is_answer_eligible(candidate):
                 continue
             candidate_map.setdefault(node_id, candidate)
             candidate_sources[node_id].append(source_label)
+            registered_ids.append(node_id)
+        return _dedupe_limited(registered_ids, limit=int(branch["budget"]["max_candidate_reads"]))
 
-    _register_candidates(
+    def _record_route_primitive_attempt(
+        primitive: str,
+        node_ids: list[str] | None = None,
+        *,
+        attempted: bool = True,
+    ) -> None:
+        if primitive not in route_primitive_counts or not attempted:
+            return
+        cleaned_node_ids = _dedupe_limited(
+            [str(item) for item in list(node_ids or []) if str(item).strip()],
+            limit=24,
+        )
+        route_primitive_counts[primitive]["attempt_count"] = int(route_primitive_counts[primitive].get("attempt_count") or 0) + 1
+        route_primitive_counts[primitive]["yield_count"] = int(route_primitive_counts[primitive].get("yield_count") or 0) + len(cleaned_node_ids)
+        route_primitive_counts[primitive]["node_ids"] = _dedupe_limited(
+            [
+                *list(route_primitive_counts[primitive].get("node_ids") or []),
+                *cleaned_node_ids,
+            ],
+            limit=24,
+        )
+
+    requested_stop = _stopped_branch_if_requested()
+    if requested_stop is not None:
+        return requested_stop
+    sphere_candidate_ids = _register_candidates(
         query_nearby_navigation(
             current_position,
             radius=radius,
@@ -23058,11 +33165,45 @@ def _process_branch_round(
         ),
         "nearby_radius",
     )
+    _record_route_primitive_attempt("sphere_scan", sphere_candidate_ids)
 
-    allow_adjacent = query.allow_adjacent_bucket_expansion and bucket_keys and (
-        query_class in {"broad_summary", "document_lookup"} or len(candidate_map) < max(8, query.max_matches)
+    temporal_terms = _explicit_temporal_terms(query.query_text)
+    candidate_lane_policy = _candidate_lane_policy(
+        semantic_authority_v2=semantic_authority_v2,
+        query_class=query_class,
+        routing_hint_goal=routing_hint_goal,
+        has_bucket_keys=bool(bucket_keys),
+        candidate_count=len(candidate_map),
+        max_matches=int(query.max_matches),
+        allow_adjacent_bucket_expansion=bool(query.allow_adjacent_bucket_expansion),
+        allow_document_anchor_expansion=bool(query.allow_document_anchor_expansion),
+        has_temporal_terms=bool(temporal_terms),
+        provider_hydration_capabilities=provider_hydration_capabilities,
     )
-    if allow_adjacent:
+    requested_stop = _stopped_branch_if_requested()
+    if requested_stop is not None:
+        return requested_stop
+    if semantic_authority_v2:
+        path_tube_bucket_keys = _route_path_tube_bucket_keys(
+            branch=branch,
+            probe=probe,
+            active_destination=active_destination,
+            blackboard=blackboard,
+            limit=8,
+        )
+        if path_tube_bucket_keys:
+            path_tube_ids = _register_candidates(
+                fetch_nav_by_coarse_bucket_keys(
+                    path_tube_bucket_keys,
+                    limit=max(4, min(int(branch["budget"]["max_candidate_reads"]), query.max_candidates_per_step)),
+                ),
+                "path_tube_scan",
+            )
+            _record_route_primitive_attempt("path_tube_scan", path_tube_ids)
+        else:
+            _record_route_primitive_attempt("path_tube_scan", [], attempted=False)
+
+    if candidate_lane_policy["adjacent_bucket"]:
         _register_candidates(
             fetch_nav_by_coarse_bucket_keys(bucket_keys, limit=int(branch["budget"]["max_candidate_reads"])),
             "adjacent_bucket",
@@ -23075,22 +33216,37 @@ def _process_branch_round(
                 for link in list(current_node_payload.get("highways") or [])[:6]
                 if str(link.get("target_node_id") or "").strip()
             ]
-            _register_candidates(fetch_nodes_by_ids(explicit_highway_targets[:12], include_raw_text=False), "route_highway")
+            highway_ids = _register_candidates(fetch_nodes_by_ids(explicit_highway_targets[:12], include_raw_text=False), "route_highway")
+            _record_route_primitive_attempt("highway_jump", highway_ids, attempted=True)
         explicit_link_targets = [
             str(link.get("target_node_id") or "").strip()
             for link in list(current_node_payload.get("links") or [])[:8]
             if str(link.get("target_node_id") or "").strip()
         ]
-        _register_candidates(fetch_nodes_by_ids(explicit_link_targets[:12], include_raw_text=False), "route_link")
+        link_ids = _register_candidates(fetch_nodes_by_ids(explicit_link_targets[:12], include_raw_text=False), "route_link")
+        _record_route_primitive_attempt("local_link_walk", link_ids, attempted=True)
 
-    allow_document_anchors = query.allow_document_anchor_expansion and bucket_keys and (
-        query_class in {"relation_fact", "style_values", "broad_summary", "document_lookup"} or goal in {"history", "family", "father", "partner", "mentor", "sibling", "company_founding", "documents"}
-    )
-    if allow_document_anchors:
-        _register_candidates(fetch_nav_by_coarse_bucket_keys(bucket_keys, limit=6, document_anchor_only=True), "document_anchor")
+    if semantic_authority_v2 and candidate_map:
+        candidate_link_targets = _route_edge_target_ids(
+            list(candidate_map.values())[: int(branch["budget"]["max_candidate_reads"])],
+            edge_field="links",
+            limit=12,
+        )
+        candidate_link_ids = _register_candidates(fetch_nodes_by_ids(candidate_link_targets, include_raw_text=False), "route_link")
+        _record_route_primitive_attempt("local_link_walk", candidate_link_ids, attempted=True)
+
+    if candidate_lane_policy["document_anchor"]:
+        requested_stop = _stopped_branch_if_requested()
+        if requested_stop is not None:
+            return requested_stop
+        document_anchor_ids = _register_candidates(fetch_nav_by_coarse_bucket_keys(bucket_keys, limit=6, document_anchor_only=True), "document_anchor")
+        _record_route_primitive_attempt("evidence_edge_follow", document_anchor_ids, attempted=True)
 
     hinted_target_ids = list(dict.fromkeys(action_highway_targets + action_link_targets + action_hydrate_ids))[:12]
     if hinted_target_ids:
+        requested_stop = _stopped_branch_if_requested()
+        if requested_stop is not None:
+            return requested_stop
         for candidate in fetch_nodes_by_ids(hinted_target_ids, include_raw_text=False):
             if not is_answer_eligible(candidate):
                 continue
@@ -23102,7 +33258,10 @@ def _process_branch_round(
             if candidate["id"] in action_hydrate_ids:
                 candidate_sources[candidate["id"]].append("action_hydrate")
 
-    if goal in {"name", "birthplace", "residence", "family", "father", "partner", "mentor", "sibling", "role", "projects", "style", "values", "history"}:
+    if candidate_lane_policy["identity_support"]:
+        requested_stop = _stopped_branch_if_requested()
+        if requested_stop is not None:
+            return requested_stop
         core_limit = 8
         if query_class == "relation_fact":
             core_limit = 3
@@ -23113,18 +33272,26 @@ def _process_branch_round(
             "identity_core",
         )
         _register_candidates(
-            fetch_nodes_by_ids(_goal_support_candidate_ids(identity_context, str(probe.get("goal") or ""), limit=10), include_raw_text=False),
+            fetch_nodes_by_ids(
+                _goal_support_candidate_ids(identity_context, routing_hint_goal, limit=10),
+                include_raw_text=False,
+            ),
             "goal_support",
         )
 
-    temporal_terms = _explicit_temporal_terms(query.query_text)
-    if goal == "history" and temporal_terms:
+    if candidate_lane_policy["exact_temporal"]:
+        requested_stop = _stopped_branch_if_requested()
+        if requested_stop is not None:
+            return requested_stop
         _register_candidates(
             fetch_nodes_by_text_terms(temporal_terms, limit=max(query.max_matches, 16), include_raw_text=False),
             "exact_temporal",
         )
-    goal_text_terms = _goal_text_terms_for_goal(goal)
+    goal_text_terms = () if semantic_authority_v2 else _goal_text_terms_for_goal(goal)
     if goal_text_terms:
+        requested_stop = _stopped_branch_if_requested()
+        if requested_stop is not None:
+            return requested_stop
         _register_candidates(
             fetch_nodes_by_text_terms(
                 list(goal_text_terms),
@@ -23144,9 +33311,12 @@ def _process_branch_round(
                 "goal_subject_text",
             )
 
-    if goal == "generic_context" or query_class == "direct_fact":
+    if candidate_lane_policy["query_text"]:
         query_text_terms = _document_lookup_terms(query.query_text)
         if query_text_terms:
+            requested_stop = _stopped_branch_if_requested()
+            if requested_stop is not None:
+                return requested_stop
             _register_candidates(
                 fetch_nodes_by_text_terms(
                     query_text_terms,
@@ -23156,36 +33326,101 @@ def _process_branch_round(
                 "query_text",
             )
 
+    if semantic_authority_v2:
+        recall_terms = _v2_bound_recall_terms(
+            probe,
+            branch,
+            query_text=query.query_text,
+            limit=16,
+        )
+        if recall_terms:
+            requested_stop = _stopped_branch_if_requested()
+            if requested_stop is not None:
+                return requested_stop
+            recall_limit = max(8, min(query.max_candidates_per_step, query.max_matches * 3))
+            _register_candidates(
+                fetch_nodes_by_text_terms(
+                    recall_terms,
+                    limit=recall_limit,
+                    include_raw_text=False,
+                ),
+                "server_bound_text_recall",
+            )
+            provenance_recall_ids = _register_candidates(
+                fetch_document_nodes_by_claim_terms(
+                    recall_terms,
+                    limit=max(4, min(recall_limit, query.max_matches * 2)),
+                    include_raw_text=False,
+                ),
+                "server_bound_provenance_recall",
+            )
+            _record_route_primitive_attempt("evidence_edge_follow", provenance_recall_ids, attempted=True)
+
     if query.allow_highway_expansion:
-        highway_targets: list[str] = []
-        for candidate in list(candidate_map.values()):
-            for highway in list(candidate.get("highways") or [])[:4]:
-                target = str(highway.get("target_node_id") or "")
-                if target:
-                    highway_targets.append(target)
-        _register_candidates(fetch_nodes_by_ids(list(dict.fromkeys(highway_targets))[:12], include_raw_text=False), "highway_neighbor")
+        requested_stop = _stopped_branch_if_requested()
+        if requested_stop is not None:
+            return requested_stop
+        highway_targets = _route_edge_target_ids(
+            list(candidate_map.values())[: int(branch["budget"]["max_candidate_reads"])],
+            edge_field="highways",
+            limit=12,
+        )
+        highway_neighbor_ids = _register_candidates(fetch_nodes_by_ids(highway_targets, include_raw_text=False), "highway_neighbor")
+        _record_route_primitive_attempt("highway_jump", highway_neighbor_ids, attempted=bool(candidate_map))
+
+    evidence_anchor_route_ids: list[str] = []
+    if semantic_authority_v2 and candidate_map:
+        evidence_anchor_ids = _evidence_anchor_ids_from_candidates(
+            list(candidate_map.values())[: int(branch["budget"]["max_candidate_reads"])],
+            limit=6,
+        )
+        if evidence_anchor_ids:
+            evidence_anchor_route_ids = _register_candidates(
+                fetch_nodes_by_ids(evidence_anchor_ids, include_raw_text=False),
+                "evidence_edge_follow",
+            )
+            evidence_child_ids = _register_candidates(
+                fetch_document_child_nodes(evidence_anchor_ids, limit_per_anchor=4, include_raw_text=False),
+                "evidence_edge_follow",
+            )
+            _record_route_primitive_attempt(
+                "evidence_edge_follow",
+                _dedupe_limited([*evidence_anchor_route_ids, *evidence_child_ids], limit=24),
+                attempted=True,
+            )
+        else:
+            _record_route_primitive_attempt("evidence_edge_follow", [], attempted=True)
 
     branch_for_route = dict(branch)
     branch_for_route["active_destination"] = dict(active_destination)
     branch_for_route["semantic_destination_queue"] = [dict(item) for item in semantic_destination_queue]
     branch_for_route["execution_destination_queue"] = [dict(item) for item in execution_destination_queue]
     branch_for_route["destination_execution_index"] = destination_execution_index
-    execution_destination_queue, destination_execution_index, reorder_event = _maybe_reorder_execution_destinations(
-        probe=probe,
-        branch=branch_for_route,
-        semantic_destination_queue=semantic_destination_queue,
-        execution_destination_queue=execution_destination_queue,
-        execution_index=destination_execution_index,
-        candidate_map=candidate_map,
-        candidate_sources=candidate_sources,
-        blackboard=blackboard,
-        current_position=current_position,
-    )
+    if plan_first_v3:
+        # The planner has already authored an ordered corridor. Candidate
+        # scores may choose a move inside the current stop, but cannot move a
+        # later stop ahead of it without invalidating that plan.
+        reorder_event = None
+    else:
+        execution_destination_queue, destination_execution_index, reorder_event = _maybe_reorder_execution_destinations(
+            probe=probe,
+            branch=branch_for_route,
+            semantic_destination_queue=semantic_destination_queue,
+            execution_destination_queue=execution_destination_queue,
+            execution_index=destination_execution_index,
+            candidate_map=candidate_map,
+            candidate_sources=candidate_sources,
+            blackboard=blackboard,
+            current_position=current_position,
+        )
     active_destination = (
         dict(execution_destination_queue[destination_execution_index])
         if execution_destination_queue and destination_execution_index < len(execution_destination_queue)
         else {}
     )
+    requested_stop = _stopped_branch_if_requested()
+    if requested_stop is not None:
+        return requested_stop
     branch_for_route["active_destination"] = dict(active_destination)
     branch_for_route["execution_destination_queue"] = [dict(item) for item in execution_destination_queue]
     branch_for_route["destination_execution_index"] = destination_execution_index
@@ -23212,6 +33447,9 @@ def _process_branch_round(
         anchor_bucket_key = str((route_anchor_candidate.get("bucket") or {}).get("key") or "")
         if anchor_bucket_key and anchor_bucket_key not in bucket_keys:
             bucket_keys.append(anchor_bucket_key)
+        requested_stop = _stopped_branch_if_requested()
+        if requested_stop is not None:
+            return requested_stop
         _register_candidates(
             query_nearby_navigation(
                 route_anchor_position,
@@ -23223,9 +33461,14 @@ def _process_branch_round(
 
     ranking_probe = {
         **dict(probe),
+        "goal": routing_hint_goal,
+        "semantic_goal": semantic_goal,
+        "routing_hint_goal": routing_hint_goal,
         "landing_position": dict(route_anchor_position),
         "base_position": dict(route_anchor_position),
         "search_radius": radius,
+        "hydration_capabilities": sorted(provider_hydration_capabilities),
+        "hydration_policy": str(active_destination.get("hydration_policy") or "") or None,
     }
     ranked: list[dict[str, Any]] = []
     node_cache_updates: dict[str, dict[str, Any]] = {}
@@ -23239,6 +33482,21 @@ def _process_branch_round(
         max(query.max_matches * 2, int(branch["budget"]["max_fulltexts"]) * 2, 12),
     )
     rerank_pool = _prepare_rerank_pool(ranked, hydrate_limit=hydrate_limit)
+    forced_ids = {str(item) for item in list(action_hydrate_ids or []) if str(item).strip()}
+    if semantic_authority_v2:
+        forced_ids.update(str(item) for item in evidence_anchor_route_ids if str(item).strip())
+    if forced_ids:
+        forced_document_targets = [
+            item for item in ranked if str(item.get("node_id") or "") in forced_ids
+        ]
+        forced_target_ids = {str(item.get("node_id") or "") for item in forced_document_targets}
+        rerank_pool = (
+            forced_document_targets
+            + [item for item in rerank_pool if str(item.get("node_id") or "") not in forced_target_ids]
+        )[: max(hydrate_limit, len(forced_document_targets))]
+    requested_stop = _stopped_branch_if_requested()
+    if requested_stop is not None:
+        return requested_stop
     reranked_matches = rerank_hydrated_matches(
         ranking_probe,
         rerank_pool,
@@ -23246,11 +33504,49 @@ def _process_branch_round(
         max_nodes_fulltext=int(branch["budget"]["max_fulltexts"]),
         identity_context=identity_context,
     )
-    top_matches = rerank_selected_top_k_with_brain_profile(
-        ranking_probe,
-        reranked_matches,
-        top_k=query.max_matches,
-    )
+    hydrated_matches = [
+        match for match in reranked_matches if bool(match.get("hydration_confirmed"))
+    ]
+    if semantic_authority_v2:
+        # Do not resolve source labels or rank packets by query terms. Only a
+        # hydrated, answer-eligible document anchor and children explicitly
+        # bound to that anchor may become a materialized document packet.
+        hydrated_anchor_ids = {
+            str(dict(match.get("node") or {}).get("id") or "").strip()
+            for match in hydrated_matches
+            if str(dict(match.get("node") or {}).get("document_role") or "").strip()
+            == "anchor"
+            and str(dict(match.get("node") or {}).get("id") or "").strip()
+        }
+        authorized_document_matches = [
+            match
+            for match in hydrated_matches
+            if str(dict(match.get("node") or {}).get("id") or "").strip()
+            in hydrated_anchor_ids
+            or str(
+                dict(match.get("node") or {}).get("document_anchor_id") or ""
+            ).strip()
+            in hydrated_anchor_ids
+        ]
+        hydrated_document_packets = _build_document_packets(
+            authorized_document_matches,
+            blackboard,
+            query_text="",
+            packet_limit=12,
+        )
+        top_matches = reranked_matches[: query.max_matches]
+    else:
+        hydrated_document_packets = _build_document_packets(
+            hydrated_matches,
+            blackboard,
+            query_text=query.query_text,
+            packet_limit=12,
+        )
+        top_matches = rerank_selected_top_k_with_brain_profile(
+            ranking_probe,
+            reranked_matches,
+            top_k=query.max_matches,
+        )
     satisfaction = compute_satisfaction(top_matches)
     center_bucket_key = position_to_bucket(route_anchor_position)["key"]
 
@@ -23290,14 +33586,48 @@ def _process_branch_round(
     )
     hydrated_round_ids = list(
         dict.fromkeys(
-            [str(match.get("node_id") or "") for match in rerank_pool if str(match.get("node_id") or "").strip()]
-            + [str(item).strip() for item in action_hydrate_ids if str(item).strip()]
+            [
+                str(match.get("node_id") or "")
+                for match in reranked_matches
+                if bool(match.get("hydration_confirmed")) and str(match.get("node_id") or "").strip()
+            ]
         )
     )
     updated_branch["studied_node_ids"] = list(dict.fromkeys(list(branch.get("studied_node_ids") or []) + studied_round_ids))[:24]
     updated_branch["hydrated_node_ids"] = list(dict.fromkeys(list(branch.get("hydrated_node_ids") or []) + hydrated_round_ids))[:24]
     updated_branch["studied_node_count"] = len(list(updated_branch.get("studied_node_ids") or []))
     updated_branch["hydrated_node_count"] = len(list(updated_branch.get("hydrated_node_ids") or []))
+    if hydrated_document_packets:
+        updated_branch["document_packets"] = hydrated_document_packets
+        updated_branch["document_refs"] = [
+            {
+                "document_id": str(packet.get("document_id") or packet.get("anchor_node_id") or ""),
+                "anchor_node_id": str(packet.get("anchor_node_id") or "") or None,
+                "chunk_node_ids": list(packet.get("chunk_node_ids") or []),
+                "title": packet.get("title"),
+                "source_label": packet.get("source_label"),
+                "source_uri": packet.get("source_uri"),
+                "content_digest": packet.get("content_digest") or packet.get("digest"),
+                "raw_available": bool(
+                    packet.get("raw_text_available")
+                    or packet.get("complete_text_available")
+                    or packet.get("anchor_raw_text")
+                    or packet.get("ordered_chunk_sequence")
+                ),
+            }
+            for packet in hydrated_document_packets
+        ]
+        updated_branch["document_workspace"] = {
+            "document_packets": hydrated_document_packets,
+            "document_refs": list(updated_branch["document_refs"]),
+            "hydrated_node_ids": hydrated_round_ids,
+            "workspace_digest": search_mission_ledger_digest(
+                {
+                    "document_packets": hydrated_document_packets,
+                    "hydrated_node_ids": hydrated_round_ids,
+                }
+            ),
+        }
     updated_branch["evidence_node_ids"] = list(dict.fromkeys(list(branch["evidence_node_ids"]) + [match["node_id"] for match in top_matches]))
     updated_branch["planned_actions"] = applied_actions
     updated_branch["recommended_next_actions"] = []
@@ -23344,6 +33674,15 @@ def _process_branch_round(
     updated_branch["link_traversed_count"] = int(updated_branch.get("link_traversed_count") or 0) + (1 if traveled and edge_type == "link" else 0)
     updated_branch["local_traversed_count"] = int(updated_branch.get("local_traversed_count") or 0) + (1 if traveled and edge_type == "local" else 0)
     updated_branch["considered_highway_count"] = int(updated_branch.get("considered_highway_count") or 0) + (1 if bool(route_decision.get("considered_highway")) else 0)
+    for primitive in _ROUTE_COMMITMENT_PRIMITIVES:
+        primitive_counts = dict(route_primitive_counts.get(primitive) or {})
+        updated_branch[_route_primitive_counter_field(primitive, "attempt_count")] = int(primitive_counts.get("attempt_count") or 0)
+        updated_branch[_route_primitive_counter_field(primitive, "yield_count")] = int(primitive_counts.get("yield_count") or 0)
+        updated_branch[_route_primitive_counter_field(primitive, "node_ids")] = _dedupe_limited(
+            [str(item) for item in list(primitive_counts.get("node_ids") or []) if str(item).strip()],
+            limit=24,
+        )
+    updated_branch["route_commitments"] = _route_commitment_rows_from_counts(route_primitive_counts)
     covered_slots = list(updated_branch.get("covered_slots") or [])
     if top_matches:
         covered_slots.append(_goal_to_slot(str(updated_branch.get("goal") or goal)))
@@ -23382,6 +33721,7 @@ def _process_branch_round(
     route_decision["semantic_order_index"] = _destination_semantic_index(semantic_destination_queue, destination_before)
     route_decision["execution_order_index"] = destination_execution_index
     route_decision["reorder_reason"] = str((reorder_event or {}).get("reorder_reason") or "").strip() or None
+    route_decision["route_commitments"] = [dict(item) for item in list(updated_branch.get("route_commitments") or [])]
 
     stop_for_step = None
     execution_destination_after = [dict(item) for item in execution_destination_queue]
@@ -23404,6 +33744,20 @@ def _process_branch_round(
         else:
             destination_after = {}
     elif not top_matches and not traveled:
+        if destination_execution_index + 1 < len(execution_destination_after):
+            destination_execution_index += 1
+            destination_after = dict(execution_destination_after[destination_execution_index] or {})
+        else:
+            destination_after = {}
+            terminal_route_exhausted = True
+    if (
+        plan_first_v3
+        and not destination_reached
+        and _destination_identity(destination_after) == _destination_identity(destination_before)
+    ):
+        # An authored stop is one bounded local traversal. A weak hit cannot
+        # pin the branch to the same coordinate and recreate a deadline-driven
+        # recursive loop; advance to the next authored stop instead.
         if destination_execution_index + 1 < len(execution_destination_after):
             destination_execution_index += 1
             destination_after = dict(execution_destination_after[destination_execution_index] or {})
@@ -23531,19 +33885,36 @@ def _process_branch_round(
         updated_branch["move_types"] = list(dict.fromkeys(list(updated_branch.get("move_types") or []) + ["route_exhausted"]))[:24]
     updated_branch["route_trace"] = route_trace[:24]
 
-    if terminal_route_exhausted:
+    plan_first_one_shot_phase = (
+        str(updated_branch.get("plan_first_phase") or "")
+        if plan_first_v3
+        else ""
+    )
+    if plan_first_one_shot_phase == "reserve":
+        updated_branch = _mark_plan_first_reserve_complete(updated_branch)
+        updated_branch["status"] = "stopped"
+        stop_for_step = "plan_first_reserve_one_shot_complete"
+        updated_branch["stop_reason"] = stop_for_step
+    elif plan_first_one_shot_phase == "conditional_extension":
+        updated_branch["plan_first_conditional_extension_completed"] = True
+        updated_branch["plan_first_conditional_extension_execution_count"] = 1
+        updated_branch["active_destination"] = {}
+        updated_branch["status"] = "stopped"
+        stop_for_step = "plan_first_conditional_extension_one_shot_complete"
+        updated_branch["stop_reason"] = stop_for_step
+    elif terminal_route_exhausted:
         updated_branch["status"] = "stopped"
         stop_for_step = "route_exhausted"
         updated_branch["stop_reason"] = stop_for_step
-    elif top_matches and float(top_matches[0]["raw_score"]) >= success_threshold:
+    elif not plan_first_v3 and top_matches and float(top_matches[0]["raw_score"]) >= success_threshold:
         updated_branch["status"] = "satisfied"
         stop_for_step = "goal_satisfied"
         updated_branch["stop_reason"] = stop_for_step
-    elif top_matches and satisfaction >= success_threshold:
+    elif not plan_first_v3 and top_matches and satisfaction >= success_threshold:
         updated_branch["status"] = "satisfied"
         stop_for_step = "shared_context_sufficient"
         updated_branch["stop_reason"] = stop_for_step
-    elif top_matches and query_class in {"direct_fact", "relation_fact"} and float(top_matches[0]["raw_score"]) >= max(float(mode_config.get("direct_fact_floor") or 0.64), success_threshold - 0.08):
+    elif not plan_first_v3 and top_matches and query_class in {"direct_fact", "relation_fact"} and float(top_matches[0]["raw_score"]) >= max(float(mode_config.get("direct_fact_floor") or 0.64), success_threshold - 0.08):
         updated_branch["status"] = "satisfied"
         stop_for_step = "high_confidence_direct_fact"
         updated_branch["stop_reason"] = stop_for_step
@@ -23660,14 +34031,24 @@ def _process_branch_round(
         updated_branch["lifecycle_stage"] = "routing"
     updated_branch["route_richness_score"] = _route_richness_score_for_branch(updated_branch)
     updated_branch["local_stop_recommendation"] = stop_for_step or _branch_local_stop_recommendation(updated_branch, query_class=query_class)
-    controller_recommendation = _branch_controller_recommendation(
-        query_text=query.query_text,
-        retrieval_mode=retrieval_mode,
-        query_class=query_class,
-        branch=updated_branch,
-        blackboard=blackboard,
-    )
-    updated_branch = _apply_controller_recommendation(updated_branch, controller_recommendation)
+    controller_recommendation: dict[str, Any] = {}
+    requested_stop = _stopped_branch_if_requested()
+    if requested_stop is not None:
+        return requested_stop
+    if not plan_first_v3:
+        controller_recommendation = _branch_controller_recommendation(
+            query_text=query.query_text,
+            retrieval_mode=retrieval_mode,
+            query_class=query_class,
+            branch=updated_branch,
+            blackboard=blackboard,
+        )
+        updated_branch = _apply_controller_recommendation(updated_branch, controller_recommendation)
+    else:
+        updated_branch["controller_kind"] = "plan_first_deterministic_executor"
+        updated_branch["controller_recommendation"] = None
+        updated_branch["controller_decision_source"] = "plan_first_v3"
+        updated_branch["controller_turn_ms"] = 0.0
     updated_branch = _finalize_terminal_branch_destinations(updated_branch, round_index=round_index)
     updated_branch["recommended_next_actions"] = list(dict.fromkeys(list(controller_recommendation.get("requested_actions") or [])))[:3]
     updated_branch["family_contribution_summary"] = {
@@ -24267,6 +34648,10 @@ def _first_answer_preflight_matches(
     identity_context: dict[str, Any],
     limit: int,
 ) -> list[dict[str, Any]]:
+    if any(_record_uses_semantic_authority_v2(probe) for probe in list(probes or [])):
+        # V2 evidence is acquired through server-bound mission corridors.
+        # The legacy preflight performs taxonomy/text lookups.
+        return []
     query_class = _query_class(query.query_text)
     temporal_query = _is_temporal_reference_query(query.query_text)
     if query_class == "document_lookup" and not temporal_query:
@@ -24444,6 +34829,8 @@ def _document_lookup_pre_route_matches(
     identity_context: dict[str, Any],
     limit: int,
 ) -> list[dict[str, Any]]:
+    if any(_record_uses_semantic_authority_v2(probe) for probe in list(probes or [])):
+        return []
     if _query_class(query_text) != "document_lookup":
         return []
     lookup_terms = _document_lookup_terms(query_text)
@@ -24578,7 +34965,9 @@ def _retrieve_runtime_attested_impl(
     ai_admission: dict[str, Any] | None = None,
     search_id: str | None = None,
     event_callback: Any | None = None,
+    runtime_stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
+    active_brain_id = str(getattr(query, "brain_id", None) or current_brain_id() or "").strip()
     if prepared_plan is not None:
         _validate_attested_runtime_plan(prepared_plan)
     else:
@@ -24633,9 +35022,58 @@ def _retrieve_runtime_attested_impl(
     }
     planner_mode = str(runtime_plan["planner_mode"])
     decomposition_mode = str(runtime_plan["decomposition_mode"])
-    query_class = _query_class(query.query_text)
+    semantic_authority_ai_v2 = str(_persisted_runtime_semantic_authority(runtime_plan)) == "ai_v2"
+    legacy_query_class = None if semantic_authority_ai_v2 else _query_class(query.query_text)
+    query_class = "semantic_v2_mission" if semantic_authority_ai_v2 else str(legacy_query_class or "general")
     retrieval_mode, retrieval_mode_selected_by = _select_retrieval_mode(query)
     mode_config = _retrieval_mode_config(retrieval_mode, query_class)
+    plan_first_v3 = bool(
+        _search_plan_first_v3_enabled()
+        and semantic_authority_ai_v2
+    )
+    plan_first_runtime = {
+        "schema_version": "agvm.search_plan_first.v3",
+        "enabled": plan_first_v3,
+        "execution": "bounded_primary_then_one_shot_reserve",
+        "navigation_ai_recurrent": False if plan_first_v3 else None,
+        "branch_controller_ai_recurrent": False if plan_first_v3 else None,
+        "master_ai_recurrent": False if plan_first_v3 else None,
+        "final_master_count": 1 if plan_first_v3 else None,
+        "reserve_activation": "primary_barrier_structurally_unresolved_mission" if plan_first_v3 else None,
+        "final_master_budget_reserved": bool(plan_first_v3),
+        "final_master_reserve_seconds": (
+            _search_final_master_reserve_seconds(
+                retrieval_mode,
+                response_mode=query.response_mode,
+            )
+            if plan_first_v3
+            else None
+        ),
+        "final_master_state": "reserved" if plan_first_v3 else None,
+        "terminal_phase_order": (
+            list(
+                _plan_first_terminal_phase_order(
+                    response_mode=query.response_mode,
+                    provider_capacity=llm_provider_concurrency_limit(),
+                )
+            )
+            if plan_first_v3
+            else None
+        ),
+    }
+
+    def sync_plan_first_runtime() -> None:
+        runtime_plan["plan_first_runtime"] = dict(plan_first_runtime)
+        runtime_plan["planner_runtime"] = {
+            **dict(runtime_plan.get("planner_runtime") or {}),
+            "plan_first_runtime": dict(plan_first_runtime),
+        }
+
+    runtime_plan["plan_first_runtime"] = dict(plan_first_runtime)
+    runtime_plan["planner_runtime"] = {
+        **dict(runtime_plan.get("planner_runtime") or {}),
+        "plan_first_runtime": dict(plan_first_runtime),
+    }
     stop_threshold = max(0.5, min(0.99, float(runtime_plan["stop_threshold"]) + float(mode_config["threshold_adjust"])))
     normalized_thread_id = str(query.thread_id or "").strip() or None
     warm_state = fetch_warm_thread_state(normalized_thread_id) if normalized_thread_id else None
@@ -24666,6 +35104,9 @@ def _retrieve_runtime_attested_impl(
     answer_now_before_exploration_complete = False
     context_level_1_before_final = False
     master_decision_history: list[dict[str, Any]] = []
+    last_operational_master_decision: dict[str, Any] = {}
+    last_operational_master_ledger: dict[str, Any] = {}
+    last_operational_master_surface: dict[str, Any] = {}
     navigator_worker_reports: dict[str, dict[str, Any]] = {}
     navigator_worker_registry: dict[str, dict[str, Any]] = {}
     session_worker_reports: dict[str, dict[str, Any]] = {}
@@ -24685,6 +35126,30 @@ def _retrieve_runtime_attested_impl(
         "evidence_snippets": [],
         "master_state": {},
         "planner_runtime": dict(runtime_plan.get("planner_runtime") or {}),
+    }
+    initial_required_missions = [
+        dict(item)
+        for item in list(dict(runtime_plan.get("path_mission_contract") or {}).get("path_missions") or [])
+        if isinstance(item, dict) and item.get("required") is not False
+    ]
+    latest_live_path_corridors: dict[str, Any] = {}
+    latest_live_mission_evidence_ledger: dict[str, Any] = {
+        "schema_version": MISSION_EVIDENCE_LEDGER_SCHEMA_VERSION,
+        "status": "pending" if initial_required_missions else "empty",
+        "row_count": len(initial_required_missions),
+        "rows": [
+            {
+                "mission_id": mission.get("mission_id"),
+                "path_id": mission.get("path_id"),
+                "goal": mission.get("goal"),
+                "answer_hypothesis": mission.get("answer_hypothesis"),
+                "expected_evidence_shape": dict(mission.get("expected_evidence_shape") or {}),
+                "coverage_state": "missed",
+                "coverage_reason": "path_mission_not_yet_materialized",
+                "required": True,
+            }
+            for mission in initial_required_missions
+        ],
     }
     route_truth_required = bool(
         getattr(query, "complete_paths", False)
@@ -24742,6 +35207,7 @@ def _retrieve_runtime_attested_impl(
     background_enrichment_yield_recorded_rounds: set[int] = set()
     background_enrichment_yield_summary: dict[str, Any] = _background_enrichment_yield_summary([], background_enrichment_yield_policy)
     background_enrichment_low_yield_rounds = 0
+    runtime_stop_event = runtime_stop_event or threading.Event()
     client_visible_partial_budget_seconds = _client_visible_partial_terminal_budget_seconds(
         query_text=query.query_text,
         retrieval_mode=retrieval_mode,
@@ -24941,8 +35407,14 @@ def _retrieve_runtime_attested_impl(
     semantic_contract_thread: threading.Thread | None = None
     semantic_contract_started_at: float | None = None
 
-    if bool(llm_scout_state["enabled"]):
+    if bool(llm_scout_state["enabled"]) and not plan_first_v3:
         _run_llm_scout()
+    elif plan_first_v3:
+        llm_scout_state.update(
+            enabled=False,
+            status="suppressed_plan_first_single_planner",
+            completed=True,
+        )
 
     runtime_ai_spatial_attempted = bool(
         dict(runtime_plan.get("ai_spatial_landing_contract") or {}).get("materialized")
@@ -24968,16 +35440,6 @@ def _retrieve_runtime_attested_impl(
         if mode == "forensic":
             return 14.0
         return 8.0
-
-    def runtime_ai_spatial_contract_timeout_seconds() -> float:
-        mode = str(retrieval_mode or "balanced").strip().lower()
-        if mode == "flash":
-            return 5.2
-        if mode == "heavy":
-            return 9.0
-        if mode == "forensic":
-            return 12.0
-        return 6.5
 
     def materialize_runtime_ai_spatial_contract_if_ready(
         *,
@@ -25109,22 +35571,28 @@ def _retrieve_runtime_attested_impl(
             query_text=query.query_text,
             max_probe_count=seed_max_probe_count,
         )
-        answer_strands = semantic_answer_strands or [
+        existing_answer_strands = [
             dict(item)
             for item in list(runtime_plan.get("answer_strands") or [])
             if isinstance(item, dict)
         ]
-        if semantic_answer_strands:
-            answer_strands = _supplement_answer_strands_for_query(
+        existing_plan_runtime = dict(runtime_plan.get("planner_seed_runtime") or {})
+        existing_plan_is_authoritative_ai = (
+            str(existing_plan_runtime.get("planner_seed_source") or "").strip().lower() == "llm"
+        )
+        authoritative_ai_strands = [dict(item) for item in existing_answer_strands] if existing_plan_is_authoritative_ai else []
+        if authoritative_ai_strands:
+            answer_strands = _preserve_authoritative_ai_missions(
+                authoritative_ai_strands,
+                max_probe_count=seed_max_probe_count,
+            )
+        elif semantic_answer_strands:
+            answer_strands = _preserve_authoritative_ai_missions(
                 semantic_answer_strands,
-                query_text=query.query_text,
                 max_probe_count=seed_max_probe_count,
             )
-            answer_strands = _select_answer_strands_for_query(
-                answer_strands,
-                query_text=query.query_text,
-                max_probe_count=seed_max_probe_count,
-            )
+        else:
+            answer_strands = existing_answer_strands[:seed_max_probe_count]
         if not answer_strands:
             return False
 
@@ -25204,6 +35672,7 @@ def _retrieve_runtime_attested_impl(
                 "max_total_branches": int(query.max_total_branches),
                 "pre_route_wait_seconds": float(semantic_wait_seconds or 0.0),
                 "bounded_route_single_shot": True,
+                "stage_timeout_authoritative": True,
                 "source": source,
             }
             spatial_started = time.perf_counter()
@@ -25214,7 +35683,7 @@ def _retrieve_runtime_attested_impl(
                     "source": source,
                     "retrieval_mode": retrieval_mode,
                     "answer_strand_count": len(answer_strands),
-                    "timeout_seconds": runtime_ai_spatial_contract_timeout_seconds(),
+                    "timeout_seconds": _runtime_ai_spatial_contract_timeout_seconds(retrieval_mode),
                     "policy": "ai_places_inverse_answer_paths_before_backend_traversal",
                 },
             )
@@ -25235,9 +35704,15 @@ def _retrieve_runtime_attested_impl(
                 or None,
                 allow_ai=True,
                 deferred=False,
-                timeout=runtime_ai_spatial_contract_timeout_seconds(),
+                timeout=_runtime_ai_spatial_contract_timeout_seconds(retrieval_mode),
                 cache_scope="retrieve_ai_spatial_contract",
                 structured_json_fn=_attested_search_ai_provider("ai_spatial_landing"),
+            )
+            spatial_contract = _repair_ai_spatial_contract_locations_from_planner_seed(
+                spatial_contract,
+                answer_strands=[dict(item) for item in answer_strands],
+                metamemory_spatial_brief=spatial_brief,
+                atlas_payload=atlas_payload,
             )
             spatial_contract = _require_materialized_ai_spatial_contract(
                 spatial_contract,
@@ -25329,6 +35804,7 @@ def _retrieve_runtime_attested_impl(
         evidence_reservoir_snapshot: dict[str, Any] | None,
         document_mode_value: str,
         after_first_answer: bool | None = None,
+        emit_event: bool = True,
     ) -> dict[str, Any]:
         nonlocal context_wave_hot_node_ids, context_wave_reservoir_node_ids, context_wave_token_estimate
         wave = _build_context_wave(
@@ -25360,7 +35836,8 @@ def _retrieve_runtime_attested_impl(
         )
         context_wave_token_estimate = int(wave.get("token_estimate") or 0)
         context_waves.append(wave)
-        emit("context_wave", wave)
+        if emit_event:
+            emit("context_wave", wave)
         return wave
 
     def stop_for_supersede_request(
@@ -25373,6 +35850,7 @@ def _retrieve_runtime_attested_impl(
         supersede_request = _peek_search_supersede(search_id)
         if not supersede_request:
             return False
+        _set_search_runtime_stop(runtime_stop_event)
         supersede_reason = str(supersede_request.get("reason") or "superseded_by_followup").strip() or "superseded_by_followup"
         target_rows = branch_rows if branch_rows is not None else branches
         for branch in target_rows:
@@ -25422,6 +35900,8 @@ def _retrieve_runtime_attested_impl(
         source: str,
         final_ready: bool = False,
         branch_rows: list[dict[str, Any]] | None = None,
+        force: bool = False,
+        reason: str | None = None,
     ) -> bool:
         nonlocal background_enrichment_state, background_enrichment_stop_reason, stop_reason, runtime_phase
         nonlocal client_visible_partial_terminalized, client_visible_partial_terminal_reason
@@ -25429,21 +35909,47 @@ def _retrieve_runtime_attested_impl(
             return True
         if final_ready or early_final_surface_sealed:
             return False
-        if route_truth_required or client_visible_partial_budget_seconds <= 0.0:
+        if route_truth_required:
             return False
-        if first_context_ms is None and partial_answer_revision <= 0:
+        if (not force) and client_visible_partial_budget_seconds <= 0.0:
             return False
-        first_visible_ms = float(first_context_ms if first_context_ms is not None else answer_first_ms or 0.0)
+        unresolved_rows_at_terminal = _unresolved_required_mission_rows(
+            latest_live_mission_evidence_ledger
+        )
+        unresolved_missions_still_had_runtime_budget = _unresolved_missions_have_runtime_budget(
+            latest_live_mission_evidence_ledger,
+            _search_deadline_remaining_seconds(),
+        )
+        has_visible_landing_evidence = bool(first_landing_ms is not None and aggregated)
+        if (
+            first_context_ms is None
+            and partial_answer_revision <= 0
+            and not has_visible_landing_evidence
+        ):
+            return False
+        first_visible_ms = float(
+            first_context_ms
+            if first_context_ms is not None
+            else answer_first_ms
+            if answer_first_ms is not None
+            else first_landing_ms
+            or 0.0
+        )
         if first_visible_ms <= 0.0:
             return False
         elapsed_after_first_visible = max(
             0.0,
             ((time.perf_counter() - started_at) * 1000.0 - first_visible_ms) / 1000.0,
         )
-        if elapsed_after_first_visible < float(client_visible_partial_budget_seconds):
+        if (not force) and elapsed_after_first_visible < float(client_visible_partial_budget_seconds):
             return False
         client_visible_partial_terminalized = True
-        client_visible_partial_terminal_reason = "partial_context_client_visible_low_yield_terminal"
+        client_visible_partial_terminal_reason = (
+            str(reason).strip()
+            if reason and str(reason).strip()
+            else "partial_context_client_visible_low_yield_terminal"
+        )
+        _set_search_runtime_stop(runtime_stop_event)
         stop_reason = client_visible_partial_terminal_reason
         background_enrichment_state = "completed" if early_final_surface_emitted else "completed_partial"
         background_enrichment_stop_reason = client_visible_partial_terminal_reason
@@ -25470,15 +35976,24 @@ def _retrieve_runtime_attested_impl(
                 "source": source,
                 "stop_reason": client_visible_partial_terminal_reason,
                 "client_visible_partial_budget_seconds": float(client_visible_partial_budget_seconds),
+                "forced_partial_terminal": bool(force),
                 "elapsed_after_first_visible_seconds": round(elapsed_after_first_visible, 3),
                 "first_context_ms": first_context_ms,
                 "first_answer_ms": answer_first_ms,
                 "background_enrichment_state": background_enrichment_state,
                 "background_enrichment_stop_reason": background_enrichment_stop_reason,
-                "completion_state": "partial_complete_low_yield",
+                "completion_state": (
+                    "partial_review_required"
+                    if client_visible_partial_terminal_reason == "flash_public_partial_before_master"
+                    else "partial_complete_low_yield"
+                ),
                 "final_materialization_pending": False,
                 "result_ready_terminal": True,
                 "final_closure_ready": False,
+                "unresolved_required_mission_count": len(unresolved_rows_at_terminal),
+                "unresolved_missions_still_had_runtime_budget": bool(
+                    unresolved_missions_still_had_runtime_budget
+                ),
             },
         )
         return True
@@ -25691,6 +36206,11 @@ def _retrieve_runtime_attested_impl(
         nonlocal background_enrichment_state, background_enrichment_stop_reason, background_enrichment_budget_exhausted
         if early_final_surface_emitted or query.response_mode not in {"answer", "both"}:
             return False
+        if not _answer_surface_allowed_for_semantic_authority(
+            dict(partial_payload.get("answer") or {}),
+            _persisted_runtime_semantic_authority(runtime_plan),
+        ):
+            return False
         candidate_answer_full = _early_final_candidate_answer_full(
             query_text=query.query_text,
             retrieval_mode=retrieval_mode,
@@ -25732,9 +36252,13 @@ def _retrieve_runtime_attested_impl(
             preserved_short_final=bool(answer_short_text and final_answer_text == answer_short_text),
         )
         semantic_snapshot_for_early_surface = semantic_contract_snapshot()
-        early_final_surface_sealed = not bool(llm_enabled()) and not bool(
-            (semantic_snapshot_for_early_surface.get("runtime") or {}).get("ai_required")
-            or (semantic_snapshot_for_early_surface.get("contract") or {}).get("ai_required")
+        early_final_surface_sealed = (
+            not bool(_unresolved_required_mission_rows(latest_live_mission_evidence_ledger))
+            and not bool(llm_enabled())
+            and not bool(
+                (semantic_snapshot_for_early_surface.get("runtime") or {}).get("ai_required")
+                or (semantic_snapshot_for_early_surface.get("contract") or {}).get("ai_required")
+            )
         )
         surface_state = "final_sealed" if early_final_surface_sealed else "answer_now_and_continue"
         closure_state = "final_sealed" if early_final_surface_sealed else "open"
@@ -27021,7 +37545,20 @@ def _retrieve_runtime_attested_impl(
         stop_reason = "direct_preflight_answer_sufficient"
     else:
         stop_reason = "warm_context_sufficient" if warm_route_budget_override == 0 and warm_state_used else "budget_exhausted"
-    default_max_rounds = min(query.max_total_steps, max(branch["budget"]["max_steps"] for branch in branches) if branches else query.max_total_steps)
+    configured_max_rounds = min(
+        query.max_total_steps,
+        max(branch["budget"]["max_steps"] for branch in branches) if branches else query.max_total_steps,
+    )
+    has_ai_missions = any(
+        str(probe.get("planner_family") or "").strip().lower() == "ai"
+        or bool(str(probe.get("semantic_goal") or "").strip())
+        for probe in probes
+    )
+    default_max_rounds = _semantic_expansion_round_budget(
+        retrieval_mode=retrieval_mode,
+        configured_rounds=configured_max_rounds,
+        has_ai_missions=has_ai_missions,
+    )
     max_rounds = min(default_max_rounds, warm_route_budget_override) if warm_route_budget_override is not None else (0 if warm_flash_short_circuit else default_max_rounds)
     if document_lookup_route_budget_override is not None:
         max_rounds = min(max_rounds, document_lookup_route_budget_override)
@@ -27029,11 +37566,51 @@ def _retrieve_runtime_attested_impl(
         max_rounds = min(max_rounds, document_synthesis_route_budget_override)
     if direct_preflight_route_budget_override is not None:
         max_rounds = min(max_rounds, direct_preflight_route_budget_override)
+    if plan_first_v3:
+        # Primary branches execute concurrently, so runtime is bounded by the
+        # longest corridor, not by the branch count. Reserve is one additional
+        # wave released only after every primary corridor reaches its barrier.
+        longest_primary_corridor = max(
+            (
+                len(list(branch.get("execution_destination_queue") or []))
+                for branch in branches
+                if str(branch.get("status") or "") == "active"
+            ),
+            default=0,
+        )
+        reserve_wave_required = any(
+            list(branch.get("plan_first_reserve_destinations") or [])
+            for branch in branches
+        )
+        conditional_extension_wave_required = any(
+            list(branch.get("plan_first_conditional_extension_destinations") or [])
+            for branch in branches
+        )
+        plan_first_required_rounds = (
+            longest_primary_corridor
+            + (1 if conditional_extension_wave_required else 0)
+            + (1 if reserve_wave_required else 0)
+        )
+        max_rounds = max(max_rounds, plan_first_required_rounds)
+        plan_first_runtime["primary_wave_budget"] = longest_primary_corridor
+        plan_first_runtime["reserve_wave_budget"] = 1 if reserve_wave_required else 0
+        plan_first_runtime["conditional_extension_wave_budget"] = (
+            1 if conditional_extension_wave_required else 0
+        )
+        plan_first_runtime["bounded_round_budget"] = max_rounds
 
     def stop_background_enrichment_if_budget_exhausted(round_index_value: int) -> bool:
         nonlocal background_enrichment_state, background_enrichment_started_round, background_enrichment_stop_reason
         nonlocal background_enrichment_budget_exhausted, background_enrichment_rounds_consumed, stop_reason, runtime_phase
         if not early_final_surface_emitted:
+            return False
+        deadline_remaining = _search_deadline_remaining_seconds()
+        if _unresolved_missions_have_runtime_budget(
+            latest_live_mission_evidence_ledger,
+            deadline_remaining,
+        ):
+            return False
+        if _has_active_or_pending_branch(branches):
             return False
         if background_enrichment_started_round is None:
             background_enrichment_started_round = int(round_index_value)
@@ -27095,7 +37672,14 @@ def _retrieve_runtime_attested_impl(
     def apply_post_final_worker_throttle(round_index_value: int, ordered_branch_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         nonlocal post_final_branch_pruned_count, post_final_worker_cap_history
         nonlocal background_enrichment_state, background_enrichment_stop_reason, stop_reason, runtime_phase
-        if not early_final_surface_emitted or not post_final_worker_throttle_enabled:
+        if (
+            not early_final_surface_emitted
+            or not post_final_worker_throttle_enabled
+            or _unresolved_missions_have_runtime_budget(
+                latest_live_mission_evidence_ledger,
+                _search_deadline_remaining_seconds(),
+            )
+        ):
             return ordered_branch_rows
         active_branches = [branch for branch in ordered_branch_rows if str(branch.get("status") or "") == "active"]
         if not active_branches:
@@ -27216,6 +37800,8 @@ def _retrieve_runtime_attested_impl(
     def complete_post_final_background_if_no_active_branches() -> bool:
         nonlocal background_enrichment_state, background_enrichment_stop_reason, stop_reason, runtime_phase
         if not early_final_surface_emitted or background_enrichment_state != "running":
+            return False
+        if _unresolved_required_mission_rows(latest_live_mission_evidence_ledger):
             return False
         if any(str(branch.get("status") or "") == "active" for branch in branches):
             return False
@@ -27393,6 +37979,12 @@ def _retrieve_runtime_attested_impl(
 
     def stop_background_enrichment_for_yield_status(status: dict[str, Any], round_index_value: int) -> None:
         nonlocal background_enrichment_state, background_enrichment_stop_reason, stop_reason, runtime_phase
+        deadline_remaining = _search_deadline_remaining_seconds()
+        if _unresolved_missions_have_runtime_budget(
+            latest_live_mission_evidence_ledger,
+            deadline_remaining,
+        ):
+            return
         background_enrichment_state = "completed"
         background_enrichment_stop_reason = str(status.get("reason") or "background_low_yield_converged")
         stop_reason = background_enrichment_stop_reason
@@ -27412,11 +38004,88 @@ def _retrieve_runtime_attested_impl(
                 )
         emit_background_enrichment_completed_event()
 
-    for round_index in range(1, max_rounds + 1):
+    round_index = 0
+    # Plan-first owns a single terminal Master and therefore reserves that
+    # phase before any primary work is admitted.  Legacy execution retains its
+    # existing adaptive reservation rule.
+    final_master_budget_reserved = bool(plan_first_v3)
+    plan_first_reserve_barrier_released = False
+    plan_first_final_master_required = False
+    while (
+        round_index < max_rounds
+        or (
+            _unresolved_missions_have_runtime_budget(
+                latest_live_mission_evidence_ledger,
+                _search_deadline_remaining_seconds(),
+            )
+        )
+    ):
+        if plan_first_v3:
+            expansion_remaining = _search_expansion_budget_remaining_seconds(
+                retrieval_mode,
+                response_mode=query.response_mode,
+            )
+            if _plan_first_expansion_cutoff_blocks_round(
+                expansion_remaining,
+                round_index=round_index,
+            ):
+                plan_first_final_master_required = True
+                plan_first_runtime["primary_barrier_reached"] = False
+                plan_first_runtime["expansion_deadline_reached"] = True
+                plan_first_runtime["execution_round_count"] = int(round_index)
+                plan_first_runtime["final_master_state"] = "reserved_ready"
+                sync_plan_first_runtime()
+                stop_reason = "final_master_budget_reserved"
+                runtime_phase = "finalizing"
+                break
+        if not plan_first_v3 and _should_reserve_final_master_budget(
+            completed_rounds=round_index,
+            mission_ledger=latest_live_mission_evidence_ledger,
+            budget_remaining_seconds=_search_deadline_remaining_seconds(),
+            retrieval_mode=retrieval_mode,
+        ):
+            final_master_budget_reserved = True
+            stop_reason = "final_master_budget_reserved"
+            break
+        branch_ids_before_spatial = {
+            str(branch.get("branch_id") or "").strip()
+            for branch in branches
+            if str(branch.get("branch_id") or "").strip()
+        }
         materialize_runtime_ai_spatial_contract_if_ready(
-            source=f"route_round_{round_index}_before_work",
+            source=f"route_round_{round_index + 1}_before_work",
             semantic_wait_seconds=0.0,
         )
+        branch_ids_after_spatial = {
+            str(branch.get("branch_id") or "").strip()
+            for branch in branches
+            if str(branch.get("branch_id") or "").strip()
+        }
+        executable_work = _master_loop_executable_work(
+            branches,
+            latest_live_mission_evidence_ledger,
+            new_landing_materialized=bool(branch_ids_after_spatial - branch_ids_before_spatial),
+        )
+        if not bool(executable_work.get("executable")):
+            stop_reason = "master_no_executable_work"
+            break
+        reactivate_branch_id = str(executable_work.get("reactivate_branch_id") or "").strip()
+        if reactivate_branch_id:
+            reactivated_branch = next(
+                (
+                    branch
+                    for branch in branches
+                    if str(branch.get("branch_id") or "").strip() == reactivate_branch_id
+                ),
+                None,
+            )
+            if reactivated_branch is not None:
+                reactivated_branch["status"] = "active"
+                reactivated_branch["route_state"] = "routing"
+                reactivated_branch["lifecycle_stage"] = "routing"
+                reactivated_branch["stop_reason"] = None
+                reactivated_branch["local_stop_recommendation"] = None
+        round_index += 1
         ingest_llm_scout_if_ready()
         if stop_background_enrichment_if_budget_exhausted(round_index):
             break
@@ -27511,6 +38180,15 @@ def _retrieve_runtime_attested_impl(
                 branch["status"] = "stopped"
                 branch["stop_reason"] = "missing_probe"
                 continue
+            pending_master_actions = [
+                dict(item)
+                for item in list(branch.get("pending_master_actions") or [])
+                if isinstance(item, dict)
+            ]
+            if pending_master_actions:
+                branch["planned_actions"] = _normalize_navigation_actions(
+                    [*pending_master_actions, *list(branch.get("planned_actions") or [])]
+                )
             success_threshold = float(branch["success_criteria"]["min_confidence"] or stop_threshold)
             requires_route_validation = _branch_requires_route_validation(
                 branch,
@@ -27519,14 +38197,17 @@ def _retrieve_runtime_attested_impl(
                 route_truth_required=route_truth_required,
             )
             if (
-                branch["goal"] in shared_topics
+                not plan_first_v3
+                and
+                not pending_master_actions
+                and branch["goal"] in shared_topics
                 and float(shared_topics[branch["goal"]]["confidence"]) >= success_threshold
                 and not requires_route_validation
             ):
                 branch["status"] = "satisfied"
                 branch["stop_reason"] = "shared_context_sufficient"
                 continue
-            if _allow_ai_navigation_worker_on_round(
+            if not plan_first_v3 and _allow_ai_navigation_worker_on_round(
                 query_text=query.query_text,
                 retrieval_mode=retrieval_mode,
                 query_class=query_class,
@@ -27534,22 +38215,38 @@ def _retrieve_runtime_attested_impl(
                 goal=str(branch.get("goal") or ""),
                 first_answer_sla_split=first_answer_sla_split,
                 answer_first_ms=answer_first_ms,
+                ai_attested_mission=bool(
+                    _record_uses_semantic_authority_v2(branch)
+                    and _record_has_family(branch, "ai")
+                    and str(branch.get("mission_id") or branch.get("path_mission_id") or "").strip()
+                ),
             ):
-                navigator_kind = "document_navigation_worker" if query_class == "document_lookup" else "llm_navigation_worker"
+                # One navigation worker owns memory, graph, source discovery
+                # and document hydration.  Query wording never selects a
+                # second Search engine; the AI chooses the capability per hop.
+                navigator_kind = "llm_navigation_worker"
                 navigation_specs.append((branch, probe, navigator_kind))
             branch_probe_rows.append((branch, probe, success_threshold))
 
         if stop_for_supersede_request(round_index, source="before_navigation_workers"):
             break
         if navigation_specs:
-            max_ai_workers = 1 if retrieval_mode == "flash" else (2 if retrieval_mode == "balanced" else (3 if retrieval_mode == "heavy" else 4))
-            if early_final_surface_emitted and post_final_worker_throttle_enabled:
+            mode_ai_worker_capacity = 1 if retrieval_mode == "flash" else (2 if retrieval_mode == "balanced" else (3 if retrieval_mode == "heavy" else 4))
+            queued_navigation_specs = _select_navigation_specs_for_round(
+                list(navigation_specs),
+                round_capacity=mode_ai_worker_capacity,
+            )
+            if (
+                early_final_surface_emitted
+                and post_final_worker_throttle_enabled
+                and not _unresolved_required_mission_rows(latest_live_mission_evidence_ledger)
+            ):
                 post_final_ai_cap = max(0, int(post_final_worker_throttle_policy.get("ai_worker_cap_after_early_final") or 0))
-                if post_final_ai_cap < max_ai_workers:
+                if post_final_ai_cap < len(queued_navigation_specs):
                     post_final_ai_worker_suppressed_count += max(0, len(navigation_specs) - post_final_ai_cap)
-                max_ai_workers = min(max_ai_workers, post_final_ai_cap)
-            selected_navigation_specs = navigation_specs[: max_ai_workers]
-            if not selected_navigation_specs:
+                queued_navigation_specs = queued_navigation_specs[:post_final_ai_cap]
+                mode_ai_worker_capacity = min(mode_ai_worker_capacity, post_final_ai_cap)
+            if not queued_navigation_specs:
                 emit(
                     "post_final_ai_worker_throttle",
                     {
@@ -27567,65 +38264,102 @@ def _retrieve_runtime_attested_impl(
                     },
                 )
             else:
-                with ThreadPoolExecutor(max_workers=min(len(selected_navigation_specs), max_ai_workers)) as nav_executor:
-                    future_map = {
-                        nav_executor.submit(
-                            copy_context().run,
-                            llm_navigation_actions,
-                            query=query,
-                            probe=probe,
-                            branch=branch,
-                            blackboard=round_blackboard_seed,
-                            atlas_shortlist=list(atlas_shortlists.get(probe["probe_id"], [])),
-                            retrieval_mode=retrieval_mode,
-                        ): (branch, navigator_kind)
-                        for branch, probe, navigator_kind in selected_navigation_specs
+                for scheduled_branch, _scheduled_probe, _scheduled_kind in queued_navigation_specs:
+                    scheduled_branch["ai_navigation_round_count"] = (
+                        int(scheduled_branch.get("ai_navigation_round_count") or 0) + 1
+                    )
+
+                def _run_navigation_worker(
+                    spec: tuple[dict[str, Any], dict[str, Any], str],
+                ) -> tuple[list[dict[str, Any]], str]:
+                    worker_branch, worker_probe, _worker_kind = spec
+                    return llm_navigation_actions(
+                        query=query,
+                        probe=worker_probe,
+                        branch=worker_branch,
+                        blackboard=round_blackboard_seed,
+                        atlas_shortlist=list(atlas_shortlists.get(worker_probe["probe_id"], [])),
+                        retrieval_mode=retrieval_mode,
+                    )
+
+                navigation_results = _run_provider_aware_ai_queue(
+                    queued_navigation_specs,
+                    worker=_run_navigation_worker,
+                    mode_capacity=max(1, mode_ai_worker_capacity),
+                    search_id=search_id,
+                    stop_event=runtime_stop_event,
+                    default_result=([], "runtime_stop_requested"),
+                )
+                for (branch, _probe, navigator_kind), (planned_actions, navigation_path) in zip(
+                    queued_navigation_specs,
+                    navigation_results,
+                ):
+                    pending_master_actions = [
+                        dict(item)
+                        for item in list(branch.get("pending_master_actions") or [])
+                        if isinstance(item, dict)
+                    ]
+                    merged_actions = _normalize_navigation_actions(
+                        [*pending_master_actions, *list(planned_actions or [])]
+                    )
+                    branch["planned_actions"] = merged_actions
+                    branch["recommended_next_actions"] = merged_actions
+                    branch["navigation_path"] = navigation_path
+                    navigator_worker_id = f"nav::{branch['branch_id']}"
+                    navigator_worker_reports[navigator_worker_id] = {
+                        "worker_id": navigator_worker_id,
+                        "worker_kind": navigator_kind,
+                        "goal": str(branch.get("goal") or ""),
+                        "status": "running",
+                        "stop_reason": "",
+                        "visited_bucket_count": len(list(branch.get("visited_bucket_keys") or [])),
+                        "evidence_count": len(list(branch.get("evidence_node_ids") or [])),
+                        "recommended_next_actions": list(merged_actions or []),
+                        "navigation_path": navigation_path,
+                        "controller_recommendation": dict(branch.get("controller_recommendation") or {}),
+                        "controller_kind": str(branch.get("controller_kind") or "") or None,
+                        "controller_decision_source": str(branch.get("controller_decision_source") or "") or None,
+                        "active_destination": _canonical_active_destination(branch.get("active_destination")),
+                        "route_state": str(branch.get("route_state") or ""),
+                        "route_yield": round(float(branch.get("route_yield") or 0.0), 4),
                     }
-                    for future in as_completed(future_map):
-                        branch, navigator_kind = future_map[future]
-                        planned_actions, navigation_path = future.result()
-                        branch["planned_actions"] = planned_actions
-                        branch["recommended_next_actions"] = planned_actions
-                        branch["navigation_path"] = navigation_path
-                        navigator_worker_id = f"nav::{branch['branch_id']}"
-                        navigator_worker_reports[navigator_worker_id] = {
-                            "worker_id": navigator_worker_id,
-                            "worker_kind": navigator_kind,
-                            "goal": str(branch.get("goal") or ""),
-                            "status": "running",
-                            "stop_reason": "",
-                            "visited_bucket_count": len(list(branch.get("visited_bucket_keys") or [])),
-                            "evidence_count": len(list(branch.get("evidence_node_ids") or [])),
-                            "recommended_next_actions": list(planned_actions or []),
-                            "navigation_path": navigation_path,
-                            "controller_recommendation": dict(branch.get("controller_recommendation") or {}),
-                            "controller_kind": str(branch.get("controller_kind") or "") or None,
-                            "controller_decision_source": str(branch.get("controller_decision_source") or "") or None,
-                            "active_destination": _canonical_active_destination(branch.get("active_destination")),
-                            "route_state": str(branch.get("route_state") or ""),
-                            "route_yield": round(float(branch.get("route_yield") or 0.0), 4),
-                        }
-                        navigator_worker_registry[navigator_worker_id] = {
-                            "worker_id": navigator_worker_id,
-                            "worker_kind": navigator_kind,
-                            "status": "running",
-                            "goal": str(branch.get("goal") or ""),
-                            "probe_ids": list(branch.get("probe_ids") or []),
-                            "controller_kind": str(branch.get("controller_kind") or "") or None,
-                            "controller_decision_source": str(branch.get("controller_decision_source") or "") or None,
-                            "active_destination_id": str((branch.get("active_destination") or {}).get("destination_id") or "") or None,
-                            "route_state": str(branch.get("route_state") or ""),
-                            "lifecycle_stage": str(branch.get("lifecycle_stage") or ""),
-                        }
-                        session_worker_reports[navigator_worker_id] = dict(navigator_worker_reports[navigator_worker_id])
-                        session_worker_registry[navigator_worker_id] = dict(navigator_worker_registry[navigator_worker_id])
+                    navigator_worker_registry[navigator_worker_id] = {
+                        "worker_id": navigator_worker_id,
+                        "worker_kind": navigator_kind,
+                        "status": "running",
+                        "goal": str(branch.get("goal") or ""),
+                        "probe_ids": list(branch.get("probe_ids") or []),
+                        "controller_kind": str(branch.get("controller_kind") or "") or None,
+                        "controller_decision_source": str(branch.get("controller_decision_source") or "") or None,
+                        "active_destination_id": str((branch.get("active_destination") or {}).get("destination_id") or "") or None,
+                        "route_state": str(branch.get("route_state") or ""),
+                        "lifecycle_stage": str(branch.get("lifecycle_stage") or ""),
+                    }
+                    session_worker_reports[navigator_worker_id] = dict(navigator_worker_reports[navigator_worker_id])
+                    session_worker_registry[navigator_worker_id] = dict(navigator_worker_registry[navigator_worker_id])
+
+            # The branch controller belongs to the same semantic control wave
+            # as its navigation worker.  Processing every deferred branch here
+            # would recreate the provider fan-out we just bounded above and
+            # could starve the Master verdict.  Deferred missions remain active
+            # and are considered first on the next round.
+            scheduled_branch_objects = {id(spec[0]) for spec in queued_navigation_specs}
+            branch_probe_rows = [
+                row for row in branch_probe_rows if id(row[0]) in scheduled_branch_objects
+            ]
 
         for branch, probe, success_threshold in branch_probe_rows:
             active_specs.append((branch, probe, success_threshold))
 
         if active_specs:
-            max_workers = min(len(active_specs), max(1, query.max_total_branches))
-            if early_final_surface_emitted and post_final_worker_throttle_enabled:
+            max_workers = _branch_round_worker_count(
+                len(active_specs), query.max_total_branches
+            )
+            if (
+                early_final_surface_emitted
+                and post_final_worker_throttle_enabled
+                and not _unresolved_required_mission_rows(latest_live_mission_evidence_ledger)
+            ):
                 max_workers = min(max_workers, max(1, int(post_final_worker_throttle_policy.get("branch_worker_cap_after_early_final") or 1)))
             def _iter_branch_round_results(
                 specs: list[tuple[dict[str, Any], dict[str, Any], float]],
@@ -27646,29 +38380,64 @@ def _retrieve_runtime_attested_impl(
                         mode_config=mode_config,
                         navigation_actions=list(branch.get("planned_actions") or []),
                         blackboard=round_blackboard_seed,
+                        plan_first_v3=plan_first_v3,
+                        search_id=search_id,
+                        stop_event=runtime_stop_event,
                     )
                     for branch, probe, success_threshold in specs
                 ]
-                completed_all = False
-                try:
-                    for future in as_completed(futures):
-                        yield future.result()
-                    completed_all = True
-                finally:
-                    if not completed_all:
-                        for pending in futures:
-                            pending.cancel()
-                    executor.shutdown(wait=completed_all, cancel_futures=not completed_all)
+                yield from _iter_completed_futures_before_deadline(
+                    futures,
+                    executor=executor,
+                    deadline_monotonic=_search_expansion_deadline_monotonic(
+                        retrieval_mode,
+                        response_mode=query.response_mode,
+                    ),
+                    minimum_wait_seconds=(
+                        min(12.0, max(2.0, _search_ai_stage_timeout_seconds("navigation", retrieval_mode) * 0.5))
+                        if plan_first_v3 and round_index <= 1 else 0.0
+                    ),
+                    search_id=search_id,
+                    stop_event=runtime_stop_event,
+                )
 
             round_results = _iter_branch_round_results(active_specs, max_workers)
+            if plan_first_v3:
+                # Keep the completion iterator live so every branch can emit a
+                # cheap travel event as soon as its worker finishes.  The full
+                # Context/Results reducer is deferred until after the single
+                # plan-first Master.
+                plan_first_runtime["wave_reducer"] = "post_master_materialization"
+                sync_plan_first_runtime()
         else:
             round_results = []
 
         branch_by_id = {branch["branch_id"]: branch for branch in branches}
         supersede_stop_triggered = False
-        for result in round_results:
+        plan_first_round_result_count = len(active_specs) if plan_first_v3 else 0
+        plan_first_wave_completed_count = 0
+        for result_index, result in enumerate(round_results):
+            plan_first_wave_completed_count += 1
             updated_branch = dict(result["branch"])
-            if early_final_surface_emitted and post_final_worker_throttle_enabled and bool(updated_branch.get("post_final_worker_throttled")):
+            consumed_master_action_ids = {
+                str(item.get("action_id") or "").strip()
+                for item in list(updated_branch.get("pending_master_actions") or [])
+                if isinstance(item, dict) and str(item.get("action_id") or "").strip()
+            }
+            updated_branch["pending_master_actions"] = []
+            if consumed_master_action_ids:
+                updated_branch["planned_actions"] = [
+                    dict(item)
+                    for item in list(updated_branch.get("planned_actions") or [])
+                    if isinstance(item, dict)
+                    and str(item.get("action_id") or "").strip() not in consumed_master_action_ids
+                ]
+            if (
+                early_final_surface_emitted
+                and post_final_worker_throttle_enabled
+                and not _unresolved_required_mission_rows(latest_live_mission_evidence_ledger)
+                and bool(updated_branch.get("post_final_worker_throttled"))
+            ):
                 post_final_round_budget = max(1, int(updated_branch.get("post_final_worker_round_budget") or 1))
                 post_final_rounds_consumed = int(updated_branch.get("post_final_worker_rounds_consumed") or 0) + 1
                 updated_branch["post_final_worker_round_budget"] = post_final_round_budget
@@ -27720,6 +38489,26 @@ def _retrieve_runtime_attested_impl(
             }
             all_steps.append(step_payload)
             if event_callback:
+                plan_first_materialize_wave = not plan_first_v3
+                if not plan_first_materialize_wave:
+                    # Preserve per-branch travel truth for the live map, but
+                    # defer expensive context/evidence/answer rendering to the
+                    # single wave barrier.
+                    emit(
+                        "step_complete",
+                        {
+                            **step_payload,
+                            "runtime_phase": "plan_first_primary_wave",
+                            "plan_first_batch_pending": True,
+                            "plan_first_wave_result_index": result_index + 1,
+                            "plan_first_wave_result_count": plan_first_round_result_count,
+                            **progressive_search_map_payload(
+                                list(branch_by_id.values()),
+                                f"route_round_{round_index}",
+                            ),
+                        },
+                    )
+                    continue
                 partial_matches = list(aggregated.values())
                 partial_matches.sort(key=lambda item: _contract_match_sort_key(query.query_text, item))
                 partial_matches = _enrich_matches_with_document_anchor_children(
@@ -27877,6 +38666,15 @@ def _retrieve_runtime_attested_impl(
                     list(branch_by_id.values()),
                     f"route_round_{round_index}",
                 )
+                progress_counters = search_snapshot_counters(
+                    {
+                        "branches": list(branch_by_id.values()),
+                        "matches": partial_matches,
+                        "document_packets": document_packets,
+                        "context_package": partial_context,
+                    }
+                )
+                step_payload.update(progress_counters)
                 step_payload.update(route_progress_payload)
                 emit("step_complete", step_payload)
                 runtime_phase = "building_hot_context" if answer_first_ms is None else "answer_now_expanding"
@@ -27896,7 +38694,7 @@ def _retrieve_runtime_attested_impl(
                     "branch_count": len(branches),
                     "visited_bucket_count": len(visited_bucket_keys),
                     "candidate_count_before_hydration": len(all_candidate_ids),
-                    "hydrated_count": len(partial_matches),
+                    "hydrated_count": progress_counters["hydrated_total"],
                     "final_match_count": len(partial_matches),
                     "active_worker_count": sum(1 for branch_state in branch_by_id.values() if str(branch_state.get("status") or "") == "active"),
                     "covered_goal_count": len(list(shared_evidence_snapshot.get("covered_goals") or [])),
@@ -27910,6 +38708,7 @@ def _retrieve_runtime_attested_impl(
                     "document_mode": document_mode,
                     "evidence_reservoir_summary": dict(evidence_reservoir.get("reservoir_summary") or {}),
                     "context_quality_metrics": dict(evidence_reservoir.get("quality_metrics") or {}),
+                    **progress_counters,
                     **route_progress_payload,
                     **{
                         key: snapshot_surface_fields[key]
@@ -27948,6 +38747,7 @@ def _retrieve_runtime_attested_impl(
                     "supporting_documents": list(document_lookup_contract.get("supporting_documents") or []),
                     "source_trace": list(document_lookup_contract.get("source_trace") or []),
                     "document_packets": document_packets,
+                    **progress_counters,
                     "semantic_contract": dict(runtime_plan.get("semantic_contract") or {}),
                     "semantic_contract_runtime": dict(runtime_plan.get("semantic_contract_runtime") or {}),
                     "ai_spatial_landing_contract": dict(runtime_plan.get("ai_spatial_landing_contract") or {}),
@@ -28102,7 +38902,22 @@ def _retrieve_runtime_attested_impl(
             if callable(close_round_results):
                 close_round_results()
         branches = list(branch_by_id.values())
+        if plan_first_v3:
+            plan_first_runtime["last_primary_wave_result_count"] = int(
+                plan_first_wave_completed_count
+            )
+            if plan_first_wave_completed_count < plan_first_round_result_count:
+                plan_first_runtime["reducer_deadline_reached"] = True
+                plan_first_runtime["final_master_state"] = "reserved_ready"
+            sync_plan_first_runtime()
         if supersede_stop_triggered:
+            break
+        if plan_first_v3 and bool(plan_first_runtime.get("reducer_deadline_reached")):
+            plan_first_final_master_required = True
+            plan_first_runtime["execution_round_count"] = int(round_index)
+            sync_plan_first_runtime()
+            stop_reason = "final_master_budget_reserved"
+            runtime_phase = "finalizing"
             break
         yield_status_before_completion = record_background_enrichment_yield_for_round(
             round_index_value=round_index,
@@ -28182,7 +38997,130 @@ def _retrieve_runtime_attested_impl(
             "contradiction_flags": [],
             "confidence": max((float(topic["confidence"]) for topic in shared_topics.values()), default=0.0),
         }
-        round_context = build_context_payload(list(aggregated.values())[: query.max_matches], round_shared_evidence_seed)
+        live_semantic_snapshot = semantic_contract_snapshot()
+        latest_live_path_corridors = build_path_corridor_package(
+            query_text=query.query_text,
+            branches=branches,
+            steps=all_steps,
+            matches=list(aggregated.values())[: query.max_matches],
+            evidence_reservoir=latest_evidence_reservoir,
+            semantic_contract=dict(live_semantic_snapshot.get("contract") or {}),
+            landing_metadata=build_landing_metadata(probes, branches),
+            retrieval_mode=retrieval_mode,
+        )
+        latest_live_mission_evidence_ledger = build_mission_evidence_ledger(
+            path_mission_contract=dict(runtime_plan.get("path_mission_contract") or {}),
+            branches=branches,
+            route_runtime=_route_runtime_summary(branches),
+            document_refs=current_document_packets,
+            document_workspace={
+                "document_packets": current_document_packets,
+                "document_refs": current_document_packets,
+            },
+            semantic_contract_runtime=dict(live_semantic_snapshot.get("runtime") or {}),
+            ai_spatial_landing_contract_runtime=dict(runtime_plan.get("ai_spatial_landing_contract_runtime") or {}),
+            path_corridors=latest_live_path_corridors,
+            evidence_reservoir=latest_evidence_reservoir,
+            matches=list(aggregated.values())[: query.max_matches],
+            query_text=query.query_text,
+            retrieval_mode=retrieval_mode,
+            revision_context={
+                "brain_revision": runtime_plan.get("brain_revision"),
+                "matrix_revision": runtime_plan.get("matrix_revision"),
+                "metamemory_revision": runtime_plan.get("metamemory_revision"),
+                "topology_revision": runtime_plan.get("topology_revision"),
+                "atlas_revision": runtime_plan.get("atlas_revision"),
+            },
+            allow_ai_branch_controller=not plan_first_v3,
+            semantic_certification_owner=(
+                "terminal_master" if plan_first_v3 else "branch_controller"
+            ),
+        )
+        controller_requested_document_hydration = any(
+            str(branch.get("controller_decision_source") or "") == "llm"
+            and str(dict(branch.get("controller_recommendation") or {}).get("action") or "")
+            == "request_doc_hydration"
+            for branch in branches
+        )
+        if controller_requested_document_hydration and not current_document_packets:
+            controller_candidate_matches = _enrich_matches_with_document_anchor_children(
+                list(aggregated.values())[: query.max_matches],
+                query_text=query.query_text,
+                identity_context=identity_context,
+            )
+            current_document_packets = _build_document_packets(
+                controller_candidate_matches,
+                round_shared_evidence_seed,
+                query_text=query.query_text,
+                packet_limit=12,
+            )
+        controller_document_hydration = _materialize_ai_controller_document_hydration(
+            branches=branches,
+            mission_ledger=latest_live_mission_evidence_ledger,
+            document_packets=current_document_packets,
+            retrieval_mode=retrieval_mode,
+        )
+        selected_controller_document_packets = list(
+            controller_document_hydration.get("document_packets") or []
+        )
+        if bool(controller_document_hydration.get("materialized")):
+            # Rebuild mission-bound evidence after the concrete read.  This is
+            # intentionally branch-scoped: global document anchors are never
+            # promoted merely because they exist in the result set.
+            latest_evidence_reservoir = _build_evidence_reservoir(
+                matches=list(aggregated.values())[: query.max_matches],
+                shared_evidence=round_shared_evidence_seed,
+                branches=branches,
+                document_packets=current_document_packets,
+                continuity_state=continuity_state,
+                warm_state_used=warm_state_used,
+            )
+            latest_live_path_corridors = build_path_corridor_package(
+                query_text=query.query_text,
+                branches=branches,
+                steps=all_steps,
+                matches=list(aggregated.values())[: query.max_matches],
+                evidence_reservoir=latest_evidence_reservoir,
+                semantic_contract=dict(live_semantic_snapshot.get("contract") or {}),
+                landing_metadata=build_landing_metadata(probes, branches),
+                retrieval_mode=retrieval_mode,
+            )
+            latest_live_mission_evidence_ledger = build_mission_evidence_ledger(
+                path_mission_contract=dict(runtime_plan.get("path_mission_contract") or {}),
+                branches=branches,
+                route_runtime=_route_runtime_summary(branches),
+                document_refs=current_document_packets,
+                document_workspace={
+                    "document_packets": current_document_packets,
+                    "document_refs": current_document_packets,
+                },
+                semantic_contract_runtime=dict(live_semantic_snapshot.get("runtime") or {}),
+                ai_spatial_landing_contract_runtime=dict(runtime_plan.get("ai_spatial_landing_contract_runtime") or {}),
+                path_corridors=latest_live_path_corridors,
+                evidence_reservoir=latest_evidence_reservoir,
+                matches=list(aggregated.values())[: query.max_matches],
+                query_text=query.query_text,
+                retrieval_mode=retrieval_mode,
+                revision_context={
+                    "brain_revision": runtime_plan.get("brain_revision"),
+                    "matrix_revision": runtime_plan.get("matrix_revision"),
+                    "metamemory_revision": runtime_plan.get("metamemory_revision"),
+                    "topology_revision": runtime_plan.get("topology_revision"),
+                    "atlas_revision": runtime_plan.get("atlas_revision"),
+                },
+                allow_ai_branch_controller=not plan_first_v3,
+                semantic_certification_owner=(
+                    "terminal_master" if plan_first_v3 else "branch_controller"
+                ),
+            )
+        unresolved_live_missions = _unresolved_required_mission_rows(latest_live_mission_evidence_ledger)
+        round_shared_evidence_seed["mission_evidence_ledger"] = latest_live_mission_evidence_ledger
+        round_shared_evidence_seed["path_corridors"] = latest_live_path_corridors
+        round_shared_evidence_seed["unresolved_required_mission_count"] = len(unresolved_live_missions)
+        round_context = _merge_ai_selected_document_context(
+            build_context_payload(list(aggregated.values())[: query.max_matches], round_shared_evidence_seed),
+            selected_controller_document_packets,
+        )
         round_surface_fields = _surface_runtime_fields(
             branches=branches,
             context=round_context,
@@ -28225,6 +39163,77 @@ def _retrieve_runtime_attested_impl(
             seed_goal_coverage=dict(runtime_plan.get("seed_goal_coverage") or {}),
             seed_destination_presence=dict(runtime_plan.get("seed_destination_presence") or {}),
         )
+        round_blackboard["path_corridors"] = latest_live_path_corridors
+        round_blackboard["mission_evidence_ledger"] = latest_live_mission_evidence_ledger
+        round_blackboard["controller_document_hydration_actions"] = list(
+            controller_document_hydration.get("actions") or []
+        )
+        round_blackboard["unresolved_required_missions"] = [
+            {
+                "mission_id": row.get("mission_id"),
+                "path_id": row.get("path_id"),
+                "branch_id": row.get("branch_id"),
+                "goal": row.get("goal"),
+                "coverage_state": row.get("coverage_state"),
+                "coverage_reason": row.get("coverage_reason"),
+                "expected_evidence_shape": dict(row.get("expected_evidence_shape") or {}),
+            }
+            for row in unresolved_live_missions[:12]
+        ]
+        if plan_first_v3:
+            active_plan_first = any(
+                str(branch.get("status") or "") == "active" for branch in branches
+            )
+            if active_plan_first:
+                # The complete primary corridor is already AI-authored. Local
+                # graph reads continue in the next parallel wave without a
+                # recurrent Navigation, Controller or Master provider call.
+                continue
+            activated_extension_ids = _activate_plan_first_conditional_extension_wave(
+                branches,
+                latest_live_mission_evidence_ledger,
+            )
+            if activated_extension_ids:
+                plan_first_runtime["conditional_extension_activated_branch_ids"] = (
+                    activated_extension_ids
+                )
+                plan_first_runtime["conditional_extension_activated_count"] = len(
+                    activated_extension_ids
+                )
+                continue
+            if not plan_first_reserve_barrier_released:
+                activated_reserve_ids = _activate_plan_first_reserve_wave(
+                    branches,
+                    latest_live_mission_evidence_ledger,
+                )
+                plan_first_reserve_barrier_released = True
+                plan_first_runtime["reserve_activated_branch_ids"] = activated_reserve_ids
+                plan_first_runtime["reserve_activated_count"] = len(activated_reserve_ids)
+                plan_first_runtime["reserve_eligible_branch_ids"] = [
+                    str(branch.get("branch_id") or "")
+                    for branch in branches
+                    if bool(branch.get("plan_first_reserve_eligible"))
+                    and str(branch.get("branch_id") or "")
+                ]
+                if activated_reserve_ids:
+                    continue
+            plan_first_final_master_required = True
+            plan_first_runtime["primary_barrier_reached"] = True
+            plan_first_runtime["execution_round_count"] = int(round_index)
+            plan_first_runtime["reserve_completed_branch_ids"] = [
+                str(branch.get("branch_id") or "")
+                for branch in branches
+                if bool(branch.get("plan_first_reserve_completed"))
+                and str(branch.get("branch_id") or "")
+            ]
+            _ensure_plan_first_execution_plan_digest(plan_first_runtime, probes)
+            plan_first_runtime["final_master_state"] = "reserved_ready"
+            sync_plan_first_runtime()
+            stop_reason = "plan_first_primary_and_reserve_complete"
+            runtime_phase = "finalizing"
+            break
+        master_call_ledger = _SEARCH_AI_CALL_LEDGER.get()
+        master_call_ledger_offset = len(master_call_ledger) if master_call_ledger is not None else 0
         master_decision = _master_decide(
             query_text=query.query_text,
             retrieval_mode=retrieval_mode,
@@ -28240,8 +39249,26 @@ def _retrieve_runtime_attested_impl(
                 "answer_first_ms": answer_first_ms,
             },
         )
-        master_decision_history.append(
-            {
+        master_decision = _guard_master_against_unresolved_missions(
+            master_decision,
+            mission_ledger=latest_live_mission_evidence_ledger,
+            branches=branches,
+            max_total_branches=int(query.max_total_branches),
+            budget_remaining_seconds=_search_deadline_remaining_seconds(),
+            can_spawn_worker=bool(probes),
+        )
+        master_attestation = {}
+        if master_call_ledger is not None:
+            master_call = next(
+                (
+                    dict(item)
+                    for item in reversed(master_call_ledger[master_call_ledger_offset:])
+                    if str(item.get("call_name") or "") == "master_judge"
+                ),
+                {},
+            )
+            master_attestation = dict(master_call.get("ai_execution_attestation") or {})
+        operational_master_record = {
                 "round": round_index,
                 "decision": str(master_decision.get("decision") or "continue"),
                 "reason": str(master_decision.get("reason") or ""),
@@ -28249,8 +39276,16 @@ def _retrieve_runtime_attested_impl(
                 "fallback_reason": str(master_decision.get("fallback_reason") or "") or None,
                 "can_answer_now": bool(master_decision.get("can_answer_now")),
                 "should_continue_expanding": bool(master_decision.get("should_continue_expanding", True)),
+                "unresolved_gap": master_decision.get("unresolved_gap"),
+                "next_evidence_action": master_decision.get("next_evidence_action"),
+                "expected_information_gain": master_decision.get("expected_information_gain"),
                 "active_worker_count": sum(1 for branch in branches if str(branch.get("status") or "") == "active"),
                 "target_branch_id": str(master_decision.get("target_branch_id") or "") or None,
+                "mission_id": str(master_decision.get("mission_id") or "") or None,
+                "path_id": str(master_decision.get("path_id") or "") or None,
+                "document_id": str(master_decision.get("document_id") or "") or None,
+                "document_anchor_id": str(master_decision.get("document_anchor_id") or "") or None,
+                "chunk_node_id": str(master_decision.get("chunk_node_id") or "") or None,
                 "target_family": str(master_decision.get("target_family") or "") or None,
                 "directive": str(master_decision.get("directive") or "") or None,
                 "directive_destination": str(master_decision.get("directive_destination") or "") or None,
@@ -28258,7 +39293,31 @@ def _retrieve_runtime_attested_impl(
                 "closure_state": str(round_surface_fields.get("closure_state") or "open"),
                 "final_closure_ready": bool(round_surface_fields.get("final_closure_ready")),
                 "unresolved_destination_count": int(round_surface_fields.get("unresolved_destination_count") or 0),
+                "unresolved_required_mission_count": int(master_decision.get("unresolved_required_mission_count") or 0),
+                "mission_guard_applied": bool(master_decision.get("mission_guard_applied")),
+                "operational_master": True,
+                "mission_ledger_digest": search_mission_ledger_digest(latest_live_mission_evidence_ledger),
+                "ledger_row_count": len(list(latest_live_mission_evidence_ledger.get("rows") or [])),
+                "ai_execution_attestation": master_attestation,
             }
+        master_decision_history.append(operational_master_record)
+        last_operational_master_decision = copy.deepcopy(operational_master_record)
+        last_operational_master_ledger = copy.deepcopy(latest_live_mission_evidence_ledger)
+        last_operational_master_surface = _freeze_operational_master_surface(
+            # Freeze every public evidence/route input consumed by the renderer
+            # together with the ledger judged above.  Detached workers and
+            # final enrichment may finish later, but their output belongs to a
+            # future Master wave and cannot leak into this package.
+            branches=branches,
+            steps=all_steps,
+            matches=list(aggregated.values())[: query.max_matches],
+            evidence_reservoir=latest_evidence_reservoir,
+            document_packets=current_document_packets,
+            shared_evidence=round_shared_evidence_seed,
+            context=round_context,
+            path_corridors=latest_live_path_corridors,
+            route_runtime=_route_runtime_summary(branches),
+            landing_metadata=build_landing_metadata(probes, branches),
         )
         master_action = str(master_decision.get("decision") or "")
         can_answer_now = bool(master_decision.get("can_answer_now"))
@@ -28281,6 +39340,28 @@ def _retrieve_runtime_attested_impl(
         directive = str(master_decision.get("directive") or "")
         directive_destination = str(master_decision.get("directive_destination") or "")
         target_family = str(master_decision.get("target_family") or "")
+        replacement_branch_id = str(master_decision.get("replace_branch_id") or "").strip()
+        if replacement_branch_id and str(master_decision.get("decision_source") or "") == "mission_guard":
+            replacement_branch = next(
+                (
+                    branch
+                    for branch in branches
+                    if str(branch.get("branch_id") or "") == replacement_branch_id
+                ),
+                None,
+            )
+            if replacement_branch is not None and str(replacement_branch.get("status") or "") == "active":
+                replacement_branch["status"] = "replaced"
+                replacement_branch["route_state"] = "replaced"
+                replacement_branch["lifecycle_stage"] = "replaced"
+                replacement_branch["stop_reason"] = str(master_decision.get("reason") or "mission_guard_branch_replacement")
+                replacement_branch["replaced_for_mission_id"] = master_decision.get("mission_id")
+                _bulk_mark_open_destinations(
+                    replacement_branch,
+                    state="superseded_by_stronger_branch",
+                    state_reason="mission_guard_branch_replacement",
+                    round_index=round_index,
+                )
         target_branch = next(
             (
                 branch
@@ -28293,6 +39374,37 @@ def _retrieve_runtime_attested_impl(
         if target_branch and directive_destination:
             queue = [dict(item) for item in list(target_branch.get("destination_queue") or [])]
             matching_destination = next((item for item in queue if str(item.get("destination_id") or "") == directive_destination or str(item.get("label") or "") == directive_destination), None)
+            if matching_destination is None and str(master_decision.get("decision_source") or "") == "llm":
+                generated_destinations = _normalize_destination_queue(
+                    spec_destinations=[
+                        {
+                            "label": directive_destination,
+                            "rationale": str(master_decision.get("destination_reason") or master_decision.get("reason") or "master_gap_directed_destination"),
+                            "priority": max(0.55, float(master_decision.get("confidence") or 0.55)),
+                        }
+                    ],
+                    goal=str(target_branch.get("goal") or master_decision.get("goal") or ""),
+                    probe_label=str(target_branch.get("branch_id") or directive_destination),
+                    fallback_guide_area=str((target_branch.get("current_region") or {}).get("guide_area") or ""),
+                    fallback_memory_type=str((target_branch.get("current_region") or {}).get("memory_type") or ""),
+                    fallback_radial_expectation=str((target_branch.get("current_region") or {}).get("radial_expectation") or "mid"),
+                    fallback_color_hex=str((target_branch.get("current_region") or {}).get("color_hex") or ""),
+                )
+                matching_destination = next(
+                    (item for item in generated_destinations if str(item.get("label") or "") == directive_destination),
+                    generated_destinations[0] if generated_destinations else None,
+                )
+                if matching_destination:
+                    queue.append(dict(matching_destination))
+                    target_branch["destination_queue"] = queue
+                    target_branch["semantic_destination_queue"] = [
+                        *[dict(item) for item in list(target_branch.get("semantic_destination_queue") or [])],
+                        dict(matching_destination),
+                    ]
+                    target_branch["execution_destination_queue"] = [
+                        *[dict(item) for item in list(target_branch.get("execution_destination_queue") or [])],
+                        dict(matching_destination),
+                    ]
             if matching_destination:
                 prior_destination = dict(target_branch.get("active_destination") or {})
                 target_branch["active_destination"] = matching_destination
@@ -28331,6 +39443,10 @@ def _retrieve_runtime_attested_impl(
         elif target_branch and directive == "continue_branch":
             target_branch["route_state"] = "routing"
             target_branch["lifecycle_stage"] = "routing"
+            if str(master_decision.get("decision_source") or "") == "mission_guard":
+                target_branch["status"] = "active"
+                target_branch["stop_reason"] = None
+                target_branch["local_stop_recommendation"] = None
         if directive == "suppress_family" and target_family:
             for branch in branches:
                 if str(branch.get("planner_family") or "") != target_family:
@@ -28385,36 +39501,136 @@ def _retrieve_runtime_attested_impl(
                     branch["search_radius"] = round(min(0.42, float(branch.get("search_radius") or 0.24) + delta), 4)
         elif master_action in {"request_doc_anchor", "request_doc_chunk"}:
             requested_action = "read_document_anchor" if master_action == "request_doc_anchor" else "read_document_chunk"
+            hydration_payload = _document_hydration_action_payload(
+                action=requested_action,
+                mission_ledger=latest_live_mission_evidence_ledger,
+                document_packets=current_document_packets,
+                reason=str(master_decision.get("reason") or master_action),
+                target_mission_id=str(master_decision.get("mission_id") or "").strip() or None,
+                target_branch_id=target_branch_id or None,
+                target_document_id=str(
+                    master_decision.get("document_id")
+                    or master_decision.get("document_anchor_id")
+                    or master_decision.get("chunk_node_id")
+                    or ""
+                ).strip()
+                or None,
+            )
+            if hydration_payload is None:
+                master_decision_history[-1]["document_hydration_status"] = "blocked_missing_concrete_target"
             for branch in branches:
                 if str(branch.get("status") or "") != "active":
                     continue
-                planned = list(branch.get("planned_actions") or [])
-                planned.append(
+                if hydration_payload is None or not _branch_accepts_document_hydration_payload(
+                    branch, hydration_payload
+                ):
+                    continue
+                master_action_id = "master_document_hydration::" + hashlib.sha256(
+                    "|".join(
+                        (
+                            str(hydration_payload.get("mission_id") or ""),
+                            str(hydration_payload.get("branch_id") or ""),
+                            str(hydration_payload.get("node_id") or ""),
+                            str(last_operational_master_decision.get("mission_ledger_digest") or ""),
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()[:20]
+                pending_master_actions = [
+                    dict(item)
+                    for item in list(branch.get("pending_master_actions") or [])
+                    if isinstance(item, dict)
+                    and str(item.get("action_id") or "").strip() != master_action_id
+                ]
+                pending_master_actions.append(
                     {
+                        "action_id": master_action_id,
                         "action": requested_action,
-                        "payload": {"reason": str(master_decision.get("reason") or master_action)},
+                        "payload": {**dict(hydration_payload), "state": "queued"},
                         "confidence": max(0.55, float(master_decision.get("confidence") or 0.55)),
                         "rationale": str(master_decision.get("reason") or master_action),
+                        "decision_source": "llm_master",
+                        "ai_execution_attestation": dict(master_attestation),
                     }
                 )
-                branch["planned_actions"] = _normalize_navigation_actions(planned)
+                branch["pending_master_actions"] = _normalize_navigation_actions(pending_master_actions)
+            if hydration_payload is not None:
+                master_decision_history[-1]["document_hydration_status"] = "targeted"
+                master_decision_history[-1]["document_hydration_target"] = {
+                    key: hydration_payload.get(key)
+                    for key in (
+                        "mission_id",
+                        "branch_id",
+                        "path_id",
+                        "document_id",
+                        "anchor_node_id",
+                        "chunk_node_id",
+                        "node_id",
+                    )
+                    if hydration_payload.get(key)
+                }
+        elif master_action == "promote_evidence":
+            promoted_ids = _apply_master_evidence_promotion(
+                latest_evidence_reservoir,
+                evidence_ids=list(master_decision.get("evidence_ids") or []),
+                evidence_topic=str(master_decision.get("evidence_topic") or "").strip() or None,
+                target_branch=target_branch,
+                reason=str(master_decision.get("reason") or "").strip() or None,
+            )
+            master_decision_history[-1]["promoted_evidence_ids"] = promoted_ids
+            if not promoted_ids:
+                master_decision_history[-1]["promotion_status"] = "rejected_no_grounded_matching_evidence"
+            else:
+                master_decision_history[-1]["promotion_status"] = "applied"
         elif master_action == "spawn_worker":
-            target_goal = str(master_decision.get("goal") or "")
-            if len(branches) < int(query.max_total_branches):
+            # ``unresolved_gap`` is authored by the Master and is the semantic
+            # reason for a worker when the optional ``goal`` field is omitted.
+            # Never create an unregistered branch: its probe belongs in the
+            # public mission/route ledger before the branch is materialized.
+            target_goal = _master_spawn_goal(master_decision)
+            active_branch_count = sum(1 for branch in branches if str(branch.get("status") or "") == "active")
+            if active_branch_count < int(query.max_total_branches):
+                required_mission_id = str(master_decision.get("mission_id") or "").strip()
                 source_probe = next(
                     (
                         probe
                         for probe in probes
-                        if not target_goal or str(probe.get("goal") or "") == target_goal
+                        if required_mission_id and _probe_path_mission_id(probe) == required_mission_id
                     ),
-                    probes[0] if probes else None,
+                    None,
                 )
+                if source_probe is None:
+                    source_probe = next(
+                        (
+                            probe
+                            for probe in probes
+                            if not target_goal or str(probe.get("goal") or "") == target_goal
+                        ),
+                        probes[0] if probes else None,
+                    )
                 if source_probe:
-                    spawned_branch = _create_branch_from_probe(query, source_probe)
+                    spawned_probe = _build_master_spawn_probe(
+                        source_probe,
+                        round_index=round_index,
+                        target_goal=target_goal,
+                        directive_destination=directive_destination or None,
+                        reason=str(master_decision.get("reason") or "").strip() or None,
+                        destination_reason=str(master_decision.get("destination_reason") or "").strip() or None,
+                        confidence=float(master_decision.get("confidence") or 0.55),
+                        root_query_text=query.query_text,
+                    )
+                    if required_mission_id:
+                        spawned_probe["mission_id"] = required_mission_id
+                        spawned_probe["path_mission_id"] = required_mission_id
+                        route_preference_prior = dict(spawned_probe.get("route_preference_prior") or {})
+                        route_preference_prior["path_mission_id"] = required_mission_id
+                        spawned_probe["route_preference_prior"] = route_preference_prior
+                    probes.append(spawned_probe)
+                    spawned_branch = _create_branch_from_probe(query, spawned_probe)
                     spawned_branch["branch_id"] = f"{spawned_branch['branch_id']}_spawn_{round_index}"
                     spawned_branch["family_branch_id"] = f"{str(spawned_branch.get('planner_family') or 'heuristic')}::{spawned_branch['branch_id']}"
                     spawned_branch["worker_id"] = spawned_branch["branch_id"]
                     spawned_branch["worker_kind"] = str(master_decision.get("worker_kind") or "llm_navigation_worker")
+                    spawned_branch["replaces_branch_id"] = replacement_branch_id or None
                     branches.append(spawned_branch)
         post_master_surface_fields = _surface_runtime_fields(
             branches=branches,
@@ -28460,16 +39676,325 @@ def _retrieve_runtime_attested_impl(
             runtime_phase = "finalizing"
             break
 
+    if plan_first_v3:
+        # Normal plan-first exits converge on the single terminal Master turn.
+        # A client-visible partial terminal is different: the product already
+        # has visible evidence and intentionally chooses a reviewable partial
+        # rather than spending the reserved Master budget on a late judgement.
+        if (
+            not client_visible_partial_terminalized
+            and _flash_public_partial_before_master_enabled(
+                retrieval_mode=retrieval_mode,
+                response_mode=query.response_mode,
+                plan_first_v3=plan_first_v3,
+                route_truth_required=route_truth_required,
+            )
+        ):
+            has_public_evidence_ready = bool(
+                partial_answer_revision > 0
+                or first_context_ms is not None
+                or current_document_packets
+                or (first_landing_ms is not None and aggregated)
+            )
+            if has_public_evidence_ready:
+                stop_for_client_visible_partial_budget(
+                    int(locals().get("round_index") or max_rounds or 0),
+                    source="plan_first_flash_public_partial",
+                    force=True,
+                    reason="flash_public_partial_before_master",
+                )
+        if _plan_first_partial_can_skip_final_master(
+            client_visible_partial_terminalized=client_visible_partial_terminalized,
+            route_truth_required=route_truth_required,
+            terminal_reason=client_visible_partial_terminal_reason,
+        ):
+            final_master_budget_reserved = False
+            plan_first_final_master_required = False
+            plan_first_runtime["final_master_state"] = "skipped_client_visible_partial_terminal"
+            plan_first_runtime["final_master_skipped_reason"] = client_visible_partial_terminal_reason
+            plan_first_runtime["client_visible_partial_terminal"] = True
+            plan_first_runtime["flash_public_partial_before_master"] = (
+                client_visible_partial_terminal_reason == "flash_public_partial_before_master"
+            )
+        else:
+            plan_first_final_master_required = True
+            if str(plan_first_runtime.get("final_master_state") or "") == "reserved":
+                plan_first_runtime["final_master_state"] = "reserved_ready"
+        sync_plan_first_runtime()
+
+    plan_first_frozen_branches: list[dict[str, Any]] | None = None
+    plan_first_grounded_answer_seed: tuple[dict[str, Any] | None, dict[str, Any] | None] | None = None
+    # Final materialization below completes every legitimate document/temporal
+    # expansion and builds the stable mission ledger. The single V3 Master is
+    # deliberately deferred until that barrier; no earlier Master callsite is
+    # retained because even dormant authority implementations can drift.
+
     if early_final_surface_emitted and background_enrichment_state == "running":
         background_enrichment_state = "completed"
         background_enrichment_stop_reason = background_enrichment_stop_reason or "background_enrichment_completed"
         runtime_phase = "background_enrichment_completed"
         emit_background_enrichment_completed_event()
 
+    # A reserved final Master must judge the state produced by the last worker
+    # wave, not the previous Master's frozen input. Frozen state remains the
+    # renderer authority in every other exit path.
+    reuse_last_operational_master_surface = bool(
+        last_operational_master_surface and not final_master_budget_reserved
+    )
     final_materialization_stage_timings: list[dict[str, Any]] = []
     final_materialization_started_at = time.perf_counter()
     final_materialization_started_ms = round((final_materialization_started_at - started_at) * 1000.0, 2)
     partial_terminal_fast_materialization = bool(client_visible_partial_terminalized)
+    flash_public_partial_before_master_active = bool(
+        plan_first_v3
+        and partial_terminal_fast_materialization
+        and client_visible_partial_terminal_reason == "flash_public_partial_before_master"
+        and _flash_public_partial_before_master_enabled(
+            retrieval_mode=retrieval_mode,
+            response_mode=query.response_mode,
+            plan_first_v3=plan_first_v3,
+            route_truth_required=route_truth_required,
+        )
+    )
+    if flash_public_partial_before_master_active:
+        partial_matches = sorted(
+            list(aggregated.values()),
+            key=lambda item: (-float(dict(item).get("raw_score") or 0.0), str(dict(item).get("node_id") or "")),
+        )[: query.max_matches]
+        evidence_snippets = _build_stream_evidence_snippets(partial_matches)
+        fragment_rows = []
+        for index, match in enumerate(partial_matches[:8], start=1):
+            match_payload = dict(match or {})
+            node_id = str(match_payload.get("node_id") or "").strip()
+            text = clean_answer_surface_text(
+                match_payload.get("evidence_snippet")
+                or match_payload.get("summary")
+                or dict(match_payload.get("node") or {}).get("summary")
+                or dict(match_payload.get("node") or {}).get("raw_text")
+            )
+            if not text:
+                continue
+            fragment_rows.append(
+                {
+                    "topic": str(match_payload.get("label") or f"Evidence {index}"),
+                    "text": text,
+                    "confidence": max(0.0, min(1.0, float(match_payload.get("score") or match_payload.get("raw_score") or 0.0))),
+                    "evidence_node_ids": [node_id] if node_id else [],
+                }
+            )
+        context_summary = clean_answer_surface_text(
+            " ".join(row["text"] for row in fragment_rows[:4])
+        ) or "AGVM retrieved source-backed context, but stopped before the final Master seal."
+        context_payload = {
+            "context_summary": context_summary,
+            "context_fragments": fragment_rows,
+            "structured_sections": [
+                {
+                    "section_id": "retrieved_evidence",
+                    "title": "Retrieved evidence",
+                    "status": "review_required",
+                    "items": [
+                        {
+                            "node_id": str(dict(match or {}).get("node_id") or ""),
+                            "summary": clean_answer_surface_text(
+                                dict(match or {}).get("summary")
+                                or dict(dict(match or {}).get("node") or {}).get("summary")
+                            ),
+                            "score": float(dict(match or {}).get("score") or 0.0),
+                        }
+                        for match in partial_matches[: query.max_matches]
+                    ],
+                }
+            ],
+            "open_uncertainties": [
+                "The run returned a public flash partial before the final Master seal."
+            ],
+            "evidence_node_ids": [
+                str(dict(match or {}).get("node_id") or "")
+                for match in partial_matches
+                if str(dict(match or {}).get("node_id") or "").strip()
+            ],
+        }
+        answer_full_text = clean_answer_surface_text(
+            " ".join(row["text"] for row in fragment_rows[:6])
+        )
+        answer_payload = None
+        if query.response_mode in {"answer", "both"} and answer_full_text:
+            answer_payload = {
+                "answer_text": answer_full_text,
+                "mode": "grounded_facts",
+                "confidence": max(
+                    0.0,
+                    min(
+                        1.0,
+                        max((float(dict(match or {}).get("score") or 0.0) for match in partial_matches), default=0.0),
+                    ),
+                ),
+                "evidence_node_ids": [
+                    str(dict(match or {}).get("node_id") or "")
+                    for match in partial_matches
+                    if str(dict(match or {}).get("node_id") or "").strip()
+                ],
+                "reasoning_summary": "Flash Search returned usable source-backed evidence and skipped the late final Master seal.",
+                "insufficient": False,
+                "answerability_state": "partial",
+                "evidence_snippets": evidence_snippets,
+                "support_node_count": len(partial_matches),
+                "support_slot_count": len(list(runtime_plan.get("answer_strands") or [])),
+                "family_attribution_summary": {},
+                "contradiction_present": False,
+                "answer_adequacy": {
+                    "state": "review_required",
+                    "reason": "public_partial_before_master",
+                },
+                "partial_known": True,
+                "semantic_authority": {
+                    "authority": _persisted_runtime_semantic_authority(runtime_plan),
+                    "final_master_used": False,
+                    "final_sealed": False,
+                    "public_partial_before_master": True,
+                },
+            }
+        completed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+        planner_runtime_payload = {
+            **dict(runtime_plan.get("planner_runtime") or {}),
+            "plan_first_runtime": dict(plan_first_runtime),
+            "client_visible_partial_terminalized": True,
+            "client_visible_partial_terminal_reason": "flash_public_partial_before_master",
+            "flash_public_partial_before_master": True,
+            "final_master_state": "skipped_client_visible_partial_terminal",
+            "result_materialization_state": "partial_review_required",
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "result_surface_ready_ms": completed_ms,
+            "final_materialization_started_ms": None,
+            "final_materialization_completed_ms": completed_ms,
+            "partial_result_early_return": True,
+        }
+        result = {
+            "search_id": str(search_id or "") or None,
+            "brain_id": str(active_brain_id or getattr(query, "brain_id", None) or "") or None,
+            "brain_revision": semantic_brain_revision,
+            "query_text": query.query_text,
+            "thread_id": normalized_thread_id,
+            "response_mode": query.response_mode,
+            "retrieval_mode": retrieval_mode,
+            "decomposition_mode": "hybrid" if llm_scout_state["added_probe_count"] else decomposition_mode,
+            "planner_mode": "hybrid" if llm_scout_state["enabled"] else planner_mode,
+            "document_mode": "lookup" if current_document_packets else "none",
+            "document_lookup_kind": "lookup" if current_document_packets else "none",
+            **semantic_contract_fields(),
+            "metamemory_snapshot": dict(runtime_plan.get("metamemory_snapshot") or {}),
+            "metamemory_spatial_brief": dict(runtime_plan.get("metamemory_spatial_brief") or {}),
+            "metamemory_spatial_brief_summary": dict(runtime_plan.get("metamemory_spatial_brief_summary") or {}),
+            "metamemory_spatial_readiness": dict(
+                runtime_plan.get("metamemory_spatial_readiness")
+                or dict(runtime_plan.get("metamemory_spatial_brief") or {}).get("spatial_readiness_contract")
+                or {}
+            ),
+            "ai_spatial_landing_contract": dict(runtime_plan.get("ai_spatial_landing_contract") or {}),
+            "ai_spatial_landing_contract_runtime": dict(runtime_plan.get("ai_spatial_landing_contract_runtime") or {}),
+            "document_lookup": {
+                "kind": "lookup" if current_document_packets else "none",
+                "status": "partial_review_required",
+                "supporting_documents": current_document_packets,
+            },
+            "supporting_documents": list(current_document_packets),
+            "source_trace": list(current_document_packets),
+            "document_workspace": {
+                "document_packets": list(current_document_packets),
+                "document_refs": list(current_document_packets),
+            },
+            "document_refs": list(current_document_packets),
+            "document_packets": list(current_document_packets),
+            "answer_strands": [dict(item) for item in list(runtime_plan.get("answer_strands") or []) if isinstance(item, dict)],
+            "planner_seed_runtime": dict(runtime_plan.get("planner_seed_runtime") or {}),
+            "seed_goal_coverage": dict(runtime_plan.get("seed_goal_coverage") or {}),
+            "seed_destination_presence": dict(runtime_plan.get("seed_destination_presence") or {}),
+            "probes": probes,
+            "branches": branches,
+            "landing_metadata": build_landing_metadata(probes, branches),
+            "steps": all_steps,
+            "matches": partial_matches,
+            "visited_node_ids": sorted(visited_node_ids),
+            "visited_bucket_keys": sorted(visited_bucket_keys),
+            "stop_reason": "flash_public_partial_before_master",
+            "answer": answer_payload,
+            "context": context_payload if query.response_mode in {"context", "both"} else None,
+            "answer_short": answer_full_text if query.response_mode in {"answer", "both"} else None,
+            "answer_full": answer_full_text if query.response_mode in {"answer", "both"} else None,
+            "context_structured": {"sections": context_payload["structured_sections"]},
+            "context_package": {
+                "schema_version": "agvm.mcp_context_package.v1",
+                "status": "partial_review_required",
+                "review_required": True,
+                "sections": context_payload["structured_sections"],
+                "document_refs": list(current_document_packets),
+                "evidence": evidence_snippets,
+                "used_memories": [
+                    {
+                        "node_id": str(dict(match or {}).get("node_id") or ""),
+                        "summary": clean_answer_surface_text(dict(match or {}).get("summary")),
+                    }
+                    for match in partial_matches
+                ],
+                "contract": {
+                    "passed": True,
+                    "review_required": True,
+                    "state": "partial_review_required",
+                    "reason": "flash_public_partial_before_master",
+                },
+            },
+            "evidence_snippets": evidence_snippets,
+            "status": "review_required",
+            "completion_state": "review_required",
+            "canonical_search_state": "review_required",
+            "review_required": True,
+            "more_evidence_needed": True,
+            "search_outcome_contract": {
+                "schema_version": "agvm.search_review_outcome.v1",
+                "state": "review_required",
+                "outcome": "public_partial_before_master",
+                "terminal": True,
+                "complete": False,
+            },
+            "answerability_state": "partial" if answer_payload else "insufficient",
+            "answer_surface_state": "answer_now_and_continue" if answer_payload else "context_level_1_ready",
+            "closure_state": "bounded_partial",
+            "final_closure_ready": False,
+            "final_closure_blockers": [
+                {
+                    "reason": "final_master_skipped_for_flash_partial",
+                    "destination_key": "final_master",
+                }
+            ],
+            "result_materialization_state": "partial_review_required",
+            "final_materialization_pending": False,
+            "result_ready_terminal": True,
+            "terminal_for_client": True,
+            "public_partial_before_master": True,
+            "final_sealed": False,
+            "planner_runtime": planner_runtime_payload,
+            "timing": {
+                "plan_ms": (runtime_plan.get("planner_runtime") or {}).get("plan_ms"),
+                "total_ms": completed_ms,
+                "result_surface_ready_ms": completed_ms,
+                "final_materialization_started_ms": None,
+                "final_materialization_completed_ms": completed_ms,
+                "final_materialization_stage_timings": [
+                    {
+                        "stage": "flash_public_partial_early_return",
+                        "duration_ms": 0.0,
+                        "completed_ms": completed_ms,
+                    }
+                ],
+            },
+        }
+        result["payload_integrity"] = _build_context_payload_integrity(result)
+        return canonicalize_search_result(
+            str(search_id or result.get("search_id") or ""),
+            normalize_retrieve_response_payload(result),
+        )
     result_surface_ready_ms = None
     if isinstance(detached_result_snapshot_payload, dict):
         snapshot_timing_for_surface = dict(detached_result_snapshot_payload.get("timing") or {})
@@ -28483,6 +40008,93 @@ def _retrieve_runtime_attested_impl(
         }
         record.update({key: value for key, value in extra.items() if value is not None})
         final_materialization_stage_timings.append(record)
+
+    def run_finalization_ai_stage(stage: str, operation: Any) -> Any:
+        """Keep the live stream observable while one terminal AI call blocks."""
+
+        stop_request_reason = _search_runtime_stop_reason(
+            search_id=search_id,
+            include_stop_event=False,
+        )
+        if stop_request_reason:
+            _set_search_runtime_stop(runtime_stop_event)
+            emit(
+                "finalization_progress",
+                {
+                    "runtime_phase": "final_materialization",
+                    "stage": stage,
+                    "state": "skipped_runtime_stop",
+                    "stop_reason": stop_request_reason,
+                    "final_materialization_pending": True,
+                    "result_ready_terminal": False,
+                },
+            )
+            raise SearchAiExecutionError(stage, stop_request_reason)
+        stage_started_at = time.perf_counter()
+        heartbeat_stop = threading.Event()
+
+        def heartbeat() -> None:
+            beat = 0
+            while not heartbeat_stop.wait(5.0):
+                beat += 1
+                emit(
+                    "finalization_progress",
+                    {
+                        "runtime_phase": "final_materialization",
+                        "stage": stage,
+                        "state": "running",
+                        "heartbeat": beat,
+                        "stage_elapsed_ms": round(
+                            (time.perf_counter() - stage_started_at) * 1000.0,
+                            2,
+                        ),
+                        "final_materialization_pending": True,
+                    },
+                )
+
+        emit(
+            "finalization_progress",
+            {
+                "runtime_phase": "final_materialization",
+                "stage": stage,
+                "state": "started",
+                "heartbeat": 0,
+                "stage_elapsed_ms": 0.0,
+                "final_materialization_pending": True,
+            },
+        )
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name=f"agvm-finalization-{stage}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        try:
+            stage_result = operation()
+            post_stage_stop_reason = _search_runtime_stop_reason(
+                search_id=search_id,
+                include_stop_event=False,
+            )
+            if post_stage_stop_reason:
+                _set_search_runtime_stop(runtime_stop_event)
+                raise SearchAiExecutionError(stage, post_stage_stop_reason)
+            return stage_result
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=0.2)
+            emit(
+                "finalization_progress",
+                {
+                    "runtime_phase": "final_materialization",
+                    "stage": stage,
+                    "state": "completed",
+                    "stage_elapsed_ms": round(
+                        (time.perf_counter() - stage_started_at) * 1000.0,
+                        2,
+                    ),
+                    "final_materialization_pending": True,
+                },
+            )
 
     if event_callback:
         emit(
@@ -28522,6 +40134,11 @@ def _retrieve_runtime_attested_impl(
         final_scout_join_wait_seconds = 0.0
         final_scout_wait_capped_by_sla = final_scout_wait_budget_seconds > 0.0
     if partial_terminal_fast_materialization:
+        final_scout_join_wait_seconds = 0.0
+        final_scout_wait_capped_by_sla = final_scout_wait_budget_seconds > 0.0
+    if plan_first_v3:
+        # The frozen ledger, not a late scout, is the terminal Master's input.
+        # Joining a background scout here would spend the reserved Master slot.
         final_scout_join_wait_seconds = 0.0
         final_scout_wait_capped_by_sla = final_scout_wait_budget_seconds > 0.0
     scout_non_blocking_finalization = bool(
@@ -28609,20 +40226,32 @@ def _retrieve_runtime_attested_impl(
     llm_scout_state["running_after_final_join"] = scout_running_after_final_join
 
     final_stage_started = time.perf_counter()
-    matches = _enrich_matches_with_document_anchor_children(
-        list(aggregated.values()),
-        query_text=query.query_text,
-        identity_context=identity_context,
-    )
-    document_expansion_matches = _document_evidence_expansion_matches(
-        query,
-        matches,
-        limit=max(query.max_matches, 24),
-    )
-    if document_expansion_matches:
-        matches.extend(document_expansion_matches)
-    matches = _augment_matches_with_temporal_sweep(query.query_text, matches, limit=query.max_matches)
-    matches.sort(key=lambda item: _contract_match_sort_key(query.query_text, item))
+    if reuse_last_operational_master_surface:
+        branches = copy.deepcopy(last_operational_master_surface.get("branches") or [])
+        all_steps = copy.deepcopy(last_operational_master_surface.get("steps") or [])
+        matches = copy.deepcopy(last_operational_master_surface.get("matches") or [])
+    elif plan_first_v3:
+        # The bounded executor has already acquired every allowed node. Late
+        # document/temporal keyword sweeps would be an unplanned second engine.
+        matches = sorted(
+            list(aggregated.values()),
+            key=lambda item: (-float(item.get("raw_score") or 0.0), str(item.get("node_id") or "")),
+        )[: query.max_matches]
+    else:
+        matches = _enrich_matches_with_document_anchor_children(
+            list(aggregated.values()),
+            query_text=query.query_text,
+            identity_context=identity_context,
+        )
+        document_expansion_matches = _document_evidence_expansion_matches(
+            query,
+            matches,
+            limit=max(query.max_matches, 24),
+        )
+        if document_expansion_matches:
+            matches.extend(document_expansion_matches)
+        matches = _augment_matches_with_temporal_sweep(query.query_text, matches, limit=query.max_matches)
+        matches.sort(key=lambda item: _contract_match_sort_key(query.query_text, item))
     branch_overlaps: list[dict[str, Any]] = []
     for left in branches:
         for right in branches:
@@ -28643,7 +40272,7 @@ def _retrieve_runtime_attested_impl(
                     }
                 )
     query_class = _query_class(query.query_text)
-    if query_class == "broad_summary":
+    if query_class == "broad_summary" and not plan_first_v3:
         matches = _diversify_broad_summary_matches(matches, limit=query.max_matches)
     shared_evidence = {
         "covered_goals": sorted(shared_topics.keys()),
@@ -28657,22 +40286,28 @@ def _retrieve_runtime_attested_impl(
         "contradiction_flags": [],
         "confidence": max((float(topic["confidence"]) for topic in shared_topics.values()), default=0.0),
     }
-    document_mode = _detect_document_mode(
-        query.query_text,
-        matches[: query.max_matches],
-        shared_evidence,
-        tool_name=query.mcp_tool_name,
-    )
-    document_match_window = matches[: query.max_matches]
-    if document_mode != "none":
-        document_match_window = matches[: max(query.max_matches, min(48, len(matches)))]
-    document_packet_limit = max(6, min(12, int(query.max_matches or 6))) if document_mode != "none" else 6
-    document_packets = _build_document_packets(
-        document_match_window,
-        shared_evidence,
-        query_text=query.query_text,
-        packet_limit=document_packet_limit,
-    )
+    if reuse_last_operational_master_surface:
+        shared_evidence = copy.deepcopy(last_operational_master_surface.get("shared_evidence") or {})
+    if plan_first_v3:
+        document_packets = copy.deepcopy(current_document_packets)
+        document_mode = "lookup" if document_packets else "none"
+    else:
+        document_mode = _detect_document_mode(
+            query.query_text,
+            matches[: query.max_matches],
+            shared_evidence,
+            tool_name=query.mcp_tool_name,
+        )
+        document_match_window = matches[: query.max_matches]
+        if document_mode != "none":
+            document_match_window = matches[: max(query.max_matches, min(48, len(matches)))]
+        document_packet_limit = max(6, min(12, int(query.max_matches or 6))) if document_mode != "none" else 6
+        document_packets = _build_document_packets(
+            document_match_window,
+            shared_evidence,
+            query_text=query.query_text,
+            packet_limit=document_packet_limit,
+        )
     evidence_reservoir = _build_evidence_reservoir(
         matches=matches[: query.max_matches],
         shared_evidence=shared_evidence,
@@ -28681,6 +40316,9 @@ def _retrieve_runtime_attested_impl(
         continuity_state=continuity_state,
         warm_state_used=warm_state_used,
     )
+    if reuse_last_operational_master_surface:
+        document_packets = copy.deepcopy(last_operational_master_surface.get("document_packets") or [])
+        evidence_reservoir = copy.deepcopy(last_operational_master_surface.get("evidence_reservoir") or {})
     record_final_materialization_stage(
         "final_evidence_packaging",
         final_stage_started,
@@ -28689,8 +40327,18 @@ def _retrieve_runtime_attested_impl(
     )
     final_answer_seed_from_early_surface = False
     final_stage_started = time.perf_counter()
-    if (
-        warm_final_answer_seed
+    answer_semantic_authority = _persisted_runtime_semantic_authority(runtime_plan)
+    if plan_first_grounded_answer_seed is not None:
+        answer, context = plan_first_grounded_answer_seed
+    elif plan_first_v3 and query.response_mode in {"answer", "both"}:
+        # The final Master has not run yet. Keep the answer surface empty;
+        # grounded composition occurs only after its attested judgement over
+        # the frozen ledger.
+        answer = None
+        context = None
+    elif (
+        answer_semantic_authority != "ai_v2"
+        and warm_final_answer_seed
         and warm_route_budget_override == 0
         and not warm_route_validation_required
         and document_mode == "none"
@@ -28712,7 +40360,8 @@ def _retrieve_runtime_attested_impl(
             answer.setdefault("answer_adequacy", {})
             answer = _apply_answer_contract(query.query_text, answer, matches[: query.max_matches])
     elif (
-        early_final_surface_emitted
+        answer_semantic_authority != "ai_v2"
+        and early_final_surface_emitted
         and early_final_surface_payload
         and query.response_mode in {"answer", "both"}
     ):
@@ -28741,6 +40390,8 @@ def _retrieve_runtime_attested_impl(
             evidence_reservoir=evidence_reservoir,
             retrieval_mode=retrieval_mode,
         )
+    if reuse_last_operational_master_surface:
+        context = copy.deepcopy(last_operational_master_surface.get("context") or {})
     context = _build_document_context(
         document_mode=document_mode,
         document_packets=document_packets,
@@ -28789,6 +40440,52 @@ def _retrieve_runtime_attested_impl(
         document_mode=document_mode,
     )
     final_stage_started = time.perf_counter()
+    final_semantic_snapshot_for_master = semantic_contract_snapshot()
+    latest_live_path_corridors = build_path_corridor_package(
+        query_text=query.query_text,
+        branches=branches,
+        steps=all_steps,
+        matches=matches[: query.max_matches],
+        evidence_reservoir=evidence_reservoir,
+        semantic_contract=dict(final_semantic_snapshot_for_master.get("contract") or {}),
+        landing_metadata=build_landing_metadata(probes, branches),
+        retrieval_mode=retrieval_mode,
+    )
+    latest_live_mission_evidence_ledger = build_mission_evidence_ledger(
+        path_mission_contract=dict(runtime_plan.get("path_mission_contract") or {}),
+        branches=branches,
+        route_runtime=_route_runtime_summary(branches),
+        document_refs=document_packets,
+        document_workspace={
+            "document_packets": document_packets,
+            "document_refs": document_packets,
+        },
+        semantic_contract_runtime=dict(final_semantic_snapshot_for_master.get("runtime") or {}),
+        ai_spatial_landing_contract_runtime=dict(runtime_plan.get("ai_spatial_landing_contract_runtime") or {}),
+        path_corridors=latest_live_path_corridors,
+        evidence_reservoir=evidence_reservoir,
+        matches=matches[: query.max_matches],
+        query_text=query.query_text,
+        retrieval_mode=retrieval_mode,
+        revision_context={
+            "brain_revision": runtime_plan.get("brain_revision"),
+            "matrix_revision": runtime_plan.get("matrix_revision"),
+            "metamemory_revision": runtime_plan.get("metamemory_revision"),
+            "topology_revision": runtime_plan.get("topology_revision"),
+            "atlas_revision": runtime_plan.get("atlas_revision"),
+        },
+        allow_ai_branch_controller=not plan_first_v3,
+        semantic_certification_owner=(
+            "terminal_master" if plan_first_v3 else "branch_controller"
+        ),
+    )
+    final_unresolved_required_missions = (
+        _plan_first_structurally_unresolved_required_mission_rows(
+            latest_live_mission_evidence_ledger
+        )
+        if plan_first_v3
+        else _unresolved_required_mission_rows(latest_live_mission_evidence_ledger)
+    )
     final_master_state = {
         **_master_state_snapshot(
             retrieval_mode=retrieval_mode,
@@ -28797,8 +40494,9 @@ def _retrieve_runtime_attested_impl(
             decision_history=master_decision_history,
             llm_scout_state=llm_scout_state,
         ),
-        "status": "completed",
+        "status": "completed" if not final_unresolved_required_missions else "review_required",
         "stop_reason": stop_reason,
+        "unresolved_required_mission_count": len(final_unresolved_required_missions),
     }
     blackboard = _build_blackboard(
         query_text=query.query_text,
@@ -28828,6 +40526,27 @@ def _retrieve_runtime_attested_impl(
         seed_goal_coverage=dict(runtime_plan.get("seed_goal_coverage") or {}),
         seed_destination_presence=dict(runtime_plan.get("seed_destination_presence") or {}),
     )
+    blackboard["path_corridors"] = latest_live_path_corridors
+    blackboard["mission_evidence_ledger"] = latest_live_mission_evidence_ledger
+    blackboard["evidence_reservoir"] = evidence_reservoir
+    blackboard["revision_context"] = {
+        "brain_revision": runtime_plan.get("brain_revision"),
+        "matrix_revision": runtime_plan.get("matrix_revision"),
+        "metamemory_revision": runtime_plan.get("metamemory_revision"),
+        "topology_revision": runtime_plan.get("topology_revision"),
+        "atlas_revision": runtime_plan.get("atlas_revision"),
+    }
+    blackboard["unresolved_required_missions"] = [
+        {
+            "mission_id": row.get("mission_id"),
+            "path_id": row.get("path_id"),
+            "branch_id": row.get("branch_id"),
+            "goal": row.get("goal"),
+            "coverage_state": row.get("coverage_state"),
+            "coverage_reason": row.get("coverage_reason"),
+        }
+        for row in final_unresolved_required_missions[:12]
+    ]
     shared_evidence = {
         **shared_evidence,
         **blackboard,
@@ -28842,54 +40561,17 @@ def _retrieve_runtime_attested_impl(
     if stop_reason == "budget_exhausted" and all_steps:
         stop_reason = all_steps[-1].get("stop_reason") or stop_reason
     answerability_state = str((answer or {}).get("answerability_state") or "")
-    normalized_branches: list[dict[str, Any]] = []
-    for branch in branches:
-        updated_branch = dict(branch)
-        branch_status = str(updated_branch.get("status") or "")
-        branch_stop_reason = str(updated_branch.get("stop_reason") or "")
-        if branch_status == "active":
-            updated_branch["status"] = "stopped" if stop_reason != "all_branch_goals_satisfied" else "satisfied"
-            updated_branch["stop_reason"] = stop_reason if stop_reason else "search_completed"
-            _bulk_mark_open_destinations(
-                updated_branch,
-                state="superseded_by_stronger_branch" if updated_branch["status"] == "satisfied" else "suppressed_by_master",
-                state_reason=str(updated_branch.get("stop_reason") or "search_completed"),
-                round_index=int(updated_branch.get("last_round_index") or max_rounds or 0),
-            )
-        elif not branch_stop_reason:
-            updated_branch["stop_reason"] = stop_reason if branch_status in {"stopped", "satisfied"} else "search_completed"
-        if branch_status == "merged":
-            _bulk_mark_open_destinations(
-                updated_branch,
-                state="merged",
-                state_reason=str(updated_branch.get("stop_reason") or "merged"),
-                round_index=int(updated_branch.get("last_round_index") or max_rounds or 0),
-            )
-        normalized_route_state = str(updated_branch.get("route_state") or "")
-        if str(updated_branch.get("status") or "") == "satisfied" and normalized_route_state not in {"goal_satisfied", "merged", "superseded"}:
-            updated_branch["route_state"] = "goal_satisfied"
-            updated_branch["lifecycle_stage"] = "satisfied"
-        elif str(updated_branch.get("status") or "") == "stopped" and normalized_route_state in {"", "planned", "landing", "routing", "evidence_holding", "reroute_pending"}:
-            terminal_stop_reason = str(updated_branch.get("stop_reason") or "")
-            updated_branch["route_state"] = (
-                "route_exhausted"
-                if terminal_stop_reason in {"route_exhausted", "destination_reached_no_remaining_destinations", "budget_exhausted"}
-                else "stopped"
-            )
-            updated_branch["lifecycle_stage"] = "stopped"
-        updated_branch = _finalize_terminal_branch_destinations(
-            updated_branch,
-            round_index=int(updated_branch.get("last_round_index") or max_rounds or 0),
+    branches = (
+        copy.deepcopy(plan_first_frozen_branches)
+        if plan_first_v3 and plan_first_frozen_branches is not None
+        else _normalize_terminal_branches(
+            branches,
+            stop_reason=stop_reason,
+            round_index=int(max_rounds or 0),
         )
-        updated_branch["active_destination"] = _canonical_active_destination(updated_branch.get("active_destination"))
-        updated_branch["family_contribution_summary"] = {
-            "planner_family": str(updated_branch.get("planner_family") or "heuristic"),
-            "evidence_node_count": len(list(updated_branch.get("evidence_node_ids") or [])),
-            "route_yield": round(float(updated_branch.get("route_yield") or 0.0), 4),
-            "covered_slot_count": len(list(updated_branch.get("covered_slots") or [])),
-        }
-        normalized_branches.append(updated_branch)
-    branches = normalized_branches
+    )
+    if reuse_last_operational_master_surface:
+        branches = copy.deepcopy(last_operational_master_surface.get("branches") or [])
     planner_family_plans.update(
         _planner_family_summary(
             probes=probes,
@@ -28901,6 +40583,8 @@ def _retrieve_runtime_attested_impl(
         )
     )
     route_runtime = _route_runtime_summary(branches)
+    if reuse_last_operational_master_surface:
+        route_runtime = copy.deepcopy(last_operational_master_surface.get("route_runtime") or {})
     final_surface_fields = _surface_runtime_fields(
         branches=branches,
         context=context or {},
@@ -28938,6 +40622,29 @@ def _retrieve_runtime_attested_impl(
         can_answer_now=bool(answer),
         final_sealed=bool(final_surface_fields.get("final_closure_ready")),
     )
+    if final_unresolved_required_missions:
+        mission_blockers = [
+            {
+                "code": "required_mission_unresolved",
+                "mission_id": row.get("mission_id"),
+                "path_id": row.get("path_id"),
+                "goal": row.get("goal"),
+                "coverage_state": row.get("coverage_state"),
+                "coverage_reason": row.get("coverage_reason"),
+            }
+            for row in final_unresolved_required_missions[:12]
+        ]
+        final_surface_fields = {
+            **dict(final_surface_fields),
+            "answer_surface_state": "answer_now_and_continue" if bool(answer) else "not_ready",
+            "closure_state": "open",
+            "final_closure_ready": False,
+            "final_closure_blockers": [
+                *[dict(item) for item in list(final_surface_fields.get("final_closure_blockers") or [])],
+                *mission_blockers,
+            ][:16],
+            "unresolved_required_mission_count": len(final_unresolved_required_missions),
+        }
     final_closure_ready = bool(final_surface_fields.get("final_closure_ready"))
     if (
         answerability_state == "grounded"
@@ -28957,15 +40664,37 @@ def _retrieve_runtime_attested_impl(
         if isinstance(decision, dict)
     )
     answer_demo_requested = bool(query.response_mode in {"answer", "both"})
-    if (
-        answer_demo_requested
-        and final_closure_ready
-        and llm_enabled()
-        and not final_llm_approval_present
-        and not partial_terminal_fast_materialization
+    # The plan-first Master is executed once at the frozen barrier. When it
+    # legitimately asks for more evidence after bounded primary+reserve work,
+    # preserve that verdict as a terminal reviewable partial. Resetting this
+    # flag made the renderer expose the same attested run as a hard block.
+    final_master_budget_review_required = _plan_first_existing_master_requires_terminal_review(
+        plan_first_runtime=plan_first_runtime if plan_first_v3 else {},
+        operational_decision=last_operational_master_decision,
+        mission_evidence_ledger=latest_live_mission_evidence_ledger,
+        unresolved_required_missions=final_unresolved_required_missions,
+    )
+    final_master_review_stop_reason = "review_required_master_needs_more_search_at_budget"
+    final_pre_master_ledger: dict[str, Any] | None = None
+    final_pre_master_surface: dict[str, Any] | None = None
+    if not (
+        plan_first_v3
+        and int(plan_first_runtime.get("final_master_attempt_count") or 0) >= 1
+    ) and _should_run_final_operational_master(
+        answer_demo_requested=answer_demo_requested,
+        final_closure_ready=final_closure_ready,
+        final_master_budget_reserved=final_master_budget_reserved,
+        provider_enabled=llm_enabled(),
+        final_llm_approval_present=final_llm_approval_present,
+        partial_terminal_fast_materialization=partial_terminal_fast_materialization,
+        previous_operational_decision=last_operational_master_decision,
+        plan_first_final_master_required=plan_first_final_master_required,
     ):
         final_decision_blackboard = {
             **dict(blackboard or {}),
+            "master_review_phase": "final_plan_barrier",
+            "bounded_plan_exhausted": True,
+            "further_worker_execution_available": False,
             "answer_surface_state": str(final_surface_fields.get("answer_surface_state") or "not_ready"),
             "closure_state": str(final_surface_fields.get("closure_state") or "open"),
             "final_closure_ready": bool(final_surface_fields.get("final_closure_ready")),
@@ -28973,40 +40702,528 @@ def _retrieve_runtime_attested_impl(
             "unresolved_destination_count": int(final_surface_fields.get("unresolved_destination_count") or 0),
             "final_ai_approval_required": True,
         }
-        final_ai_master_decision, final_ai_master_error = master_judge_llm(
-            query_text=query.query_text,
-            query_class=query_class,
-            retrieval_mode=retrieval_mode,
-            blackboard=final_decision_blackboard,
-            round_index=int(max_rounds or 0),
-            timing={
-                "first_landing_ms": first_landing_ms,
-                "first_context_ms": first_context_ms,
-                "answer_first_ms": answer_first_ms,
-                "answer_final_ms": answer_final_ms,
-            },
-        )
-        if final_ai_master_decision:
-            master_decision_history.append(
-                {
-                    "round": int(max_rounds or 0),
-                    "decision": str(final_ai_master_decision.get("decision") or "emit_answer_partial"),
-                    "reason": str(final_ai_master_decision.get("reason") or "final_ai_master_review"),
-                    "decision_source": "llm",
-                    "fallback_reason": None,
-                    "can_answer_now": bool(final_ai_master_decision.get("can_answer_now", bool(answer))),
-                    "should_continue_expanding": bool(final_ai_master_decision.get("should_continue_expanding", False)),
-                    "active_worker_count": sum(1 for branch in branches if str(branch.get("status") or "") == "active"),
-                    "target_branch_id": str(final_ai_master_decision.get("target_branch_id") or "") or None,
-                    "target_family": str(final_ai_master_decision.get("target_family") or "") or None,
-                    "directive": str(final_ai_master_decision.get("directive") or ("finalize_now" if str(final_ai_master_decision.get("decision") or "") in {"emit_answer_final", "stop_all"} else "continue_search")) or None,
-                    "directive_destination": str(final_ai_master_decision.get("directive_destination") or "") or None,
-                    "answer_surface_state": str(final_surface_fields.get("answer_surface_state") or "not_ready"),
-                    "closure_state": str(final_surface_fields.get("closure_state") or "open"),
-                    "final_closure_ready": bool(final_surface_fields.get("final_closure_ready")),
-                    "unresolved_destination_count": int(final_surface_fields.get("unresolved_destination_count") or 0),
-                }
+        if plan_first_final_master_required:
+            plan_digest_was_missing = not str(
+                plan_first_runtime.get("plan_digest") or ""
+            ).strip()
+            _ensure_plan_first_execution_plan_digest(plan_first_runtime, probes)
+            if plan_digest_was_missing:
+                plan_first_runtime["plan_digest_recovered_at_final_barrier"] = True
+            sync_plan_first_runtime()
+            # Freeze all evidence before the only Master call. From this point
+            # onward the renderer may only project this detached snapshot.
+            final_pre_master_ledger = copy.deepcopy(
+                latest_live_mission_evidence_ledger
             )
+            final_pre_master_surface = _freeze_operational_master_surface(
+                branches=branches,
+                steps=all_steps,
+                matches=matches[: query.max_matches],
+                evidence_reservoir=evidence_reservoir,
+                document_packets=document_packets,
+                shared_evidence=shared_evidence,
+                context=context or {},
+                path_corridors=latest_live_path_corridors,
+                route_runtime=route_runtime,
+                landing_metadata=build_landing_metadata(probes, branches),
+            )
+            plan_first_runtime["ledger_digest"] = search_mission_ledger_digest(
+                final_pre_master_ledger
+            )
+            plan_first_runtime["frozen_surface_digest"] = search_mission_ledger_digest(
+                final_pre_master_surface
+            )
+            plan_first_runtime["evidence_ledger_frozen_before_master"] = True
+            plan_first_runtime["frozen_state_order"] = (
+                "materialize_then_freeze_then_master_then_project"
+            )
+            final_decision_blackboard["mission_evidence_ledger"] = copy.deepcopy(
+                final_pre_master_ledger
+            )
+            final_decision_blackboard["plan_first_runtime"] = dict(
+                plan_first_runtime
+            )
+        evidence_authority: dict[str, Any] = {}
+        if plan_first_final_master_required and final_pre_master_ledger is not None:
+            try:
+                evidence_authority = run_finalization_ai_stage(
+                    "evidence_judge",
+                    lambda: evidence_judge_llm(
+                        query_text=query.query_text,
+                        retrieval_mode=retrieval_mode,
+                        mission_evidence_ledger=final_pre_master_ledger,
+                    ),
+                )
+            except SearchAiExecutionError as exc:
+                evidence_authority = {
+                    "schema_version": "agvm.blind_evidence_authority.v1",
+                    "valid": False,
+                    "mission_claim_packets": [],
+                    "required_mission_count": len(
+                        [
+                            row
+                            for row in list(final_pre_master_ledger.get("rows") or [])
+                            if isinstance(row, Mapping) and dict(row).get("required") is not False
+                        ]
+                    ),
+                    "attestation": {},
+                    "blockers": [
+                        {
+                            "reason": "evidence_judge_provider_failure",
+                            "call_name": exc.call_name,
+                            "provider_error": exc.provider_error,
+                        }
+                    ],
+                }
+            final_decision_blackboard["evidence_authority"] = copy.deepcopy(
+                evidence_authority
+            )
+            plan_first_runtime["evidence_judge_state"] = (
+                "attested" if bool(evidence_authority.get("valid")) else "review_required"
+            )
+            plan_first_runtime["evidence_judge_blockers"] = copy.deepcopy(
+                list(evidence_authority.get("blockers") or [])[:16]
+            )
+            sync_plan_first_runtime()
+        final_master_call_ledger = _SEARCH_AI_CALL_LEDGER.get()
+        final_master_call_ledger_offset = (
+            len(final_master_call_ledger) if final_master_call_ledger is not None else 0
+        )
+        if plan_first_final_master_required:
+            plan_first_runtime["final_master_attempt_count"] = int(
+                plan_first_runtime.get("final_master_attempt_count") or 0
+            ) + 1
+            plan_first_runtime["final_master_state"] = "attempting"
+            plan_first_runtime["final_master_budget_remaining_seconds"] = round(
+                float(_search_deadline_remaining_seconds() or 0.0), 3
+            )
+            plan_first_runtime["final_master_input_state"] = "frozen_surface_available"
+            sync_plan_first_runtime()
+        try:
+            final_ai_master_decision, final_ai_master_error = run_finalization_ai_stage(
+                "master_judge",
+                lambda: master_judge_llm(
+                    query_text=query.query_text,
+                    query_class=query_class,
+                    retrieval_mode=retrieval_mode,
+                    blackboard=final_decision_blackboard,
+                    round_index=int(max_rounds or 0),
+                    timing={
+                        "first_landing_ms": first_landing_ms,
+                        "first_context_ms": first_context_ms,
+                        "answer_first_ms": answer_first_ms,
+                        "answer_final_ms": answer_final_ms,
+                    },
+                ),
+            )
+        except SearchAiExecutionError as exc:
+            if plan_first_final_master_required:
+                plan_first_runtime["final_master_state"] = "provider_degraded"
+                plan_first_runtime["final_master_provider_error"] = exc.provider_error
+                plan_first_runtime["final_master_failed_call"] = exc.call_name
+                sync_plan_first_runtime()
+                # The outer admission wrapper owns the canonical review result.
+                # Attach the live V3 state so that its failure projection does
+                # not replace the execution proof with a minimal legacy shell.
+                setattr(exc, "planner_runtime_snapshot", dict(runtime_plan.get("planner_runtime") or {}))
+            raise
+        if final_ai_master_decision and plan_first_final_master_required:
+            hydration_binding = _bind_plan_first_ai_document_hydration_request(
+                final_ai_master_decision,
+                final_pre_master_ledger,
+            )
+            hydration_stop_reason = (
+                _search_runtime_stop_reason(
+                    search_id=search_id,
+                    include_stop_event=False,
+                )
+                if hydration_binding
+                else None
+            )
+            if hydration_stop_reason:
+                _set_search_runtime_stop(runtime_stop_event)
+                plan_first_runtime["hydration_recovery_state"] = "skipped_runtime_stop"
+                plan_first_runtime["hydration_recovery_skip_reason"] = hydration_stop_reason
+                emit(
+                    "document_hydration_recovery_completed",
+                    {
+                        "runtime_phase": "final_materialization",
+                        "mission_id": hydration_binding.get("mission_id"),
+                        "document_id": hydration_binding.get("document_id"),
+                        "hydrated_node_ids": [],
+                        "no_new_search": True,
+                        "master_rejudged": False,
+                        "review_required": True,
+                        "stop_reason": hydration_stop_reason,
+                    },
+                )
+                hydration_binding = {}
+            if hydration_binding:
+                emit(
+                    "document_hydration_recovery_started",
+                    {
+                        "runtime_phase": "final_materialization",
+                        "mission_id": hydration_binding.get("mission_id"),
+                        "document_id": hydration_binding.get("document_id"),
+                        "document_anchor_id": hydration_binding.get("document_anchor_id"),
+                        "chunk_node_id": hydration_binding.get("chunk_node_id"),
+                        "no_new_search": True,
+                    },
+                )
+                recovered_ledger, recovered_surface, hydration_receipt = (
+                    _materialize_plan_first_ai_document_hydration(
+                        binding=hydration_binding,
+                        mission_evidence_ledger=final_pre_master_ledger,
+                        frozen_surface=final_pre_master_surface,
+                    )
+                )
+                plan_first_runtime["hydration_recovery_attempt_count"] = 1
+                plan_first_runtime["hydration_recovery_receipt"] = copy.deepcopy(
+                    hydration_receipt
+                )
+                if bool(hydration_receipt.get("applied")):
+                    original_pre_master_ledger = final_pre_master_ledger
+                    original_pre_master_surface = final_pre_master_surface
+                    original_evidence_authority = evidence_authority
+                    final_pre_master_ledger = recovered_ledger
+                    final_pre_master_surface = recovered_surface
+                    plan_first_runtime["ledger_digest"] = search_mission_ledger_digest(
+                        final_pre_master_ledger
+                    )
+                    plan_first_runtime["frozen_surface_digest"] = search_mission_ledger_digest(
+                        final_pre_master_surface
+                    )
+                    plan_first_runtime["hydration_recovery_state"] = "rejudging"
+                    final_decision_blackboard["mission_evidence_ledger"] = copy.deepcopy(
+                        final_pre_master_ledger
+                    )
+                    final_decision_blackboard["plan_first_runtime"] = dict(
+                        plan_first_runtime
+                    )
+                    try:
+                        recovered_evidence_authority = run_finalization_ai_stage(
+                            "evidence_judge_after_hydration",
+                            lambda: evidence_judge_llm(
+                                query_text=query.query_text,
+                                retrieval_mode=retrieval_mode,
+                                mission_evidence_ledger=final_pre_master_ledger,
+                            ),
+                        )
+                        final_decision_blackboard["evidence_authority"] = copy.deepcopy(
+                            recovered_evidence_authority
+                        )
+                        plan_first_runtime["evidence_judge_state"] = (
+                            "attested"
+                            if bool(recovered_evidence_authority.get("valid"))
+                            else "review_required"
+                        )
+                        plan_first_runtime["evidence_judge_blockers"] = copy.deepcopy(
+                            list(recovered_evidence_authority.get("blockers") or [])[:16]
+                        )
+                        final_decision_blackboard["plan_first_runtime"] = dict(
+                            plan_first_runtime
+                        )
+                        recovery_master_ledger = _SEARCH_AI_CALL_LEDGER.get()
+                        recovery_master_offset = (
+                            len(recovery_master_ledger)
+                            if recovery_master_ledger is not None
+                            else 0
+                        )
+                        plan_first_runtime["hydration_recovery_master_attempt_count"] = 1
+                        recovered_master_decision, recovered_master_error = (
+                            run_finalization_ai_stage(
+                                "master_judge_after_hydration",
+                                lambda: master_judge_llm(
+                                    query_text=query.query_text,
+                                    query_class=query_class,
+                                    retrieval_mode=retrieval_mode,
+                                    blackboard=final_decision_blackboard,
+                                    round_index=int(max_rounds or 0),
+                                    timing={
+                                        "first_landing_ms": first_landing_ms,
+                                        "first_context_ms": first_context_ms,
+                                        "answer_first_ms": answer_first_ms,
+                                        "answer_final_ms": answer_final_ms,
+                                    },
+                                ),
+                            )
+                        )
+                        recovery_master_attestation: dict[str, Any] = {}
+                        if recovery_master_ledger is not None:
+                            recovery_master_call = next(
+                                (
+                                    dict(item)
+                                    for item in reversed(
+                                        recovery_master_ledger[recovery_master_offset:]
+                                    )
+                                    if str(item.get("call_name") or "")
+                                    == "master_judge"
+                                ),
+                                {},
+                            )
+                            recovery_master_attestation = dict(
+                                recovery_master_call.get("ai_execution_attestation")
+                                or {}
+                            )
+                        validate_ai_execution_attestation(
+                            recovery_master_attestation
+                        )
+                        if not recovered_master_decision:
+                            raise SearchAiExecutionError(
+                                "master_judge_after_hydration",
+                                recovered_master_error or "llm_empty",
+                            )
+                        final_ai_master_decision = recovered_master_decision
+                        evidence_authority = recovered_evidence_authority
+                        plan_first_runtime["hydration_recovery_master_attested_count"] = 1
+                        plan_first_runtime["hydration_recovery_state"] = "attested"
+                        emit(
+                            "document_hydration_recovery_completed",
+                            {
+                                "runtime_phase": "final_materialization",
+                                "mission_id": hydration_binding.get("mission_id"),
+                                "document_id": hydration_binding.get("document_id"),
+                                "hydrated_node_ids": list(
+                                    hydration_receipt.get("hydrated_node_ids") or []
+                                ),
+                                "no_new_search": True,
+                                "master_rejudged": True,
+                            },
+                        )
+                    except (
+                        AiModuleContractError,
+                        SearchAiExecutionError,
+                        TypeError,
+                        ValueError,
+                    ) as recovery_exc:
+                        final_pre_master_ledger = original_pre_master_ledger
+                        final_pre_master_surface = original_pre_master_surface
+                        evidence_authority = original_evidence_authority
+                        plan_first_runtime["ledger_digest"] = search_mission_ledger_digest(
+                            final_pre_master_ledger
+                        )
+                        plan_first_runtime["frozen_surface_digest"] = search_mission_ledger_digest(
+                            final_pre_master_surface
+                        )
+                        plan_first_runtime["hydration_recovery_state"] = "review_required"
+                        plan_first_runtime["hydration_recovery_error"] = str(
+                            recovery_exc
+                        )[:500]
+                        emit(
+                            "document_hydration_recovery_completed",
+                            {
+                                "runtime_phase": "final_materialization",
+                                "mission_id": hydration_binding.get("mission_id"),
+                                "document_id": hydration_binding.get("document_id"),
+                                "hydrated_node_ids": [],
+                                "no_new_search": True,
+                                "master_rejudged": False,
+                                "review_required": True,
+                            },
+                        )
+                else:
+                    plan_first_runtime["hydration_recovery_state"] = "raw_unavailable"
+                    emit(
+                        "document_hydration_recovery_completed",
+                        {
+                            "runtime_phase": "final_materialization",
+                            "mission_id": hydration_binding.get("mission_id"),
+                            "document_id": hydration_binding.get("document_id"),
+                            "hydrated_node_ids": [],
+                            "no_new_search": True,
+                            "master_rejudged": False,
+                            "review_required": True,
+                        },
+                    )
+                sync_plan_first_runtime()
+        if final_ai_master_decision:
+            if plan_first_final_master_required and not bool(
+                dict(final_ai_master_decision.get("_evidence_authority") or {}).get("valid")
+            ):
+                final_ai_master_decision.update(
+                    {
+                        "decision": "emit_answer_partial",
+                        "can_answer_now": False,
+                        "should_continue_expanding": False,
+                        "grounded_answer": None,
+                        "unresolved_gap": "blind_evidence_authority_not_certified",
+                        "next_evidence_action": None,
+                        "expected_information_gain": None,
+                        "directive": "review_grounding",
+                    }
+                )
+            final_master_attestation: dict[str, Any] = {}
+            if final_master_call_ledger is not None:
+                final_master_call = next(
+                    (
+                        dict(item)
+                        for item in reversed(
+                            final_master_call_ledger[final_master_call_ledger_offset:]
+                        )
+                        if str(item.get("call_name") or "") == "master_judge"
+                    ),
+                    {},
+                )
+                final_master_attestation = dict(
+                    final_master_call.get("ai_execution_attestation") or {}
+                )
+            if plan_first_final_master_required:
+                try:
+                    validate_ai_execution_attestation(final_master_attestation)
+                    plan_first_runtime["final_master_attested_count"] = int(
+                        plan_first_runtime.get("final_master_attested_count") or 0
+                    ) + 1
+                    plan_first_runtime["final_master_state"] = "attested"
+                except (AiModuleContractError, TypeError, ValueError):
+                    plan_first_runtime["final_master_attested_count"] = int(
+                        plan_first_runtime.get("final_master_attested_count") or 0
+                    )
+                    plan_first_runtime["final_master_state"] = "attestation_failed"
+                sync_plan_first_runtime()
+            final_decision_name = str(
+                final_ai_master_decision.get("decision") or "emit_answer_partial"
+            )
+            final_should_continue = bool(
+                final_ai_master_decision.get("should_continue_expanding", False)
+            )
+            final_can_answer = bool(
+                final_ai_master_decision.get("can_answer_now", bool(answer))
+            )
+            final_master_budget_review_required = bool(
+                (final_master_budget_reserved or plan_first_final_master_required)
+                and not (
+                    final_decision_name in {"emit_answer_final", "stop_all"}
+                    and not final_should_continue
+                    and final_can_answer
+                    and not final_unresolved_required_missions
+                )
+            )
+            if plan_first_final_master_required and not final_master_budget_reserved:
+                final_master_review_stop_reason = (
+                    "review_required_plan_first_master_found_unresolved_gap"
+                )
+            final_operational_master_record = {
+                "round": int(max_rounds or 0),
+                "decision": final_decision_name,
+                "reason": str(
+                    final_ai_master_decision.get("reason")
+                    or "final_ai_master_review"
+                ),
+                "decision_source": "llm",
+                "fallback_reason": None,
+                "can_answer_now": final_can_answer,
+                "should_continue_expanding": final_should_continue,
+                "unresolved_gap": final_ai_master_decision.get("unresolved_gap"),
+                "next_evidence_action": final_ai_master_decision.get("next_evidence_action"),
+                "expected_information_gain": final_ai_master_decision.get(
+                    "expected_information_gain"
+                ),
+                "active_worker_count": sum(
+                    1 for branch in branches if str(branch.get("status") or "") == "active"
+                ),
+                "target_branch_id": str(
+                    final_ai_master_decision.get("target_branch_id") or ""
+                )
+                or None,
+                "mission_id": str(final_ai_master_decision.get("mission_id") or "") or None,
+                "path_id": str(final_ai_master_decision.get("path_id") or "") or None,
+                "target_family": str(
+                    final_ai_master_decision.get("target_family") or ""
+                )
+                or None,
+                "directive": str(
+                    final_ai_master_decision.get("directive")
+                    or (
+                        "finalize_now"
+                        if final_decision_name in {"emit_answer_final", "stop_all"}
+                        else "continue_search"
+                    )
+                )
+                or None,
+                "directive_destination": str(
+                    final_ai_master_decision.get("directive_destination") or ""
+                )
+                or None,
+                "answer_surface_state": str(
+                    final_surface_fields.get("answer_surface_state") or "not_ready"
+                ),
+                "closure_state": str(final_surface_fields.get("closure_state") or "open"),
+                "final_closure_ready": bool(final_surface_fields.get("final_closure_ready")),
+                "unresolved_destination_count": int(
+                    final_surface_fields.get("unresolved_destination_count") or 0
+                ),
+                "operational_master": True,
+                "budget_terminal_review": final_master_budget_review_required,
+                "mission_ledger_digest": search_mission_ledger_digest(
+                    final_pre_master_ledger
+                    if final_pre_master_ledger is not None
+                    else latest_live_mission_evidence_ledger
+                ),
+                "plan_first_plan_digest": (
+                    str(plan_first_runtime.get("plan_digest") or "") or None
+                ),
+                "ledger_row_count": len(
+                    list(latest_live_mission_evidence_ledger.get("rows") or [])
+                ),
+                "ai_execution_attestation": final_master_attestation,
+                "frozen_surface_digest": (
+                    str(plan_first_runtime.get("frozen_surface_digest") or "")
+                    or None
+                ),
+                "grounded_answer": copy.deepcopy(
+                    final_ai_master_decision.get("grounded_answer")
+                ),
+                "mission_evidence_assessments": copy.deepcopy(
+                    final_ai_master_decision.get(
+                        "mission_evidence_assessments"
+                    )
+                    or []
+                ),
+                "mission_entailment_validation": copy.deepcopy(
+                    final_ai_master_decision.get(
+                        "mission_entailment_validation"
+                    )
+                    or {}
+                ),
+                "_evidence_authority": copy.deepcopy(
+                    final_ai_master_decision.get("_evidence_authority") or {}
+                ),
+            }
+            master_decision_history.append(final_operational_master_record)
+            last_operational_master_decision = copy.deepcopy(
+                final_operational_master_record
+            )
+            last_operational_master_ledger = copy.deepcopy(
+                final_pre_master_ledger
+                if final_pre_master_ledger is not None
+                else latest_live_mission_evidence_ledger
+            )
+            last_operational_master_surface = copy.deepcopy(
+                final_pre_master_surface
+                if final_pre_master_surface is not None
+                else _freeze_operational_master_surface(
+                    branches=branches,
+                    steps=all_steps,
+                    matches=matches[: query.max_matches],
+                    evidence_reservoir=evidence_reservoir,
+                    document_packets=document_packets,
+                    shared_evidence=shared_evidence,
+                    context=context or {},
+                    path_corridors=latest_live_path_corridors,
+                    route_runtime=route_runtime,
+                    landing_metadata=build_landing_metadata(probes, branches),
+                )
+            )
+            if plan_first_final_master_required:
+                final_operational_master_record["frozen_surface_digest"] = str(
+                    plan_first_runtime.get("frozen_surface_digest") or ""
+                )
+                master_decision_history[-1] = copy.deepcopy(
+                    final_operational_master_record
+                )
+                last_operational_master_decision = copy.deepcopy(
+                    final_operational_master_record
+                )
         else:
             master_decision_history.append(
                 {
@@ -29028,6 +41245,59 @@ def _retrieve_runtime_attested_impl(
                     "unresolved_destination_count": int(final_surface_fields.get("unresolved_destination_count") or 0),
                 }
             )
+    plan_first_master_answer_projected = False
+    if (
+        plan_first_v3
+        and last_operational_master_surface is not None
+        and last_operational_master_ledger is not None
+    ):
+        frozen_projection = _project_frozen_plan_first_evidence(
+            last_operational_master_surface,
+            last_operational_master_ledger,
+        )
+        branches = frozen_projection["branches"]
+        all_steps = frozen_projection["steps"]
+        matches = frozen_projection["matches"]
+        evidence_reservoir = frozen_projection["evidence_reservoir"]
+        document_packets = frozen_projection["document_packets"]
+        shared_evidence = frozen_projection["shared_evidence"]
+        context = frozen_projection["context"]
+        latest_live_path_corridors = frozen_projection["path_corridors"]
+        route_runtime = frozen_projection["route_runtime"]
+        latest_live_mission_evidence_ledger = frozen_projection[
+            "mission_evidence_ledger"
+        ]
+        master_can_answer = bool(
+            dict(last_operational_master_decision or {}).get("can_answer_now")
+        )
+        master_attested = bool(
+            str(plan_first_runtime.get("final_master_state") or "") == "attested"
+            and int(plan_first_runtime.get("final_master_attested_count") or 0) == 1
+        )
+        if master_can_answer and master_attested:
+            answer, composed_context, grounded_answer_state = (
+                _project_master_authored_grounded_answer(
+                    query_text=query.query_text,
+                    response_mode=query.response_mode,
+                    master_decision=last_operational_master_decision,
+                    master_attestation=dict(
+                        last_operational_master_decision or {}
+                    ).get("ai_execution_attestation"),
+                    frozen_surface=last_operational_master_surface,
+                    frozen_ledger=last_operational_master_ledger,
+                )
+            )
+            if composed_context is not None:
+                context = composed_context
+            plan_first_runtime["grounded_answer_state"] = grounded_answer_state
+            plan_first_master_answer_projected = bool(
+                answer
+                and grounded_answer_state == "projected_from_master"
+            )
+        elif query.response_mode in {"answer", "both"}:
+            answer = None
+            plan_first_runtime["grounded_answer_state"] = "suppressed_by_master"
+        sync_plan_first_runtime()
     final_llm_approval_present = any(
         str((decision or {}).get("decision_source") or "").strip() == "llm"
         and str((decision or {}).get("decision") or "").strip() in {"emit_answer_final", "stop_all"}
@@ -29253,8 +41523,9 @@ def _retrieve_runtime_attested_impl(
             last_decision_source=(str((master_decision_history[-1] or {}).get("decision_source") or "").strip() or None) if master_decision_history else None,
             last_fallback_reason=(str((master_decision_history[-1] or {}).get("fallback_reason") or "").strip() or None) if master_decision_history else None,
         ),
-        "status": "completed",
+        "status": "completed" if not final_unresolved_required_missions else "review_required",
         "stop_reason": stop_reason,
+        "unresolved_required_mission_count": len(final_unresolved_required_missions),
     }
     blackboard.update(
         {
@@ -29400,7 +41671,7 @@ def _retrieve_runtime_attested_impl(
         final_stage_started,
         context_dossier_chars=len(str(context_dossier or "")),
         answer_full_chars=len(str(answer_full or "")),
-        allow_llm=bool('final_context_dossier_allow_llm' in locals() and final_context_dossier_allow_llm),
+        allow_llm=bool(locals().get("final_context_dossier_allow_llm", False)),
     )
     effective_stop_reason = stop_reason if matches else "no_candidates"
     if query.response_mode in {"answer", "both"} and answerability_state == "insufficient" and effective_stop_reason in {
@@ -29516,8 +41787,14 @@ def _retrieve_runtime_attested_impl(
         )
     semantic_snapshot = semantic_contract_snapshot()
     semantic_contract_payload = dict(semantic_snapshot["contract"] or {})
+    semantic_authority_v2_payload = bool(semantic_contract_payload.get("semantic_authority_v2"))
     semantic_identity_hints = sanitize_identity_hints(semantic_contract_payload.get("identity_hints") or {})
-    runtime_identity_hints = sanitize_identity_hints(identity_context)
+    runtime_identity_hints = _semantic_identity_hints_for_named_targets(
+        query_text=query.query_text,
+        identity_hints=identity_context,
+        semantic_authority_v2=semantic_authority_v2_payload,
+        semantic_contract=semantic_contract_payload,
+    )
     if not semantic_identity_hints.get("core_name") and runtime_identity_hints.get("core_name"):
         semantic_contract_payload["identity_hints"] = runtime_identity_hints
     elif "identity_hints" not in semantic_contract_payload:
@@ -29539,6 +41816,8 @@ def _retrieve_runtime_attested_impl(
     ai_contribution_reason = ai_materiality_summary.get("reason")
     answer_surface_content_ready = bool(clean_answer_surface_text(answer_short) or clean_answer_surface_text(answer_full))
     final_landing_metadata = build_landing_metadata(probes, branches)
+    if last_operational_master_surface:
+        final_landing_metadata = copy.deepcopy(last_operational_master_surface.get("landing_metadata") or [])
     path_corridors = build_path_corridor_package(
         query_text=query.query_text,
         branches=branches,
@@ -29549,6 +41828,8 @@ def _retrieve_runtime_attested_impl(
         landing_metadata=final_landing_metadata,
         retrieval_mode=retrieval_mode,
     )
+    if last_operational_master_surface:
+        path_corridors = copy.deepcopy(last_operational_master_surface.get("path_corridors") or {})
     ai_materiality_summary = _build_ai_materiality_summary(
         query_text=query.query_text,
         retrieval_mode=retrieval_mode,
@@ -29599,9 +41880,32 @@ def _retrieve_runtime_attested_impl(
             "topology_revision": runtime_plan.get("topology_revision"),
             "atlas_revision": runtime_plan.get("atlas_revision"),
         },
-        allow_ai_branch_controller=True,
+        allow_ai_branch_controller=not plan_first_v3,
+        semantic_certification_owner=(
+            "terminal_master" if plan_first_v3 else "branch_controller"
+        ),
     )
+    if last_operational_master_ledger:
+        # The renderer consumes the exact atomic ledger snapshot judged by the
+        # operational Master. Later branch/status decoration must not silently
+        # create a second semantic universe.
+        mission_evidence_ledger = copy.deepcopy(last_operational_master_ledger)
     runtime_plan["mission_evidence_ledger"] = mission_evidence_ledger
+    ledger_projected_document_refs = _ledger_document_refs(
+        mission_evidence_ledger,
+        limit=24,
+    )
+    if ledger_projected_document_refs:
+        document_refs = _ledger_document_refs(
+            document_refs,
+            ledger_projected_document_refs,
+            limit=24,
+        )
+        document_workspace = {
+            **dict(document_workspace or {}),
+            "document_refs": list(document_refs),
+            "source_refs_projected_from_mission_ledger": True,
+        }
     runtime_plan["planner_runtime"] = {
         **dict(runtime_plan.get("planner_runtime") or {}),
         "mission_evidence_ledger": mission_evidence_ledger,
@@ -29609,6 +41913,22 @@ def _retrieve_runtime_attested_impl(
         "mission_evidence_ledger_status": str(mission_evidence_ledger.get("status") or ""),
     }
     shared_evidence["mission_evidence_ledger"] = mission_evidence_ledger
+    unresolved_required_missions = (
+        _plan_first_structurally_unresolved_required_mission_rows(
+            mission_evidence_ledger
+        )
+        if plan_first_v3
+        else _unresolved_required_mission_rows(mission_evidence_ledger)
+    )
+    persisted_semantic_authority = _persisted_runtime_semantic_authority(runtime_plan)
+    operational_master_judgement = _operational_master_renderer_judgement(
+        query_text=query.query_text,
+        retrieval_mode=retrieval_mode,
+        mission_evidence_ledger=mission_evidence_ledger,
+        operational_decision=last_operational_master_decision,
+        document_refs=list(document_refs or []),
+        plan_first_runtime=plan_first_runtime,
+    )
 
     def build_current_context_package(*, include_answer_payload: bool = True) -> dict[str, Any]:
         answer_payload: dict[str, Any] = {}
@@ -29634,7 +41954,12 @@ def _retrieve_runtime_attested_impl(
             package_mode=getattr(query, "context_package_mode", None),
             document_text_policy=getattr(query, "document_text_policy", "refs_only"),
             mission_evidence_ledger=mission_evidence_ledger,
-            allow_ai_master=True,
+            allow_ai_master=False,
+            ai_master_timeout_ceiling_seconds=None,
+            semantic_authority=persisted_semantic_authority,
+            master_judgement_override=(
+                None if flash_public_partial_before_master_active else operational_master_judgement
+            ),
         )
 
     context_package = build_current_context_package()
@@ -29667,7 +41992,9 @@ def _retrieve_runtime_attested_impl(
         answer_mode=str((answer or {}).get("mode") or ""),
         context_package=context_package,
     )
-    if answer_alignment_only_unresolved or answer_surface_guard_blocked:
+    if (persisted_semantic_authority != "ai_v2" or flash_public_partial_before_master_active) and (
+        answer_alignment_only_unresolved or answer_surface_guard_blocked
+    ):
         answerless_context_package = build_current_context_package(include_answer_payload=False)
         answerless_context_contract = dict(answerless_context_package.get("contract") or {})
         if bool(answerless_context_contract.get("passed")):
@@ -29676,6 +42003,7 @@ def _retrieve_runtime_attested_impl(
             context_package_contract_passed = True
     if (
         query.response_mode in {"answer", "both"}
+        and (persisted_semantic_authority != "ai_v2" or flash_public_partial_before_master_active)
         and (
             not answer_surface_content_ready
             or answer_alignment_only_unresolved
@@ -29707,7 +42035,19 @@ def _retrieve_runtime_attested_impl(
             ):
                 answer = synthesized_answer
                 answer["answer_full"] = synthesized_full or synthesized_text
-                answer["final_seed_source"] = "approved_mcp_context_package"
+                answer["final_seed_source"] = (
+                    "flash_public_context_package"
+                    if flash_public_partial_before_master_active
+                    else "approved_mcp_context_package"
+                )
+                if flash_public_partial_before_master_active:
+                    answer["review_required"] = True
+                    answer["semantic_authority"] = {
+                        "authority": persisted_semantic_authority,
+                        "final_master_used": False,
+                        "final_sealed": False,
+                        "public_partial_before_master": True,
+                    }
                 answer_short = synthesized_text
                 answer_full = synthesized_full or synthesized_text
                 answerability_state = str(answer.get("answerability_state") or "grounded")
@@ -29774,8 +42114,44 @@ def _retrieve_runtime_attested_impl(
         final_surface_fields=final_surface_fields,
         response_mode=query.response_mode,
     )
+    if final_master_budget_review_required:
+        # A completed, attested Master review that requests more evidence at the
+        # hard budget boundary is a valid terminal partial. It must not be
+        # rewritten as a missing/rejected-judge infrastructure failure.
+        budget_review_reason = str(
+            last_operational_master_decision.get("reason")
+            or "master_requires_more_evidence_at_budget_boundary"
+        )
+        final_surface_fields = {
+            **dict(final_surface_fields or {}),
+            "answer_surface_state": "usable_partial",
+            "closure_state": "review_required",
+            "final_closure_ready": False,
+            "final_closure_after_destination_resolution": False,
+            "review_required": True,
+            "review_reason": budget_review_reason,
+        }
+        stop_reason = final_master_review_stop_reason
+        effective_stop_reason = stop_reason
+        ai_validation_gate = {
+            **dict(ai_validation_gate or {}),
+            "satisfied": False,
+            "blocked": False,
+            "final_requested": False,
+            "final_llm_approval": False,
+            "final_llm_judge_attempted": True,
+            "final_llm_judge_rejected": True,
+            "final_llm_rejection_reason": budget_review_reason,
+            "review_required": True,
+            "review_reason": budget_review_reason,
+            "blockers": [],
+        }
     final_ai_approval_payload: dict[str, Any] = {}
-    if _final_answer_approval_needed(
+    # Plan-first V3 already has one attested SufficiencyMaster over the frozen
+    # ledger. Running the legacy final-answer approval here creates a second
+    # semantic authority after the barrier and can invert an honest terminal
+    # or review-required verdict. The renderer remains diagnostic only.
+    if (not plan_first_v3) and _final_answer_approval_needed(
         ai_validation_gate=ai_validation_gate,
         answer_surface_content_ready=answer_surface_content_ready,
     ):
@@ -29997,6 +42373,8 @@ def _retrieve_runtime_attested_impl(
             }
         )
     final_landing_metadata = build_landing_metadata(probes, branches)
+    if last_operational_master_surface:
+        final_landing_metadata = copy.deepcopy(last_operational_master_surface.get("landing_metadata") or [])
     path_corridors = build_path_corridor_package(
         query_text=query.query_text,
         branches=branches,
@@ -30007,6 +42385,8 @@ def _retrieve_runtime_attested_impl(
         landing_metadata=final_landing_metadata,
         retrieval_mode=retrieval_mode,
     )
+    if last_operational_master_surface:
+        path_corridors = copy.deepcopy(last_operational_master_surface.get("path_corridors") or {})
     document_workspace = build_document_workspace_package(
         query_text=query.query_text,
         document_mode=document_mode,
@@ -30051,7 +42431,9 @@ def _retrieve_runtime_attested_impl(
         answer_mode=str((answer or {}).get("mode") or ""),
         context_package=context_package,
     )
-    if final_answer_alignment_only_unresolved or final_answer_surface_guard_blocked:
+    if (persisted_semantic_authority != "ai_v2" or flash_public_partial_before_master_active) and (
+        final_answer_alignment_only_unresolved or final_answer_surface_guard_blocked
+    ):
         answerless_context_package = build_current_context_package(include_answer_payload=False)
         answerless_context_contract = dict(answerless_context_package.get("contract") or {})
         if bool(answerless_context_contract.get("passed")):
@@ -30060,6 +42442,7 @@ def _retrieve_runtime_attested_impl(
             context_package_contract_passed = True
     if (
         query.response_mode in {"answer", "both"}
+        and (persisted_semantic_authority != "ai_v2" or flash_public_partial_before_master_active)
         and (
             not answer_surface_content_ready
             or final_answer_alignment_only_unresolved
@@ -30091,7 +42474,19 @@ def _retrieve_runtime_attested_impl(
             ):
                 answer = synthesized_answer
                 answer["answer_full"] = synthesized_full or synthesized_text
-                answer["final_seed_source"] = "approved_mcp_context_package"
+                answer["final_seed_source"] = (
+                    "flash_public_context_package"
+                    if flash_public_partial_before_master_active
+                    else "approved_mcp_context_package"
+                )
+                if flash_public_partial_before_master_active:
+                    answer["review_required"] = True
+                    answer["semantic_authority"] = {
+                        "authority": persisted_semantic_authority,
+                        "final_master_used": False,
+                        "final_sealed": False,
+                        "public_partial_before_master": True,
+                    }
                 answer_short = synthesized_text
                 answer_full = synthesized_full or synthesized_text
                 answerability_state = str(answer.get("answerability_state") or "grounded")
@@ -30145,6 +42540,7 @@ def _retrieve_runtime_attested_impl(
                 )
     if (
         query.response_mode in {"answer", "both"}
+        and not plan_first_master_answer_projected
         and (ai_material_contribution or bool(semantic_contract_runtime_payload.get("material")))
         and not context_package_contract_passed
         and str((answer or {}).get("mode") or "").lower() in {"heuristic", "grounded_facts", "llm"}
@@ -30188,7 +42584,9 @@ def _retrieve_runtime_attested_impl(
     ]
     unknown_seal_eligible = bool(
         query.response_mode in {"answer", "both"}
+        and persisted_semantic_authority != "ai_v2"
         and unresolved_after_suppression
+        and not unresolved_required_missions
         and not context_package_contract_passed
         and not answer_surface_content_ready
         and not _has_active_or_pending_branch(branches)
@@ -30313,6 +42711,63 @@ def _retrieve_runtime_attested_impl(
             answer_chars=len(answer_short or ""),
         )
     if (
+        query.response_mode in {"answer", "both"}
+        and not plan_first_master_answer_projected
+        and not (
+            flash_public_partial_before_master_active
+            and isinstance(answer, Mapping)
+            and str(answer.get("final_seed_source") or "") == "flash_public_context_package"
+        )
+        and not _answer_surface_allowed_for_semantic_authority(
+            answer if isinstance(answer, Mapping) else None,
+            persisted_semantic_authority,
+        )
+    ):
+        suppressed_answer_mode = str((answer or {}).get("mode") or "")
+        answer = None
+        answer_short = None
+        answer_full = None
+        candidate_answer_full = None
+        answerability_state = "partial"
+        answer_surface_content_ready = False
+        answer_surface_update = _answer_surface_update_summary(
+            query_text=query.query_text,
+            answer_short=None,
+            candidate_answer_full=None,
+            final_answer_full=None,
+            preserved_short_final=False,
+        )
+        effective_stop_reason = "review_required_ai_answer_not_attested"
+        final_surface_fields = {
+            **dict(final_surface_fields or {}),
+            "answer_surface_state": "context_level_1_ready" if context_package.get("sections") else "not_ready",
+            "closure_state": "open",
+            "final_closure_ready": False,
+            "final_closure_after_destination_resolution": False,
+        }
+        context_package = build_current_context_package(include_answer_payload=False)
+        context_package_contract = dict(context_package.get("contract") or {})
+        context_package_contract_passed = bool(context_package_contract.get("passed"))
+        context_dossier = str(context_package.get("agent_markdown") or context_dossier or "").strip() or None
+        record_final_materialization_stage(
+            "ai_v2_unattested_answer_suppressed",
+            final_stage_started,
+            suppressed_answer_mode=suppressed_answer_mode,
+            semantic_authority=persisted_semantic_authority,
+        )
+    if plan_first_v3 and not flash_public_partial_before_master_active:
+        context_package, renderer_authority_applied = (
+            _apply_plan_first_terminal_master_renderer_authority(
+                context_package,
+                master_judgement=operational_master_judgement,
+                plan_first_runtime=plan_first_runtime,
+                mission_evidence_ledger=mission_evidence_ledger,
+            )
+        )
+        if renderer_authority_applied:
+            context_package_contract = dict(context_package.get("contract") or {})
+            context_package_contract_passed = True
+    if (
         query.response_mode in {"context", "both"}
         and not context_package_contract_passed
         and not unknown_not_in_memory_seal_applied
@@ -30412,6 +42867,13 @@ def _retrieve_runtime_attested_impl(
         for item in list(context_package_contract.get("unresolved_sections") or [])
         if str(item).strip()
     ]
+    search_issue_diagnostics = _build_search_issue_diagnostics(
+        query_text=query.query_text,
+        final_surface_fields=final_surface_fields,
+        context_package_contract=context_package_contract,
+        evidence_reservoir=evidence_reservoir,
+        mission_evidence_ledger=mission_evidence_ledger,
+    )
     context_package_agent_markdown = str(context_package.get("agent_markdown") or "")
     context_package_materialization = {
         "schema_version": "agvm.context_package_materialization.v1",
@@ -30509,6 +42971,67 @@ def _retrieve_runtime_attested_impl(
         document_lookup=document_lookup_contract,
         document_packets=document_packets,
     )
+    if flash_public_partial_before_master_active and (
+        bool(matches)
+        or bool(document_refs)
+        or bool(context_package.get("sections"))
+        or bool(context_package_agent_markdown)
+    ):
+        flash_review_reason = "flash_public_partial_before_final_master"
+        final_surface_fields = {
+            **dict(final_surface_fields or {}),
+            "answer_surface_state": "usable_partial" if answer_surface_content_ready else "context_level_1_ready",
+            "closure_state": "review_required",
+            "final_closure_ready": False,
+            "final_closure_after_destination_resolution": False,
+            "review_required": True,
+            "review_reason": flash_review_reason,
+            "public_partial_before_master": True,
+        }
+        ai_materialization_hard_gate = {
+            **dict(ai_materialization_hard_gate or {}),
+            "satisfied": False,
+            "blocked": False,
+            "validation_state": flash_review_reason,
+            "blockers": [],
+            "final_requested": False,
+            "judge_materialized": False,
+            "review_required": True,
+            "public_partial_before_master": True,
+        }
+        ai_validation_gate = {
+            **dict(ai_validation_gate or {}),
+            "satisfied": False,
+            "blocked": False,
+            "final_requested": False,
+            "final_llm_approval": False,
+            "review_required": True,
+            "review_reason": flash_review_reason,
+            "materialization_hard_gate": dict(ai_materialization_hard_gate),
+            "materialization_gate_state": flash_review_reason,
+            "public_partial_before_master": True,
+            "blockers": [],
+        }
+        stop_reason = "flash_public_partial_before_master"
+        effective_stop_reason = stop_reason
+    if final_master_budget_review_required:
+        ai_materialization_hard_gate = {
+            **dict(ai_materialization_hard_gate or {}),
+            "satisfied": False,
+            "blocked": False,
+            "validation_state": final_master_review_stop_reason,
+            "blockers": [],
+            "final_requested": False,
+            "judge_materialized": True,
+            "review_required": True,
+        }
+        ai_validation_gate = {
+            **dict(ai_validation_gate or {}),
+            "materialization_hard_gate": dict(ai_materialization_hard_gate),
+            "materialization_gate_state": final_master_review_stop_reason,
+        }
+        stop_reason = final_master_review_stop_reason
+        effective_stop_reason = stop_reason
     if bool(ai_materialization_hard_gate.get("blocked")):
         hard_gate_state = str(ai_materialization_hard_gate.get("validation_state") or "blocked_ai_material_missing")
         final_surface_fields = _apply_ai_materialization_hard_gate(
@@ -30644,33 +43167,144 @@ def _retrieve_runtime_attested_impl(
     context_dossier = str(context_package.get("agent_markdown") or context_dossier or "").strip() or None
     master_judgement = dict(context_package.get("master_judgement") or {})
     master_ledger_counts = dict(master_judgement.get("branch_state_counts") or {})
-    current_ledger_counts = dict((mission_evidence_ledger or {}).get("branch_judge_state_counts") or {})
+    current_ledger_rows = [
+        dict(row)
+        for row in list((mission_evidence_ledger or {}).get("rows") or [])
+        if isinstance(row, dict)
+    ]
+    current_ledger_counts: dict[str, int] = {}
+    for row in current_ledger_rows:
+        state = str(
+            dict(row.get("branch_judgement") or {}).get("state")
+            or row.get("coverage_state")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        current_ledger_counts[state] = current_ledger_counts.get(state, 0) + 1
+    current_ledger_digest = search_mission_ledger_digest(mission_evidence_ledger or {})
+    master_ledger_digest = str(master_judgement.get("mission_ledger_digest") or "").strip()
     master_ledger_stale = bool(
         mission_evidence_ledger
         and (
             not master_judgement
-            or int(master_judgement.get("ledger_row_count") or -1) != int((mission_evidence_ledger or {}).get("row_count") or 0)
+            or int(master_judgement.get("ledger_row_count") or -1) != len(current_ledger_rows)
+            or len(list(master_judgement.get("goal_coverage") or [])) != len(current_ledger_rows)
             or (current_ledger_counts and master_ledger_counts != current_ledger_counts)
+            or not master_ledger_digest
+            or master_ledger_digest != current_ledger_digest
         )
     )
     if master_ledger_stale:
-        package_render_contract_for_master = dict(
-            context_package.get("package_render_contract")
-            or dict(context_package.get("metrics") or {}).get("package_render_contract")
-            or {}
-        )
-        path_truth_for_master = dict(
-            context_package.get("path_truth_contract")
-            or dict(dict(context_package.get("contract") or {}).get("path_truth") or {})
-        )
-        master_judgement = build_mcp_master_judgement(
+        master_judgement = _operational_master_renderer_judgement(
             query_text=query.query_text,
+            retrieval_mode=retrieval_mode,
             mission_evidence_ledger=mission_evidence_ledger,
-            package_render_contract=package_render_contract_for_master,
-            path_truth_contract=path_truth_for_master,
+            operational_decision=last_operational_master_decision,
             document_refs=list(document_refs or []),
+            plan_first_runtime=plan_first_runtime,
         )
         context_package["master_judgement"] = master_judgement
+    final_surface_fields, master_resolved_required_missions = _reconcile_final_surface_with_master_judgement(
+        final_surface_fields=final_surface_fields,
+        master_judgement=master_judgement,
+    )
+    if not (
+        master_judgement.get("terminal_for_client") is True
+        and master_judgement.get("final_seal_allowed") is True
+    ):
+        final_surface_fields = {
+            **dict(final_surface_fields or {}),
+            "answer_surface_state": "answer_now_and_continue" if bool(answer) else "not_ready",
+            "closure_state": "open",
+            "final_closure_ready": False,
+            "final_closure_after_destination_resolution": False,
+        }
+    answer, final_surface_fields, attested_terminal_answer_applied = (
+        _apply_attested_ai_v2_terminal_answer_authority(
+            answer=answer if isinstance(answer, dict) else None,
+            master_judgement=master_judgement,
+            final_surface_fields=final_surface_fields,
+            context_package=context_package,
+            mission_evidence_ledger=mission_evidence_ledger,
+        )
+    )
+    if attested_terminal_answer_applied:
+        answer_short = clean_answer_surface_text((answer or {}).get("answer_text")) or answer_short
+        answer_full = clean_answer_surface_text((answer or {}).get("answer_full") or answer_short) or answer_full
+        answerability_state = "grounded"
+        answer_surface_content_ready = bool(answer_short or answer_full)
+        stop_reason = "master_ai_terminal_grounded_answer_attested"
+        effective_stop_reason = stop_reason
+        ai_materialization_hard_gate = {
+            **dict(ai_materialization_hard_gate or {}),
+            "satisfied": True,
+            "blocked": False,
+            "validation_state": "master_ai_terminal_grounded_answer_attested",
+            "blockers": [],
+            "answer_demo_ready": True,
+            "answer_demo_blockers": [],
+        }
+        ai_validation_gate = {
+            **dict(ai_validation_gate or {}),
+            "required": True,
+            "satisfied": True,
+            "blocked": False,
+            "final_requested": True,
+            "blockers": [],
+            "materialization_hard_gate": dict(ai_materialization_hard_gate),
+            "materialization_gate_state": "master_ai_terminal_grounded_answer_attested",
+            "mcp_context_package_ready": True,
+            "answer_demo_ready": True,
+            "answer_demo_blockers": [],
+        }
+        answer_demo_materialization = {
+            **dict(answer_demo_materialization or {}),
+            "state": "ready",
+            "reason": "master_ai_terminal_grounded_answer_attested",
+            "source": "grounded_answer",
+            "blocked_by_ai_materialization_hard_gate": False,
+            "answer_context_aligned": True,
+        }
+        nested_landing_gate = dict(ai_landing_materialization.get("hard_gate") or {})
+        if nested_landing_gate:
+            nested_landing_gate.update(dict(ai_materialization_hard_gate))
+        ai_landing_materialization = {
+            **dict(ai_landing_materialization or {}),
+            "hard_gate": nested_landing_gate or dict(ai_materialization_hard_gate),
+            "final_gate_state": "master_ai_terminal_grounded_answer_attested",
+            "final_seal_blocked": False,
+        }
+        terminal_projection = {
+            "status": "completed",
+            "stop_reason": "master_ai_terminal_grounded_answer_attested",
+            "answer_surface_state": "final_sealed",
+            "closure_state": "final_sealed",
+            "final_closure_ready": True,
+            "final_closure_blockers": [],
+            "unresolved_destination_count": 0,
+            "answer_surface_content_ready": True,
+            "ai_validation_gate": dict(ai_validation_gate),
+            "ai_materialization_hard_gate": dict(ai_materialization_hard_gate),
+        }
+        final_master_state.update(terminal_projection)
+        blackboard.update(terminal_projection)
+        shared_evidence.update(terminal_projection)
+        blackboard["master_state"] = final_master_state
+        shared_evidence["master_state"] = final_master_state
+        shared_evidence["blackboard"] = blackboard
+    if master_resolved_required_missions:
+        final_unresolved_required_missions = []
+        final_master_state = {
+            **dict(final_master_state or {}),
+            "status": "completed",
+            "unresolved_required_mission_count": 0,
+            "answer_surface_state": str(final_surface_fields.get("answer_surface_state") or "not_ready"),
+            "closure_state": str(final_surface_fields.get("closure_state") or "open"),
+            "final_closure_ready": bool(final_surface_fields.get("final_closure_ready")),
+        }
+        blackboard["master_state"] = final_master_state
+        blackboard["unresolved_required_missions"] = []
+        shared_evidence["master_state"] = final_master_state
+        shared_evidence["blackboard"] = blackboard
     mission_learning_rollup = build_mission_learning_rollup(
         query_text=query.query_text,
         mission_evidence_ledger=mission_evidence_ledger,
@@ -30691,6 +43325,22 @@ def _retrieve_runtime_attested_impl(
         "family_counts": dict(mission_learning_rollup.get("family_counts") or {}),
     }
     context_package["metrics"] = context_package_metrics
+    public_mission_path_projection = _build_public_search_mission_path_projection(
+        path_mission_contract=dict(runtime_plan.get("path_mission_contract") or {}),
+        mission_evidence_ledger=mission_evidence_ledger,
+        branches=branches,
+    )
+    canonical_path_missions = [
+        dict(item)
+        for item in list(public_mission_path_projection.get("path_missions") or [])
+        if isinstance(item, dict)
+    ]
+    physical_path_executions = [
+        dict(item)
+        for item in list(public_mission_path_projection.get("physical_path_executions") or [])
+        if isinstance(item, dict)
+    ]
+    public_mission_path_metrics = dict(public_mission_path_projection.get("metrics") or {})
     context_structured = {
         **dict(context_structured or {}),
         "context_package": {
@@ -30711,6 +43361,7 @@ def _retrieve_runtime_attested_impl(
         },
         "mission_evidence_ledger": mission_evidence_ledger,
         "mission_learning_rollup": mission_learning_rollup,
+        "public_mission_path_projection": public_mission_path_projection,
     }
     planner_runtime_payload = {
         **dict(runtime_plan.get("planner_runtime") or {}),
@@ -30719,6 +43370,11 @@ def _retrieve_runtime_attested_impl(
         "planner_mode": "hybrid" if llm_scout_state["enabled"] else planner_mode,
         "decomposition_mode": "hybrid" if llm_scout_state["added_probe_count"] else decomposition_mode,
         "branch_count": len(branches),
+        "path_missions": canonical_path_missions,
+        "path_mission_count": len(canonical_path_missions),
+        "physical_path_executions": physical_path_executions,
+        "physical_path_execution_count": len(physical_path_executions),
+        "public_mission_path_metrics": public_mission_path_metrics,
         "landing_count": max(
             int((runtime_plan.get("planner_runtime") or {}).get("landing_count") or 0),
             len(probes),
@@ -30727,6 +43383,8 @@ def _retrieve_runtime_attested_impl(
         "shared_confidence": float(shared_evidence.get("confidence") or 0.0),
         "planner_path": "hybrid_parallel" if llm_scout_state["enabled"] else ("llm" if planner_mode == "llm" else "fallback"),
         "query_class": query_class,
+        "legacy_query_class_authority": not semantic_authority_ai_v2,
+        "legacy_query_class_diagnostic": legacy_query_class,
         "query_contract": dict(contract_matrix.get("query_contract") or {}),
         "semantic_contract": semantic_contract_payload,
         "semantic_contract_runtime": semantic_contract_runtime_payload,
@@ -30971,6 +43629,7 @@ def _retrieve_runtime_attested_impl(
         evidence_reservoir_snapshot=evidence_reservoir,
         document_mode_value=document_mode,
         after_first_answer=True,
+        emit_event=_emit_final_context_wave_event(),
     )
     record_final_materialization_stage(
         "final_context_wave",
@@ -31064,7 +43723,8 @@ def _retrieve_runtime_attested_impl(
     accumulated_decision_history = list(accumulated_master_state.get("decision_history") or [])
     current_decision_history = list(final_master_state.get("decision_history") or [])
     if (
-        not bool(ai_validation_gate.get("blocked"))
+        not attested_terminal_answer_applied
+        and not bool(ai_validation_gate.get("blocked"))
         and accumulated_decision_history
         and len(accumulated_decision_history) >= len(current_decision_history)
     ):
@@ -31078,6 +43738,7 @@ def _retrieve_runtime_attested_impl(
             "unresolved_destination_count": int(final_surface_fields.get("unresolved_destination_count") or 0),
             "stop_reason": effective_stop_reason,
             "ai_validation_gate": dict(ai_validation_gate),
+            "ai_materialization_hard_gate": dict(ai_materialization_hard_gate),
         }
     )
     shared_evidence["master_state"] = final_master_state
@@ -31137,7 +43798,9 @@ def _retrieve_runtime_attested_impl(
         "terminal_frozen": True,
     }
     terminal_result_materialization_state = (
-        "partial_complete_low_yield"
+        "partial_review_required"
+        if flash_public_partial_before_master_active
+        else "partial_complete_low_yield"
         if partial_terminal_fast_materialization and not bool(final_surface_fields.get("final_closure_ready"))
         else "finalized"
     )
@@ -31153,6 +43816,7 @@ def _retrieve_runtime_attested_impl(
     planner_runtime_payload["route_truth_summary"] = route_truth_summary
     planner_runtime_payload["search_map_2d_truth"] = search_map_2d_truth
     planner_runtime_payload["map_stream_state"] = final_map_stream_state
+    planner_runtime_payload["plan_first_runtime"] = dict(plan_first_runtime)
     planner_runtime_payload["context_wave_count"] = len(context_waves)
     planner_runtime_payload["latest_context_wave_id"] = str(final_context_wave.get("wave_id") or "")
     planner_runtime_payload["early_final_sealed"] = bool(early_final_surface_sealed)
@@ -31174,6 +43838,7 @@ def _retrieve_runtime_attested_impl(
     planner_runtime_payload["client_visible_partial_budget_seconds"] = float(client_visible_partial_budget_seconds)
     planner_runtime_payload["client_visible_partial_terminalized"] = bool(client_visible_partial_terminalized)
     planner_runtime_payload["client_visible_partial_terminal_reason"] = client_visible_partial_terminal_reason
+    planner_runtime_payload["flash_public_partial_before_master"] = bool(flash_public_partial_before_master_active)
     planner_runtime_payload["post_final_worker_throttle_enabled"] = bool(post_final_worker_throttle_enabled)
     planner_runtime_payload["post_final_worker_throttle_policy"] = dict(post_final_worker_throttle_policy)
     planner_runtime_payload["post_final_branch_pruned_count"] = int(post_final_branch_pruned_count)
@@ -31193,6 +43858,11 @@ def _retrieve_runtime_attested_impl(
     final_stage_started = time.perf_counter()
     result = {
         "search_id": str(search_id or "") or None,
+        **_search_final_runtime_bindings(
+            brain_id=str(active_brain_id or getattr(query, "brain_id", None) or ""),
+            brain_revision=semantic_brain_revision,
+            mission_evidence_ledger=mission_evidence_ledger,
+        ),
         "query_text": query.query_text,
         "mcp_tool_name": query.mcp_tool_name,
         "thread_id": normalized_thread_id,
@@ -31215,8 +43885,16 @@ def _retrieve_runtime_attested_impl(
         "ai_spatial_landing_contract": dict(runtime_plan.get("ai_spatial_landing_contract") or {}),
         "ai_spatial_landing_contract_runtime": dict(runtime_plan.get("ai_spatial_landing_contract_runtime") or {}),
         "document_lookup": document_lookup_contract,
-        "supporting_documents": list(document_lookup_contract.get("supporting_documents") or []),
-        "source_trace": list(document_lookup_contract.get("source_trace") or []),
+        "supporting_documents": list(
+            document_lookup_contract.get("supporting_documents")
+            or ledger_projected_document_refs
+            or []
+        ),
+        "source_trace": list(
+            document_lookup_contract.get("source_trace")
+            or ledger_projected_document_refs
+            or []
+        ),
         "document_workspace": document_workspace,
         "document_text_policy": getattr(query, "document_text_policy", "refs_only"),
         "document_refs": list(context_package.get("document_refs") or document_workspace.get("document_refs") or []),
@@ -31231,6 +43909,8 @@ def _retrieve_runtime_attested_impl(
         "seed_destination_presence": dict(runtime_plan.get("seed_destination_presence") or {}),
         "probes": probes,
         "branches": branches,
+        "path_missions": canonical_path_missions,
+        "physical_path_executions": physical_path_executions,
         "landing_metadata": final_landing_metadata,
         "shared_evidence": shared_evidence,
         "steps": all_steps,
@@ -31240,8 +43920,11 @@ def _retrieve_runtime_attested_impl(
         "stop_reason": effective_stop_reason,
         "answer": answer if query.response_mode in {"answer", "both"} else None,
         "context": context if query.response_mode in {"context", "both"} else None,
-        "answer_short": answer_short,
-        "answer_full": answer_full,
+        # Context-only retrieval returns the context package, not a synthetic
+        # answer surface. Keeping deterministic compatibility text here made
+        # downstream consumers mistake a sentence collage for an AI answer.
+        "answer_short": answer_short if query.response_mode in {"answer", "both"} else None,
+        "answer_full": answer_full if query.response_mode in {"answer", "both"} else None,
         "answer_surface_update": answer_surface_update,
         "final_answer_update_policy": str(answer_surface_update.get("policy") or ""),
         "final_answer_seed_from_early_surface": bool(final_answer_seed_from_early_surface),
@@ -31262,6 +43945,7 @@ def _retrieve_runtime_attested_impl(
         "client_visible_partial_budget_seconds": float(client_visible_partial_budget_seconds),
         "client_visible_partial_terminalized": bool(client_visible_partial_terminalized),
         "client_visible_partial_terminal_reason": client_visible_partial_terminal_reason,
+        "flash_public_partial_before_master": bool(flash_public_partial_before_master_active),
         "post_final_worker_throttle_enabled": bool(post_final_worker_throttle_enabled),
         "post_final_worker_throttle_policy": dict(post_final_worker_throttle_policy),
         "post_final_branch_pruned_count": int(post_final_branch_pruned_count),
@@ -31280,9 +43964,25 @@ def _retrieve_runtime_attested_impl(
         "context_structured": context_structured,
         "context_package": context_package,
         "mission_evidence_ledger": mission_evidence_ledger,
+        "unresolved_required_missions": [
+            {
+                "mission_id": row.get("mission_id"),
+                "path_id": row.get("path_id"),
+                "branch_id": row.get("branch_id"),
+                "goal": row.get("goal"),
+                "coverage_state": row.get("coverage_state"),
+                "coverage_reason": row.get("coverage_reason") or row.get("missing_reason"),
+                "branch_judgement": dict(row.get("branch_judgement") or {}),
+            }
+            for row in unresolved_required_missions
+        ],
+        "unresolved_required_mission_count": len(unresolved_required_missions),
         "master_judgement": master_judgement,
         "mission_learning_rollup": mission_learning_rollup,
         "context_package_materialization": context_package_materialization,
+        "issue_diagnostics": list(search_issue_diagnostics.get("issues") or []),
+        "correction_guidance": search_issue_diagnostics.get("correction_guidance"),
+        "search_issue_diagnostics": search_issue_diagnostics,
         "answer_demo_materialization": answer_demo_materialization,
         "ai_landing_materialization": ai_landing_materialization,
         "ai_materialization_hard_gate": ai_materialization_hard_gate,
@@ -31317,6 +44017,82 @@ def _retrieve_runtime_attested_impl(
         "search_map_2d_truth": search_map_2d_truth,
         "map_stream_state": final_map_stream_state,
     }
+    if flash_public_partial_before_master_active:
+        review_reason = "Flash Search returned usable evidence before the final Master seal."
+        result.update(
+            {
+                "status": "review_required",
+                "completion_state": "review_required",
+                "canonical_search_state": "review_required",
+                "review_required": True,
+                "terminal_for_client": True,
+                "grounded_partial": bool(
+                    result.get("matches")
+                    or result.get("document_refs")
+                    or (result.get("context_package") or {}).get("sections")
+                ),
+                "stop_reason": "flash_public_partial_before_master",
+                "result_materialization_state": "partial_review_required",
+                "final_materialization_pending": False,
+                "result_ready_terminal": True,
+                "review_reason": review_reason,
+                "final_sealed": False,
+                "public_partial_before_master": True,
+            }
+        )
+    if final_master_budget_review_required:
+        review_reason = str(
+            last_operational_master_decision.get("reason")
+            or "master_requires_more_evidence_at_budget_boundary"
+        )
+        result.update(
+            {
+                "status": "review_required",
+                "completion_state": "review_required",
+                "review_required": True,
+                "terminal_for_client": True,
+                "grounded_partial": bool(
+                    result.get("matches") or result.get("document_refs")
+                ),
+                "stop_reason": final_master_review_stop_reason,
+                "result_materialization_state": "partial_review_required",
+                "final_materialization_pending": False,
+                "result_ready_terminal": True,
+                "review_reason": review_reason,
+            }
+        )
+    # Publish the context product from the single attested terminal Master
+    # independently from the optional answer demo. Then, only if the Master
+    # explicitly returned a bounded partial, publish the review projection.
+    result, _terminal_context_projected = (
+        _apply_plan_first_terminal_context_public_projection(
+            result,
+            # Bind the public projection to the exact Master payload shipped
+            # in the final product.  The ledger reconciliation immediately
+            # above may legitimately rebuild the renderer judgement after the
+            # initial operational snapshot; validating against that stale
+            # object can invert an attested terminal/usable-partial verdict
+            # back to a renderer-level ``blocked`` state.
+            master_judgement=master_judgement,
+            plan_first_runtime=plan_first_runtime,
+            mission_evidence_ledger=mission_evidence_ledger,
+        )
+    )
+    # Run the strict partial authority projection regardless of earlier
+    # convenience flags. The helper independently validates provider
+    # attestation and all current plan/ledger/frozen-surface digests.
+    result, _bounded_partial_projected = (
+        _apply_plan_first_usable_partial_public_projection(
+            result,
+            master_judgement=master_judgement,
+            plan_first_runtime=plan_first_runtime,
+            mission_evidence_ledger=mission_evidence_ledger,
+        )
+    )
+    result["plan_first_no_match_certification"] = (
+        _plan_first_no_match_certification(result)
+    )
+    result["payload_integrity"] = _build_context_payload_integrity(result)
     result = normalize_retrieve_response_payload(result)
     record_final_materialization_stage("result_payload_normalize", final_stage_started)
     final_materialization_completed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
@@ -31337,6 +44113,7 @@ def _retrieve_runtime_attested_impl(
     result["planner_runtime"] = planner_runtime_payload
     result["final_materialization_completed_ms"] = final_materialization_completed_ms
     result["final_materialization_stage_timings"] = [dict(item) for item in final_materialization_stage_timings]
+    result = canonicalize_search_result(str(search_id or result.get("search_id") or ""), result)
     if event_callback:
         final_context_update_required = (
             partial_answer_revision > 0
@@ -31507,7 +44284,7 @@ def _retrieve_runtime_attested_impl(
                 "runtime_phase": "completed",
                 "result_materialization_state": terminal_result_materialization_state,
                 "final_materialization_pending": False,
-                "result_ready_terminal": True,
+                "result_ready_terminal": False,
                 "result_surface_ready_ms": result_surface_ready_ms,
                 "final_materialization_started_ms": final_materialization_started_ms,
                 "final_materialization_completed_ms": final_materialization_completed_ms,
@@ -31637,8 +44414,176 @@ def _retrieve_runtime_attested_impl(
                 "warm_context_carryover": warm_context_carryover,
             },
         )
-    _clear_search_supersede(search_id)
     return result
+
+
+def _checkpoint_list_identity(value: Any) -> str:
+    if isinstance(value, Mapping):
+        for key in (
+            "mission_id",
+            "node_id",
+            "document_id",
+            "source_id",
+            "evidence_id",
+            "branch_id",
+            "path_id",
+            "bucket_key",
+            "section_id",
+            "key",
+        ):
+            if value.get(key) not in (None, ""):
+                return f"{key}:{value.get(key)}"
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _merge_checkpoint_value(current: Any, incoming: Any) -> Any:
+    if isinstance(current, Mapping) and isinstance(incoming, Mapping):
+        merged = dict(current)
+        for key, value in incoming.items():
+            merged[key] = _merge_checkpoint_value(merged.get(key), value) if key in merged else value
+        return merged
+    if isinstance(current, list) and isinstance(incoming, list):
+        merged = list(current)
+        index_by_identity = {_checkpoint_list_identity(value): index for index, value in enumerate(merged)}
+        for value in incoming:
+            identity = _checkpoint_list_identity(value)
+            if identity in index_by_identity:
+                index = index_by_identity[identity]
+                merged[index] = _merge_checkpoint_value(merged[index], value)
+            else:
+                index_by_identity[identity] = len(merged)
+                merged.append(value)
+        return merged
+    return incoming if incoming not in (None, "", [], {}) else current
+
+
+def _preserved_checkpoint_is_useful(checkpoint: Mapping[str, Any]) -> bool:
+    def collection_count(value: Any) -> int:
+        return len(value) if isinstance(value, (list, tuple, set)) else 0
+
+    raw_package = checkpoint.get("context_package")
+    package = dict(raw_package) if isinstance(raw_package, Mapping) else {}
+    raw_package_metrics = package.get("metrics")
+    package_metrics = dict(raw_package_metrics) if isinstance(raw_package_metrics, Mapping) else {}
+    raw_shared_evidence = checkpoint.get("shared_evidence")
+    shared_evidence = dict(raw_shared_evidence) if isinstance(raw_shared_evidence, Mapping) else {}
+    raw_hot_item_count = package_metrics.get("hot_item_count")
+    hot_item_count = (
+        raw_hot_item_count
+        if isinstance(raw_hot_item_count, int) and not isinstance(raw_hot_item_count, bool) and raw_hot_item_count > 0
+        else 0
+    )
+    return any(
+        (
+            collection_count(checkpoint.get("matches")),
+            collection_count(checkpoint.get("evidence_snippets")),
+            collection_count(checkpoint.get("source_trace")),
+            collection_count(checkpoint.get("document_refs")),
+            collection_count(checkpoint.get("visited_node_ids")),
+            collection_count(checkpoint.get("visited_bucket_keys")),
+            collection_count(package.get("sections")),
+            hot_item_count,
+            collection_count(shared_evidence.get("shared_node_ids")),
+        )
+    )
+
+
+def _preserved_search_checkpoint(buffered_events: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    """Merge already-produced evidence without manufacturing a successful lifecycle."""
+    useful_fields = {
+        "matches",
+        "source_trace",
+        "evidence_snippets",
+        "document_refs",
+        "document_workspace",
+        "path_corridors",
+        "route_trace",
+        "context_package",
+        "context_dossier",
+        "context",
+        "context_structured",
+        "section_snapshots",
+        "shared_evidence",
+        "mission_evidence_ledger",
+        "branches",
+        "visited_node_ids",
+        "visited_bucket_keys",
+        "run_projection_truth",
+        "search_map_2d_truth",
+    }
+    checkpoint: dict[str, Any] = {}
+    candidate_count = 0
+    for _event_type, event_payload in buffered_events:
+        nested = event_payload.get("result") or event_payload.get("result_snapshot")
+        source = dict(nested) if isinstance(nested, Mapping) else dict(event_payload)
+        candidate = {key: source[key] for key in useful_fields if key in source and source[key]}
+        raw_shared_evidence = source.get("shared_evidence")
+        shared_evidence = dict(raw_shared_evidence) if isinstance(raw_shared_evidence, Mapping) else {}
+        if shared_evidence.get("mission_evidence_ledger") and not candidate.get("mission_evidence_ledger"):
+            candidate["mission_evidence_ledger"] = shared_evidence["mission_evidence_ledger"]
+        if not candidate:
+            continue
+        candidate_count += 1
+        checkpoint = _merge_checkpoint_value(checkpoint, candidate)
+    if not checkpoint or not _preserved_checkpoint_is_useful(checkpoint):
+        return {}
+
+    raw_package = checkpoint.get("context_package")
+    package = dict(raw_package) if isinstance(raw_package, Mapping) else {}
+    if package:
+        raw_contract = package.get("contract")
+        contract = dict(raw_contract) if isinstance(raw_contract, Mapping) else {}
+        contract.update({"passed": False, "contract_passed": False, "terminal": True})
+        package.update({"contract": contract, "status": "review_required_with_preserved_evidence"})
+        checkpoint["context_package"] = package
+    checkpoint["late_ai_failure_preserved_checkpoint"] = True
+    checkpoint["preserved_checkpoint_event_count"] = candidate_count
+    return checkpoint
+
+
+def _checkpoint_unresolved_missions(checkpoint: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw_ledger = checkpoint.get("mission_evidence_ledger")
+    ledger = dict(raw_ledger) if isinstance(raw_ledger, Mapping) else {}
+    if not ledger:
+        raw_shared_evidence = checkpoint.get("shared_evidence")
+        shared_evidence = dict(raw_shared_evidence) if isinstance(raw_shared_evidence, Mapping) else {}
+        raw_nested_ledger = shared_evidence.get("mission_evidence_ledger")
+        ledger = dict(raw_nested_ledger) if isinstance(raw_nested_ledger, Mapping) else {}
+    ledger_rows = [dict(row) for row in list(ledger.get("rows") or []) if isinstance(row, Mapping)]
+    unresolved: list[dict[str, Any]] = []
+    for row in _unresolved_required_mission_rows(ledger):
+        judgement = dict(row.get("branch_judgement") or {})
+        unresolved.append(
+            {
+                "mission_id": row.get("mission_id"),
+                "path_id": row.get("path_id"),
+                "branch_id": row.get("branch_id"),
+                "goal": row.get("goal"),
+                "coverage_state": str(row.get("coverage_state") or "unknown").strip().lower(),
+                "coverage_reason": row.get("coverage_reason") or row.get("missing_reason"),
+                "branch_judgement_state": str(judgement.get("state") or "unknown").strip().lower(),
+                "judgement_input_digest": judgement.get("judgement_input_digest"),
+                "mission_ledger_input_digest": judgement.get("mission_ledger_input_digest"),
+                "judgement_current": bool(judgement.get("current")),
+                "ai_branch_controller_used": bool(judgement.get("ai_branch_controller_used")),
+            }
+        )
+    if ledger_rows:
+        return unresolved
+    for branch in list(checkpoint.get("branches") or []):
+        if not isinstance(branch, Mapping) or str(branch.get("status") or "active") not in {"active", "running"}:
+            continue
+        unresolved.append(
+            {
+                "mission_id": branch.get("mission_id") or branch.get("path_mission_id"),
+                "path_id": branch.get("path_id"),
+                "branch_id": branch.get("branch_id"),
+                "goal": branch.get("goal"),
+                "coverage_state": "unresolved",
+                "coverage_reason": branch.get("stop_reason") or "provider_failed_before_mission_resolution",
+            }
+        )
+    return unresolved
 
 
 def retrieve_runtime(
@@ -31669,11 +44614,33 @@ def retrieve_runtime(
         }
     ]
     buffered_events: list[tuple[str, dict[str, Any]]] = []
+    runtime_stop_event = threading.Event()
 
-    def buffer_event(event_type: str, payload: dict[str, Any]) -> None:
-        buffered_events.append((str(event_type), dict(payload or {})))
+    def relay_event(event_type: str, payload: dict[str, Any]) -> None:
+        """Expose live progress immediately while retaining a failure checkpoint.
+
+        Inner runtime emits ``search_stopped`` and ``result_ready`` before the
+        session finalizer has written the authoritative package.  Keep those
+        lifecycle markers internal so the session writer emits the only
+        terminal client event after final persistence.
+        """
+        normalized_event_type = str(event_type)
+        normalized_payload = normalize_stream_lifecycle_payload(normalized_event_type, dict(payload or {}))
+        buffered_events.append((normalized_event_type, normalized_payload))
+        if event_callback and normalized_event_type not in {"result_ready", "search_stopped"}:
+            event_callback(normalized_event_type, normalized_payload)
 
     token = _SEARCH_AI_CALL_LEDGER.set(call_ledger)
+    runtime_search_id_token = _SEARCH_RUNTIME_SEARCH_ID.set(str(search_id or "").strip() or None)
+    runtime_stop_event_token = _SEARCH_RUNTIME_STOP_EVENT.set(runtime_stop_event)
+    inherited_deadline = _SEARCH_AI_DEADLINE.get()
+    deadline_token = _SEARCH_AI_DEADLINE.set(
+        _effective_search_deadline_monotonic(
+            query,
+            inherited_deadline=inherited_deadline,
+            authoritative_deadline_at_ms=admission.get("runtime_deadline_at_ms"),
+        )
+    )
     try:
         result = _retrieve_runtime_attested_impl(
             query,
@@ -31682,8 +44649,14 @@ def retrieve_runtime(
             prepared_plan=prepared_plan,
             ai_admission=admission,
             search_id=search_id,
-            event_callback=buffer_event if event_callback else None,
+            event_callback=relay_event,
+            runtime_stop_event=runtime_stop_event,
         )
+        if isinstance(result.get("answer"), Mapping):
+            result["answer"] = _attest_grounded_answer_surface(
+                dict(result.get("answer") or {}),
+                call_ledger,
+            )
         execution_summary = {
             "schema_version": "agvm.search_ai_execution.v2",
             "status": "completed",
@@ -31697,11 +44670,10 @@ def retrieve_runtime(
         planner_runtime["search_ai_execution"] = execution_summary
         planner_runtime["ai_execution_attestations"] = [dict(item) for item in call_ledger]
         result["planner_runtime"] = planner_runtime
-        if event_callback:
-            for event_type, payload in buffered_events:
-                if event_type == "result_ready":
-                    payload["result"] = result
-                event_callback(event_type, payload)
+        canonical_search_id = str(search_id or result.get("search_id") or "")
+        result = canonicalize_search_result(canonical_search_id, result)
+        ready_payload = canonical_result_ready_payload(canonical_search_id, result)
+        result = dict(ready_payload["result"])
         return result
     except SearchAiExecutionError as exc:
         blocked_admission = {
@@ -31720,6 +44692,124 @@ def retrieve_runtime(
             blocked_admission,
             search_id=search_id,
         )
+        checkpoint = _preserved_search_checkpoint(buffered_events)
+        if checkpoint:
+            unresolved_missions = _checkpoint_unresolved_missions(checkpoint)
+            failure_planner_runtime = {
+                **dict(checkpoint.get("planner_runtime") or {}),
+                **dict(getattr(exc, "planner_runtime_snapshot", {}) or {}),
+            }
+            failure_planner_runtime.update(
+                {
+                    "planner_path": "ai_attested_partial",
+                    "planner_mode": "ai",
+                    "ai_required": True,
+                    "ai_execution_attested": False,
+                    "attested_call_count": len(call_ledger),
+                    "failed_call": exc.call_name,
+                    "heuristic_fallback_used": False,
+                    "semantic_contract_runtime": {
+                        "status": "provider_degraded",
+                        "provider_error": exc.provider_error,
+                        "material": True,
+                    },
+                }
+            )
+            blocked = {**blocked, **checkpoint}
+            blocked.update(
+                {
+                    "status": "review_required",
+                    "completion_state": "review_required",
+                    "review_required": True,
+                    "grounded_partial": True,
+                    "stop_reason": "review_required_ai_provider_error_after_useful_evidence",
+                    "result_materialization_state": "partial_review_required",
+                    "final_materialization_pending": False,
+                    "result_ready_terminal": True,
+                    "canonical_search_state": "review_required",
+                    "closure_state": "open",
+                    "final_closure_ready": False,
+                    "answer_surface_state": "context_level_1_ready",
+                    "answerability_state": "partial",
+                    "context_package_materialization": {
+                        "state": "partial_review_required",
+                        "terminal": True,
+                        "contract_passed": False,
+                        "final_materialization_pending": False,
+                    },
+                    "semantic_contract_runtime": {
+                        "schema_version": "agvm.semantic_contract_runtime.v2",
+                        "status": "provider_degraded",
+                        "source": "late_search_ai_failure_with_preserved_evidence",
+                        "material": True,
+                        "ai_required": True,
+                        "provider_state": blocked_admission["reason"],
+                        "provider_error": exc.provider_error,
+                        "fallback_used": False,
+                        "heuristic_result_exposed": False,
+                    },
+                    "provider_issue": {
+                        "reason": blocked_admission["reason"],
+                        "failed_call": exc.call_name,
+                        "provider_error": exc.provider_error,
+                    },
+                    "unresolved_required_missions": unresolved_missions,
+                    "unresolved_required_mission_count": len(unresolved_missions),
+                    "review_blockers": [
+                        {
+                            "branch_id": str(row.get("branch_id") or row.get("mission_id") or "provider"),
+                            "mission_id": row.get("mission_id"),
+                            "reason": row.get("coverage_reason") or "provider_failed_before_mission_resolution",
+                        }
+                        for row in unresolved_missions
+                    ]
+                    or [
+                        {
+                            "branch_id": "provider",
+                            "reason": blocked_admission["reason"],
+                        }
+                    ],
+                    "final_closure_blockers": [],
+                    "ai_materialization_hard_gate": {
+                        "required": True,
+                        "blocked": False,
+                        "satisfied": False,
+                        "validation_state": "review_required_after_late_provider_error",
+                        "review_required": True,
+                    },
+                    "ai_landing_materialization": {
+                        "required": True,
+                        "materialized": True,
+                        "validation_state": "partial_review_required",
+                        "blockers": [],
+                    },
+                    "ai_spatial_landing_contract": {
+                        "schema_version": "agvm.public_v1_landing_landing_contract.v1",
+                        "status": "review_required",
+                        "source": "late_search_ai_failure_with_preserved_evidence",
+                        "materialized": True,
+                        "certifiable": False,
+                        "missing_reasons": [exc.provider_error],
+                    },
+                    "payload_integrity": {
+                        "passed": True,
+                        "no_material_returned": False,
+                        "heuristic_result_exposed": False,
+                    },
+                    "planner_runtime": failure_planner_runtime,
+                    "completion_contract": {
+                        "state": "review_required",
+                        "status": "review_required",
+                        "visible_reason": "review_required_ai_provider_error_after_useful_evidence",
+                        "operator_message": (
+                            "Useful grounded context was preserved. Review the partial package; "
+                            "the listed missions remain unresolved because a later AI call failed."
+                        ),
+                        "final_materialization_pending": False,
+                        "result_ready_terminal": True,
+                    },
+                }
+            )
         blocked["billing"] = {
             "chargeable": False,
             "charged_units": 0,
@@ -31727,7 +44817,7 @@ def retrieve_runtime(
         }
         blocked["search_ai_execution"] = {
             "schema_version": "agvm.search_ai_execution.v2",
-            "status": "blocked",
+            "status": "review_required" if checkpoint else "blocked",
             "failed_call": exc.call_name,
             "provider_error": exc.provider_error,
             "call_count": len(call_ledger),
@@ -31735,6 +44825,9 @@ def retrieve_runtime(
             "calls": [dict(item) for item in call_ledger],
         }
         blocked["ai_execution_attestations"] = [dict(item) for item in call_ledger]
+        canonical_search_id = str(search_id or blocked.get("search_id") or "")
+        ready_payload = canonical_result_ready_payload(canonical_search_id, blocked)
+        blocked = dict(ready_payload.get("result") or blocked)
         if event_callback:
             terminal_payload = {
                 "search_id": search_id,
@@ -31743,8 +44836,12 @@ def retrieve_runtime(
                 "provider_error": exc.provider_error,
                 "result": blocked,
             }
-            event_callback("search_blocked", terminal_payload)
-            event_callback("result_ready", terminal_payload)
+            event_callback("search_review_required" if checkpoint else "search_blocked", terminal_payload)
+            event_callback("result_ready", ready_payload)
         return blocked
     finally:
+        _clear_search_supersede(search_id)
+        _SEARCH_AI_DEADLINE.reset(deadline_token)
         _SEARCH_AI_CALL_LEDGER.reset(token)
+        _SEARCH_RUNTIME_STOP_EVENT.reset(runtime_stop_event_token)
+        _SEARCH_RUNTIME_SEARCH_ID.reset(runtime_search_id_token)

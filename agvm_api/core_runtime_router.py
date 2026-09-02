@@ -7,16 +7,73 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from brain_registry import active_brain_summary
 from edition_gate import build_edition_route_report
+from llm import clear_llm_provider_auth_errors, llm_runtime_status
 from setup_env import ProviderKeyTestError, managed_env_status, save_managed_env_values, test_openai_provider_key
+from release_provenance import runtime_release_provenance
 
 
 HostedRegistrySummaryProvider = Callable[[], dict[str, Any]]
+
+
+def _runtime_provider_execution_block() -> dict[str, Any]:
+    """Return recent observed provider execution failures that make AI unusable.
+
+    Configuration only proves that a credential is present. Search/Grow need a
+    provider execution to succeed. A key with exhausted quota must not keep the
+    runtime in an AI-ready state after the process has observed that failure.
+    """
+
+    try:
+        runtime = llm_runtime_status()
+    except Exception:  # pragma: no cover - readiness must not break liveness.
+        return {}
+    blocked_roles: list[dict[str, Any]] = []
+    for role, row in dict(runtime or {}).items():
+        if not isinstance(row, dict):
+            continue
+        error = str(row.get("last_error") or "").strip()
+        if not error:
+            continue
+        lowered = error.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "insufficient_quota",
+                "credit_balance",
+                "no credits remaining",
+                "billing",
+                "invalid_api_key",
+                "401",
+                "403",
+            )
+        ):
+            blocked_roles.append(
+                {
+                    "role": str(role),
+                    "last_error_type": (
+                        "quota_exhausted"
+                        if any(marker in lowered for marker in ("insufficient_quota", "credit_balance", "no credits remaining", "billing"))
+                        else "provider_auth_rejected"
+                    ),
+                    "last_model": row.get("last_model") or None,
+                    "requests": int(row.get("requests") or 0),
+                    "success": int(row.get("success") or 0),
+                }
+            )
+    if not blocked_roles:
+        return {}
+    primary = blocked_roles[0]
+    return {
+        "state": primary["last_error_type"],
+        "blocked": True,
+        "roles": blocked_roles,
+    }
 
 
 def runtime_configuration_status() -> dict[str, Any]:
@@ -29,8 +86,12 @@ def runtime_configuration_status() -> dict[str, Any]:
     request_scoped_provider = edition == "cloud"
     llm_enabled = bool(llm.get("enabled", True))
     provider_configured = bool(provider.get("configured"))
+    provider_execution = _runtime_provider_execution_block()
     ai_ready = bool(llm_enabled and (provider_configured or request_scoped_provider))
-    if ai_ready:
+    if ai_ready and provider_execution.get("blocked"):
+        ai_ready = False
+        state = str(provider_execution.get("state") or "provider_execution_blocked")
+    elif ai_ready:
         state = "request_scoped_provider" if request_scoped_provider and not provider_configured else "ready"
     elif not llm_enabled:
         state = "ai_disabled"
@@ -48,10 +109,21 @@ def runtime_configuration_status() -> dict[str, Any]:
             "configured": provider_configured,
             "source": provider.get("source") or "missing",
             "credential_mode": "request_scoped" if request_scoped_provider else "local_managed_or_process_env",
+            "execution": provider_execution or {"state": "not_observed", "blocked": False},
         },
         "llm": {
             "enabled": llm_enabled,
             "model": llm.get("model"),
+            "compiler_model": llm.get("compiler_model"),
+            "retrieval_model": llm.get("retrieval_model"),
+            "answer_model": llm.get("answer_model"),
+            "sleep_model": llm.get("sleep_model"),
+            "planner_model": llm.get("planner_model"),
+            "ai_spatial_model": llm.get("ai_spatial_model"),
+            "branch_controller_model": llm.get("branch_controller_model"),
+            "evidence_judge_model": llm.get("evidence_judge_model"),
+            "master_model": llm.get("master_model"),
+            "grow_semantic_model": llm.get("grow_semantic_model"),
         },
         "setup": {
             "status_path": "/setup/env",
@@ -70,6 +142,12 @@ class SetupEnvSaveRequest(BaseModel):
     agvm_retrieval_model: str | None = Field(default=None, max_length=120)
     agvm_answer_model: str | None = Field(default=None, max_length=120)
     agvm_sleep_model: str | None = Field(default=None, max_length=120)
+    agvm_planner_model: str | None = Field(default=None, max_length=120)
+    agvm_ai_spatial_model: str | None = Field(default=None, max_length=120)
+    agvm_branch_controller_model: str | None = Field(default=None, max_length=120)
+    agvm_evidence_judge_model: str | None = Field(default=None, max_length=120)
+    agvm_master_model: str | None = Field(default=None, max_length=120)
+    agvm_grow_semantic_model: str | None = Field(default=None, max_length=120)
     agvm_clone_app_arbiter_model: str | None = Field(default=None, max_length=120)
     agvm_clone_app_sufficiency_model: str | None = Field(default=None, max_length=120)
     agvm_clone_app_speaker_model: str | None = Field(default=None, max_length=120)
@@ -108,19 +186,32 @@ def create_core_runtime_router(
         if not isinstance(payload, dict) or not isinstance(payload.get("api_key"), str):
             raise HTTPException(status_code=400, detail=_provider_test_request_error("provider_key_required"))
         try:
-            return await run_in_threadpool(test_openai_provider_key, payload["api_key"])
+            result = await run_in_threadpool(test_openai_provider_key, payload["api_key"])
+            if bool(result.get("ok")):
+                result["cleared_provider_auth_errors"] = clear_llm_provider_auth_errors()
+            return result
         except ProviderKeyTestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.response_detail()) from None
 
     @router.get("/health")
-    def health() -> dict[str, Any]:
+    def health(response: Response) -> dict[str, Any]:
         summary = active_brain_summary()
         hosted_summary = _hosted_registry_summary(hosted_registry_summary_provider)
         configuration = runtime_configuration_status()
+        release = runtime_release_provenance(component="core_api", default_version=app_version)
+        release_status = release["release_bundle_status"]
+        if not release_status["ok"]:
+            response.status_code = 503
         return {
-            "ok": True,
+            "ok": bool(release_status["ok"]),
+            "code": release_status["code"],
             "service": app_name,
-            "version": app_version,
+            "version": release["version"],
+            "revision": release["revision"],
+            "source_sha": release["source_sha"],
+            "release_bundle": release["release_bundle"],
+            "release_bundle_status": release_status,
+            "release": release,
             "ai_ready": configuration["ai_ready"],
             "needs_configuration": configuration["needs_configuration"],
             "runtime_configuration": configuration,
@@ -130,6 +221,10 @@ def create_core_runtime_router(
             "hosted_tenant_registry": hosted_summary,
             "runtime_scope_status": summary.get("runtime_scope_status"),
         }
+
+    @router.get("/version")
+    def version() -> dict[str, Any]:
+        return runtime_release_provenance(component="core_api", default_version=app_version)
 
     @router.get("/runtime/edition")
     def runtime_edition_endpoint(request: Request) -> dict[str, Any]:
@@ -187,6 +282,12 @@ def _setup_env_updates_from_payload(payload: SetupEnvSaveRequest) -> dict[str, s
         "agvm_retrieval_model": "AGVM_RETRIEVAL_MODEL",
         "agvm_answer_model": "AGVM_ANSWER_MODEL",
         "agvm_sleep_model": "AGVM_SLEEP_MODEL",
+        "agvm_planner_model": "AGVM_PLANNER_MODEL",
+        "agvm_ai_spatial_model": "AGVM_AI_SPATIAL_MODEL",
+        "agvm_branch_controller_model": "AGVM_BRANCH_CONTROLLER_MODEL",
+        "agvm_evidence_judge_model": "AGVM_EVIDENCE_JUDGE_MODEL",
+        "agvm_master_model": "AGVM_MASTER_MODEL",
+        "agvm_grow_semantic_model": "AGVM_GROW_SEMANTIC_MODEL",
         "agvm_clone_app_arbiter_model": "AGVM_CLONE_APP_ARBITER_MODEL",
         "agvm_clone_app_sufficiency_model": "AGVM_CLONE_APP_SUFFICIENCY_MODEL",
         "agvm_clone_app_speaker_model": "AGVM_CLONE_APP_SPEAKER_MODEL",

@@ -49,8 +49,10 @@ Restart Claude after editing the config and ask it to call
 `get_agvm_usage_guide`. If that tool is missing, check the `cwd`, Python import
 path and `AGVM_API_BASE_URL`.
 
-Keep provider API keys in `.env` or backend-managed environment storage unless
-you intentionally want Claude's MCP child process to receive the secret.
+Do not pass provider API keys to Claude's MCP child process. Provider keys
+belong in backend-managed environment storage or an OS/platform secret
+manager. Configure the key once in AGVM Local Settings; headless deployments
+may use the API container's `.env`.
 
 `AGVM_MCP_MODULE_VISIBILITY_POLICY=block_unlicensed` keeps Core memory tools
 executable and keeps advanced Detwin Cloud module tools visible in the local
