@@ -15642,7 +15642,11 @@ def build_mcp_master_judgement(
     return result
 
 
-def _mcp_ledger_candidate_text(value: Any) -> str | None:
+def _mcp_ledger_candidate_text(
+    value: Any,
+    *,
+    recover_cited_context_dependent_evidence: bool = False,
+) -> str | None:
     if not isinstance(value, dict):
         return None
     for key in (
@@ -15655,9 +15659,27 @@ def _mcp_ledger_candidate_text(value: Any) -> str | None:
         "title",
         "source_title",
     ):
-        text = _mcp_clean_agent_text(value.get(key))
+        raw_text = value.get(key)
+        text = _mcp_clean_agent_text(raw_text)
         if text:
             return text
+        # A provider may cite a valid ledger node whose stored claim uses a
+        # context-dependent subject (for example, "The system must ..."). The
+        # normal renderer correctly rejects such fragments, but dropping an
+        # explicitly cited, already-accepted ledger node leaves the final
+        # answer bound to evidence that is absent from the agent package. Keep
+        # the global orphan filter strict and recover only this narrow case by
+        # making the source boundary explicit. Re-running the normal cleaner on
+        # the wrapped value preserves every other noise/truncation safeguard.
+        if recover_cited_context_dependent_evidence:
+            normalized = " ".join(str(raw_text or "").replace("\r", "\n").split()).strip()
+            if normalized and _mcp_agent_text_is_context_dependent_fragment(
+                normalized,
+                _fold_text(normalized),
+            ):
+                text = _mcp_clean_agent_text(f"Stored memory evidence: {normalized}")
+                if text:
+                    return text
     return None
 
 
@@ -15835,9 +15857,18 @@ def _mcp_ledger_row_section_candidates(row: dict[str, Any]) -> list[str]:
     return sections or ["history"]
 
 
-def _mcp_ledger_hot_candidates(compact_ledger: dict[str, Any]) -> list[dict[str, Any]]:
+def _mcp_ledger_hot_candidates(
+    compact_ledger: dict[str, Any],
+    *,
+    answer_evidence_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+    cited_node_ids = {
+        str(node_id).strip()
+        for node_id in set(answer_evidence_ids or set())
+        if str(node_id).strip()
+    }
     for row_index, raw_row in enumerate(list(compact_ledger.get("rows") or []), start=1):
         if not isinstance(raw_row, dict):
             continue
@@ -15849,7 +15880,16 @@ def _mcp_ledger_hot_candidates(compact_ledger: dict[str, Any]) -> list[dict[str,
             if not isinstance(raw_evidence, dict):
                 continue
             evidence = dict(raw_evidence)
-            text = _mcp_ledger_candidate_text(evidence)
+            node_id = str(
+                evidence.get("node_id")
+                or evidence.get("target_node_id")
+                or evidence.get("source_node_id")
+                or ""
+            ).strip()
+            text = _mcp_ledger_candidate_text(
+                evidence,
+                recover_cited_context_dependent_evidence=bool(node_id and node_id in cited_node_ids),
+            )
             if not text:
                 continue
             mission_grounding = _mcp_mission_candidate_grounding(row, text, section_candidates)
@@ -15862,12 +15902,6 @@ def _mcp_ledger_hot_candidates(compact_ledger: dict[str, Any]) -> list[dict[str,
             )
             if section not in _MCP_CONTEXT_SECTION_TITLES:
                 section = primary_section
-            node_id = str(
-                evidence.get("node_id")
-                or evidence.get("target_node_id")
-                or evidence.get("source_node_id")
-                or ""
-            ).strip()
             key = (section, node_id, _fold_text(text))
             if key in seen:
                 continue
@@ -16459,7 +16493,10 @@ def build_mcp_context_package(
         )
 
     if ledger_renderer_mode:
-        for ledger_candidate in _mcp_ledger_hot_candidates(compact_mission_evidence_ledger):
+        for ledger_candidate in _mcp_ledger_hot_candidates(
+            compact_mission_evidence_ledger,
+            answer_evidence_ids=answer_evidence_ids,
+        ):
             add_candidate(ledger_candidate)
 
     structured_subject_name = _mcp_identity_subject_name_from_contract(semantic_contract)
