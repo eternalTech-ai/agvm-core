@@ -4075,7 +4075,11 @@ def require_search_ai_admission(
             query,
             identity_source=identity_source,
             retrieval_mode=retrieval_mode,
-            minimal=False,
+            # Admission owns the semantic MissionPlan only. Destination
+            # geometry and memory-class routing belong to the downstream AI
+            # spatial planner; requesting both here duplicates work and made a
+            # healthy cold GPT-5 planner exceed the public admission deadline.
+            minimal=True,
             timeout_override=max(
                 0.1,
                 min(

@@ -1353,10 +1353,12 @@ def test_search_ai_admission_uses_product_bounded_planner_timeout(monkeypatch) -
     monkeypatch.delenv("AGVM_SEARCH_AI_ADMISSION_FLASH_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("AGVM_SEARCH_AI_ADMISSION_TIMEOUT_SECONDS", raising=False)
     observed_timeouts: list[float | None] = []
+    observed_minimal: list[bool | None] = []
     started_at_ms = int(time.time() * 1000)
 
     def provider(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], None]:
         observed_timeouts.append(kwargs.get("timeout_override"))
+        observed_minimal.append(kwargs.get("minimal"))
         kwargs["execution_metadata"].update(_attestation())
         return _planner_payload(), None
 
@@ -1372,6 +1374,7 @@ def test_search_ai_admission_uses_product_bounded_planner_timeout(monkeypatch) -
 
     assert admission["status"] == "admitted"
     assert observed_timeouts == [pytest.approx(60.0)]
+    assert observed_minimal == [True]
     runtime_budget_seconds = (
         int(admission["runtime_deadline_at_ms"]) - started_at_ms
     ) / 1000.0
