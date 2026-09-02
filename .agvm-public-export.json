@@ -102,7 +102,7 @@
       "agvm_api/public_v1_landing_contract.py": "18098b6cf475be8f06ad16d367f62e20cfd48eff37de36b20679bf945cfd33dd",
       "agvm_api/release_provenance.py": "cd8decb58a5a5e3d4d4455cd1d05e17768b4e4ee655028e084aadfe6714d156e",
       "agvm_api/requirements.txt": "351bef2722885a2d29c896f4a522f776a28d03f42dd96192034d5327200dd1b3",
-      "agvm_api/retrieval.py": "bc988164bc6f66fbed0fab37aec4f01c3c093009ae7556779acb81f680a1394c",
+      "agvm_api/retrieval.py": "560e8fda939669eb2a0d7d4adb00a8baa182634bc4a0b7711ac74886508123aa",
       "agvm_api/retrieval_limits.py": "4f07b9d5408b72dc810f3e926a87299b8ea6d590ed018ba05c456800d47c57a7",
       "agvm_api/route_classification.py": "1b67e00f51bb4c746f47af324db005be0c26d1af3524b3f1ef8305b59bf2efea",
       "agvm_api/run_projection.py": "dcb2edb807c003df1a28d7374d3973757ff22d1dd657ab922872588f4b4a0b2e",
@@ -188,7 +188,7 @@
       "tests/test_public_release_contract.py": "79824368bd47f3e0f1285fcd58858781902f3643f1f1bfbd5ee4c3b4705c9f47",
       "tests/test_public_v1_landing_contract.py": "801aac81629ecb25e57d6ba5d607f0bfb194535fc2c0168d03b6dfe91ca9fc91",
       "tests/test_public_v1_search_edition_boundary.py": "1f14114637e2c038869aae4163b2d405d793e96bb9c554186c6a8a1fc30708f0",
-      "tests/test_search_ai_fail_closed_v2.py": "c16fd1969c95a46f73cc4d0d774b761363291de9cbe140879209f9893ef556f7",
+      "tests/test_search_ai_fail_closed_v2.py": "809901e0d6c4b9845235770ccbd5940dad8fa6b1c3c531facac38d60e659195b",
       "tests/test_setup_env_runtime.py": "47fa07a9a6f531c25f2b1a86aae2c91930032dfcd6323bebb63da6615b881d7b"
     },
     "ignored_generated_path_prefixes": [
@@ -202,7 +202,7 @@
       "agvm_cockpit_prototype/vite.config.js",
       "brains"
     ],
-    "tree_sha256": "b9778821dc9d90f744fd448f252c9ab0a1177a398a71843ba376f27aeca6f396"
+    "tree_sha256": "c485f2a0979231845dd3d158ce9ab9b4563d6c85b3b64d75639f76e7f9065bba"
   },
   "commentable_file_count": 166,
   "exported_file_count": 181,
@@ -210,7 +210,7 @@
   "release_eligible": true,
   "schema_version": "agvm.public_core_export.v2",
   "source_clean": true,
-  "source_commit": "ce02957c6159766c6e87c9e9e2c0b977664f74ad",
+  "source_commit": "789161add11b380c71aa74d946ef90ae593308b1",
   "source_status_count": 0,
   "spdx_header_injected_file_count": 87
 }

@@ -1154,15 +1154,16 @@ def _search_ai_admission_timeout_seconds(
         mode = "heavy"
     defaults = {
         # The public defaults use GPT-5-family planners. Structured planner
-        # responses regularly cross the old 12-16 second admission window
-        # even when the provider is healthy, which made a fresh local install
-        # fail closed before Search could create its session. Keep admission
-        # bounded well below each mode's end-to-end budget while allowing one
-        # healthy provider round-trip to finish.
-        "flash": 20.0,
-        "balanced": 30.0,
-        "heavy": 45.0,
-        "forensic": 60.0,
+        # responses can take materially longer than a simple provider probe,
+        # especially on a fresh brain where no semantic-contract cache exists.
+        # The former 20/30 second flash/balanced gates repeatedly rejected a
+        # healthy provider before Search could create a plan. Keep admission
+        # bounded below each mode's end-to-end budget, but give one structured
+        # provider round-trip enough time to finish.
+        "flash": 60.0,
+        "balanced": 60.0,
+        "heavy": 75.0,
+        "forensic": 90.0,
     }
     default = defaults.get(mode, 12.0)
     for env_name in (

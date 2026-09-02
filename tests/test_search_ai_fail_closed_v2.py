@@ -1086,6 +1086,8 @@ def test_main_final_materialization_heartbeat_uses_search_brain_scope(monkeypatc
 
 
 def test_main_background_stream_event_reenters_payload_brain_scope(monkeypatch, tmp_path) -> None:
+    if not (API_DIR / "main.py").is_file():
+        pytest.skip("monolith main.py is intentionally absent from the public Core export")
     main = importlib.import_module("main")
     search_id = "search-main-background-callback"
     brain_id = "brain-main-background-callback"
@@ -1369,7 +1371,7 @@ def test_search_ai_admission_uses_product_bounded_planner_timeout(monkeypatch) -
     )
 
     assert admission["status"] == "admitted"
-    assert observed_timeouts == [pytest.approx(20.0)]
+    assert observed_timeouts == [pytest.approx(60.0)]
     runtime_budget_seconds = (
         int(admission["runtime_deadline_at_ms"]) - started_at_ms
     ) / 1000.0
@@ -1394,10 +1396,10 @@ def test_search_ai_admission_defaults_allow_one_structured_provider_round_trip(m
     ):
         monkeypatch.delenv(name, raising=False)
 
-    assert retrieval._search_ai_admission_timeout_seconds("flash") == 20.0
-    assert retrieval._search_ai_admission_timeout_seconds("balanced") == 30.0
-    assert retrieval._search_ai_admission_timeout_seconds("heavy") == 45.0
-    assert retrieval._search_ai_admission_timeout_seconds("forensic") == 60.0
+    assert retrieval._search_ai_admission_timeout_seconds("flash") == 60.0
+    assert retrieval._search_ai_admission_timeout_seconds("balanced") == 60.0
+    assert retrieval._search_ai_admission_timeout_seconds("heavy") == 75.0
+    assert retrieval._search_ai_admission_timeout_seconds("forensic") == 90.0
 
 
 def test_search_ai_timeout_http_block_does_not_report_missing_configuration() -> None:
