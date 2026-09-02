@@ -9396,6 +9396,43 @@ def _mcp_answer_payload_text(answer_payload: dict[str, Any] | None) -> str:
     return "\n".join(parts).strip()
 
 
+_MCP_GENERIC_PRODUCT_BOUNDARY_ALIGNMENT_TOKENS = frozenset(
+    {
+        "agvm",
+        "billed",
+        "billing",
+        "boundary",
+        "byok",
+        "capabilities",
+        "capability",
+        "core",
+        "credit",
+        "credits",
+        "hosted",
+        "key",
+        "keys",
+        "local",
+        "operation",
+        "operations",
+        "own",
+        "platform",
+        "product",
+        "provider",
+        "service",
+        "services",
+        "user",
+    }
+)
+
+
+def _mcp_answer_alignment_term_is_generic_product_boundary(value: Any) -> bool:
+    tokens = re.findall(r"[a-z0-9]+", _fold_text(value))
+    return bool(tokens) and all(
+        token in _MCP_GENERIC_PRODUCT_BOUNDARY_ALIGNMENT_TOKENS
+        for token in tokens
+    )
+
+
 def _mcp_answer_alignment_terms(value: Any) -> list[str]:
     text = str(value or "")
     folded = _fold_text(text)
@@ -9405,7 +9442,12 @@ def _mcp_answer_alignment_terms(value: Any) -> list[str]:
 
     def add_term(term: str) -> None:
         cleaned = _fold_text(term)
-        if cleaned and cleaned not in {"agvm", "mcp", "llm", "ai", "ceo"} and cleaned not in terms:
+        if (
+            cleaned
+            and cleaned not in {"agvm", "mcp", "llm", "ai", "ceo"}
+            and not _mcp_answer_alignment_term_is_generic_product_boundary(cleaned)
+            and cleaned not in terms
+        ):
             terms.append(cleaned)
 
     for year in re.findall(r"\b(?:19|20)\d{2}\b", text):
