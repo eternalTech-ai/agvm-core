@@ -58,9 +58,9 @@ AGVM_HOSTED_MCP_API_KEY = "<hosted-key-from-detwin-account>"
 AGVM_HOSTED_MCP_URL = "https://mcp.detwin.ai"
 ```
 
-Do not put provider API keys in the MCP bridge config unless you intentionally
-want that client process to own the secret. Prefer `.env` or backend-managed
-environment storage.
+Do not put provider API keys in the MCP bridge config. Configure the local
+provider once in AGVM Local Settings; the stdio bridge only needs the local API
+URL and brain policy. Headless deployments may use the API container's `.env`.
 
 ## 3. Restart Codex
 
@@ -79,6 +79,12 @@ not, check:
 - Python can run `python -m agvm_mcp_server` from that directory;
 - `AGVM_API_BASE_URL` points to the running API;
 - Codex was restarted after editing the config.
+
+For a new brain, ask Codex to keep the `brain_id` returned by `ensure_brain`,
+complete the reviewed `brain_bootstrap_*` workflow, preview/apply Grow with the
+exact server-issued IDs, and finally call `retrieve_context`. Those operations
+use the provider configured in Local Settings and no Detwin credits. Do not ask
+it to use Sleep or Evolve for local onboarding; those are Hosted MCP operations.
 
 ## Permission Families
 

@@ -32,6 +32,7 @@ from agvm_mcp_server.server import (  # noqa: E402
     run_stdio,
 )
 from mcp_contracts import AGENT_MEMORY_MCP_TOOL_NAMES, GUIDE_MCP_TOOL_NAMES, REQUIRED_MCP_TOOL_NAMES, build_mcp_contract_registry  # noqa: E402
+from mcp_retrieval import build_mcp_retrieval_tool_output  # noqa: E402
 from schemas import (  # noqa: E402
     McpMaintenanceApplyRequest,
     McpMaintenanceRequest,
@@ -311,6 +312,175 @@ def test_pr12m_c_tools_call_injects_brain_id_and_mcp_header() -> None:
             "brain_header": "simone_massaro",
             "payload": {"query_text": "raccontami del lavoro", "brain_id": "simone_massaro"},
         }
+    ]
+
+
+def test_downloaded_from_zero_tool_flow_preserves_public_search_truth() -> None:
+    class FreshPublicCoreClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def get_json(
+            self,
+            path: str,
+            *,
+            brain_id: str | None = None,
+            hosted_scope: dict[str, str | None] | None = None,
+        ) -> dict[str, Any]:
+            del brain_id, hosted_scope
+            assert path == "/mcp/contracts"
+            return build_mcp_contract_registry()
+
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            brain_id: str | None = None,
+            hosted_scope: dict[str, str | None] | None = None,
+        ) -> dict[str, Any]:
+            del hosted_scope
+            self.requests.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "payload": dict(payload),
+                    "brain_id": brain_id,
+                }
+            )
+            if path == "/mcp/brains/ensure":
+                return {
+                    "status": "ready",
+                    "brain_id": "fresh_public_brain",
+                    "created": True,
+                }
+            assert path == "/mcp/retrieve-context"
+            return build_mcp_retrieval_tool_output(
+                "retrieve_context",
+                {
+                    "search_id": "search-downloaded-from-zero",
+                    "brain_id": "fresh_public_brain",
+                    "query_text": payload["query_text"],
+                    "status": "completed",
+                    "response_mode": "context",
+                    "retrieval_mode": "balanced",
+                    "document_text_policy": "refs_only",
+                    "context_package": {
+                        "schema_version": "agvm.mcp_context_package.v2",
+                        "status": "contract_satisfied",
+                        "agent_markdown": "# Context\n\nFresh public Core evidence.",
+                        "contract": {"passed": True, "unresolved_sections": []},
+                    },
+                    "context_package_materialization": {
+                        "state": "finalized",
+                        "contract_passed": True,
+                        "final_materialization_pending": False,
+                    },
+                    "matches": [
+                        {
+                            "node_id": "node_fresh_public_core",
+                            "summary": "Fresh public Core evidence.",
+                        }
+                    ],
+                    "semantic_contract_runtime": {
+                        "enabled": True,
+                        "ai_required": True,
+                        "status": "completed",
+                        "source": "llm",
+                        "material": True,
+                        "provider_state": "fresh_llm_contract",
+                    },
+                    "ai_landing_materialization": {
+                        "required": True,
+                        "materialized": True,
+                        "route_level_materialized": True,
+                        "ai_landing_count": 1,
+                    },
+                    "ai_materialization_hard_gate": {
+                        "required": True,
+                        "satisfied": True,
+                        "blocked": False,
+                    },
+                    "ai_spatial_landing_contract": {
+                        # Exercise compaction of the private input contract
+                        # without embedding its denied marker in public source.
+                        "schema_version": ".".join(
+                            ("agvm", "ai_spatial_landing_contract", "v1")
+                        ),
+                        "status": "materialized",
+                        "materialized": True,
+                        "certifiable": True,
+                        "inverse_answer_paths": [
+                            {
+                                "path_id": "P1",
+                                "answer_field": "product",
+                                "landing_coordinate": {"x": 0.71, "y": -0.22, "z": 0.13},
+                            }
+                        ],
+                    },
+                    "closure_state": "final_sealed",
+                    "final_closure_ready": True,
+                    "final_materialization_pending": False,
+                    "result_ready_terminal": True,
+                    "stop_reason": "final_sealed",
+                },
+                include_raw_text=False,
+            )
+
+    client = FreshPublicCoreClient()
+    server = AgvmMcpServer(
+        AgvmMcpConfig(
+            api_base_url="http://127.0.0.1:8010",
+            brain_policy="ai_create_if_missing",
+            brain_id_hint="fresh_public_brain",
+            brain_display_name="Fresh Public Brain",
+        ),
+        client=client,  # type: ignore[arg-type]
+    )
+    ensured = server.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": "ensure-from-zero",
+            "method": "tools/call",
+            "params": {"name": "ensure_brain", "arguments": {}},
+        }
+    )
+    assert ensured is not None
+    brain_id = ensured["result"]["structuredContent"]["brain_id"]
+    retrieved = server.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": "retrieve-from-zero",
+            "method": "tools/call",
+            "params": {
+                "name": "retrieve_context",
+                "arguments": {
+                    "brain_id": brain_id,
+                    "query_text": "What evidence is available?",
+                },
+            },
+        }
+    )
+
+    assert retrieved is not None
+    assert retrieved["result"]["isError"] is False
+    result = retrieved["result"]["structuredContent"]
+    resilience = result["ai_materialization_resilience_contract"]
+    assert resilience["ai_required"] is True
+    assert resilience["ai_materialized"] is True
+    assert resilience["materialization_source"] == "fresh_llm"
+    assert any(
+        node.get("origin_kind") == "ai"
+        and node.get("coordinate") == [0.71, -0.22, 0.13]
+        for node in result["run_projection_truth"]["nodes"]
+    )
+    projection_stream = result["run_projection_event_stream_contract"]
+    assert projection_stream["client_terminal"] is True
+    assert projection_stream["terminal_for_client"] is True
+    assert [request["path"] for request in client.requests] == [
+        "/mcp/brains/ensure",
+        "/mcp/retrieve-context",
     ]
 
 

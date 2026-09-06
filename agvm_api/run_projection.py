@@ -96,6 +96,23 @@ def build_run_projection_truth(
     document_workspace = _as_dict(source.get("document_workspace"))
     path_corridors = _as_dict(source.get("path_corridors"))
     ai_materialization = _as_dict(source.get("ai_landing_materialization"))
+    ai_spatial_contract = _as_dict(
+        source.get("ai_spatial_landing_contract")
+        or planner_runtime.get("ai_spatial_landing_contract")
+    )
+    ai_spatial_paths = [
+        _as_dict(item)
+        for item in _as_list(ai_spatial_contract.get("inverse_answer_paths"))
+        if isinstance(item, dict)
+    ]
+    ai_spatial_materialized = bool(
+        ai_spatial_paths
+        and (
+            ai_spatial_contract.get("materialized")
+            or ai_spatial_contract.get("certifiable")
+            or _string(ai_spatial_contract.get("status")).lower() == "materialized"
+        )
+    )
 
     resolved_search_id = search_id or _string(source.get("search_id") or map_truth.get("search_id")) or None
     resolved_brain_id = brain_id or _string(source.get("brain_id")) or None
@@ -186,7 +203,10 @@ def build_run_projection_truth(
             return
         clean_path = _string(path_id)
         clean_source = _string(source)
-        key = f"{clean_from}->{clean_to}:{clean_path}:{clean_source}"
+        # One physical traversal has one identity even when both the live map
+        # and the finalized corridor project it.  Source is provenance, not
+        # part of edge identity.
+        key = f"{clean_from}->{clean_to}:{clean_path}"
         if key in edge_keys:
             return
         edge_keys.add(key)
@@ -279,8 +299,12 @@ def build_run_projection_truth(
         or ai_landing.get("materialized")
         or ai_path.get("corridor_materialized")
         or semantic_contract.get("materialized")
+        or ai_spatial_materialized
     )
-    ai_hypothesis_count = int(ai_landing.get("hypothesis_count") or ai_landing.get("probe_count") or 0)
+    ai_hypothesis_count = max(
+        int(ai_landing.get("hypothesis_count") or ai_landing.get("probe_count") or 0),
+        len(ai_spatial_paths),
+    )
     if not ai_hypothesis_count and ai_route_materialized:
         ai_hypothesis_count = 1
     existing_ai_landings = [
@@ -288,6 +312,60 @@ def build_run_projection_truth(
         for node in nodes_by_key.values()
         if node.get("kind") == "landing" and node.get("origin_kind") == "ai"
     ]
+    if ai_spatial_materialized and not existing_ai_landings:
+        for path_index, path in enumerate(ai_spatial_paths, start=1):
+            path_id = _string(path.get("path_id") or path.get("strand_id"), f"P{path_index}")
+            primary_destinations = [
+                _as_dict(item)
+                for item in _as_list(path.get("destinations") or path.get("destination_queue"))
+                if isinstance(item, dict)
+                and _string(item.get("execution_role"), "primary").lower() == "primary"
+            ]
+            if not primary_destinations:
+                primary_destinations = [{}]
+            for destination_index, destination in enumerate(primary_destinations, start=1):
+                destination_id = _string(
+                    destination.get("destination_id"),
+                    f"destination_{destination_index}",
+                )
+                landing_id = f"ai_spatial::{path_id}::{destination_id}"
+                coordinate = _as_dict(
+                    destination.get("coordinate")
+                    or path.get("landing_coordinate")
+                )
+                add_event(
+                    "ai_landing_materialized",
+                    landing_id=landing_id,
+                    path_id=path_id,
+                    origin_kind="ai",
+                    source="ai_spatial_landing_contract.inverse_answer_paths",
+                )
+                add_node(
+                    f"landing::{landing_id}",
+                    kind="landing",
+                    role="ai_landing_origin",
+                    semantic_area=_string(
+                        path.get("answer_field")
+                        or path.get("goal")
+                        or destination.get("expected_discovery"),
+                        "semantic_ai",
+                    ),
+                    coordinate_seed=f"ai_spatial:{resolved_search_id or 'run'}:{path_id}:{destination_id}",
+                    coordinate_raw=coordinate,
+                    tooltip=_short_tooltip(
+                        path.get("goal"),
+                        destination.get("label") or destination.get("expected_discovery"),
+                        fallback=f"AI landing {path_id}",
+                    ),
+                    package_role="debug_only",
+                    origin_kind="ai",
+                    source="ai_spatial_landing_contract.inverse_answer_paths",
+                )
+        existing_ai_landings = [
+            node
+            for node in nodes_by_key.values()
+            if node.get("kind") == "landing" and node.get("origin_kind") == "ai"
+        ]
     if ai_route_materialized and not existing_ai_landings:
         semantic_area = _string(ai_landing.get("semantic_area") or ai_path.get("semantic_area"), "semantic_ai")
         expected_evidence_count = int(semantic_contract.get("expected_evidence_count") or 0)
@@ -335,6 +413,25 @@ def build_run_projection_truth(
             source="search_map_2d_truth.intermediate_nodes",
         )
 
+    corridor_path_ids = {
+        _string(item.get("path_id"))
+        for item in _as_list(path_corridors.get("paths"))
+        if isinstance(item, dict) and _string(item.get("path_id"))
+    }
+    canonical_path_id_by_route: dict[str, str] = {}
+    for plan_index, plan in enumerate(_as_list(map_truth.get("route_plans"))):
+        if not isinstance(plan, dict):
+            continue
+        route_id = _string(plan.get("route_id") or plan.get("branch_id"), f"route::{plan_index + 1}")
+        lifecycle_ids = [
+            _string(item.get("path_id"))
+            for item in _as_list(plan.get("path_lifecycle"))
+            if isinstance(item, dict) and _string(item.get("path_id"))
+        ]
+        canonical_path_id_by_route[route_id] = (
+            lifecycle_ids[0] if len(set(lifecycle_ids)) == 1 else route_id
+        )
+
     for segment_index, segment in enumerate(_as_list(map_truth.get("route_segments"))):
         if not isinstance(segment, dict):
             continue
@@ -346,7 +443,10 @@ def build_run_projection_truth(
             from_id,
             to_id,
             kind=_string(segment.get("edge_type"), "local"),
-            path_id=_string(segment.get("route_id") or segment.get("branch_id")) or None,
+            path_id=canonical_path_id_by_route.get(
+                _string(segment.get("route_id") or segment.get("branch_id")),
+                _string(segment.get("route_id") or segment.get("branch_id")),
+            ) or None,
             source="search_map_2d_truth.route_segments",
             edge_id=_string(segment.get("segment_id"), f"edge::{segment_index + 1}"),
         )
@@ -355,13 +455,18 @@ def build_run_projection_truth(
         if not isinstance(plan, dict):
             continue
         route_id = _string(plan.get("route_id") or plan.get("branch_id"), f"route::{plan_index + 1}")
+        canonical_path_id = canonical_path_id_by_route.get(route_id, route_id)
         branch_id = _string(plan.get("branch_id"))
         landing_id = _string(plan.get("landing_id") or landing_ids_by_branch.get(branch_id) or branch_id)
         path_rows = _as_list(plan.get("path_lifecycle"))
         state = _string(plan.get("path_lifecycle_state") or plan.get("route_state") or plan.get("status"), "planned")
+        # The finalized corridor owns the canonical path record when present;
+        # the live route plan still contributes its real traversed edges.
+        if canonical_path_id in corridor_path_ids:
+            continue
         paths.append(
             {
-                "path_id": route_id,
+                "path_id": canonical_path_id,
                 "origin_node_id": f"landing::{landing_id}" if landing_id else None,
                 "origin_kind": _string(plan.get("planner_family"), "unknown"),
                 "planned_node_ids": [],

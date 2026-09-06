@@ -21,7 +21,8 @@ def create_brain_bootstrap_v1_router(service: BrainBootstrapV1Service | None = N
         try:
             return runtime.execute(operation, payload)
         except (BootstrapV1Error, BootstrapStoreError) as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+            detail = exc.http_detail() if isinstance(exc, BootstrapV1Error) else exc.code
+            raise HTTPException(status_code=exc.status_code, detail=detail) from exc
 
     for operation in OPERATIONS:
         endpoint = _endpoint(operation, execute)

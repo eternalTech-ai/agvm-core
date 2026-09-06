@@ -68,8 +68,10 @@ Ask the client to call `get_agvm_usage_guide` and then list the AGVM tools it
 can see. If the tool is missing, check the process working directory, Python
 environment and `AGVM_API_BASE_URL`.
 
-The current V1 contract registry defines 55 tool contracts. `tools/list` is the
-runtime authority because client permission policy can expose a filtered set. Grow,
+The current tool catalog is generated at runtime from `GET /mcp/contracts`.
+Do not hard-code a tool count in client setup: the catalog grows as bounded Core
+and cloud-handoff contracts are released. `tools/list` is the runtime authority
+because client permission policy can expose a filtered set. Grow,
 brain registry, retrieval, write-preview/commit and local graph inspection
 tools are Core tools. The registry also includes nine bounded
 `brain_bootstrap_*` tools and three `brain_profile_*` tools. Maintain-family
@@ -113,6 +115,22 @@ the server-side Hosted MCP gate. Missing credentials, entitlement or credits
 return structured recovery responses; paid operations never fall back to local
 execution. Grow remains a local Core operation and does not consume Detwin
 credits.
+
+For a fresh local brain, the intended MCP order is:
+
+1. `ensure_brain` and retain the returned `brain_id`;
+2. complete the reviewed `brain_bootstrap_*` sequence, using the local BYOK
+   provider for adaptive interview questions and semantic candidate formation;
+3. call `grow_source_preview`, review its exact IDs, then
+   `grow_source_apply` with explicit confirmation;
+4. call `retrieve_context` and use its `search_id` with inspection tools.
+
+Do not use Sleep or Evolve to finish local onboarding. Those calls cross the
+Hosted MCP boundary and require a Detwin account, entitlement, cloud brain and
+credits. If a local Bootstrap, Grow or `retrieve_context` call reports platform
+credits as its requirement, verify that the client is connected to
+`http://127.0.0.1:8010` and invoking the Core tool rather than a hosted/cloud
+endpoint.
 
 Brain Profile preview is shadow-only. Profile fitting, activation and rollback
 authority are cloud-backed and must return an action contract when the local

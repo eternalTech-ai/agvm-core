@@ -29,6 +29,7 @@ BRAIN_PROFILE_V1_CLOUD_CAPABILITIES = ["fitting", "backfill", "activation"]
 
 LOCAL_CORE_MAINTAIN_PREVIEW_TOOL_NAMES = frozenset(
     {
+        "calibrate_brain_preview",
         "geometry_calibration_preview",
         "matrix_calibration_preview",
         "sleep_preview",

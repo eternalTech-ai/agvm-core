@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import faulthandler
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,3 +53,36 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         name = str(item.name).lower()
         if any(marker in name for marker in LEGACY_DOC_TEST_NAME_MARKERS):
             item.add_marker(skip_legacy_doc_test)
+
+
+@pytest.fixture
+def windows_threaded_asgi_faulthandler_guard(request: pytest.FixtureRequest):
+    """Suppress handled first-chance Windows SEH noise around threaded TestClient calls.
+
+    Pytest's faulthandler plugin installs a Windows exception handler that can
+    print "Windows fatal exception: access violation" for handled first-chance
+    access violations raised underneath AnyIO/Starlette's blocking portal.  The
+    affected in-process ASGI tests complete with exit code 0; keep the guard
+    scoped to those tests so ordinary faulthandler coverage remains available
+    elsewhere.
+    """
+
+    was_enabled = faulthandler.is_enabled()
+    restore_fd: int | None = None
+    try:
+        from _pytest.faulthandler import fault_handler_stderr_fd_key
+
+        if fault_handler_stderr_fd_key in request.config.stash:
+            restore_fd = request.config.stash[fault_handler_stderr_fd_key]
+    except Exception:
+        restore_fd = None
+    if sys.platform == "win32" and was_enabled:
+        faulthandler.disable()
+    try:
+        yield
+    finally:
+        if sys.platform == "win32" and was_enabled:
+            if restore_fd is not None:
+                faulthandler.enable(file=restore_fd)
+            else:
+                faulthandler.enable()

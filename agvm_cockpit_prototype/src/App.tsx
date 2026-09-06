@@ -15,10 +15,13 @@ import {
   ClipboardCheck,
   Database,
   Download,
+  Eye,
+  EyeOff,
   FileUp,
   GitBranch,
   Globe2,
   HeartPulse,
+  KeyRound,
   Layers3,
   Link2,
   Lock,
@@ -46,6 +49,7 @@ import { Html, OrbitControls } from "@react-three/drei";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Quaternion, Vector3, type Group } from "three";
+import { runtimeConfigValue } from "./runtimeConfig";
 
 type HealthState = {
   ok?: boolean;
@@ -137,6 +141,7 @@ type RouteId =
   | "settings";
 type Tone = "ready" | "active" | "pending" | "blocked" | "neutral";
 type ThemeMode = "light" | "dark";
+type BrainRegistryStatus = "loading" | "ready" | "error";
 type GrowSourceKind = "manual_text" | "url" | "website" | "pdf" | "docx" | "transcript" | "mixed_bundle";
 type BrainActivity = {
   active: boolean;
@@ -154,14 +159,22 @@ type BrainPoint3d = {
   size: number;
 };
 
-const apiBaseUrl = String(import.meta.env.VITE_API_URL || "http://localhost:8010").replace(/\/$/, "");
+const apiBaseUrl = String(
+  runtimeConfigValue("apiBaseUrl")
+  || import.meta.env.VITE_API_URL
+  || "http://localhost:8010",
+).replace(/\/$/, "");
 const cloudUrl = String(
-  import.meta.env.VITE_PLATFORM_URL
+  runtimeConfigValue("platformBaseUrl")
+  || import.meta.env.VITE_PLATFORM_URL
   || import.meta.env.VITE_DETWIN_CLOUD_URL
   || "https://app.detwin.ai",
 ).replace(/\/$/, "");
 const connectedClientDeviceTokenKey = "agvm.platform.connected_client.device_token.v1";
 const connectedClientPlatformOriginKey = "agvm.platform.connected_client.platform_origin.v1";
+const retrieveInspectDeadlineMs = 120_000;
+const retrieveInspectBaseDelayMs = 750;
+const retrieveInspectMaxDelayMs = 3_000;
 
 const routes: Array<{ id: RouteId; label: string; shortLabel?: string; eyebrow: string; icon: LucideIcon }> = [
   { id: "brain_center", label: "Brain Center", eyebrow: "Registry", icon: Brain },
@@ -200,6 +213,7 @@ export function CockpitApp() {
   });
   const [health, setHealth] = useState<HealthState | null>(null);
   const [registry, setRegistry] = useState<BrainRegistry | null>(null);
+  const [registryStatus, setRegistryStatus] = useState<BrainRegistryStatus>("loading");
   const [graph, setGraph] = useState<GraphResponse | null>(null);
   const [mcpRegistry, setMcpRegistry] = useState<McpRegistry | null>(null);
   const [loading, setLoading] = useState(true);
@@ -220,11 +234,12 @@ export function CockpitApp() {
   const [importBrainId, setImportBrainId] = useState("");
   const [toolName, setToolName] = useState("retrieve_context");
   const [rawPayload, setRawPayload] = useState("{\n  \"query_text\": \"What should AGVM retrieve from this brain?\"\n}");
-  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [resultsByRoute, setResultsByRoute] = useState<Partial<Record<RouteId, Record<string, unknown>>>>({});
   const [bootstrapSession, setBootstrapSession] = useState<Record<string, unknown> | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    setRegistryStatus("loading");
     setLastError(null);
     const [nextHealth, nextRegistry, nextGraph, nextMcp] = await Promise.all([
       readApi<HealthState>("/health").catch(() => null),
@@ -234,6 +249,7 @@ export function CockpitApp() {
     ]);
     setHealth(nextHealth);
     setRegistry(nextRegistry);
+    setRegistryStatus(nextRegistry ? "ready" : "error");
     setGraph(nextGraph);
     setMcpRegistry(nextMcp);
     setLoading(false);
@@ -252,6 +268,10 @@ export function CockpitApp() {
     window.localStorage?.setItem("agvm.core.theme", theme);
   }, [theme]);
 
+  useEffect(() => {
+    document.querySelector<HTMLElement>(".agvm-product-main")?.scrollTo({ top: 0, behavior: "auto" });
+  }, [route]);
+
   const brains = useMemo(() => registry?.brains || [], [registry]);
   const activeBrainId = String(
     registry?.active_brain_id || health?.active_brain_id || brains.find((brain) => brain.is_active)?.brain_id || brains[0]?.brain_id || "",
@@ -262,7 +282,19 @@ export function CockpitApp() {
   const toolOptions = useMemo(() => (mcpRegistry?.tools || []).filter((tool) => tool.endpoint_path).slice(0, 80), [mcpRegistry]);
   const selectedTool = toolOptions.find((tool) => tool.name === toolName) || toolOptions[0] || null;
   const routeModel = routes.find((item) => item.id === route) || routes[0];
+  const result = resultsByRoute[route] || null;
   const activity = activityFor(busyAction, route, result);
+
+  const setResult = (next: Record<string, unknown> | null) => {
+    setResultsByRoute((current) => {
+      if (!next) {
+        const updated = { ...current };
+        delete updated[route];
+        return updated;
+      }
+      return { ...current, [route]: next };
+    });
+  };
 
   useEffect(() => {
     if (loading || !activeBrainId || bootstrapReady || route === "brain_center") return;
@@ -361,6 +393,43 @@ export function CockpitApp() {
     );
   }
 
+  function previewGrowSource() {
+    return runAction("grow", () =>
+      writeApi<Record<string, unknown>>("/mcp/grow-source-preview", {
+        brain_id: activeBrainId || undefined,
+        raw_input: growRawInput(sourceKind, sourceText, sourceUrl, sourceFileName),
+        input_kind: sourceKind,
+        source_label: sourceLabel,
+        source_uri: sourceKind === "url" || sourceKind === "website" ? sourceUrl : undefined,
+        run_preview: true,
+        options: {
+          pause_on_questions: true,
+        },
+      }),
+    );
+  }
+
+  async function resumeGrowClarification(clarificationAnswers: Record<string, string>) {
+    const investigationId = growInvestigationId(result);
+    const resumeToken = growResumeToken(result);
+    if (!investigationId || !resumeToken) {
+      setLastError("Grow clarification cannot resume because the investigation id or resume token is missing.");
+      return null;
+    }
+    return runAction("grow", () =>
+      writeApi<Record<string, unknown>>("/mcp/grow-source-preview", {
+        brain_id: activeBrainId || undefined,
+        investigation_id: investigationId,
+        resume_token: resumeToken,
+        run_preview: true,
+        options: {
+          clarification_answers: clarificationAnswers,
+          pause_on_questions: true,
+        },
+      }),
+    );
+  }
+
   async function runBootstrapCommand(operation: string, payload: Record<string, unknown>) {
     const response = await runAction(`bootstrap-${operation}`, async () => {
       const next = await writeApi<Record<string, unknown>>(`/mcp/brain-bootstrap-${operation.replace(/_/g, "-")}`, {
@@ -378,7 +447,9 @@ export function CockpitApp() {
   async function applyGrowPreview(selectedPreviewIds: string[]) {
     const data = resultData(result);
     const investigation = objectAt(data, "source_investigation");
-    const investigationId = String(investigation?.investigation_id || "").trim();
+    const investigationId = growInvestigationId(result);
+    const resumeToken = growResumeToken(result);
+    const investigationVersion = growInvestigationVersion(result);
     if (!investigationId) {
       setLastError("Run a Grow preview before applying reviewed candidates.");
       return null;
@@ -387,6 +458,8 @@ export function CockpitApp() {
       const response = await writeApi<Record<string, unknown>>("/mcp/grow-source-apply", {
         brain_id: activeBrainId || undefined,
         investigation_id: investigationId,
+        investigation_version: investigationVersion ?? undefined,
+        resume_token: resumeToken || undefined,
         source_investigation: investigation || undefined,
         source_formation_contract: objectAt(data, "source_formation_contract") || undefined,
         preview_bundle: objectAt(data, "preview_bundle") || undefined,
@@ -416,14 +489,35 @@ export function CockpitApp() {
       setResult(first);
       let latest = first;
       const searchId = contextSearchId(first);
-      for (let attempt = 0; searchId && !contextResultIsTerminal(latest) && attempt < 8; attempt += 1) {
-        await waitFor(350 + attempt * 150);
+      const inspectStartedAt = Date.now();
+      for (let attempt = 0; searchId && !contextResultIsTerminal(latest) && Date.now() - inspectStartedAt < retrieveInspectDeadlineMs; attempt += 1) {
+        const elapsed = Date.now() - inspectStartedAt;
+        const nextDelay = Math.min(
+          retrieveInspectMaxDelayMs,
+          retrieveInspectBaseDelayMs + attempt * 250,
+          Math.max(0, retrieveInspectDeadlineMs - elapsed),
+        );
+        if (nextDelay > 0) await waitFor(nextDelay);
         try {
           latest = await writeApi<Record<string, unknown>>("/mcp/inspect-context-package", { search_id: searchId });
           setResult(latest);
-        } catch {
-          // The first package remains usable while background materialization catches up.
+        } catch (error: unknown) {
+          const message = errorMessage(error).toLowerCase();
+          if (!message.includes("409") && !message.includes("search_not_completed")) throw error;
+          // Background materialization may not expose an inspectable package yet.
         }
+      }
+      if (searchId && !contextResultIsTerminal(latest)) {
+        latest = {
+          ...latest,
+          ui_retrieve_polling: {
+            state: "timeout_partial",
+            search_id: searchId,
+            deadline_ms: retrieveInspectDeadlineMs,
+            last_result_terminal: false,
+          },
+        };
+        setResult(latest);
       }
       if (searchId) {
         try {
@@ -456,7 +550,7 @@ export function CockpitApp() {
       <header className="agvm-product-topbar" aria-label="Local AGVM status">
         <div className="agvm-product-brand">
           <span className="agvm-product-mark"><Brain size={20} /></span>
-          <div><strong>AGVM</strong><span>Local AGVM</span></div>
+          <div><strong>de.twin</strong><span>AGVM Local</span></div>
         </div>
         <div className="agvm-product-context-strip" aria-label="Workspace context">
           <StatusTile label="Workspace" value="Local Workspace" tone="neutral" />
@@ -468,6 +562,7 @@ export function CockpitApp() {
             importBrainId={importBrainId}
             newBrainDisplayName={newBrainDisplayName}
             newBrainId={newBrainId}
+            registryStatus={registryStatus}
             onBootstrap={bootstrapRegistry}
             onCreateBrain={() => createLocalBrain()}
             onExportBrain={exportActiveBrain}
@@ -478,7 +573,7 @@ export function CockpitApp() {
                 const response = await writeApi<Record<string, unknown>>("/mcp/select-brain", { brain_id: brain, make_default: false });
                 await refresh();
                 setBootstrapSession(null);
-                setResult(null);
+                setResultsByRoute({});
                 const selected = brains.find((item) => brainId(item) === brain) || null;
                 if (!isBootstrapReady(selected)) {
                   setRoute("brain_center");
@@ -557,7 +652,18 @@ export function CockpitApp() {
               </div>
             </header>
           ) : null}
-          {lastError ? <Notice tone="blocked" title="Local request did not complete" detail={lastError} /> : null}
+          {lastError ? (
+            <Notice
+              actionLabel={isProviderConfigurationError(lastError) ? "Configure provider" : undefined}
+              detail={localRequestErrorDetail(lastError)}
+              onAction={isProviderConfigurationError(lastError) ? () => {
+                setRoute("settings");
+                window.location.hash = "settings";
+              } : undefined}
+              title={isProviderConfigurationError(lastError) ? "Connect your AI provider to continue" : "Local request did not complete"}
+              tone="blocked"
+            />
+          ) : null}
           {!activeBrainId && route !== "context" && route !== "brain_center" ? <BrainBootstrapNotice busyAction={busyAction} onBootstrap={bootstrapRegistry} /> : null}
 
           {route === "brain_center" ? (
@@ -572,6 +678,8 @@ export function CockpitApp() {
                 setRoute("context");
                 window.location.hash = "context";
               }}
+              onRetryRegistry={refresh}
+              registryStatus={registryStatus}
               session={bootstrapSession}
             />
           ) : null}
@@ -583,6 +691,7 @@ export function CockpitApp() {
               bootstrapReady={bootstrapReady}
               busy={busyAction === "retrieve"}
               includeAnswerDemo={includeAnswerDemo}
+              loading={loading}
               nodes={nodes}
               query={query}
               retrievalLimit={retrievalLimit}
@@ -593,6 +702,10 @@ export function CockpitApp() {
               onOpenBootstrap={() => {
                 setRoute("brain_center");
                 window.location.hash = "brain_center";
+              }}
+              onConfigureProvider={() => {
+                setRoute("settings");
+                window.location.hash = "settings";
               }}
               onRun={() => void retrieveContext()}
             />
@@ -617,22 +730,16 @@ export function CockpitApp() {
               setSourceText={setSourceText}
               onFileChange={(file) => void loadGrowSourceFile(file)}
               onApply={applyGrowPreview}
+              onConfigureProvider={() => {
+                setRoute("settings");
+                window.location.hash = "settings";
+              }}
               onOpenBootstrap={() => {
                 setRoute("brain_center");
                 window.location.hash = "brain_center";
               }}
-              onRun={() =>
-                runAction("grow", () =>
-                  writeApi<Record<string, unknown>>("/mcp/grow-source-preview", {
-                    brain_id: activeBrainId || undefined,
-                    raw_input: growRawInput(sourceKind, sourceText, sourceUrl, sourceFileName),
-                    input_kind: sourceKind,
-                    source_label: sourceLabel,
-                    source_uri: sourceKind === "url" || sourceKind === "website" ? sourceUrl : undefined,
-                    run_preview: true,
-                  }),
-                )
-              }
+              onResumeClarification={resumeGrowClarification}
+              onRun={() => void previewGrowSource()}
             />
           ) : null}
           {route === "mcp" ? (
@@ -698,6 +805,8 @@ function BrainCenterRoute({
   nodes,
   onCommand,
   onOpenContext,
+  onRetryRegistry,
+  registryStatus,
   session,
 }: {
   activeBrain: BrainSummary | null;
@@ -707,6 +816,8 @@ function BrainCenterRoute({
   nodes: GraphNode[];
   onCommand: (operation: string, payload: Record<string, unknown>) => Promise<Record<string, unknown> | null | undefined>;
   onOpenContext: () => void;
+  onRetryRegistry: () => void;
+  registryStatus: BrainRegistryStatus;
   session: Record<string, unknown> | null;
 }) {
   const [goal, setGoal] = useState("");
@@ -734,6 +845,21 @@ function BrainCenterRoute({
     const ids = candidates.map((candidate) => candidate.id);
     setSelectedIds((current) => current.length ? current.filter((id) => ids.includes(id)) : ids);
   }, [candidates.map((candidate) => candidate.id).join("|")]);
+
+  if (registryStatus !== "ready") {
+    const registryLoading = registryStatus === "loading";
+    return (
+      <section className={`brain-center-registry-state ${registryLoading ? "loading" : "error"}`} aria-live="polite" role={registryLoading ? "status" : "alert"}>
+        {registryLoading ? <RefreshCw className="spin" size={30} /> : <CircleAlert size={30} />}
+        <div>
+          <PanelEyebrow icon={Brain} label="Brain Center" />
+          <h1>{registryLoading ? "Loading brains" : "Brain registry unavailable"}</h1>
+          <p>{registryLoading ? "Reading the local brain registry before enabling lifecycle actions." : "Local AGVM could not load the brain list. Check the backend connection, then retry."}</p>
+        </div>
+        {!registryLoading ? <button className="secondary" onClick={onRetryRegistry} type="button"><RefreshCw size={16} />Retry brain registry</button> : null}
+      </section>
+    );
+  }
 
   if (!activeBrainId || !activeBrain) {
     return (
@@ -929,7 +1055,9 @@ function ContextRoute({
   bootstrapReady,
   busy,
   includeAnswerDemo,
+  loading,
   nodes,
+  onConfigureProvider,
   onOpenBootstrap,
   onRun,
   query,
@@ -944,7 +1072,9 @@ function ContextRoute({
   bootstrapReady: boolean;
   busy: boolean;
   includeAnswerDemo: boolean;
+  loading: boolean;
   nodes: GraphNode[];
+  onConfigureProvider: () => void;
   onOpenBootstrap: () => void;
   onRun: () => void;
   query: string;
@@ -955,6 +1085,18 @@ function ContextRoute({
   setRetrievalLimit: (value: number) => void;
 }) {
   const canRetrieve = Boolean(activeBrainId && bootstrapReady);
+  const providerBlock = providerBlockReason(result);
+  const searchState = loading
+    ? "Loading brain registry"
+    : busy
+      ? "Retrieval active"
+      : result
+        ? resultStatusLabel(result)
+        : !activeBrainId
+          ? "Brain required"
+          : !bootstrapReady
+            ? "Bootstrap required"
+            : "Ready for a question";
   return (
     <section className="context-core-workspace">
       <div className="context-command-bar">
@@ -995,8 +1137,22 @@ function ContextRoute({
         <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
         <aside className="context-insight-rail">
           <PanelEyebrow icon={Search} label="Search status" />
-          <strong>{busy ? "Retrieval active" : result ? resultStatusLabel(result) : canRetrieve ? "Ready for a question" : "Bootstrap required"}</strong>
+          <strong>{searchState}</strong>
+          <div className="context-search-state" aria-label="Search lane">
+            <span><b>Lane</b> Local brain</span>
+            <span><b>Evidence</b> Memory + paths</span>
+            <span><b>Sources</b> On demand</span>
+          </div>
           <div className="context-progress" aria-label="Context progress"><i style={{ width: busy ? "58%" : result ? "100%" : "0%" }} /></div>
+          {providerBlock ? (
+            <Notice
+              actionLabel="Configure provider"
+              detail="Context requires a verified AI provider for landing and reranking. This run stopped before retrieval; the brain was not changed and no Detwin credits were used."
+              onAction={onConfigureProvider}
+              title="AI provider required"
+              tone="blocked"
+            />
+          ) : null}
           <ResultPanel emptyTitle={activeBrainId ? "No evidence yet" : "Select or create a brain first"} result={result} />
         </aside>
       </div>
@@ -1011,8 +1167,10 @@ function GrowRoute({
   busy,
   nodes,
   onApply,
+  onConfigureProvider,
   onFileChange,
   onOpenBootstrap,
+  onResumeClarification,
   onRun,
   result,
   setSourceKind,
@@ -1031,8 +1189,10 @@ function GrowRoute({
   busy: boolean;
   nodes: GraphNode[];
   onApply: (selectedPreviewIds: string[]) => Promise<Record<string, unknown> | null | undefined>;
+  onConfigureProvider: () => void;
   onFileChange: (file: File | null) => void;
   onOpenBootstrap: () => void;
+  onResumeClarification: (clarificationAnswers: Record<string, string>) => Promise<Record<string, unknown> | null | undefined>;
   onRun: () => void;
   result: Record<string, unknown> | null;
   setSourceKind: (value: GrowSourceKind) => void;
@@ -1048,7 +1208,10 @@ function GrowRoute({
   const requiresUrl = sourceKind === "url" || sourceKind === "website";
   const sourceReady = requiresUrl ? sourceUrl.trim().length > 0 : sourceText.trim().length > 0;
   const preview = growPreviewSummary(result);
-  const previewReady = preview.sourceUnits !== "0" || preview.candidates !== "0";
+  const previewReady = Number(preview.candidates || 0) > 0 && String(resultData(result)?.status || result?.status || "") !== "blocked";
+  const growApplied = preview.applyState === "applied";
+  const providerBlock = providerBlockReason(result);
+  const sourceEvidenceBlock = growSourceEvidenceBlock(result);
   if (!activeBrainId || !bootstrapReady) {
     return (
       <section className="bootstrap-gate-surface">
@@ -1073,8 +1236,8 @@ function GrowRoute({
         <div className="grow-overview-metrics">
           <Receipt title="Source units" detail={preview.sourceUnits} tone={preview.sourceUnits === "0" ? "pending" : "ready"} />
           <Receipt title="Ghost nodes" detail={preview.candidates} tone={preview.candidates === "0" ? "pending" : "active"} />
-          <Receipt title="Will add" detail={previewReady ? preview.candidates : "0"} tone={previewReady ? "active" : "pending"} />
-          <Receipt title="Current state" detail={previewReady ? "Review candidates" : "Preview required"} tone={previewReady ? "ready" : "pending"} />
+          <Receipt title="Proposed" detail={previewReady ? preview.candidates : "0"} tone={previewReady ? "active" : "pending"} />
+          <Receipt title="Current state" detail={growApplied ? "Applied" : previewReady ? "Review candidates" : "Preview required"} tone={growApplied || previewReady ? "ready" : "pending"} />
         </div>
       </section>
 
@@ -1082,10 +1245,11 @@ function GrowRoute({
         <aside className="grow-runway" aria-label="Grow steps">
           <PanelEyebrow icon={GitBranch} label="Operator runway" />
           {[
-            { label: "Prepare source", detail: sourceReady ? "source ready" : "text, URL, website or upload", state: sourceReady ? "done" : "active" },
-            { label: "Preview formation", detail: previewReady ? "preview ready" : "not run", state: previewReady ? "done" : sourceReady ? "active" : "pending" },
-            { label: "Inspect candidates", detail: previewReady ? `${preview.candidates} proposed` : "waiting for preview", state: previewReady ? "active" : "pending" },
-            { label: "Apply growth", detail: previewReady ? "explicit review required" : "locked until review", state: "pending" },
+            { label: "Source", detail: growApplied || sourceReady ? "source ready" : "text, URL, website or upload", state: growApplied || sourceReady ? "done" : "active" },
+            { label: "Brain comparison", detail: growApplied || previewReady ? "comparison complete" : "run preview", state: growApplied || previewReady ? "done" : sourceReady ? "active" : "pending" },
+            { label: "Clarify", detail: sourceEvidenceBlock ? "source content required" : providerBlock ? "provider required" : growApplied || previewReady ? "no open blockers" : "waiting", state: sourceEvidenceBlock || providerBlock ? "active" : growApplied || previewReady ? "done" : "pending" },
+            { label: "Proposals", detail: growApplied ? "reviewed set accepted" : previewReady ? `${preview.candidates} proposed` : "waiting for preview", state: growApplied ? "done" : previewReady ? "active" : "pending" },
+            { label: "Apply", detail: growApplied ? `${preview.graphDelta} persisted` : previewReady ? "explicit review required" : "locked until review", state: growApplied ? "done" : "pending" },
           ].map((step, index) => (
             <article className={step.state} key={step.label}>
               <span>{step.state === "done" ? <CheckCircle2 size={15} /> : index + 1}</span>
@@ -1163,19 +1327,34 @@ function GrowRoute({
         <div className="grow-review-strip">
           <Receipt title="Source units" detail={preview.sourceUnits} tone={preview.sourceUnits === "0" ? "pending" : "ready" } />
           <Receipt title="Candidate nodes" detail={preview.candidates} tone={preview.candidates === "0" ? "pending" : "active" } />
-          <Receipt title="Apply" detail={preview.applyState} tone={preview.applyState === "review needed" ? "pending" : "ready"} />
+          <Receipt title="Apply" detail={preview.applyState} tone={preview.applyState === "applied" ? "ready" : "pending"} />
         </div>
         <button className="primary wide" disabled={busy || !sourceReady} onClick={onRun} type="button">
           {busy ? <RefreshCw size={17} /> : <GitBranch size={17} />}
           Preview memory growth
         </button>
         <p className="fine-print">
-          Grow produces reviewable source units, ghost nodes, candidate nodes and an apply contract. Local Core preview uses no Detwin credits.
+          Local BYOK · Provider usage is billed to the account that owns the saved key. Grow produces reviewable source units, ghost nodes, candidate nodes and an apply contract; Local Core uses no Detwin credits.
         </p>
           </section>
           <div className="live-result-stack">
             <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
-            <GrowResultPanel busy={busy} emptyTitle="Grow preview has not run" onApply={onApply} result={result} />
+            {sourceEvidenceBlock ? (
+              <Notice
+                detail="Detwin received the reference, but not verified page content. Add source notes or paste the relevant text so Grow can ground every candidate before the AI runs. Nothing was applied."
+                title="Source content required"
+                tone="blocked"
+              />
+            ) : providerBlock ? (
+              <Notice
+                actionLabel="Configure provider"
+                detail="Grow stopped before candidate formation because no verified AI provider is available. Your source text is preserved; no preview was applied and no Detwin credits were used."
+                onAction={onConfigureProvider}
+                title="AI formation unavailable"
+                tone="blocked"
+              />
+            ) : null}
+            <GrowResultPanel busy={busy} emptyTitle="Grow preview has not run" onApply={onApply} onResumeClarification={onResumeClarification} result={result} />
           </div>
         </div>
       </div>
@@ -1213,8 +1392,8 @@ function McpRoute({
   toolOptions: ToolContract[];
 }) {
   return (
-    <div className="operation-grid">
-      <section className="command-surface">
+    <div className="health-workspace">
+      <section className="command-surface health-command-surface">
         <PanelEyebrow icon={TerminalSquare} label="Raw MCP console" />
         <div className="field-grid">
           <label>
@@ -1685,8 +1864,8 @@ function HealthRoute({
   result: Record<string, unknown> | null;
 }) {
   return (
-    <div className="operation-grid">
-      <section className="command-surface">
+    <div className="operation-grid health-workspace">
+      <section className="command-surface health-command-surface">
         <PanelEyebrow icon={Activity} label="Runtime Health" />
         <MetricGrid
           metrics={[
@@ -1701,11 +1880,61 @@ function HealthRoute({
           Run brain health proof
         </button>
       </section>
-      <div className="live-result-stack">
+      <div className="health-live-layout">
         <BrainCanvas activeBrainId={activeBrainId} activity={activity} nodes={nodes} variant="compact" />
-        <ResultPanel emptyTitle="Health proof has not run" result={result} />
+        <HealthResultPanel result={result} />
       </div>
     </div>
+  );
+}
+
+function HealthResultPanel({ result }: { result: Record<string, unknown> | null }) {
+  if (!result) {
+    return (
+      <section className="result-panel">
+        <PanelEyebrow icon={HeartPulse} label="Brain health" />
+        <div className="empty-result compact"><HeartPulse size={22} /><strong>Health proof has not run</strong><span>Run the deterministic whole-brain scan to see coverage, score and prioritized repair paths.</span></div>
+      </section>
+    );
+  }
+  const data = resultData(result) || result;
+  const report = objectAt(data, "brain_health_report") || objectAt(data, "health_report");
+  const summary = objectAt(report, "summary");
+  const alerts = arrayAt(report, "health_alerts").length ? arrayAt(report, "health_alerts") : arrayAt(data, "health_alerts");
+  const score = Number(report?.overall_score || 0);
+  const nodeCount = Number(summary?.node_count || 0);
+  const edgeCount = Number(summary?.edge_count || 0);
+  const readiness = String(report?.readiness || data.status || "complete").replace(/_/g, " ");
+  return (
+    <section className="result-panel health-result-panel">
+      <PanelEyebrow icon={HeartPulse} label="Whole-brain verdict" />
+      <div className="health-verdict">
+        <div><span>Health score</span><strong>{score ? `${Math.round(score * 100)}%` : "Not scored"}</strong></div>
+        <div><span>Analyzed</span><strong>{nodeCount} nodes</strong></div>
+        <div><span>Connections</span><strong>{edgeCount} edges</strong></div>
+        <div><span>Verdict</span><strong>{readiness}</strong></div>
+      </div>
+      <Notice
+        detail={`The deterministic scan analyzed the persisted graph and returned ${alerts.length} prioritized ${alerts.length === 1 ? "issue" : "issues"}. It did not mutate memory.`}
+        title={alerts.length ? "Review the priority repairs" : "No priority repair found"}
+        tone={alerts.length ? "pending" : "ready"}
+      />
+      {alerts.length ? (
+        <div className="health-alert-list">
+          {alerts.slice(0, 4).map((item, index) => {
+            const alert = isRecord(item) ? item : {};
+            return (
+              <article key={String(alert.alert_id || index)}>
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                <div><strong>{String(alert.signal_family || "Brain quality").replace(/_/g, " ")}</strong><p>{String(alert.product_gate_impact || alert.recommendation || "Review the technical evidence before applying a change.").replace(/_/g, " ")}</p></div>
+                <em>{String(alert.recommendation || "review").replace(/_/g, " ")}</em>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
+      <details className="raw-receipt"><summary>Open exact health receipt</summary><pre>{JSON.stringify(result, null, 2)}</pre></details>
+    </section>
   );
 }
 
@@ -1722,9 +1951,97 @@ function SettingsRoute({
   setTheme: (theme: ThemeMode) => void;
   theme: ThemeMode;
 }) {
+  const [providerKey, setProviderKey] = useState("");
+  const [showProviderKey, setShowProviderKey] = useState(false);
+  const [providerStatus, setProviderStatus] = useState<"checking" | "configured" | "required" | "failed">("checking");
+  const [providerAction, setProviderAction] = useState<"testing" | "saving" | null>(null);
+  const [providerNotice, setProviderNotice] = useState("");
+  const [verifiedProviderKey, setVerifiedProviderKey] = useState("");
+
+  const refreshProviderStatus = useCallback(async () => {
+    setProviderStatus("checking");
+    try {
+      const payload = await readApi<Record<string, unknown>>("/setup/env");
+      const provider = objectAt(payload, "provider");
+      setProviderStatus(provider?.configured === true ? "configured" : "required");
+    } catch {
+      setProviderStatus("failed");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshProviderStatus();
+  }, [refreshProviderStatus]);
+
+  const testProvider = async () => {
+    const apiKey = providerKey.trim();
+    if (!apiKey) return;
+    setProviderAction("testing");
+    setProviderNotice("");
+    try {
+      const response = await writeApi<Record<string, unknown>>("/setup/provider/test", { api_key: apiKey });
+      const verified = response.ok === true;
+      setVerifiedProviderKey(verified ? apiKey : "");
+      setProviderNotice(verified ? "Connection verified. Save this exact key to enable local AI operations." : "The provider did not accept this key.");
+    } catch (error) {
+      setVerifiedProviderKey("");
+      setProviderNotice(localRequestErrorDetail(errorMessage(error)));
+    } finally {
+      setProviderAction(null);
+    }
+  };
+
+  const saveProvider = async () => {
+    const apiKey = providerKey.trim();
+    if (!apiKey) return;
+    setProviderAction("saving");
+    setProviderNotice("");
+    try {
+      await writeApi<Record<string, unknown>>("/setup/env", { agvm_llm_enabled: true, openai_api_key: apiKey });
+      setProviderKey("");
+      setVerifiedProviderKey("");
+      setProviderNotice("Verified provider key saved server-side. AI actions will still fail closed if the provider later rejects a request.");
+      await refreshProviderStatus();
+    } catch (error) {
+      setProviderNotice(localRequestErrorDetail(errorMessage(error)));
+    } finally {
+      setProviderAction(null);
+    }
+  };
+
   return (
     <div className="settings-grid">
       <Notice tone="ready" title="Local-first boundary" detail="This UI talks only to the local AGVM API configured with VITE_API_URL. It does not sign in, sync, bill, or unlock cloud modules." />
+      <section className="settings-panel provider-setup-panel">
+        <PanelEyebrow icon={KeyRound} label="AI provider" />
+        <div className="provider-setup-heading">
+          <div><h2>Connect local intelligence.</h2><p>Bootstrap, Grow and Context remain available as product surfaces, but AI-backed actions fail closed until a provider is configured.</p></div>
+          <span className={`provider-status state-${providerStatus}`}>{providerStatus === "configured" ? "Configured" : providerStatus === "checking" ? "Checking" : providerStatus === "failed" ? "Unavailable" : "Setup required"}</span>
+        </div>
+        <label className="provider-key-field">
+          <span>OpenAI API key</span>
+          <div>
+            <input
+              aria-label="OpenAI API key"
+              autoComplete="new-password"
+              onChange={(event) => { setProviderKey(event.target.value); setVerifiedProviderKey(""); setProviderNotice(""); }}
+              placeholder="Paste a key, test it, then save"
+              type={showProviderKey ? "text" : "password"}
+              value={providerKey}
+            />
+            <button aria-label={showProviderKey ? "Hide provider key" : "Show provider key"} className="icon-button" onClick={() => setShowProviderKey((current) => !current)} type="button">
+              {showProviderKey ? <EyeOff size={16} /> : <Eye size={16} />}
+            </button>
+          </div>
+        </label>
+        <p className="fine-print">The raw key is sent only to the local API, stored by its managed environment, and never written to browser storage or returned to the UI.</p>
+        {providerNotice ? <p className="provider-setup-notice" role="status">{providerNotice}</p> : null}
+        <div className="provider-setup-actions">
+          <button className="secondary" disabled={!providerKey.trim() || providerAction !== null} onClick={() => void testProvider()} type="button">{providerAction === "testing" ? "Testing connection" : "Test connection"}</button>
+          <button className="primary" disabled={!providerKey.trim() || verifiedProviderKey !== providerKey.trim() || providerAction !== null} onClick={() => void saveProvider()} type="button">{providerAction === "saving" ? "Saving key" : "Save verified key"}</button>
+          <button className="secondary" disabled={providerAction !== null} onClick={() => void refreshProviderStatus()} type="button"><RefreshCw size={15} />Refresh status</button>
+        </div>
+      </section>
       <section className="settings-panel">
         <PanelEyebrow icon={Sun} label="Interface palette" />
         <h2>Match Detwin by default.</h2>
@@ -1770,11 +2087,31 @@ function BrainCanvas({
   const nodeLimit = density === "focus" ? 30 : density === "balanced" ? 90 : density === "detailed" ? 240 : nodes.length;
   const visibleNodes = nodes.slice(0, nodeLimit);
   const liveGraph = Boolean(activeBrainId && nodes.length);
-  const theme = readTheme();
-  const points = useMemo(() => visibleNodes.map((node, index) => nodePoint3d(node, index, visibleNodes.length)), [visibleNodes]);
+  const [theme, setCanvasTheme] = useState<ThemeMode>(() => readTheme());
+  useEffect(() => {
+    const updateTheme = () => setCanvasTheme(readTheme());
+    const observer = new MutationObserver(updateTheme);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-core-theme"] });
+    updateTheme();
+    return () => observer.disconnect();
+  }, []);
+  const points = useMemo(
+    () => normalizeBrainPointCloud(visibleNodes.map((node, index) => nodePoint3d(node, index, visibleNodes.length))),
+    [visibleNodes],
+  );
   return (
     <section className={`brain-canvas ${variant} ${activity.active ? "is-active" : "is-idle"}`} aria-label="Local AGVM brain projection">
-      <Canvas className="brain-three-canvas" camera={{ fov: variant === "stage" ? 42 : 48, position: [0, 0.16, variant === "stage" ? 5.2 : 5.8] }} dpr={[1, 1.75]}>
+      <Canvas
+        className="brain-three-canvas"
+        camera={{ fov: variant === "stage" ? 42 : 48, position: [0, 0.16, variant === "stage" ? 5.2 : 5.8] }}
+        dpr={[1, 1.35]}
+        gl={{ antialias: true, powerPreference: "high-performance" }}
+        onCreated={({ gl }) => {
+          // R3F forces a WebGL loss event while unmounting a route. Dispose resources
+          // without emitting a false GPU-loss signal; the detached canvas is then GC'd.
+          gl.forceContextLoss = () => { gl.dispose(); };
+        }}
+      >
         <color args={[theme === "dark" ? "#071311" : "#f7faf9"]} attach="background" />
         <ambientLight intensity={0.68} />
         <directionalLight color="#f7fffb" intensity={1.2} position={[3.2, 4.5, 5]} />
@@ -1855,21 +2192,6 @@ function BrainThreeScene({
 
   return (
     <group ref={groupRef} scale={scale}>
-      {points.length >= 8 ? <group>
-        <mesh position={[-0.72, 0.08, 0]} rotation={[0.04, 0.02, -0.08]} scale={[1.18, 0.78, 0.54]}>
-          <sphereGeometry args={[1, 48, 24]} />
-          <meshStandardMaterial color="#0e2b28" emissive="#00e9b1" emissiveIntensity={0.08} metalness={0.08} opacity={Math.min(0.16, 0.035 + points.length / 900)} roughness={0.72} transparent wireframe />
-        </mesh>
-        <mesh position={[0.72, 0.08, 0]} rotation={[0.04, -0.02, 0.08]} scale={[1.18, 0.78, 0.54]}>
-          <sphereGeometry args={[1, 48, 24]} />
-          <meshStandardMaterial color="#17122a" emissive="#8b55e7" emissiveIntensity={0.08} metalness={0.08} opacity={Math.min(0.16, 0.035 + points.length / 900)} roughness={0.72} transparent wireframe />
-        </mesh>
-        <mesh position={[0, -0.45, -0.08]} rotation={[0.05, 0, 0]} scale={[0.8, 0.32, 0.38]}>
-          <sphereGeometry args={[1, 36, 18]} />
-          <meshStandardMaterial color="#ded5ed" opacity={Math.min(0.1, 0.02 + points.length / 1200)} roughness={0.8} transparent wireframe />
-        </mesh>
-      </group> : null}
-
       {pathPoints.length > 1 ? (
         <group>
           {pathPoints.slice(1).map((point, index) => {
@@ -1954,6 +2276,7 @@ type BrainSelectorProps = {
   importBrainId: string;
   newBrainDisplayName: string;
   newBrainId: string;
+  registryStatus: BrainRegistryStatus;
   onBootstrap: () => void;
   onCreateBrain: () => void;
   onExportBrain: () => void;
@@ -1974,6 +2297,7 @@ function BrainSelector({
   importBrainId,
   newBrainDisplayName,
   newBrainId,
+  registryStatus,
   onBootstrap,
   onCreateBrain,
   onExportBrain,
@@ -1986,6 +2310,10 @@ function BrainSelector({
   setNewBrainId,
 }: BrainSelectorProps) {
   const busy = Boolean(busyAction);
+  const manageMenuRef = useRef<HTMLDetailsElement>(null);
+  const closeManageMenu = () => {
+    if (manageMenuRef.current) manageMenuRef.current.open = false;
+  };
   return (
     <section className="brain-selector brain-management" title="Active local brain">
       <label>
@@ -1995,14 +2323,14 @@ function BrainSelector({
           {brains.length ? brains.map((brain) => <option key={brainId(brain)} value={brainId(brain)}>{brainName(brain)}</option>) : <option value="">No local brain</option>}
         </select>
       </label>
-      <details className="brain-actions-menu">
+      <details className="brain-actions-menu" ref={manageMenuRef}>
         <summary>Manage</summary>
         <div className="brain-menu-panel">
           <fieldset>
             <legend>Create local brain</legend>
             <input aria-label="New brain display name" onChange={(event) => setNewBrainDisplayName(event.target.value)} placeholder="My product brain" value={newBrainDisplayName} />
             <input aria-label="New brain id" onChange={(event) => setNewBrainId(event.target.value)} placeholder="Optional technical id" value={newBrainId} />
-            <button disabled={busy || !newBrainDisplayName.trim()} onClick={onCreateBrain} type="button"><PlusCircle size={15} />Create and select</button>
+            <button disabled={busy || registryStatus !== "ready" || !newBrainDisplayName.trim()} onClick={() => { closeManageMenu(); onCreateBrain(); }} type="button"><PlusCircle size={15} />Create and select</button>
           </fieldset>
           <fieldset>
             <legend>Import brain archive</legend>
@@ -2011,14 +2339,14 @@ function BrainSelector({
             <label className="file-action">
               <FileUp size={15} />
               Import .zip
-              <input accept=".zip,.agvm-brain,.agvm-brain.zip" disabled={busy} onChange={(event) => onImportFile(event.currentTarget.files?.[0] || null)} type="file" />
+              <input accept=".zip,.agvm-brain,.agvm-brain.zip" disabled={busy || registryStatus !== "ready"} onChange={(event) => { const file = event.currentTarget.files?.[0] || null; if (file) closeManageMenu(); onImportFile(file); }} type="file" />
             </label>
           </fieldset>
           <div className="brain-menu-actions">
-            <button disabled={busy} onClick={onBootstrap} type="button"><RefreshCw size={15} />Refresh brain list</button>
-            <button disabled={busy || !activeBrainId} onClick={onExportBrain} type="button"><Download size={15} />Export active</button>
-            <button disabled={busy} onClick={onRefresh} type="button"><RefreshCw size={15} />Refresh</button>
-            <a href="#brain_explorer"><Brain size={15} />Open Brain Explorer</a>
+            <button disabled={busy} onClick={() => { closeManageMenu(); onBootstrap(); }} type="button"><RefreshCw size={15} />Refresh brain list</button>
+            <button disabled={busy || !activeBrainId} onClick={() => { closeManageMenu(); onExportBrain(); }} type="button"><Download size={15} />Export active</button>
+            <button disabled={busy} onClick={() => { closeManageMenu(); onRefresh(); }} type="button"><RefreshCw size={15} />Refresh</button>
+            <a href="#brain_explorer" onClick={closeManageMenu}><Brain size={15} />Open Brain Explorer</a>
           </div>
         </div>
       </details>
@@ -2052,7 +2380,7 @@ function StatusTile({ label, tone, value }: { label: string; tone: Tone; value: 
   );
 }
 
-function Notice({ detail, title, tone }: { detail: string; title: string; tone: "ready" | "blocked" | "pending" }) {
+function Notice({ actionLabel, detail, onAction, title, tone }: { actionLabel?: string; detail: string; onAction?: () => void; title: string; tone: "ready" | "blocked" | "pending" }) {
   const Icon = tone === "ready" ? CheckCircle2 : tone === "blocked" ? CircleAlert : RefreshCw;
   return (
     <article className={`notice ${tone}`}>
@@ -2061,6 +2389,7 @@ function Notice({ detail, title, tone }: { detail: string; title: string; tone: 
         <strong>{title}</strong>
         <p>{detail}</p>
       </div>
+      {actionLabel && onAction ? <button className="secondary" onClick={onAction} type="button">{actionLabel}<ArrowRight size={15} /></button> : null}
     </article>
   );
 }
@@ -2185,20 +2514,36 @@ function GrowResultPanel({
   busy,
   emptyTitle,
   onApply,
+  onResumeClarification,
   result,
 }: {
   busy: boolean;
   emptyTitle: string;
   onApply: (selectedPreviewIds: string[]) => Promise<Record<string, unknown> | null | undefined>;
+  onResumeClarification: (clarificationAnswers: Record<string, string>) => Promise<Record<string, unknown> | null | undefined>;
   result: Record<string, unknown> | null;
 }) {
   const summary = growPreviewSummary(result);
   const candidates = growCandidateSummaries(result);
+  const clarificationQuestions = growClarificationQuestions(result);
+  const resumeToken = growResumeToken(result);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
   const candidateKey = candidates.map((candidate) => candidate.id).join("|");
+  const clarificationKey = clarificationQuestions.map((question) => question.id).join("|");
+  const answeredClarifications = clarificationQuestions.filter((question) => String(clarificationAnswers[question.id] || "").trim()).length;
   useEffect(() => {
-    setSelectedIds(candidates.map((candidate) => candidate.id).filter(Boolean));
+    const candidateIds = candidates.map((candidate) => candidate.id).filter(Boolean);
+    setSelectedIds((current) => current.filter((id) => candidateIds.includes(id)));
+    setReviewConfirmed(false);
   }, [candidateKey]);
+  useEffect(() => {
+    const questionIds = clarificationQuestions.map((question) => question.id);
+    setClarificationAnswers((current) =>
+      Object.fromEntries(questionIds.map((id) => [id, current[id] || ""])),
+    );
+  }, [clarificationKey]);
   return (
     <section className="result-panel grow-result-panel">
       <PanelEyebrow icon={GitBranch} label="Grow preview" />
@@ -2210,11 +2555,56 @@ function GrowResultPanel({
             {summary.applyState === "applied" ? <Receipt title="Graph delta" detail={`+${summary.graphDelta} nodes`} tone="ready" /> : null}
             <Receipt title="Write state" detail={summary.applyState} tone={summary.applyState === "review needed" ? "pending" : "ready"} />
           </div>
-          {candidates.length ? (
+          {clarificationQuestions.length ? (
+            <div className="grow-review-gate" aria-label="Grow clarification questions">
+              <Notice
+                detail="Answer the pending source questions, then resume the same Grow investigation. Nothing is applied until preview returns reviewable candidates and you approve them."
+                title="Clarification required"
+                tone="pending"
+              />
+              <dl className="operation-summary">
+                <div><dt>Investigation</dt><dd>{growInvestigationId(result) || "pending"}</dd></div>
+                <div><dt>Resume token</dt><dd>{resumeToken ? "available" : "missing"}</dd></div>
+                <div><dt>Answers</dt><dd>{answeredClarifications} / {clarificationQuestions.length}</dd></div>
+              </dl>
+              {clarificationQuestions.map((question) => (
+                <label key={question.id}>
+                  <strong>{question.text}</strong>
+                  <small>{question.detail || question.id}</small>
+                  {question.choices.length ? (
+                    <select
+                      aria-label={`Answer ${question.id}`}
+                      onChange={(event) => setClarificationAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
+                      value={clarificationAnswers[question.id] || ""}
+                    >
+                      <option value="">Choose an answer</option>
+                      {question.choices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
+                    </select>
+                  ) : (
+                    <textarea
+                      aria-label={`Answer ${question.id}`}
+                      onChange={(event) => setClarificationAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
+                      placeholder="Answer this clarification question before resuming Grow."
+                      value={clarificationAnswers[question.id] || ""}
+                    />
+                  )}
+                </label>
+              ))}
+              <button
+                className="primary wide"
+                disabled={busy || !resumeToken || answeredClarifications < clarificationQuestions.length}
+                onClick={() => void onResumeClarification(compact(clarificationAnswers) as Record<string, string>)}
+                type="button"
+              >
+                {busy ? <RefreshCw size={16} /> : <MessageSquareText size={16} />}
+                Resume Grow preview
+              </button>
+            </div>
+          ) : candidates.length ? (
             <div className="grow-candidate-list">
               {candidates.map((candidate, index) => (
                 <label className={selectedIds.includes(candidate.id) ? "selected" : ""} key={candidate.id || `${candidate.title}-${index}`}>
-                  <input checked={selectedIds.includes(candidate.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, candidate.id])] : current.filter((id) => id !== candidate.id))} type="checkbox" />
+                  <input checked={selectedIds.includes(candidate.id)} onChange={(event) => { setReviewConfirmed(false); setSelectedIds((current) => event.target.checked ? [...new Set([...current, candidate.id])] : current.filter((id) => id !== candidate.id)); }} type="checkbox" />
                   <span>{String(index + 1).padStart(2, "0")}</span>
                   <div>
                     <strong>{candidate.title}</strong>
@@ -2223,6 +2613,8 @@ function GrowResultPanel({
                 </label>
               ))}
             </div>
+          ) : summary.applyState === "applied" ? (
+            <Notice detail={`${summary.graphDelta} reviewed ${summary.graphDelta === "1" ? "memory was" : "memories were"} persisted to the active brain.`} title="Growth applied" tone="ready" />
           ) : (
             <div className="empty-result compact">
               <Network size={22} />
@@ -2230,11 +2622,20 @@ function GrowResultPanel({
               <span>Run a source preview with enough source material to inspect proposed memory nodes before apply.</span>
               </div>
           )}
-          {candidates.length && summary.applyState !== "applied" ? (
-            <button className="primary wide" disabled={busy || !selectedIds.length} onClick={() => void onApply(selectedIds)} type="button">
-              {busy ? <RefreshCw size={16} /> : <CheckCircle2 size={16} />}
-              Apply {selectedIds.length} reviewed {selectedIds.length === 1 ? "memory" : "memories"}
-            </button>
+          {candidates.length && !clarificationQuestions.length && summary.applyState !== "applied" ? (
+            reviewConfirmed ? (
+              <div className="grow-review-gate">
+                <Notice detail="Only this checked set can cross the write boundary. Applying still requires the guarded backend confirmation." title={`${selectedIds.length} ${selectedIds.length === 1 ? "memory" : "memories"} reviewed`} tone="ready" />
+                <button className="primary wide" disabled={busy} onClick={() => void onApply(selectedIds)} type="button">
+                  {busy ? <RefreshCw size={16} /> : <CheckCircle2 size={16} />}
+                  Apply {selectedIds.length} reviewed {selectedIds.length === 1 ? "memory" : "memories"}
+                </button>
+              </div>
+            ) : (
+              <button className="primary wide" disabled={busy || !selectedIds.length} onClick={() => setReviewConfirmed(true)} type="button">
+                <ClipboardCheck size={16} />Review {selectedIds.length} selected {selectedIds.length === 1 ? "memory" : "memories"}
+              </button>
+            )
           ) : null}
           <details className="raw-receipt">
             <summary>Open exact receipt</summary>
@@ -2252,21 +2653,40 @@ function GrowResultPanel({
   );
 }
 
+const defaultApiRequestTimeoutMs = 45_000;
+const longRunningAiRequestTimeoutMs = 180_000;
+const growAiRequestTimeoutMs = 1_260_000;
+const growAiEndpointFragments = [
+  "/mcp/grow-source-preview",
+  "/mcp/grow-source-apply",
+] as const;
+const longRunningAiEndpointFragments = [
+  "/mcp/brain-bootstrap-start",
+  "/mcp/brain-bootstrap-preview",
+  "/mcp/brain-bootstrap-apply",
+  "/mcp/retrieve-context",
+] as const;
+
+type ApiRequestOptions = {
+  timeoutMs?: number;
+};
+
 async function readApi<T>(path: string): Promise<T> {
   return requestApi<T>(path, { method: "GET" });
 }
 
-async function writeApi<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  return requestApi<T>(path, { method: "POST", body: JSON.stringify(compact(body)) });
+async function writeApi<T>(path: string, body: Record<string, unknown>, options: ApiRequestOptions = {}): Promise<T> {
+  return requestApi<T>(path, { method: "POST", body: JSON.stringify(compact(body)) }, true, options);
 }
 
 async function uploadApi<T>(path: string, body: FormData): Promise<T> {
   return requestApi<T>(path, { method: "POST", body }, false);
 }
 
-async function requestApi<T>(path: string, init: RequestInit, jsonBody = true): Promise<T> {
+async function requestApi<T>(path: string, init: RequestInit, jsonBody = true, options: ApiRequestOptions = {}): Promise<T> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 45000);
+  const timeoutMs = options.timeoutMs ?? apiTimeoutMsForPath(path);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${apiBaseUrl}${path}`, {
       ...init,
@@ -2284,6 +2704,17 @@ async function requestApi<T>(path: string, init: RequestInit, jsonBody = true): 
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+function apiTimeoutMsForPath(path: string) {
+  const normalized = path.split("?")[0].replace(/^\/memory(?=\/mcp\/)/, "");
+  if (growAiEndpointFragments.some((fragment) => normalized === fragment || normalized.endsWith(fragment))) {
+    return growAiRequestTimeoutMs;
+  }
+  if (longRunningAiEndpointFragments.some((fragment) => normalized === fragment || normalized.endsWith(fragment))) {
+    return longRunningAiRequestTimeoutMs;
+  }
+  return defaultApiRequestTimeoutMs;
 }
 
 function brainSyncPlatformOrigin() {
@@ -2574,7 +3005,7 @@ function descriptionForRoute(route: RouteId) {
   if (route === "health") return "Run health proof against the selected brain and keep the result separate from cloud readiness.";
   if (route === "bench") return "Use public Core contracts to compare runtime, graph and retrieval readiness.";
   if (route === "brain_sync") return "Keep local brains on-device until an explicit cloud sync workflow is authorized.";
-  return "Configure local API and Cloud handoff links without storing account, billing or provider state here.";
+  return "Configure server-side local provider custody, interface preferences and explicit Cloud handoff links from one place.";
 }
 
 function brainId(brain: BrainSummary) {
@@ -2634,6 +3065,37 @@ function nodePoint3d(node: GraphNode, index: number, total: number): BrainPoint3
     color,
     size: 0.032 + (index % 5) * 0.006,
   };
+}
+
+function normalizeBrainPointCloud(points: BrainPoint3d[]) {
+  if (points.length < 2) return points;
+  const center = points.reduce<[number, number, number]>(
+    (value, point) => [value[0] + point.position[0], value[1] + point.position[1], value[2] + point.position[2]],
+    [0, 0, 0],
+  ).map((value) => value / points.length) as [number, number, number];
+  const extents = points.reduce<[number, number, number]>(
+    (value, point) => [
+      Math.max(value[0], Math.abs(point.position[0] - center[0])),
+      Math.max(value[1], Math.abs(point.position[1] - center[1])),
+      Math.max(value[2], Math.abs(point.position[2] - center[2])),
+    ],
+    [0, 0, 0],
+  );
+  const scale = Math.min(
+    extents[0] > 0.01 ? 2.05 / extents[0] : Number.POSITIVE_INFINITY,
+    extents[1] > 0.01 ? 1.12 / extents[1] : Number.POSITIVE_INFINITY,
+    extents[2] > 0.01 ? 0.98 / extents[2] : Number.POSITIVE_INFINITY,
+    5.5,
+  );
+  if (!Number.isFinite(scale) || scale <= 1) return points;
+  return points.map((point) => ({
+    ...point,
+    position: [
+      (point.position[0] - center[0]) * scale,
+      (point.position[1] - center[1]) * scale,
+      (point.position[2] - center[2]) * scale,
+    ] as [number, number, number],
+  }));
 }
 
 function detwinNodeColor(index: number, memoryType?: string | null) {
@@ -2706,7 +3168,8 @@ function growPreviewSummary(result: Record<string, unknown> | null) {
     numberString(completeness?.preview_node_count) ||
     (previewBundle?.primary_node_preview ? "1" : "0");
   const applyContract = objectAt(data, "source_formation_contract") || objectAt(data, "apply_contract") || objectAt(previewBundle, "apply_contract");
-  const applyState = result?.status === "applied" ? "applied" : applyContract ? "review needed" : "preview first";
+  const status = String(data?.status || result?.status || "").toLowerCase();
+  const applyState = status === "applied" ? "applied" : status === "blocked" ? "blocked" : applyContract ? "review needed" : "preview first";
   const graphDelta = numberString(completeness?.persisted_node_count) || (applyState === "applied" ? candidates : "0");
   return { applyState, candidates, graphDelta, sourceUnits };
 }
@@ -2733,6 +3196,75 @@ function growCandidateSummaries(result: Record<string, unknown> | null) {
     });
   }
   return candidates;
+}
+
+function growClarificationQuestions(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const sourceInvestigation = objectAt(data, "source_investigation");
+  const investigation = objectAt(data, "investigation");
+  const rawQuestions = [
+    ...arrayAt(data, "clarification_questions"),
+    ...arrayAt(sourceInvestigation, "clarification_questions"),
+    ...arrayAt(investigation, "pending_questions"),
+  ];
+  const seen = new Set<string>();
+  return rawQuestions.flatMap((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    const id = String(row.question_id || row.id || `clarification-${index + 1}`).trim();
+    if (!id || seen.has(id)) return [];
+    seen.add(id);
+    const choices = arrayAt(row, "choices").map((choice) => String(choice || "").trim()).filter(Boolean);
+    return [{
+      id,
+      text: String(row.question_text || row.text || row.question || row.prompt || "Clarify this source before Grow continues."),
+      detail: String(row.reason || row.context || row.decision_effect || row.answer_type || ""),
+      choices,
+    }];
+  });
+}
+
+function growInvestigationId(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const sourceInvestigation = objectAt(data, "source_investigation");
+  const investigation = objectAt(data, "investigation");
+  return String(
+    data?.investigation_id ||
+    sourceInvestigation?.investigation_id ||
+    investigation?.investigation_id ||
+    result?.investigation_id ||
+    "",
+  ).trim();
+}
+
+function growResumeToken(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const sourceInvestigation = objectAt(data, "source_investigation");
+  const investigation = objectAt(data, "investigation");
+  return String(
+    data?.resume_token ||
+    sourceInvestigation?.resume_token ||
+    investigation?.resume_token ||
+    result?.resume_token ||
+    "",
+  ).trim();
+}
+
+function growInvestigationVersion(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const sourceInvestigation = objectAt(data, "source_investigation");
+  const investigation = objectAt(data, "investigation");
+  const investigationSession = objectAt(data, "investigation_session");
+  const value =
+    data?.investigation_version ??
+    investigationSession?.investigation_version ??
+    investigation?.version ??
+    sourceInvestigation?.investigation_version ??
+    sourceInvestigation?.version ??
+    result?.investigation_version ??
+    result?.version;
+  const version = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  return Number.isInteger(version) && version > 0 ? version : null;
 }
 
 function resultData(result: Record<string, unknown> | null) {
@@ -2896,8 +3428,11 @@ function contextResultIsTerminal(result: Record<string, unknown>) {
   const data = resultData(result) || result;
   const payload = objectAt(data, "result");
   const delivery = objectAt(data, "mcp_delivery_contract");
-  const terminal = data.result_ready_terminal ?? payload?.result_ready_terminal ?? delivery?.terminal_for_client;
-  const pending = data.final_materialization_pending ?? payload?.final_materialization_pending ?? delivery?.final_materialization_pending;
+  const completion = objectAt(delivery, "completion_contract");
+  const terminal = data.result_ready_terminal ?? payload?.result_ready_terminal ?? completion?.result_ready_terminal ?? delivery?.terminal_for_client;
+  const pending = data.final_materialization_pending ?? payload?.final_materialization_pending ?? completion?.final_materialization_pending ?? delivery?.final_materialization_pending;
+  const completionState = String(completion?.state || "").trim();
+  if (completionState === "finalized" || completionState === "complete_context" || completionState === "sealed") return pending !== true;
   return terminal === true && pending !== true;
 }
 
@@ -2914,6 +3449,32 @@ function resultStatusLabel(result: Record<string, unknown>) {
   if (state === "complete_context" || state === "contract_satisfied" || state === "sealed") return "Complete context";
   if (state === "applied") return "Applied";
   return state.replace(/_/g, " ");
+}
+
+function providerBlockReason(result: Record<string, unknown> | null) {
+  const reason = resultBlockedReason(result);
+  return reason.includes("provider") || reason.includes("llm") || reason.includes("ai_unavailable") ? reason : "";
+}
+
+function growSourceEvidenceBlock(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  const investigation = objectAt(data, "source_investigation");
+  const formation = objectAt(data, "source_formation_contract");
+  return [resultBlockedReason(result), investigation?.status, formation?.blocked_reason]
+    .some((value) => String(value || "").toLowerCase().includes("rich_extraction_required"));
+}
+
+function resultBlockedReason(result: Record<string, unknown> | null) {
+  const data = resultData(result);
+  if (!data || String(data.status || result?.status || "").toLowerCase() !== "blocked") return "";
+  const semantic = objectAt(data, "semantic_contract_runtime");
+  const admission = objectAt(semantic, "search_ai_admission");
+  const lifecycle = objectAt(data, "memory_operation_lifecycle_contract");
+  const completeness = objectAt(data, "completeness");
+  return String(
+    admission?.reason || admission?.provider_error || semantic?.provider_state || semantic?.provider_error
+      || lifecycle?.blocked_reason || completeness?.reason || "",
+  ).toLowerCase();
 }
 
 function objectAt(source: unknown, key: string): Record<string, unknown> | null {
@@ -2951,6 +3512,19 @@ function responseDetail(payload: unknown) {
 function errorMessage(error: unknown) {
   if (error instanceof Error) return error.name === "AbortError" ? "The local API request timed out." : error.message;
   return "Unknown local API error.";
+}
+
+function isProviderConfigurationError(error: string) {
+  const normalized = error.toLowerCase();
+  return normalized.includes("bootstrap_question_generation_unavailable")
+    || normalized.includes("missing_api_key")
+    || normalized.includes("provider_unavailable")
+    || normalized.includes("provider key");
+}
+
+function localRequestErrorDetail(error: string) {
+  if (isProviderConfigurationError(error)) return "Add and verify your provider key in Local Settings, then retry. The brain was not changed and no false AI result was created.";
+  return error.replace(/_/g, " ");
 }
 
 function clamp(value: number, min: number, max: number) {

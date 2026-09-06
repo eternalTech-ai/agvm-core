@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Eternal Tech SRL <info@eternaltech.ai>
+# SPDX-FileContributor: Lorenzo Massaro
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Public Core test/development dependencies only.
+# Keep runtime dependencies in agvm_api/requirements.txt.
+#
+# FastAPI 0.133.0 allows Starlette >=0.40.0. Pin the public test harness to
+# the pre-1.x Starlette TestClient line that uses the canonical httpx package.
+starlette==0.50.0
+httpx==0.28.1
+pytest==9.1.1
+reuse==6.2.0

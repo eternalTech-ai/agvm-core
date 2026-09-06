@@ -20,6 +20,7 @@ from core_maintenance_runtime import (
     create_core_maintenance_cloud_handoff_router,
 )
 from core_retrieve_router import create_core_retrieve_router
+from core_search_composition_router import create_core_search_composition_router
 from core_runtime_router import create_core_runtime_router
 from edition_gate import install_edition_route_gate, read_edition_settings
 
@@ -41,6 +42,7 @@ def create_core_app() -> FastAPI:
     app.include_router(create_core_maintenance_cloud_handoff_router())
     app.include_router(create_brain_bootstrap_v1_router())
     app.include_router(create_core_retrieve_router())
+    app.include_router(create_core_search_composition_router())
     app.include_router(create_core_license_router())
     app.include_router(create_brain_sync_restore_router())
     install_edition_route_gate(app, read_edition_settings())

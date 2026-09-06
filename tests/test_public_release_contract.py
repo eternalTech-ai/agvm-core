@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -39,6 +38,10 @@ def _canonical_file_digest(path: Path) -> str:
     else:
         canonical = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _normalized_text(path: Path) -> str:
+    return " ".join(path.read_text(encoding="utf-8").split())
 
 
 def test_public_release_excludes_paid_profile_and_geometry_implementations() -> None:
@@ -149,6 +152,7 @@ def test_public_local_core_compatibility_route_cannot_apply(monkeypatch) -> None
 
 def test_public_release_tree_has_no_private_runtime_roots() -> None:
     assert (ROOT / ".agvm-public-export-marker").is_file()
+    assert (ROOT / "requirements-dev.txt").is_file()
     assert (ROOT / "agvm_api" / "Dockerfile.core.dockerignore").is_file()
     assert (ROOT / "agvm_api" / "Dockerfile.dockerignore").is_file()
     assert not (ROOT / "agvm_api" / ".dockerignore").exists()
@@ -196,6 +200,12 @@ def test_public_mcp_contract_has_v1_bootstrap_profile_and_free_grow() -> None:
         assert classification.category == "core"
         assert classification.public_core_allowed is True
 
+    for name in ("change_node_content", "delete_node"):
+        classification = classify_mcp_tool(name)
+        assert classification is not None
+        assert classification.category == "core"
+        assert classification.public_core_allowed is True
+
     for name in (
         "sleep_preview",
         "sleep_apply",
@@ -213,16 +223,15 @@ def test_public_mcp_contract_has_v1_bootstrap_profile_and_free_grow() -> None:
 
 
 def test_public_docs_describe_visibility_without_claiming_authorization() -> None:
-    modules = (ROOT / "docs" / "modules.md").read_text(encoding="utf-8")
-    local_mcp = (ROOT / "docs" / "local-mcp.md").read_text(encoding="utf-8")
-    cloud = (ROOT / "docs" / "cloud-and-pro.md").read_text(encoding="utf-8")
-    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    modules = _normalized_text(ROOT / "docs" / "modules.md")
+    local_mcp = _normalized_text(ROOT / "docs" / "local-mcp.md")
+    cloud = _normalized_text(ROOT / "docs" / "cloud-and-pro.md")
+    changelog = _normalized_text(ROOT / "CHANGELOG.md")
     assert "complete current contract catalog" in modules
-    documented_count = re.search(r"defines (\d+) tool contracts", local_mcp)
-    assert documented_count is not None
-    assert int(documented_count.group(1)) == len(
-        [*GUIDE_MCP_TOOL_NAMES, *REQUIRED_MCP_TOOL_NAMES, *AGENT_MEMORY_MCP_TOOL_NAMES]
-    )
+    assert "generated at runtime from `GET /mcp/contracts`" in local_mcp
+    assert "Do not hard-code a tool count" in local_mcp
+    assert "retrieve_context" in local_mcp
+    assert "Local Core tools do not consume Detwin Cloud credits" in local_mcp
     assert "brain_bootstrap_*" in local_mcp
     assert "brain_profile_*" in local_mcp
     assert "Grow" in modules and "Core" in modules
@@ -231,11 +240,56 @@ def test_public_docs_describe_visibility_without_claiming_authorization() -> Non
     assert "structured Detwin Cloud action contract" in changelog
 
 
+def test_public_fresh_user_docs_separate_local_byok_from_hosted_credits() -> None:
+    readme = _normalized_text(ROOT / "README.md")
+    local_install = _normalized_text(ROOT / "docs" / "local-install.md")
+    bootstrap = _normalized_text(ROOT / "docs" / "brain-bootstrap.md")
+    local_mcp = _normalized_text(ROOT / "docs" / "local-mcp.md")
+    env_example = _normalized_text(ROOT / ".env.example")
+
+    assert "docker compose up --build" in readme
+    assert "http://localhost:3020" in readme
+    assert "local BYOK" in readme
+    assert "no Detwin account or Detwin credits" in readme
+    assert "test and save your provider key" in readme
+    assert "provider billing and quota" in local_install.lower()
+    assert "The **AI interview** option is also a Local Core workflow" in bootstrap
+    assert "Manual questions replace only question generation" in bootstrap
+    assert "platform_memory_credit_unavailable" in bootstrap
+    assert "platform_memory_outbox_worker_unavailable" in bootstrap
+    assert "retrieve_context" in local_mcp
+    assert "AGVM_HOSTED_MCP_URL=https://mcp.detwin.ai" in env_example
+    assert "AGVM_HOSTED_MCP_API_KEY=" in env_example
+    assert "required only" in env_example and "Sleep and Evolve" in env_example
+
+
+def test_public_fresh_install_forwards_bounded_grow_defaults() -> None:
+    env_example_path = ROOT / ".env.example"
+    if not env_example_path.exists():
+        env_example_path = ROOT / "examples" / "env.example"
+    env_example = env_example_path.read_text(encoding="utf-8")
+    compose_path = ROOT / "docker-compose.yml"
+    if not compose_path.exists():
+        compose_path = ROOT.parent / "docker-compose.core.yml"
+    compose = compose_path.read_text(encoding="utf-8")
+
+    assert "AGVM_LLM_MODEL=gpt-4.1-mini" in env_example
+    assert "AGVM_GROW_SEMANTIC_MODEL=gpt-4.1-mini" in env_example
+    assert "AGVM_LLM_MAX_CONCURRENT_REQUESTS=1" in env_example
+    assert "AGVM_LLM_QUEUE_TIMEOUT_SECONDS=30" in env_example
+    assert "AGVM_LLM_MODEL: ${AGVM_LLM_MODEL:-gpt-4.1-mini}" in compose
+    assert "AGVM_GROW_SEMANTIC_MODEL: ${AGVM_GROW_SEMANTIC_MODEL:-gpt-4.1-mini}" in compose
+    assert "AGVM_LLM_MAX_CONCURRENT_REQUESTS: ${AGVM_LLM_MAX_CONCURRENT_REQUESTS:-1}" in compose
+    assert "AGVM_LLM_QUEUE_TIMEOUT_SECONDS: ${AGVM_LLM_QUEUE_TIMEOUT_SECONDS:-30}" in compose
+
+
 def test_public_ci_contains_release_hygiene_gates() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    requirements_dev = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
 
     for expected in (
         "python -m pytest",
+        "python -m pip install -r requirements-dev.txt",
         "Public source boundary: PASS",
         '"LicenseRef-Eternal-Tech-" + "Proprietary"',
         "python -m reuse lint",
@@ -251,6 +305,28 @@ def test_public_ci_contains_release_hygiene_gates() -> None:
     assert "run: npm ci" in workflow
     assert "run: npm run build" in workflow
     assert workflow.count("working-directory: agvm_cockpit_prototype") >= 2
+    assert "httpx2" not in workflow
+    assert "httpx2" not in requirements_dev
+    assert "httpx==0.28.1" in requirements_dev
+    assert "starlette==0.50.0" in requirements_dev
+    assert "pytest==9.1.1" in requirements_dev
+    assert "reuse==6.2.0" in requirements_dev
+
+
+def test_public_ui_package_json_exposes_only_exported_scripts() -> None:
+    package_json = json.loads(
+        (ROOT / "agvm_cockpit_prototype" / "package.json").read_text(encoding="utf-8")
+    )
+    scripts = package_json.get("scripts")
+
+    assert scripts == {
+        "dev": "vite --host 0.0.0.0 --port 3020",
+        "build": "tsc -b && vite build",
+        "preview": "vite preview --host 0.0.0.0 --port 3020",
+    }
+    for command in scripts.values():
+        assert "scripts/test-" not in command
+        assert "src/new-ui/modules" not in command
 
 
 def test_public_vite_config_cannot_reference_private_source_paths() -> None:
@@ -337,6 +413,51 @@ def test_public_ui_is_the_rich_local_product_shell() -> None:
     assert "grow-workbench" in styles
     assert "brain-three-canvas" in styles
     assert "color-scheme: light" in styles
+
+
+def test_public_ui_has_truthful_registry_search_and_grow_review_states() -> None:
+    app = (ROOT / "agvm_cockpit_prototype" / "src" / "App.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "agvm_cockpit_prototype" / "src" / "new-ui" / "neural-cockpit.css").read_text(encoding="utf-8")
+
+    assert 'type BrainRegistryStatus = "loading" | "ready" | "error"' in app
+    assert "Brain registry unavailable" in app
+    assert "Retry brain registry" in app
+    assert 'aria-label="Search lane"' in app
+    assert "Loading brain registry" in app
+    assert "Local BYOK · Provider usage is billed" in app
+    assert "Review {selectedIds.length} selected" in app
+    assert "Apply {selectedIds.length} reviewed" in app
+    assert 'title="Growth applied"' in app
+    assert "function resumeGrowClarification" in app
+    assert "function growClarificationQuestions" in app
+    assert "investigation_id: investigationId" in app
+    assert "resume_token: resumeToken" in app
+    assert "clarification_answers: clarificationAnswers" in app
+    assert 'aria-label="Grow clarification questions"' in app
+    assert "Resume Grow preview" in app
+    assert "answeredClarifications < clarificationQuestions.length" in app
+    assert "growResumeToken(result)" in app
+    assert "setSelectedIds(candidates.map" not in app
+    assert '.brain-actions-menu:not([open]) > .brain-menu-panel' in styles
+    assert ".agvm-product-context-strip .brain-actions-menu { position: static; }" in styles
+
+
+def test_public_ui_uses_long_timeouts_only_for_ai_write_boundaries() -> None:
+    app = (ROOT / "agvm_cockpit_prototype" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+    assert "const defaultApiRequestTimeoutMs = 45_000;" in app
+    assert "const longRunningAiRequestTimeoutMs = 180_000;" in app
+    assert "const growAiRequestTimeoutMs = 1_260_000;" in app
+    assert "const timeoutMs = options.timeoutMs ?? apiTimeoutMsForPath(path);" in app
+    assert "window.setTimeout(() => controller.abort(), timeoutMs)" in app
+    assert '"/mcp/brain-bootstrap-start"' in app
+    assert '"/mcp/brain-bootstrap-preview"' in app
+    assert '"/mcp/brain-bootstrap-apply"' in app
+    assert '"/mcp/grow-source-preview"' in app
+    assert '"/mcp/grow-source-apply"' in app
+    assert '"/mcp/retrieve-context"' in app
+    assert "return growAiRequestTimeoutMs;" in app
+    assert 'path.split("?")[0].replace(/^\\/memory(?=\\/mcp\\/)/, "")' in app
 
 
 def test_every_commentable_public_file_has_owner_contributor_and_license_headers() -> None:

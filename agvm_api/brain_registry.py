@@ -103,6 +103,32 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
                     pass
 
 
+def write_imported_bootstrap_lifecycle_marker(
+    *,
+    registry_brain_path: Path,
+    brain_id: str,
+    session_id: str,
+    source: str,
+    revision: int = 0,
+    overwrite: bool = False,
+) -> None:
+    marker_path = registry_brain_path / "brain_bootstrap_v1" / "import_lifecycle.json"
+    if marker_path.exists() and not overwrite:
+        return
+    _atomic_write_json(
+        marker_path,
+        {
+            "schema_version": IMPORTED_BOOTSTRAP_LIFECYCLE_SCHEMA_VERSION,
+            "lifecycle_state": "applied",
+            "brain_id": brain_id,
+            "session_id": session_id,
+            "revision": int(revision),
+            "source": source,
+            "recorded_at": utc_timestamp(),
+        },
+    )
+
+
 def _safe_id(value: str) -> str:
     value = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(value or "").strip().lower()).strip("_")
     return value or "brain"
@@ -321,16 +347,11 @@ def _ensure_nonempty_import_bootstrap_lifecycle(
     marker_path = registry_brain_path / "brain_bootstrap_v1" / "import_lifecycle.json"
     if bootstrap or bootstrap_error or marker_path.exists():
         return
-    _atomic_write_json(
-        marker_path,
-        {
-            "schema_version": IMPORTED_BOOTSTRAP_LIFECYCLE_SCHEMA_VERSION,
-            "lifecycle_state": "applied",
-            "session_id": f"archive-import:{brain_id}",
-            "revision": 0,
-            "source": "nonempty_archive_import",
-            "recorded_at": utc_timestamp(),
-        },
+    write_imported_bootstrap_lifecycle_marker(
+        registry_brain_path=registry_brain_path,
+        brain_id=brain_id,
+        session_id=f"archive-import:{brain_id}",
+        source="nonempty_archive_import",
     )
 
 
@@ -805,6 +826,36 @@ def refresh_local_brain_registry(*, brain_root: Path | None = None) -> dict[str,
         )
     registry["brains"] = refreshed
     return _finalize_registry(registry, brain_root=root)
+
+
+def project_local_brain_registry_lifecycle(registry: dict[str, Any], *, brain_root: Path | None = None) -> dict[str, Any]:
+    """Return a registry view with authoritative lightweight lifecycle fields.
+
+    The public list endpoint intentionally avoids a full registry refresh because
+    that rebuilds storage-derived fields for every brain.  Bootstrap lifecycle is
+    stored as small registry-side JSON artifacts, though, and must remain
+    read-authoritative when a newer explicit session revision supersedes an
+    import marker.
+    """
+
+    root = (brain_root or brain_root_path()).resolve()
+    projected = dict(registry)
+    refreshed: list[dict[str, Any]] = []
+    for previous in list(projected.get("brains") or []):
+        if not isinstance(previous, dict):
+            continue
+        brain_id = str(previous.get("brain_id") or "").strip()
+        if not brain_id:
+            continue
+        item = dict(previous)
+        storage_path = _portable_registered_storage_path(item, brain_root=root, brain_id=brain_id)
+        registry_brain_path = _portable_registered_brain_path(item, brain_root=root, brain_id=brain_id)
+        item["lifecycle"] = _brain_lifecycle(storage_path, registry_brain_path)
+        refreshed.append(item)
+    projected["brains"] = refreshed
+    projected["brain_count"] = len(refreshed)
+    projected["validation"] = validate_local_brain_registry(projected)
+    return projected
 
 
 def refresh_local_brain_record(

@@ -21,8 +21,8 @@ packaging checks, but stdio clients still need their own local process.
 - Docker Desktop or a compatible Docker Compose runtime;
 - Python 3.11 or newer for desktop MCP clients that launch the local bridge;
 - Node.js 20 or newer only when developing the UI outside Docker;
-- an LLM provider key when provider-backed retrieval or memory formation is
-  needed.
+- an LLM provider key only when provider-backed retrieval or memory formation
+  is needed; it is not required for startup or local setup.
 
 ## Start The Local Stack
 
@@ -61,9 +61,20 @@ AGVM_MCP_MODULE_VISIBILITY_POLICY=block_unlicensed
 AGVM_GROW_PREVIEW_BINDING_SECRET=
 ```
 
-The public Docker UI reports provider readiness but does not persist a raw key.
-Set provider keys in `.env` and restart the API container. Raw provider keys
-must not be written to browser localStorage.
+The public Docker UI can test and save a provider key from Local Settings. The
+API persists it in `agvm_core_data/agvm_runtime.env`, updates the running
+process immediately and never returns the raw value to the browser. No restart
+is required. Raw provider keys are never written to browser `localStorage`.
+
+This is BYOK for the local runtime. AI interview generation and semantic
+candidate formation in reviewed Brain Bootstrap, semantic Grow and
+Context/Search use the configured provider account; they do not reserve or
+consume Detwin credits. Provider billing and quota still apply directly to the
+account that owns the key.
+
+`OPENAI_API_KEY` in `.env` remains an optional headless/managed deployment
+override. If both are present, the key explicitly saved through Local Settings
+is the active local value on subsequent starts.
 
 When `AGVM_GROW_PREVIEW_BINDING_SECRET` is empty, first-run setup generates a
 random key and stores it in the local API data volume. Set an explicit value of
@@ -100,3 +111,16 @@ tool, the MCP bridge did not start or cannot reach `AGVM_API_BASE_URL`.
 
 If Context, Grow or MCP pages report that no active brain exists, create or
 import one before retrying. See [Brain Bootstrap](brain-bootstrap.md).
+
+For a new brain, complete this order in the UI:
+
+1. create or select the brain in Brain Center;
+2. configure Local Settings before choosing the AI interview;
+3. answer the bounded interview and add reviewed source material;
+4. preview and explicitly apply the Bootstrap candidates;
+5. preview/apply one Grow source;
+6. run one Context query and inspect its returned search result.
+
+Sleep and Evolve are not part of this local acceptance path. They are
+cloud-backed Maintain tools and require a Detwin account, entitlement, cloud
+brain and credits through Hosted MCP.
