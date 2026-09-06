@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -21,8 +22,15 @@ from brain_bootstrap_v1.router import create_brain_bootstrap_v1_router  # noqa: 
 import brain_bootstrap_v1.service as bootstrap_service  # noqa: E402
 from brain_bootstrap_v1.service import BrainBootstrapV1Service, BootstrapV1Error  # noqa: E402
 from brain_bootstrap_v1.store import BootstrapSessionStore, BootstrapStoreError  # noqa: E402
+from config import FACET_FIELDS, ROUTING_FIELDS  # noqa: E402
 from brain_registry import create_local_brain  # noqa: E402
-from mcp_contracts import BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES, build_mcp_contract_registry  # noqa: E402
+from mcp_contracts import (  # noqa: E402
+    AGENT_MEMORY_MCP_TOOL_NAMES,
+    BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES,
+    GUIDE_MCP_TOOL_NAMES,
+    REQUIRED_MCP_TOOL_NAMES,
+    build_mcp_contract_registry,
+)
 from runtime_scope import use_runtime_brain  # noqa: E402
 from sqlite_store import fetch_graph_snapshot, replace_runtime_graph  # noqa: E402
 from storage import load_graph, load_graph_view  # noqa: E402
@@ -67,6 +75,7 @@ def _service(
     fail_apply: bool = False,
     question_generator=None,
     registry_committer=None,
+    source_resolver=None,
 ) -> tuple[BrainBootstrapV1Service, list[dict]]:
     brain = _brain(tmp_path)
     apply_calls: list[dict] = []
@@ -121,6 +130,7 @@ def _service(
             mutation_probe=mutation_probe,
             question_generator=question_generator,
             registry_committer=registry_committer or (lambda _brain, _session, _root: {}),
+            source_resolver=source_resolver,
         ),
         apply_calls,
     )
@@ -128,10 +138,19 @@ def _service(
 
 def test_bootstrap_v1_registry_exposes_nine_bounded_core_tools() -> None:
     registry = build_mcp_contract_registry()
+    registered_names = [tool["name"] for tool in registry["tools"]]
+    expected_names = [
+        *GUIDE_MCP_TOOL_NAMES,
+        *REQUIRED_MCP_TOOL_NAMES,
+        *AGENT_MEMORY_MCP_TOOL_NAMES,
+    ]
     tools = {tool["name"]: tool for tool in registry["tools"]}
 
     assert registry["registry_validation"]["passed"] is True
-    assert len(registry["tools"]) == 55
+    assert len(BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES) == 9
+    assert registered_names == expected_names
+    assert len(tools) == len(registered_names)
+    assert registry["registry_validation"]["registered_tool_count"] == len(expected_names)
     assert set(BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES).issubset(tools)
     for name in BRAIN_BOOTSTRAP_V1_MCP_TOOL_NAMES:
         tool = tools[name]
@@ -265,6 +284,100 @@ def test_bootstrap_v1_is_immutable_cas_guarded_and_writes_only_on_explicit_apply
     assert len(apply_calls) == 1
 
 
+def test_bootstrap_url_source_is_fetched_into_reviewed_foundation_text(tmp_path: Path) -> None:
+    requested_urls: list[str] = []
+
+    def resolve_source(source_uri: str) -> dict:
+        requested_urls.append(source_uri)
+        return {
+            "source_text": "Detwin builds reviewed memory systems from explicit public evidence.",
+            "source_uri": "https://example.com/about",
+            "source_kind": "website",
+            "title": "About Detwin",
+            "extraction": {
+                "schema_version": "agvm.brain_bootstrap_v1.source_extraction.v1",
+                "method": "public_core_static_html",
+                "provider_executed": False,
+            },
+        }
+
+    service, _ = _service(tmp_path, source_resolver=resolve_source)
+    service.execute(
+        "start",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "session-url",
+            "idempotency_key": "start-url",
+        },
+    )
+    added = service.execute(
+        "add_source",
+        {
+            "brain_id": "bootstrap_v1_test_brain",
+            "session_id": "session-url",
+            "expected_revision": 1,
+            "idempotency_key": "source-url",
+            "source_uri": "https://example.com/about?tracking=discarded",
+        },
+    )
+
+    assert requested_urls == ["https://example.com/about?tracking=discarded"]
+    source = added["session"]["sources"][0]
+    assert source["label"] == "About Detwin"
+    assert source["kind"] == "website"
+    assert source["source_uri"] == "https://example.com/about"
+    assert source["trust"] == "verified_public"
+    assert source["source_text"].startswith("Detwin builds reviewed memory systems")
+    assert source["extraction"]["provider_executed"] is False
+
+
+def test_bootstrap_public_html_reader_extracts_visible_text_without_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Headers:
+        @staticmethod
+        def get(name: str):
+            return "text/html; charset=utf-8" if name.lower() == "content-type" else None
+
+        @staticmethod
+        def get_content_charset():
+            return "utf-8"
+
+    class Response:
+        headers = Headers()
+
+        def __init__(self) -> None:
+            self._body = b"<html><head><title>Foundation</title><script>ignore me</script></head><body><h1>Trusted profile</h1><p>Reviewed public evidence for the first brain.</p></body></html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def geturl(self):
+            return "https://example.com/about?tracking=discarded"
+
+        def read(self, size: int = -1):
+            if not self._body:
+                return b""
+            if size < 0:
+                result, self._body = self._body, b""
+                return result
+            result, self._body = self._body[:size], self._body[size:]
+            return result
+
+    monkeypatch.setattr(bootstrap_service, "validate_public_source_url", lambda value: value)
+    monkeypatch.setattr(bootstrap_service, "open_public_source_request", lambda *_args, **_kwargs: Response())
+
+    resolved = bootstrap_service._resolve_bootstrap_source_uri("https://example.com/about?token=secret")
+
+    assert resolved["title"] == "Foundation"
+    assert "Trusted profile" in resolved["source_text"]
+    assert "Reviewed public evidence" in resolved["source_text"]
+    assert "ignore me" not in resolved["source_text"]
+    assert resolved["source_uri"] == "https://example.com/about"
+    assert resolved["extraction"]["provider_executed"] is False
+
+
 def test_adaptive_bootstrap_generates_domain_questions_and_exposes_runtime_quality_gates(tmp_path: Path) -> None:
     generated_goals: list[str] = []
 
@@ -336,6 +449,62 @@ def test_adaptive_bootstrap_generates_domain_questions_and_exposes_runtime_quali
                 "questions": ["This must never replace the provider-authored interview plan."],
             },
         )
+
+
+def test_adaptive_bootstrap_retries_invalid_provider_interview_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import llm
+
+    attestation = {
+        "schema_version": "agvm.ai_execution_attestation.v2",
+        "status": "completed",
+        "provider_executed": True,
+        "provider": "openai_compatible",
+        "model": "gpt-4.1-mini",
+        "request_sha256": "a" * 64,
+        "output_sha256": "b" * 64,
+        "usage": {
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "reasoning_tokens": 0,
+            "total_tokens": 30,
+        },
+    }
+    calls: list[str] = []
+
+    def fake_structured_json(**kwargs):
+        calls.append(str(kwargs["system_prompt"]))
+        kwargs["execution_metadata"].update(attestation)
+        if len(calls) == 1:
+            return {
+                "questions": ["Too short"],
+                "required_answer_count": 1,
+                "coverage_dimensions": ["scope"],
+            }, None
+        return {
+            "questions": [
+                f"Which reviewed bootstrap boundary should the product memory preserve for area {index}?"
+                for index in range(1, 7)
+            ],
+            "required_answer_count": 6,
+            "coverage_dimensions": [f"dimension-{index}" for index in range(1, 7)],
+        }, None
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(llm, "compiler_model", lambda: "gpt-4.1-mini")
+    monkeypatch.setattr(llm, "structured_json", fake_structured_json)
+
+    plan = bootstrap_service._generate_adaptive_interview(
+        "Build a reviewed customer rollout memory brain.",
+        {"brain_id": "bootstrap_v1_test_brain", "display_name": "Bootstrap test brain"},
+    )
+
+    assert len(calls) == 2
+    assert "Previous attempt was rejected" in calls[1]
+    assert len(plan["questions"]) == 6
+    assert plan["generation_source"] == "provider"
+    assert plan["ai_execution_attestation"]["provider_retry"]["count"] == 1
 
 
 def test_adaptive_bootstrap_rejects_unattested_provider_questions_before_revision(
@@ -486,6 +655,715 @@ def test_guided_bootstrap_quality_enforces_inclusive_12_to_30_candidate_bounds()
     assert maximum["ready_to_apply"] is True
     assert too_many["ready_to_apply"] is False
     assert "too_many_atomic_candidates" in too_many["issues"]
+
+
+def test_guided_seed_compilation_is_provider_bounded_and_order_preserving(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} keeps its exact semantic routing contract for one traceable memory decision.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 31)
+    ]
+    compiler_calls: list[dict] = []
+    attestation = {
+        "schema_version": "agvm.ai_execution_attestation.v2",
+        "status": "completed",
+        "provider_executed": True,
+        "provider": "openai_compatible",
+        "model": "gpt-4.1-mini",
+        "request_sha256": "a" * 64,
+        "output_sha256": "b" * 64,
+        "usage": {
+            "input_tokens": 120,
+            "output_tokens": 80,
+            "reasoning_tokens": 0,
+            "total_tokens": 200,
+        },
+    }
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        sections = [dict(section) for section in kwargs["source_sections"]]
+        compiler_calls.append(
+            {
+                "candidate_target": kwargs["candidate_target"],
+                "timeout_seconds": kwargs["timeout_seconds"],
+                "section_ids": [section["section_id"] for section in sections],
+                "texts": [section["text"] for section in sections],
+            }
+        )
+        kwargs["execution_metadata"].update(attestation)
+        return [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": f"Provider semantic rewrite for {section['section_id']}",
+                "summary": f"Provider semantic rewrite for {section['section_id']}",
+                "memory_type": "knowledge",
+                "node_kind": "fact",
+                "routing_semantic_scores": {
+                    field: round((index + 1) / 100, 4) for field in ROUTING_FIELDS
+                },
+                "routing_facets": {field: round((index + 2) / 100, 4) for field in FACET_FIELDS},
+                "confidence": 0.88,
+                "memory_confidence": 0.88,
+                "evidence_confidence": 0.91,
+                "stability_confidence": 0.82,
+                "retrieval_aliases": [f"reviewed seed {index}"],
+                "provenance": {"compiler_contract": section["section_id"]},
+            }
+            for index, section in enumerate(sections)
+        ], {"schema_version": "agvm.source_unit_semantic_compiler_batches.v1"}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    brain_record = {
+        "brain_id": "bounded-bootstrap",
+        "storage_path": str(tmp_path / "bounded-bootstrap"),
+    }
+    with use_runtime_brain(brain_record):
+        bundle = bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "bounded-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+    candidates = bundle["derived_nodes"]
+    assert len(compiler_calls) == 1
+    assert compiler_calls[0]["candidate_target"] == 12
+    assert compiler_calls[0]["timeout_seconds"] == 120.0
+    assert compiler_calls[0]["texts"] == [row["statement"] for row in statement_rows[:12]]
+    assert [candidate["preview_id"] for candidate in candidates] == [
+        f"bootstrap_seed_{index:03d}" for index in range(1, 13)
+    ]
+    assert [candidate["raw_text"] for candidate in candidates] == [
+        row["statement"] for row in statement_rows[:12]
+    ]
+    assert all(candidate["semantic_vector_source"] == "provider_guided_seed_semantic_compiler" for candidate in candidates)
+    assert [candidate["provenance"]["compiler_contract"] for candidate in candidates] == [
+        f"bootstrap_seed_{index:03d}" for index in range(1, 13)
+    ]
+    assert bundle["ai_execution_attestation"]["applicable"] is True
+    assert bundle["semantic_compiler"]["mode"] == "provider_batch"
+
+
+def test_guided_seed_compilation_fails_closed_without_provider_attestation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} keeps enough grounded detail for one traceable decision.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+
+    def fake_unattested_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        return [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": section["text"],
+                "summary": section["text"],
+                "memory_type": "knowledge",
+                "routing_semantic_scores": {field: 0.5 for field in ROUTING_FIELDS},
+                "routing_facets": {field: 0.5 for field in FACET_FIELDS},
+                "provenance": {"compiler_contract": section["section_id"]},
+            }
+            for section in kwargs["source_sections"]
+        ], {"schema_version": "agvm.source_unit_semantic_compiler_batches.v1"}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_unattested_semantic_compile)
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_guided_seed_semantic_compiler_unattested"):
+        bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "unattested-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+
+def test_guided_seed_uses_attested_raw_semantics_when_generic_claim_filter_drops_rows(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} preserves one exact fact and its provider-authored routing weights.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+    routing = {field: 0.5 for field in ROUTING_FIELDS}
+    facets = {field: 0.5 for field in FACET_FIELDS}
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        kwargs["execution_metadata"].update(
+            {
+                "schema_version": "agvm.ai_execution_attestation.v2",
+                "status": "completed",
+                "provider_executed": True,
+                "provider": "openai_compatible",
+                "model": "gpt-4.1-mini",
+                "request_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+                "usage": {"input_tokens": 120, "output_tokens": 80, "reasoning_tokens": 0, "total_tokens": 200},
+            }
+        )
+        raw_items = [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": section["text"],
+                "summary": section["text"],
+                "routing_semantic_scores": routing,
+                "routing_facets": facets,
+                "confidence": 0.88,
+                "memory_confidence": 0.88,
+                "evidence_confidence": 0.91,
+                "stability_confidence": 0.82,
+                "retrieval_aliases": [section["text"]],
+            }
+            for section in kwargs["source_sections"]
+        ]
+        return raw_items[:1], {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": raw_items}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    brain_record = {"brain_id": "raw-semantic-bootstrap", "storage_path": str(tmp_path / "raw-semantic-bootstrap")}
+    with use_runtime_brain(brain_record):
+        bundle = bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "raw-semantic-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+    assert len(bundle["derived_nodes"]) == 12
+    assert bundle["semantic_compiler"]["provider_raw_candidate_count"] == 12
+    assert bundle["semantic_compiler"]["stabilized_candidate_count"] == 1
+    assert bundle["semantic_compiler"]["complete_source_unit_coverage"] is True
+
+
+def test_guided_seed_recovers_all_attested_raw_semantics_when_generic_claim_filter_drops_every_row(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} remains exact while provider routing survives generic filtering.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+    routing = {field: 0.5 for field in ROUTING_FIELDS}
+    facets = {field: 0.5 for field in FACET_FIELDS}
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        kwargs["execution_metadata"].update(
+            {
+                "schema_version": "agvm.ai_execution_attestation.v2",
+                "status": "completed",
+                "provider_executed": True,
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "request_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+                "usage": {"input_tokens": 120, "output_tokens": 80, "reasoning_tokens": 0, "total_tokens": 200},
+            }
+        )
+        raw_items = [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": section["text"],
+                "summary": section["text"],
+                "routing_semantic_scores": routing,
+                "routing_facets": facets,
+                "confidence": 0.88,
+                "memory_confidence": 0.88,
+                "evidence_confidence": 0.91,
+                "stability_confidence": 0.82,
+                "retrieval_aliases": [section["text"]],
+                "provenance": {"compiler_contract": section["section_id"]},
+            }
+            for section in kwargs["source_sections"]
+        ]
+        return [], {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": raw_items}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    brain_record = {"brain_id": "raw-semantic-bootstrap-all-filtered", "storage_path": str(tmp_path / "raw-all")}
+    with use_runtime_brain(brain_record):
+        bundle = bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "raw-semantic-bootstrap-all-filtered"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+    assert len(bundle["derived_nodes"]) == 12
+    assert bundle["semantic_compiler"]["provider_raw_candidate_count"] == 12
+    assert bundle["semantic_compiler"]["stabilized_candidate_count"] == 0
+    assert bundle["semantic_compiler"]["complete_source_unit_coverage"] is True
+    assert bundle["ai_execution_attestation"]["provider_executed"] is True
+
+
+def test_guided_seed_recovery_keeps_semantic_error_fatal(monkeypatch) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} should not bypass a compiler error.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, str]:
+        kwargs["execution_metadata"].update(
+            {
+                "schema_version": "agvm.ai_execution_attestation.v2",
+                "status": "completed",
+                "provider_executed": True,
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "request_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+                "usage": {"input_tokens": 120, "output_tokens": 80, "reasoning_tokens": 0, "total_tokens": 200},
+            }
+        )
+        return [], {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": []}, "compiler_error"
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_guided_seed_semantic_compiler_unavailable") as captured:
+        bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "semantic-error-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+    detail = captured.value.http_detail()
+    assert detail["code"] == "bootstrap_guided_seed_semantic_compiler_unavailable"
+    assert detail["diagnostic"] == {
+        "schema_version": "agvm.brain_bootstrap_v1.semantic_compiler_failure.v1",
+        "category": "compiler_error",
+        "error_kind": "compiler_error",
+        "role": "compiler",
+        "model": "gpt-4o-mini",
+    }
+
+
+def test_guided_seed_semantic_compiler_diagnostic_exposes_category_without_raw_detail() -> None:
+    diagnostic = bootstrap_service._semantic_compiler_failure_diagnostic(
+        'batch_2:http_error:400:{"error":{"message":"do not leak prompt source sk-test-secret","code":"max_output_tokens"}}',
+        {"model": "gpt-4o-mini", "batch_count": 4},
+    )
+
+    assert diagnostic == {
+        "schema_version": "agvm.brain_bootstrap_v1.semantic_compiler_failure.v1",
+        "category": "provider_request_rejected",
+        "error_kind": "http_error",
+        "role": "compiler",
+        "batch_index": 2,
+        "provider_status_code": 400,
+        "provider_error_code": "max_output_tokens",
+        "model": "gpt-4o-mini",
+        "batch_count": 4,
+    }
+    rendered = json.dumps(diagnostic, sort_keys=True)
+    assert "prompt" not in rendered
+    assert "source" not in rendered
+    assert "sk-test-secret" not in rendered
+
+
+def test_guided_seed_repairs_missing_source_unit_with_attested_provider_call(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} keeps exact source coverage through AI-bound repair.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+    calls: list[list[str]] = []
+
+    def attest(call_index: int) -> dict:
+        return {
+            "schema_version": "agvm.ai_execution_attestation.v2",
+            "status": "completed",
+            "provider_executed": True,
+            "provider": "openai_compatible",
+            "model": "gpt-4o-mini",
+            "response_id": f"resp-{call_index}",
+            "request_sha256": f"{call_index + 1:064x}",
+            "output_sha256": f"{call_index + 17:064x}",
+            "usage": {"input_tokens": 100 + call_index, "output_tokens": 20, "reasoning_tokens": 0, "total_tokens": 120 + call_index},
+        }
+
+    def item(section: dict) -> dict:
+        return {
+            "source_unit_id": section["section_id"],
+            "raw_text": section["text"],
+            "summary": section["text"],
+            "routing_semantic_scores": {field: 0.5 for field in ROUTING_FIELDS},
+            "routing_facets": {field: 0.5 for field in FACET_FIELDS},
+            "confidence": 0.88,
+            "memory_confidence": 0.88,
+            "evidence_confidence": 0.91,
+            "stability_confidence": 0.82,
+            "retrieval_aliases": [section["text"]],
+        }
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        call_index = len(calls)
+        sections = [dict(section) for section in kwargs["source_sections"]]
+        calls.append([section["section_id"] for section in sections])
+        kwargs["execution_metadata"].update(attest(call_index))
+        items = [item(section) for section in sections]
+        if call_index == 0:
+            items = items[:-1]
+        else:
+            assert calls[-1] == ["bootstrap_seed_012"]
+        if call_index == 0:
+            payload = {
+                "schema_version": "agvm.source_unit_semantic_compiler_batches.v1",
+                "batch_count": 2,
+                "batches": [
+                    {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": items[:6]},
+                    {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": items[6:]},
+                ],
+            }
+        else:
+            payload = {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": items}
+        return items, payload, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    brain_record = {"brain_id": "repair-bootstrap", "storage_path": str(tmp_path / "repair-bootstrap")}
+    with use_runtime_brain(brain_record):
+        bundle = bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "repair-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+    assert calls == [[f"bootstrap_seed_{index:03d}" for index in range(1, 13)], ["bootstrap_seed_012"]]
+    assert len(bundle["derived_nodes"]) == 12
+    assert bundle["semantic_compiler"]["complete_source_unit_coverage"] is True
+    assert bundle["semantic_compiler"]["repair"] == {
+        "schema_version": "agvm.brain_bootstrap_v1.guided_seed_semantic_repair.v1",
+        "ai_bound": True,
+        "attempt_count": 1,
+        "covered_source_unit_count": 1,
+    }
+    assert bundle["semantic_compiler"]["stabilized_candidate_count"] == 12
+    attestation = bundle["ai_execution_attestation"]
+    assert attestation["provider_executed"] is True
+    assert attestation["batch_count"] == 2
+    assert attestation["response_ids"] == ["resp-0", "resp-1"]
+    assert attestation["bootstrap_semantic_compiler_repair"]["repaired_source_unit_count"] == 1
+
+
+def test_guided_seed_repair_persistent_missing_source_unit_fails_closed(monkeypatch) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} must stay fail-closed when provider omits coverage.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        sections = [dict(section) for section in kwargs["source_sections"]]
+        kwargs["execution_metadata"].update(
+            {
+                "schema_version": "agvm.ai_execution_attestation.v2",
+                "status": "completed",
+                "provider_executed": True,
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "request_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+                "usage": {"input_tokens": 120, "output_tokens": 80, "reasoning_tokens": 0, "total_tokens": 200},
+            }
+        )
+        items = [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": section["text"],
+                "summary": section["text"],
+                "routing_semantic_scores": {field: 0.5 for field in ROUTING_FIELDS},
+                "routing_facets": {field: 0.5 for field in FACET_FIELDS},
+            }
+            for section in sections
+            if section["section_id"] != "bootstrap_seed_012"
+        ]
+        return items, {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": items}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_guided_seed_semantic_compiler_incomplete") as captured:
+        bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "persistent-incomplete-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+    detail = captured.value.http_detail()
+    assert detail["diagnostic"] == {
+        "schema_version": "agvm.brain_bootstrap_v1.semantic_compiler_incomplete.v1",
+        "missing_source_unit_count": 1,
+        "repair_attempt_count": 2,
+        "ai_bound_repair": True,
+    }
+
+
+def test_guided_seed_repair_provider_error_fails_unavailable_with_safe_diagnostic(monkeypatch) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} keeps repair provider errors categorized safely.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+    calls = 0
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, str | None]:
+        nonlocal calls
+        calls += 1
+        kwargs["execution_metadata"].update(
+            {
+                "schema_version": "agvm.ai_execution_attestation.v2",
+                "status": "completed",
+                "provider_executed": True,
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "request_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+                "usage": {"input_tokens": 120, "output_tokens": 80, "reasoning_tokens": 0, "total_tokens": 200},
+            }
+        )
+        sections = [dict(section) for section in kwargs["source_sections"]]
+        if calls == 1:
+            items = [
+                {
+                    "source_unit_id": section["section_id"],
+                    "raw_text": section["text"],
+                    "summary": section["text"],
+                    "routing_semantic_scores": {field: 0.5 for field in ROUTING_FIELDS},
+                    "routing_facets": {field: 0.5 for field in FACET_FIELDS},
+                }
+                for section in sections[:-1]
+            ]
+            return items, {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": items}, None
+        return [], None, 'http_error:429:{"error":{"message":"hidden source text","code":"rate_limit_exceeded"}}'
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_guided_seed_semantic_compiler_unavailable") as captured:
+        bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "repair-error-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+    diagnostic = captured.value.http_detail()["diagnostic"]
+    assert diagnostic["category"] == "provider_rate_limited"
+    assert diagnostic["provider_status_code"] == 429
+    assert diagnostic["provider_error_code"] == "rate_limit_exceeded"
+    rendered = json.dumps(diagnostic, sort_keys=True)
+    assert "hidden source text" not in rendered
+
+
+def test_guided_seed_repair_requires_provider_attestation(monkeypatch) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} keeps unattested repair blocked.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+    calls = 0
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        nonlocal calls
+        calls += 1
+        sections = [dict(section) for section in kwargs["source_sections"]]
+        items = [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": section["text"],
+                "summary": section["text"],
+                "routing_semantic_scores": {field: 0.5 for field in ROUTING_FIELDS},
+                "routing_facets": {field: 0.5 for field in FACET_FIELDS},
+            }
+            for section in sections
+        ]
+        if calls == 1:
+            kwargs["execution_metadata"].update(
+                {
+                    "schema_version": "agvm.ai_execution_attestation.v2",
+                    "status": "completed",
+                    "provider_executed": True,
+                    "provider": "openai_compatible",
+                    "model": "gpt-4o-mini",
+                    "request_sha256": "a" * 64,
+                    "output_sha256": "b" * 64,
+                    "usage": {"input_tokens": 120, "output_tokens": 80, "reasoning_tokens": 0, "total_tokens": 200},
+                }
+            )
+            return items[:-1], {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": items[:-1]}, None
+        return items, {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": items}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_guided_seed_semantic_compiler_unattested"):
+        bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "repair-unattested-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+
+def test_guided_seed_recovery_requires_provider_attestation_when_all_rows_are_filtered(monkeypatch) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} should not recover from unattested provider payload.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        raw_items = [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": section["text"],
+                "summary": section["text"],
+                "routing_semantic_scores": {field: 0.5 for field in ROUTING_FIELDS},
+                "routing_facets": {field: 0.5 for field in FACET_FIELDS},
+            }
+            for section in kwargs["source_sections"]
+        ]
+        return [], {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": raw_items}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_guided_seed_semantic_compiler_unattested"):
+        bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "unattested-filtered-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
+
+
+def test_guided_seed_recovery_requires_complete_provider_payload_coverage(monkeypatch) -> None:
+    statement_rows = [
+        {
+            "statement": f"Reviewed statement {index:02d} should fail when provider payload misses its section.",
+            "source_unit": {"source_id": f"source-{index:02d}"},
+            "source_span_start": index * 10,
+            "source_span_end": index * 10 + 9,
+        }
+        for index in range(1, 13)
+    ]
+
+    def fake_semantic_compile(**kwargs) -> tuple[list[dict], dict, None]:
+        kwargs["execution_metadata"].update(
+            {
+                "schema_version": "agvm.ai_execution_attestation.v2",
+                "status": "completed",
+                "provider_executed": True,
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "request_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+                "usage": {"input_tokens": 120, "output_tokens": 80, "reasoning_tokens": 0, "total_tokens": 200},
+            }
+        )
+        raw_items = [
+            {
+                "source_unit_id": section["section_id"],
+                "raw_text": section["text"],
+                "summary": section["text"],
+                "routing_semantic_scores": {field: 0.5 for field in ROUTING_FIELDS},
+                "routing_facets": {field: 0.5 for field in FACET_FIELDS},
+            }
+            for section in kwargs["source_sections"][:-1]
+        ]
+        return [], {"schema_version": "agvm.source_unit_semantic_compiler.v1", "derived_nodes": raw_items}, None
+
+    monkeypatch.setattr(bootstrap_service, "_reviewed_atomic_seed_rows", lambda _session: statement_rows)
+    monkeypatch.setattr(bootstrap_service, "llm_source_unit_semantic_compile", fake_semantic_compile)
+
+    with pytest.raises(BootstrapV1Error, match="bootstrap_guided_seed_semantic_compiler_incomplete"):
+        bootstrap_service._build_guided_seed_bundle(
+            session={"session_id": "incomplete-filtered-bootstrap"},
+            raw_text="\n".join(row["statement"] for row in statement_rows),
+            graph={"nodes": [], "edges": []},
+            index={},
+            atlas={},
+            requirements={"target_candidate_count": 12, "maximum_candidate_count": 30},
+        )
 
 
 def test_guided_bootstrap_apply_rechecks_the_actual_selected_subset(tmp_path: Path) -> None:
@@ -1156,6 +2034,44 @@ def test_bootstrap_v1_router_maps_domain_errors_and_exposes_status(tmp_path: Pat
     )
     assert stale.status_code == 409
     assert "bootstrap_revision_conflict" in stale.json()["detail"]
+
+
+def test_bootstrap_v1_router_exposes_safe_semantic_compiler_diagnostic() -> None:
+    class FailingService:
+        def execute(self, _operation: str, _payload: dict) -> dict:
+            raise BootstrapV1Error(
+                "bootstrap_guided_seed_semantic_compiler_unavailable",
+                status_code=503,
+                safe_detail={
+                    "diagnostic": {
+                        "schema_version": "agvm.brain_bootstrap_v1.semantic_compiler_failure.v1",
+                        "category": "provider_rate_limited",
+                        "error_kind": "http_error",
+                        "role": "compiler",
+                        "provider_status_code": 429,
+                        "provider_error_code": "rate_limit_exceeded",
+                        "model": "gpt-4o-mini",
+                    }
+                },
+            )
+
+    app = FastAPI()
+    app.include_router(create_brain_bootstrap_v1_router(FailingService()))
+    response = TestClient(app).post("/memory/mcp/brain-bootstrap-preview", json={})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "bootstrap_guided_seed_semantic_compiler_unavailable",
+        "diagnostic": {
+            "schema_version": "agvm.brain_bootstrap_v1.semantic_compiler_failure.v1",
+            "category": "provider_rate_limited",
+            "error_kind": "http_error",
+            "role": "compiler",
+            "provider_status_code": 429,
+            "provider_error_code": "rate_limit_exceeded",
+            "model": "gpt-4o-mini",
+        },
+    }
 
 
 def _brain_record_from_response(tmp_path: Path, _response: dict) -> dict:

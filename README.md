@@ -47,14 +47,42 @@ Then open:
 - API health: `http://localhost:8010/health`
 - API docs: `http://localhost:8010/docs`
 
-Set `OPENAI_API_KEY` in `.env` before starting Docker when provider-backed
-operations are needed. The browser UI never stores raw provider keys in
-localStorage; keys belong in backend-managed environment storage or an OS secret
-manager.
+No provider key is required to start AGVM Core, create a brain, begin the manual
+Bootstrap flow or connect MCP. When provider-backed operations are needed, open
+Local Settings, test the OpenAI key and save it there. The API stores it in the
+local Docker data volume and applies it to the running process; no container
+restart is required. The browser never writes the raw key to `localStorage`.
+Headless operators may still provide `OPENAI_API_KEY` through `.env` instead.
+
+The saved key is local BYOK: provider usage is billed by the provider account
+that owns the key, not by Detwin. AI interview generation and semantic candidate
+formation during reviewed Brain Bootstrap, semantic Grow and Context/Search run
+against this local provider and do not consume Detwin credits.
 
 See [Local Install](docs/local-install.md), [Brain Bootstrap](docs/brain-bootstrap.md),
 [Brain Profile V1](docs/brain-profile-v1.md) and [Brain Core](docs/brain-core.md)
 for the setup, personalization and visualization boundaries.
+
+## First Local Workflow
+
+1. Run `docker compose up --build`, then open `http://localhost:3020`.
+2. In Local Settings, test and save your provider key. Manual setup can start
+   without it, but AI interview, Bootstrap semantic preview, semantic Grow and
+   Context/Search fail closed until a provider is configured.
+3. In Brain Center, create or select a local brain and start the **AI interview**
+   for locally generated bounded questions. API and MCP callers may instead
+   start a manual interview and supply the bounded questions themselves. Answer
+   the interview, add reviewed source material, preview the candidates and
+   explicitly apply the selected candidate IDs.
+4. In Grow, preview a local source and explicitly apply the reviewed nodes.
+5. In Context, run a query against the selected brain. MCP clients use
+   `retrieve_context` and can inspect the returned `search_id` without starting
+   another search.
+
+These steps use Local Core and require no Detwin account or Detwin credits.
+Sleep, Evolve and advanced calibration are separate cloud-backed Maintain
+operations. Calling them through MCP requires a Hosted MCP key plus a valid
+Detwin account, plan, cloud brain, provider readiness and available credits.
 
 ## Connect An MCP Client
 

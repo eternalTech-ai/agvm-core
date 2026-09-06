@@ -82,11 +82,16 @@ REQUIRED_MCP_TOOL_NAMES = [
     "write_memory_preview",
     "write_memory_commit",
     "ask_memory_clarification",
+    "change_node_content",
+    "delete_node",
     "grow_preview",
     "grow_guided",
     "grow_apply",
     "grow_status",
     "brain_health",
+    "calibrate_brain_preview",
+    "calibrate_brain_apply",
+    "calibrate_brain_rollback",
     "geometry_calibration_preview",
     "geometry_calibration_apply",
     "geometry_calibration_rollback",
@@ -139,6 +144,8 @@ PR12J_C_IMPLEMENTED_TOOL_NAMES = {
     "write_memory_preview",
     "write_memory_commit",
     "ask_memory_clarification",
+    "change_node_content",
+    "delete_node",
     "grow_preview",
     "grow_guided",
     "grow_apply",
@@ -146,6 +153,9 @@ PR12J_C_IMPLEMENTED_TOOL_NAMES = {
 }
 
 PR12J_D_IMPLEMENTED_TOOL_NAMES = {
+    "calibrate_brain_preview",
+    "calibrate_brain_apply",
+    "calibrate_brain_rollback",
     "geometry_calibration_preview",
     "geometry_calibration_apply",
     "geometry_calibration_rollback",
@@ -352,12 +362,21 @@ def _context_output_schema(
 def _source_input_schema() -> dict[str, Any]:
     return _schema_object(
         properties={
+            "brain_id": {
+                **_string(
+                    "Explicit brain id returned by list_brains or ensure_brain. Must match X-AGVM-Brain-Id/query scope and any compatibility options/runtime assertion."
+                ),
+                "minLength": 1,
+            },
             "raw_input": _string("Manual text, URL or extracted source text."),
             "input_kind": _string("Source kind hint.", enum=["auto", "manual_text", "url", "website", "pdf", "docx", "image", "transcript", "mixed_bundle"]),
             "source_label": _string("Optional source label.", nullable=True),
             "source_uri": _string("Optional source URI.", nullable=True),
             "user_instruction": _string("Optional ingestion instruction.", nullable=True),
             "options": _object("Source investigation options."),
+            "trusted_source_investigation": _object(
+                "Trusted local-module source package. Public Core validates schema, digest, acquisition proof, URL/provenance and brain scope before running one Grow Investigator; Core never imports private extraction code."
+            ),
             "run_preview": _boolean(
                 "Run compiler preview when eligible. Set false for the fast MCP source-unit proof path; apply still requires a later full preview.",
                 default=True,
@@ -371,6 +390,10 @@ def _source_input_schema() -> dict[str, Any]:
 def _source_apply_input_schema() -> dict[str, Any]:
     return _schema_object(
         properties={
+            "brain_id": {
+                **_string("Explicit brain id bound to the preview investigation."),
+                "minLength": 1,
+            },
             "investigation_id": _string(
                 "Source investigation id returned by grow_source_preview or grow_preview.",
                 nullable=True,
@@ -412,6 +435,10 @@ def _source_apply_input_schema() -> dict[str, Any]:
 def _source_status_input_schema() -> dict[str, Any]:
     return _schema_object(
         properties={
+            "brain_id": {
+                **_string("Explicit brain id bound to the stored investigation."),
+                "minLength": 1,
+            },
             "investigation_id": _string("Source investigation id returned by preview.", nullable=True),
         },
         required=["investigation_id"],
@@ -422,6 +449,7 @@ def _source_status_input_schema() -> dict[str, Any]:
 def _source_output_schema(*, applied: bool = False) -> dict[str, Any]:
     properties = {
         "schema_version": _string("Tool output schema version."),
+        "brain_id": _string("Resolved brain id attested by Core for this Grow operation."),
         "tool_name": _string("MCP tool name."),
         "status": _string("Source investigation state.", enum=["preview_ready", "asking_clarification", "partial_budget_exhausted", "applied", "blocked", "failed"]),
         "source_investigation": _object("Versioned source investigation package."),
@@ -502,6 +530,86 @@ def _write_output_schema(*, commit: bool = False) -> dict[str, Any]:
     if commit:
         properties["persist_result"] = _object("Persisted node ids, merge ids and write trace.")
     return _schema_object(properties=properties, required=["schema_version", "tool_name", "status", "memory_operation_lifecycle_contract"], description="Write memory MCP output contract.")
+
+
+def _change_node_content_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "brain_id": {
+                **_string("Explicit brain id returned by list_brains or ensure_brain."),
+                "minLength": 1,
+            },
+            "node_id": {
+                **_string("Exact memory node id selected by a Search/Review result."),
+                "minLength": 1,
+            },
+            "new_content": {
+                **_string("Replacement human-readable node content."),
+                "minLength": 1,
+            },
+            "title": _string("Optional replacement title.", nullable=True),
+            "claim_status": _string("Optional claim status after the content change.", nullable=True),
+            "reason": _string("Human reason for the correction.", nullable=True),
+            "search_id": _string("Optional Search id that exposed the issue.", nullable=True),
+            "conflict_id": _string("Optional conflict/review item id from the Company layer.", nullable=True),
+            "expected_brain_revision": _string("Optional graph revision from preview; blocks stale apply.", nullable=True),
+            "idempotency_key": _string("Optional client idempotency key for apply replay safety.", nullable=True),
+            "confirm_change": _boolean("Required explicit confirmation for mutation. Omit/false for preview only.", default=False),
+        },
+        required=["brain_id", "node_id", "new_content"],
+        description="Preview or apply a direct content update to one existing memory node. The Company layer decides the human correction; Core only executes the exact primitive.",
+    )
+
+
+def _delete_node_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "brain_id": {
+                **_string("Explicit brain id returned by list_brains or ensure_brain."),
+                "minLength": 1,
+            },
+            "node_id": _string("Exact node id to delete.", nullable=True),
+            "target_node_ids": _array("Exact node ids to delete.", item_type="string"),
+            "reason": _string("Human reason for deletion.", nullable=True),
+            "search_id": _string("Optional Search id that exposed the issue.", nullable=True),
+            "conflict_id": _string("Optional conflict/review item id from the Company layer.", nullable=True),
+            "expected_brain_revision": _string("Optional graph revision from preview; blocks stale apply.", nullable=True),
+            "idempotency_key": _string("Optional client idempotency key for apply replay safety.", nullable=True),
+            "allow_document_anchor_delete": _boolean("Extra guard for deleting document anchors.", default=False),
+            "confirm_delete": _boolean("Required explicit confirmation for mutation. Omit/false for preview only.", default=False),
+        },
+        required=["brain_id"],
+        description="Preview or apply deletion of one or more exact memory nodes, including connected edge cleanup. At least node_id or target_node_ids is required at runtime.",
+    )
+
+
+def _node_mutation_output_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "schema_version": _string("Tool output schema version."),
+            "tool_name": _string("MCP primitive name."),
+            "status": _string("Primitive state.", enum=["preview_ready", "applied", "blocked", "applying"]),
+            "brain_id": _string("Resolved brain id."),
+            "node_id": _string("Target node id.", nullable=True),
+            "node_ids": _array("Target node ids.", item_type="string"),
+            "preview_id": _string("Stable preview id for the exact node mutation."),
+            "before_brain_revision": _string("Graph revision read before the mutation."),
+            "after_brain_revision": _string("Graph revision after apply.", nullable=True),
+            "expected_brain_revision": _string("Revision clients should pass back before apply."),
+            "can_apply_now": _boolean("Whether the primitive can apply with confirmation."),
+            "mutates_memory": _boolean("False for preview; true only after confirmed apply."),
+            "before": _object("Compact before node."),
+            "after": _object("Compact after node."),
+            "nodes": _array("Compact nodes affected by delete-node."),
+            "edges_to_remove": _integer("Number of graph edges removed by delete-node.", minimum=0),
+            "blocked_reasons": _array("Reasons the primitive cannot apply.", item_type="string"),
+            "apply_contract": _object("Explicit confirmation and revision guard contract."),
+            "apply_receipt": _object("Mutation receipt returned after apply."),
+            "mcp_latency_profile": _object("Elapsed milliseconds."),
+        },
+        required=["schema_version", "tool_name", "status", "brain_id", "mutates_memory"],
+        description="Direct node primitive output for Company-layer conflict resolution.",
+    )
 
 
 def _maintenance_input_schema(*, apply: bool = False) -> dict[str, Any]:
@@ -651,6 +759,116 @@ def _matrix_calibration_input_schema() -> dict[str, Any]:
             "include_recommendations": _boolean("Include bounded calibration recommendations.", default=True),
         },
         description="Non-mutating Geometry/Matrix calibration preview request with explicit brain, optional focus and bounded node/update limits.",
+    )
+
+
+def _calibrate_brain_v2_preview_input_schema() -> dict[str, Any]:
+    feedback_summary = _schema_object(
+        properties={
+            "schema_version": _string("Optional feedback-ledger schema version."),
+            "signal_count": _integer("Number of feedback signals summarized for calibration.", minimum=1),
+            "signals": {
+                **_array("Trusted retrieval and memory-quality feedback signals used by the AI calibration run."),
+                "minItems": 1,
+            },
+        },
+        required=["signals"],
+        description="Bounded feedback-ledger evidence. Detwin Cloud derives this from the selected brain's durable feedback ledger.",
+    )
+    return _schema_object(
+        properties={
+            "brain_id": {
+                **_string("Explicit brain id returned by list_brains or ensure_brain."),
+                "minLength": 1,
+            },
+            "feedback_digest": {
+                **_string("Stable digest of the exact feedback-ledger snapshot being calibrated."),
+                "minLength": 1,
+            },
+            "feedback_summary": feedback_summary,
+            "metadata": _object("Optional caller metadata preserved in Hosted MCP receipts."),
+        },
+        required=["feedback_digest", "feedback_summary"],
+        description=(
+            "Cloud-backed BrainProfile V2 calibration preview. The provider generates bounded semantic-metric "
+            "weights from a trusted feedback-ledger snapshot; callers do not supply or impersonate the AI result."
+        ),
+    )
+
+
+def _calibrate_brain_v2_apply_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "brain_id": {
+                **_string("Explicit brain id returned by list_brains or ensure_brain."),
+                "minLength": 1,
+            },
+            "preview_signature": {
+                **_string("Exact plan_signature returned by calibrate_brain_preview."),
+                "minLength": 1,
+            },
+            "selected_proposal_ids": {
+                **_array("Complete reviewed BrainProfile V2 proposal id set returned by the preview.", item_type="string"),
+                "minItems": 1,
+                "uniqueItems": True,
+            },
+            "confirm_apply": _boolean("Explicit apply confirmation.", default=False),
+            "rollback_consent": _boolean("Consent to create and retain the atomic rollback state.", default=False),
+            "metadata": _object("Optional caller metadata preserved in Hosted MCP receipts."),
+        },
+        required=[
+            "preview_signature",
+            "selected_proposal_ids",
+            "confirm_apply",
+            "rollback_consent",
+        ],
+        description="Apply one exact signed BrainProfile V2 calibration preview with explicit confirmation and rollback consent.",
+    )
+
+
+def _calibrate_brain_v2_rollback_input_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "brain_id": {
+                **_string("Explicit brain id returned by list_brains or ensure_brain."),
+                "minLength": 1,
+            },
+            "plan_signature": {
+                **_string("Exact plan_signature of the applied BrainProfile V2 calibration to restore."),
+                "minLength": 1,
+            },
+            "confirm_rollback": _boolean("Explicit rollback confirmation.", default=False),
+            "metadata": _object("Optional caller metadata preserved in Hosted MCP receipts."),
+        },
+        required=["plan_signature", "confirm_rollback"],
+        description="Atomically rollback one exact applied BrainProfile V2 calibration revision.",
+    )
+
+
+def _calibrate_brain_v2_output_schema() -> dict[str, Any]:
+    return _schema_object(
+        properties={
+            "schema_version": _string("BrainProfile V2 calibration output schema version."),
+            "brain_id": _string("Brain inspected or changed by this operation."),
+            "tool_name": _string("Canonical Calibrate Brain V2 MCP tool name."),
+            "status": _string(
+                "Calibration lifecycle state.",
+                enum=["preview_ready", "applied", "already_applied", "rolled_back", "already_rolled_back", "blocked"],
+            ),
+            "plan_signature": _string("Stable signed calibration plan identity.", nullable=True),
+            "preview_signature": _string("Compatibility alias for the calibration plan identity.", nullable=True),
+            "selected_proposal_ids": _array("Exact proposal ids accepted by apply.", item_type="string"),
+            "signed_preview_receipt": _object("Signed preview receipt binding brain, profile revision and plan."),
+            "brain_profile_v2_preview": _object("Provider-attested before/after BrainProfile V2 calibration preview."),
+            "brain_profile_v2_apply_result": _object("Atomic apply result and idempotent replay proof."),
+            "brain_profile_v2_rollback_result": _object("Atomic rollback result and idempotent replay proof."),
+            "ai_execution_attestation": _object("Provider/model/request/output evidence for the preview AI execution."),
+            "mutation_surface": _object("Exact touched surfaces and atomicity evidence."),
+            "metering": _object("Hosted estimate/settlement result. Replays settle at zero units."),
+            "terminal_receipt": _object("Durable semantic-operation terminal receipt."),
+        },
+        required=["schema_version", "brain_id", "tool_name", "status"],
+        description="Cloud-backed Calibrate Brain V2 preview/apply/rollback output contract.",
     )
 
 
@@ -1483,6 +1701,37 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
                 candidate_backend_routes=["POST /memory/source-investigation/preview", "POST /memory/preview"],
                 mutation_policy="preview_only",
             ),
+            _tool_contract(
+                name="change_node_content",
+                title="Change Node Content",
+                description=(
+                    "Preview or explicitly apply a direct content change to one exact memory node. "
+                    "Use this as the simple MCP primitive under a human conflict-resolution layer; "
+                    "Core does not invent the correction text."
+                ),
+                category="write",
+                planned_slice="PR-12J-C",
+                default_output_package="node_change_preview",
+                input_schema=_change_node_content_input_schema(),
+                output_schema=_node_mutation_output_schema(),
+                candidate_backend_routes=["POST /memory/mcp/change-node-content", "POST /mcp/change-node-content"],
+                mutation_policy="explicit_apply",
+            ),
+            _tool_contract(
+                name="delete_node",
+                title="Delete Node",
+                description=(
+                    "Preview or explicitly apply deletion of exact memory node ids, including connected edge cleanup. "
+                    "Use this as the simple MCP primitive under a human conflict-resolution layer."
+                ),
+                category="write",
+                planned_slice="PR-12J-C",
+                default_output_package="node_delete_preview",
+                input_schema=_delete_node_input_schema(),
+                output_schema=_node_mutation_output_schema(),
+                candidate_backend_routes=["POST /memory/mcp/delete-node", "POST /mcp/delete-node"],
+                mutation_policy="destructive",
+            ),
         ]
     )
 
@@ -1498,6 +1747,95 @@ def _build_tool_contracts() -> list[dict[str, Any]]:
             output_schema=_brain_health_output_schema(),
             candidate_backend_routes=["GET /memory/brain-health", "POST /mcp/brain-health"],
             mutation_policy="read_only",
+        )
+    )
+
+    contracts.append(
+        _tool_contract(
+            name="calibrate_brain_preview",
+            title="Calibrate Brain Preview",
+            description=(
+                "Generate a non-mutating, provider-attested BrainProfile V2 semantic-metric calibration preview "
+                "from the selected brain's trusted feedback ledger."
+                + _advanced_module_visibility_note()
+            ),
+            category="maintenance",
+            planned_slice="PR-12J-D",
+            default_output_package="brain_profile_v2_preview",
+            input_schema=_calibrate_brain_v2_preview_input_schema(),
+            output_schema=_calibrate_brain_v2_output_schema(),
+            candidate_backend_routes=[
+                "POST /mcp/calibrate-brain-preview",
+                "POST /memory/mcp/calibrate-brain-preview",
+            ],
+            mutation_policy="preview_only",
+            client_usage={
+                "when_to_use": (
+                    "Use after the selected brain has enough trusted retrieval feedback to propose a new semantic metric. "
+                    "The Hosted provider generates the candidate profile and attestation."
+                ),
+                "must_not": [
+                    "Do not invent proposed weights, an AI execution attestation or trusted benchmark evidence.",
+                    "Do not treat preview_ready as an applied profile revision.",
+                ],
+                "followups": ["calibrate_brain_apply", "calibrate_brain_rollback", "brain_health"],
+            },
+        )
+    )
+
+    contracts.append(
+        _tool_contract(
+            name="calibrate_brain_apply",
+            title="Calibrate Brain Apply",
+            description=(
+                "Apply one exact signed BrainProfile V2 calibration proposal with explicit confirmation, "
+                "rollback consent and atomic persistence."
+                + _advanced_module_visibility_note()
+            ),
+            category="maintenance",
+            planned_slice="PR-12J-D",
+            default_output_package="brain_profile_v2_apply_result",
+            input_schema=_calibrate_brain_v2_apply_input_schema(),
+            output_schema=_calibrate_brain_v2_output_schema(),
+            candidate_backend_routes=[
+                "POST /mcp/calibrate-brain-apply",
+                "POST /memory/mcp/calibrate-brain-apply",
+            ],
+            mutation_policy="explicit_apply",
+            client_usage={
+                "when_to_use": "Use only after reviewing the exact preview signature and complete proposal id set.",
+                "must_not": [
+                    "Do not call without explicit user approval and rollback consent.",
+                    "Do not substitute proposal ids or a stale preview signature.",
+                ],
+                "followups": ["brain_health", "calibrate_brain_rollback"],
+            },
+        )
+    )
+
+    contracts.append(
+        _tool_contract(
+            name="calibrate_brain_rollback",
+            title="Calibrate Brain Rollback",
+            description=(
+                "Atomically restore the prior BrainProfile V2 revision for one exact applied calibration plan."
+                + _advanced_module_visibility_note()
+            ),
+            category="maintenance",
+            planned_slice="PR-12J-D",
+            default_output_package="brain_profile_v2_rollback_result",
+            input_schema=_calibrate_brain_v2_rollback_input_schema(),
+            output_schema=_calibrate_brain_v2_output_schema(),
+            candidate_backend_routes=[
+                "POST /mcp/calibrate-brain-rollback",
+                "POST /memory/mcp/calibrate-brain-rollback",
+            ],
+            mutation_policy="explicit_apply",
+            client_usage={
+                "when_to_use": "Use to restore the exact prior profile revision recorded by an applied calibration plan.",
+                "must_not": ["Do not rollback without the exact applied plan signature and explicit user confirmation."],
+                "followups": ["brain_health", "calibrate_brain_preview"],
+            },
         )
     )
 

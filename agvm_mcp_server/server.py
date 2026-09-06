@@ -32,6 +32,8 @@ MUTATION_TOOLS = {
     "sleep_rollback",
     "evolve_apply",
     "evolve_rollback",
+    "calibrate_brain_apply",
+    "calibrate_brain_rollback",
     "geometry_calibration_apply",
     "geometry_calibration_rollback",
     "matrix_calibration_apply",

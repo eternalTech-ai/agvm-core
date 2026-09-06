@@ -65,10 +65,14 @@ def _configured_trusted_origins() -> tuple[str, ...]:
         origin = raw.strip().rstrip("/")
         if not origin or origin in values:
             continue
+        if origin == "*":
+            raise RuntimeError("AGVM_CORE_TRUSTED_BROWSER_ORIGINS cannot use a wildcard origin")
         try:
             parsed = urlsplit(origin)
         except ValueError:
-            continue
+            raise RuntimeError(
+                "AGVM_CORE_TRUSTED_BROWSER_ORIGINS must contain only exact HTTP(S) origins"
+            ) from None
         if (
             parsed.scheme in {"http", "https"}
             and parsed.hostname
@@ -79,4 +83,8 @@ def _configured_trusted_origins() -> tuple[str, ...]:
             and not parsed.fragment
         ):
             values.append(origin)
+        else:
+            raise RuntimeError(
+                "AGVM_CORE_TRUSTED_BROWSER_ORIGINS must contain only exact HTTP(S) origins"
+            )
     return tuple(values)
